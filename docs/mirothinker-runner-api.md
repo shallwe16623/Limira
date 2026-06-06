@@ -70,3 +70,9 @@ Completed, failed, and cancelled tasks attempt to create:
 - `archive.zip`
 
 `archive.zip` contains only the first four files with relative paths. If zip creation fails, research `status` remains unchanged and `archive_status` becomes `failed`.
+
+## Trace Compatibility
+
+`archives/<timestamp>_<task_id>/trace.json` is a new archive contract for downloadable research diagnostics. It is separate from the legacy MiroThinker trace viewer input.
+
+The legacy pipeline still writes `logs/api-server/task_<task_id>_<timestamp>.json` through `TaskLog.save()`. Runner archives must not replace, move, or rewrite those legacy task JSON files. Existing trace tooling should continue reading `logs/api-server/task_*.json` unless a viewer update explicitly adds support for the new archive `trace.json` format and is regression-tested.

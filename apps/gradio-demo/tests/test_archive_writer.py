@@ -234,3 +234,95 @@ def test_scrub_secrets_redacts_full_authorization_string_values():
     assert scrubbed["api_header"] == "Authorization: [REDACTED]"
     assert scrubbed["bearer"] == "Authorization: [REDACTED]"
     assert scrubbed["delimited"] == "Authorization: [REDACTED]; next=value"
+
+
+def test_archive_and_extracted_zip_do_not_contain_exact_secret_values(tmp_path):
+    secrets = [
+        "sk-querysecret123456",
+        "baseurlsecret123456",
+        "sk-urlsecret123456",
+        "sk-modelsecret123456",
+        "eventbearersecret123456",
+        "cookiesessionsecret123456",
+        "serpersecret123456",
+        "errorbearersecret123456",
+        "sk-stateerror123456",
+        "statecookiesecret123456",
+    ]
+    writer = ResearchArchiveWriter(
+        tmp_path / "archives",
+        clock=lambda: "2026-06-06T12:00:00+00:00",
+    )
+    writer.start(
+        task_id="secret-scan",
+        query=f"research query OPENAI_API_KEY={secrets[0]}",
+        user_id="user-a",
+        model_summary={
+            "provider": "deepseek",
+            "model": "deepseek-v4",
+            "base_url": (
+                f"https://user:{secrets[1]}@api.example.com/path?api_key={secrets[2]}"
+            ),
+            "api_key": secrets[3],
+        },
+    )
+    writer.record_event(
+        {
+            "type": "tool_call",
+            "timestamp": "2026-06-06T12:00:01+00:00",
+            "payload": {
+                "event": "tool_call",
+                "data": {
+                    "Authorization": f"Bearer {secrets[4]}",
+                    "Cookie": f"session={secrets[5]}",
+                    "headers": {
+                        "Set-Cookie": f"token={secrets[9]}",
+                    },
+                    "note": f"SERPER_API_KEY={secrets[6]}",
+                },
+            },
+        }
+    )
+
+    result = writer.complete(
+        status="failed",
+        error=f"Authorization: Bearer {secrets[7]}",
+        state={
+            "errors": [
+                f"DEEPSEEK_API_KEY={secrets[8]}",
+                f"Cookie: state={secrets[9]}",
+            ]
+        },
+    )
+
+    assert result.archive_status == "ready"
+    assert result.archive_zip_path is not None
+
+    for path in result.archive_dir.rglob("*"):
+        if path.is_file() and path.name != "archive.zip":
+            assert_no_exact_secret_values(path.read_text(encoding="utf-8"), secrets)
+
+    extract_dir = tmp_path / "unzipped"
+    with zipfile.ZipFile(result.archive_zip_path) as archive:
+        names = archive.namelist()
+        assert sorted(names) == [
+            "metadata.json",
+            "report.html",
+            "report.md",
+            "trace.json",
+        ]
+        assert all(not name.startswith("/") for name in names)
+        assert all(".." not in name.split("/") for name in names)
+        assert all(".env" not in name for name in names)
+        assert all("logs/" not in name for name in names)
+        assert all("__pycache__" not in name for name in names)
+        archive.extractall(extract_dir)
+
+    for path in extract_dir.rglob("*"):
+        if path.is_file():
+            assert_no_exact_secret_values(path.read_text(encoding="utf-8"), secrets)
+
+
+def assert_no_exact_secret_values(text: str, secrets: list[str]) -> None:
+    for secret in secrets:
+        assert secret not in text

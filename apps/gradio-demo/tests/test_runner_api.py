@@ -25,6 +25,12 @@ ADMIN_HEADERS = {
     "X-OpenWebUI-User-Id": "admin-user",
     "X-OpenWebUI-User-Role": "admin",
 }
+ARCHIVE_MEMBERS = [
+    "metadata.json",
+    "report.html",
+    "report.md",
+    "trace.json",
+]
 
 
 def init_state():
@@ -71,6 +77,14 @@ async def cancelled_stream(task_id, query, _unused, disconnect_check=None):
         "data": {"delta": {"content": "partial"}},
     }
     raise asyncio.CancelledError("client disconnected")
+
+
+async def cancelled_secret_stream(task_id, query, _unused, disconnect_check=None):
+    yield {
+        "event": "message",
+        "data": {"delta": {"content": "partial"}},
+    }
+    raise asyncio.CancelledError("Authorization: Bearer cancelledsecret123456")
 
 
 class CancellationProbe:
@@ -150,6 +164,55 @@ async def start_task(client, headers=USER_A_HEADERS, query="test query"):
     return await response.json()
 
 
+async def complete_task(client, headers=USER_A_HEADERS):
+    start_payload = await start_task(client, headers=headers)
+    task_id = start_payload["task_id"]
+    events_response = await client.get(
+        f"/mirothinker/tasks/{task_id}/events",
+        headers=headers,
+    )
+    assert events_response.status == 200
+    await events_response.text()
+    return task_id
+
+
+def archive_dir_for(store, task_id):
+    record = store.get_task(task_id)
+    assert record is not None
+    assert record.archive_dir is not None
+    return Path(record.archive_dir)
+
+
+def assert_zip_members(zip_path):
+    with zipfile.ZipFile(zip_path) as archive:
+        assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
+
+
+def assert_diagnostic_archive(store, task_id, expected_status, forbidden_text):
+    archive_dir = archive_dir_for(store, task_id)
+    expected_files = {*ARCHIVE_MEMBERS, "archive.zip"}
+    assert expected_files.issubset({path.name for path in archive_dir.iterdir()})
+
+    metadata = json.loads((archive_dir / "metadata.json").read_text(encoding="utf-8"))
+    trace = json.loads((archive_dir / "trace.json").read_text(encoding="utf-8"))
+    report = (archive_dir / "report.md").read_text(encoding="utf-8")
+    report_html = (archive_dir / "report.html").read_text(encoding="utf-8")
+
+    assert metadata["status"] == expected_status
+    assert trace["events"]
+    assert report.strip()
+    assert f"MiroThinker Research {expected_status.title()}" in report
+    assert "<!doctype html>" in report_html
+    assert forbidden_text not in json.dumps(metadata)
+    assert forbidden_text not in json.dumps(trace)
+    assert forbidden_text not in report
+    assert forbidden_text not in report_html
+
+    record = store.get_task(task_id)
+    assert record.archive_zip_path is not None
+    assert_zip_members(record.archive_zip_path)
+
+
 @pytest.mark.asyncio
 async def test_runner_api_start_events_status_and_download(tmp_path):
     client, store = await make_client(tmp_path)
@@ -196,12 +259,7 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         )
         assert download_response.status == 200
         with zipfile.ZipFile(io.BytesIO(await download_response.read())) as archive:
-            assert sorted(archive.namelist()) == [
-                "metadata.json",
-                "report.html",
-                "report.md",
-                "trace.json",
-            ]
+            assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
     finally:
         await client.close()
 
@@ -270,6 +328,129 @@ async def test_runner_api_allows_admin_but_blocks_foreign_download(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runner_api_foreign_user_denied_for_status(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{start_payload['task_id']}",
+            headers=USER_B_HEADERS,
+        )
+        assert response.status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_foreign_user_denied_for_events(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{start_payload['task_id']}/events",
+            headers=USER_B_HEADERS,
+        )
+        assert response.status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_foreign_user_denied_for_archive_download(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        task_id = await complete_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{task_id}/archive.zip",
+            headers=USER_B_HEADERS,
+        )
+        assert response.status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_foreign_user_denied_for_cancel(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        response = await client.post(
+            f"/mirothinker/tasks/{start_payload['task_id']}/cancel",
+            headers=USER_B_HEADERS,
+        )
+        assert response.status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_admin_allowed_for_status(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{start_payload['task_id']}",
+            headers=ADMIN_HEADERS,
+        )
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["user_id"] == "user-a"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_admin_allowed_for_events(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{start_payload['task_id']}/events",
+            headers=ADMIN_HEADERS,
+        )
+        assert response.status == 200
+        sse_events = parse_sse(await response.text())
+        assert [event["type"] for event in sse_events] == ["heartbeat", "message"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_admin_allowed_for_archive_download(tmp_path):
+    client, _store = await make_client(tmp_path)
+    try:
+        task_id = await complete_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{task_id}/archive.zip",
+            headers=ADMIN_HEADERS,
+        )
+        assert response.status == 200
+        with zipfile.ZipFile(io.BytesIO(await response.read())) as archive:
+            assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_admin_allowed_for_cancel(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        response = await client.post(
+            f"/mirothinker/tasks/{start_payload['task_id']}/cancel",
+            headers=ADMIN_HEADERS,
+        )
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["status"] == "cancelled"
+        assert payload["archive_status"] == "ready"
+        record = store.get_task(start_payload["task_id"])
+        assert record.status == "cancelled"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_path):
     probe = CancellationProbe()
     client, store = await make_client(tmp_path, stream_events=probe.stream)
@@ -311,13 +492,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         assert metadata["status"] == "cancelled"
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
         assert "MiroThinker Research Cancelled" in report
-        with zipfile.ZipFile(record.archive_zip_path) as archive:
-            assert sorted(archive.namelist()) == [
-                "metadata.json",
-                "report.html",
-                "report.md",
-                "trace.json",
-            ]
+        assert_zip_members(record.archive_zip_path)
     finally:
         await client.close()
 
@@ -431,6 +606,108 @@ async def test_runner_api_validation_rejects_untrusted_inputs(tmp_path):
             json={"query": "  "},
         )
         assert empty_query.status == 400
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_failed_outcome_writes_scrubbed_diagnostic_archive(tmp_path):
+    client, store = await make_client(tmp_path, stream_events=failed_stream)
+    try:
+        task = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert response.status == 200
+        await response.text()
+
+        status_response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}",
+            headers=USER_A_HEADERS,
+        )
+        payload = await status_response.json()
+        assert payload["status"] == "failed"
+        assert payload["archive_status"] == "ready"
+        assert "dXNlcjpzZWNyZXQ" not in json.dumps(payload)
+
+        assert_diagnostic_archive(
+            store,
+            task["task_id"],
+            expected_status="failed",
+            forbidden_text="dXNlcjpzZWNyZXQ",
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_cancelled_outcome_writes_scrubbed_diagnostic_archive(
+    tmp_path,
+):
+    client, store = await make_client(tmp_path, stream_events=cancelled_secret_stream)
+    try:
+        task = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert response.status == 200
+        await response.text()
+
+        status_response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}",
+            headers=USER_A_HEADERS,
+        )
+        payload = await status_response.json()
+        assert payload["status"] == "cancelled"
+        assert payload["archive_status"] == "ready"
+        assert "cancelledsecret123456" not in json.dumps(payload)
+
+        assert_diagnostic_archive(
+            store,
+            task["task_id"],
+            expected_status="cancelled",
+            forbidden_text="cancelledsecret123456",
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_archive_failed_exposes_warning_without_failing_research(
+    tmp_path,
+):
+    client, store = await make_client(tmp_path, writer_cls=ZipFailWriter)
+    try:
+        task = await start_task(client)
+        response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert response.status == 200
+        await response.text()
+
+        status_response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}",
+            headers=USER_A_HEADERS,
+        )
+        payload = await status_response.json()
+        assert payload["status"] == "completed"
+        assert payload["archive_status"] == "failed"
+        assert payload["download_url"] is None
+        assert payload["warnings"] == ["archive.zip creation failed: zip unavailable"]
+
+        record = store.get_task(task["task_id"])
+        assert record.status == "completed"
+        assert record.archive_status == "failed"
+        assert record.archive_zip_path is None
+
+        download_response = await client.get(
+            f"/mirothinker/tasks/{task['task_id']}/archive.zip",
+            headers=USER_A_HEADERS,
+        )
+        assert download_response.status == 409
     finally:
         await client.close()
 
