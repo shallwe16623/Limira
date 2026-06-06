@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from archive_writer import (
+    ArchiveResult,
     ResearchArchiveWriter,
     base_url_host,
     scrub_secrets,
@@ -317,14 +318,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                             report_markdown=report_markdown,
                             end_time=end_time,
                         )
-                        archive_updates = {
-                            "archive_status": archive_result.archive_status,
-                            "archive_dir": str(archive_result.archive_dir),
-                            "archive_zip_path": str(archive_result.archive_zip_path)
-                            if archive_result.archive_zip_path
-                            else None,
-                            "warnings": archive_result.warnings,
-                        }
+                        archive_updates = _archive_result_updates(archive_result)
                     except Exception as exc:
                         archive_updates = {
                             "archive_status": "failed",
@@ -483,14 +477,9 @@ def _finalize_running_without_worker_cancellation(
         updated = store.update_task(
             record.task_id,
             status="cancelled",
-            archive_status=archive_result.archive_status,
-            archive_dir=str(archive_result.archive_dir),
-            archive_zip_path=str(archive_result.archive_zip_path)
-            if archive_result.archive_zip_path
-            else None,
             completed_at=end_time,
             error=scrub_secrets(error),
-            warnings=archive_result.warnings,
+            **_archive_result_updates(archive_result),
         )
     except Exception as exc:
         end_time = clock()
@@ -549,13 +538,8 @@ def _finalize_queued_cancellation(
         )
         updated = store.update_task(
             claimed_record.task_id,
-            archive_status=archive_result.archive_status,
-            archive_dir=str(archive_result.archive_dir),
-            archive_zip_path=str(archive_result.archive_zip_path)
-            if archive_result.archive_zip_path
-            else None,
             completed_at=end_time,
-            warnings=archive_result.warnings,
+            **_archive_result_updates(archive_result),
         )
     except Exception as exc:
         end_time = clock()
@@ -572,6 +556,17 @@ def _finalize_queued_cancellation(
     finally:
         _clear_task_cancel(request.app, claimed_record.task_id)
     return updated
+
+
+def _archive_result_updates(archive_result: ArchiveResult) -> dict[str, Any]:
+    return {
+        "archive_status": archive_result.archive_status,
+        "archive_dir": str(archive_result.archive_dir),
+        "archive_zip_path": str(archive_result.archive_zip_path)
+        if archive_result.archive_zip_path
+        else None,
+        "warnings": archive_result.warnings,
+    }
 
 
 def _task_response(record: TaskRecord) -> dict[str, Any]:
