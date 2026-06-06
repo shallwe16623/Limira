@@ -92,9 +92,11 @@ class CancellationProbe:
         self.started = asyncio.Event()
         self.stopped = asyncio.Event()
         self.check_count = 0
+        self.stream_count = 0
 
     async def stream(self, task_id, query, _unused, disconnect_check=None):
         assert disconnect_check is not None
+        self.stream_count += 1
         yield {
             "event": "message",
             "data": {"delta": {"content": "partial"}},
@@ -493,6 +495,41 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
         assert "MiroThinker Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_rejects_duplicate_running_event_stream(tmp_path):
+    probe = CancellationProbe()
+    client, _store = await make_client(tmp_path, stream_events=probe.stream)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_task = asyncio.create_task(
+            client.get(
+                f"/mirothinker/tasks/{task_id}/events",
+                headers=USER_A_HEADERS,
+            )
+        )
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
+
+        duplicate_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert duplicate_response.status == 409
+        assert await duplicate_response.json() == {"error": "task_already_running"}
+        assert probe.stream_count == 1
+
+        cancel_response = await client.post(
+            f"/mirothinker/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
+        events_response = await asyncio.wait_for(events_task, timeout=1)
+        assert events_response.status == 200
+        await asyncio.wait_for(events_response.text(), timeout=1)
     finally:
         await client.close()
 

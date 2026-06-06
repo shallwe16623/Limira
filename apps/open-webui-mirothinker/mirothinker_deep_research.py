@@ -362,8 +362,37 @@ def visible_event_text(event: dict[str, Any]) -> str:
         delta = data.get("delta")
         if isinstance(delta, dict) and isinstance(delta.get("content"), str):
             return delta["content"]
+    if source_event == "tool_call" and isinstance(data, dict):
+        return show_text_tool_call_text(data)
     if source_event == "error":
         return f"\n\nResearch error: {safe_error_text(data)}\n"
+    return ""
+
+
+def show_text_tool_call_text(data: dict[str, Any]) -> str:
+    if data.get("tool_name") != "show_text":
+        return ""
+
+    delta_input = data.get("delta_input")
+    if isinstance(delta_input, dict):
+        text = delta_input.get("text") or delta_input.get("content")
+        if isinstance(text, str):
+            return text
+    if isinstance(delta_input, str):
+        return delta_input
+
+    tool_input = data.get("tool_input")
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            return tool_input
+    if isinstance(tool_input, dict):
+        text = tool_input.get("text") or tool_input.get("content")
+        if isinstance(text, str):
+            return text
+    if tool_input is not None:
+        return str(tool_input)
     return ""
 
 

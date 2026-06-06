@@ -165,6 +165,11 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             text=json.dumps({"error": "task_already_finished"}),
             content_type="application/json",
         )
+    if record.status == "running":
+        raise web.HTTPConflict(
+            text=json.dumps({"error": "task_already_running"}),
+            content_type="application/json",
+        )
 
     store: TaskStore = request.app[TASK_STORE_KEY]
     clock: Callable[[], str] = request.app[CLOCK_KEY]

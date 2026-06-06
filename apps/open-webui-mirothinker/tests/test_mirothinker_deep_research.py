@@ -235,6 +235,47 @@ async def test_pending_archive_disables_download():
 
 
 @pytest.mark.asyncio
+async def test_show_text_tool_call_events_are_rendered():
+    fake_runner = FakeRunner(
+        stream_events=[
+            {
+                "task_id": "task-user-a",
+                "type": "tool_call",
+                "timestamp": "2026-06-06T12:00:00+00:00",
+                "payload": {
+                    "event": "tool_call",
+                    "data": {
+                        "tool_name": "show_text",
+                        "tool_call_id": "show-text-1",
+                        "delta_input": {"text": "show_text delta report\n"},
+                    },
+                },
+            },
+            {
+                "task_id": "task-user-a",
+                "type": "tool_call",
+                "timestamp": "2026-06-06T12:00:01+00:00",
+                "payload": {
+                    "event": "tool_call",
+                    "data": {
+                        "tool_name": "show_text",
+                        "tool_call_id": "show-text-1",
+                        "tool_input": json.dumps({"text": "show_text final report\n"}),
+                    },
+                },
+            },
+        ]
+    )
+    pipe = configured_pipe(fake_runner)
+
+    output, _events = await collect_pipe(pipe, {"query": "research"})
+
+    assert "show_text delta report" in output
+    assert "show_text final report" in output
+    assert "Final report preview" in output
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["failed", "cancelled"])
 async def test_failed_and_cancelled_ready_archive_use_diagnostic_download_text(status):
     fake_runner = FakeRunner(final_status=status, archive_status="ready")
