@@ -43,6 +43,16 @@ curl http://localhost:8081/mirothinker/tasks/<task_id> \
   -H "X-OpenWebUI-User-Id: user-a"
 ```
 
+To request cancellation for a queued or running task:
+
+```bash
+curl -X POST http://localhost:8081/mirothinker/tasks/<task_id>/cancel \
+  -H "X-MiroThinker-Service-Token: dev-shared-secret" \
+  -H "X-OpenWebUI-User-Id: user-a"
+```
+
+Only the task owner or an explicit admin identity may cancel a task. The browser must never submit `user_id`; it must be injected by the trusted Open WebUI backend/proxy path.
+
 ```bash
 curl -OJ http://localhost:8081/mirothinker/tasks/<task_id>/archive.zip \
   -H "X-MiroThinker-Service-Token: dev-shared-secret" \

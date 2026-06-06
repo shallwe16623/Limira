@@ -36,6 +36,9 @@ STREAM_EVENTS_KEY = web.AppKey("stream_events", object)
 INIT_RENDER_STATE_KEY = web.AppKey("init_render_state", object)
 UPDATE_STATE_KEY = web.AppKey("update_state_with_event", object)
 RENDER_MARKDOWN_KEY = web.AppKey("render_markdown", object)
+TRANSPORT_CLOSING_KEY = web.AppKey("transport_closing", object)
+CANCELLED_TASKS_KEY = web.AppKey("cancelled_tasks", set[str])
+FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def create_app(
@@ -48,6 +51,7 @@ def create_app(
     update_state_with_event: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
     | None = None,
     render_markdown: Callable[[dict[str, Any]], str] | None = None,
+    transport_closing: Callable[[web.Request], bool] | None = None,
     archive_writer_cls: type[ResearchArchiveWriter] = ResearchArchiveWriter,
     clock: Callable[[], str] = utc_now_iso,
 ) -> web.Application:
@@ -77,9 +81,12 @@ def create_app(
     app[INIT_RENDER_STATE_KEY] = init_render_state
     app[UPDATE_STATE_KEY] = update_state_with_event
     app[RENDER_MARKDOWN_KEY] = render_markdown
+    app[TRANSPORT_CLOSING_KEY] = transport_closing or _transport_closing
+    app[CANCELLED_TASKS_KEY] = set()
 
     app.router.add_post("/mirothinker/research", start_research)
     app.router.add_get("/mirothinker/tasks/{task_id}", get_task_status)
+    app.router.add_post("/mirothinker/tasks/{task_id}/cancel", cancel_task)
     app.router.add_get("/mirothinker/tasks/{task_id}/events", stream_task_events)
     app.router.add_get("/mirothinker/tasks/{task_id}/archive.zip", download_archive)
     return app
@@ -134,11 +141,30 @@ async def get_task_status(request: web.Request) -> web.Response:
     return web.json_response(_task_response(record))
 
 
+async def cancel_task(request: web.Request) -> web.Response:
+    auth = _authenticate(request)
+    record = _get_authorized_task(request, auth)
+    if not record:
+        return _not_found()
+    if record.status in FINAL_TASK_STATUSES:
+        return web.json_response(_task_response(record))
+
+    _request_task_cancel(request.app, record.task_id)
+    if record.status == "queued":
+        record = _finalize_queued_cancellation(request, record)
+    return web.json_response({**_task_response(record), "cancel_requested": True})
+
+
 async def stream_task_events(request: web.Request) -> web.StreamResponse:
     auth = _authenticate(request)
     record = _get_authorized_task(request, auth)
     if not record:
         raise web.HTTPNotFound(text=json.dumps({"error": "not_found"}))
+    if record.status in FINAL_TASK_STATUSES:
+        raise web.HTTPConflict(
+            text=json.dumps({"error": "task_already_finished"}),
+            content_type="application/json",
+        )
 
     store: TaskStore = request.app[TASK_STORE_KEY]
     clock: Callable[[], str] = request.app[CLOCK_KEY]
@@ -154,7 +180,6 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
         start_time=started_at,
     )
     state = request.app[INIT_RENDER_STATE_KEY]()
-    cancelled = False
     status = "completed"
     error = None
 
@@ -169,7 +194,9 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
 
     async def disconnect_check() -> bool:
-        return cancelled
+        return _task_cancel_requested(request.app, record.task_id) or request.app[
+            TRANSPORT_CLOSING_KEY
+        ](request)
 
     try:
         async for message in request.app[STREAM_EVENTS_KEY](
@@ -186,8 +213,11 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                     status = "failed"
                     error = _event_error(normalized)
             await _write_sse(response, normalized)
+        if await disconnect_check():
+            status = "cancelled"
+            error = "task cancelled"
     except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError) as exc:
-        cancelled = True
+        _request_task_cancel(request.app, record.task_id)
         status = "cancelled"
         error = str(exc) or "client disconnected"
     except Exception as exc:
@@ -230,6 +260,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             error=scrub_secrets(error),
             warnings=archive_result.warnings,
         )
+        _clear_task_cancel(request.app, record.task_id)
         try:
             await response.write_eof()
         except Exception:
@@ -290,6 +321,62 @@ def _get_authorized_task(
     if not auth.is_admin and record.user_id != auth.user_id:
         return None
     return record
+
+
+def _request_task_cancel(app: web.Application, task_id: str) -> None:
+    app[CANCELLED_TASKS_KEY].add(task_id)
+
+
+def _clear_task_cancel(app: web.Application, task_id: str) -> None:
+    app[CANCELLED_TASKS_KEY].discard(task_id)
+
+
+def _task_cancel_requested(app: web.Application, task_id: str) -> bool:
+    return task_id in app[CANCELLED_TASKS_KEY]
+
+
+def _transport_closing(request: web.Request) -> bool:
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
+def _finalize_queued_cancellation(
+    request: web.Request,
+    record: TaskRecord,
+) -> TaskRecord:
+    clock: Callable[[], str] = request.app[CLOCK_KEY]
+    cancelled_at = clock()
+    writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
+    writer.start(
+        task_id=record.task_id,
+        query=record.query,
+        user_id=record.user_id,
+        model_summary=record.model_summary,
+        start_time=cancelled_at,
+    )
+    error = "task cancelled before stream started"
+    end_time = clock()
+    archive_result = writer.complete(
+        state={},
+        status="cancelled",
+        error=error,
+        end_time=end_time,
+    )
+    _clear_task_cancel(request.app, record.task_id)
+    store: TaskStore = request.app[TASK_STORE_KEY]
+    return store.update_task(
+        record.task_id,
+        status="cancelled",
+        archive_status=archive_result.archive_status,
+        archive_dir=str(archive_result.archive_dir),
+        archive_zip_path=str(archive_result.archive_zip_path)
+        if archive_result.archive_zip_path
+        else None,
+        started_at=cancelled_at,
+        completed_at=end_time,
+        error=scrub_secrets(error),
+        warnings=archive_result.warnings,
+    )
 
 
 def _task_response(record: TaskRecord) -> dict[str, Any]:
