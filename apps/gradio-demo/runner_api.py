@@ -77,11 +77,17 @@ def create_app(
         or render_markdown is None
     ):
         (
-            stream_events,
-            init_render_state,
-            update_state_with_event,
-            render_markdown,
+            default_stream_events,
+            default_init_render_state,
+            default_update_state_with_event,
+            default_render_markdown,
         ) = _load_gradio_helpers()
+        stream_events = stream_events or default_stream_events
+        init_render_state = init_render_state or default_init_render_state
+        update_state_with_event = (
+            update_state_with_event or default_update_state_with_event
+        )
+        render_markdown = render_markdown or default_render_markdown
 
     app[STREAM_EVENTS_KEY] = stream_events
     app[INIT_RENDER_STATE_KEY] = init_render_state

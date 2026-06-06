@@ -8,7 +8,15 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from archive_writer import ResearchArchiveWriter
-from runner_api import ACTIVE_TASKS_KEY, CANCELLED_TASKS_KEY, create_app
+from runner_api import (
+    ACTIVE_TASKS_KEY,
+    CANCELLED_TASKS_KEY,
+    INIT_RENDER_STATE_KEY,
+    RENDER_MARKDOWN_KEY,
+    STREAM_EVENTS_KEY,
+    UPDATE_STATE_KEY,
+    create_app,
+)
 from task_store import TaskStore
 
 
@@ -209,6 +217,45 @@ def parse_sse(body):
         for line in body.splitlines()
         if line.startswith("data: ")
     ]
+
+
+def test_create_app_preserves_partial_helper_overrides(tmp_path, monkeypatch):
+    async def custom_stream():
+        yield {}
+
+    async def default_stream():
+        yield {}
+
+    def default_init():
+        return {"default": True}
+
+    def default_update(state, message):
+        return state
+
+    def custom_render(state):
+        return "custom"
+
+    def default_render(state):
+        return "default"
+
+    monkeypatch.setattr(
+        "runner_api._load_gradio_helpers",
+        lambda: (default_stream, default_init, default_update, default_render),
+    )
+
+    app = create_app(
+        task_store=TaskStore(tmp_path / "tasks.sqlite3"),
+        archive_root=tmp_path / "archives",
+        service_token="shared",
+        stream_events=custom_stream,
+        render_markdown=custom_render,
+        clock=Clock(),
+    )
+
+    assert app[STREAM_EVENTS_KEY] is custom_stream
+    assert app[RENDER_MARKDOWN_KEY] is custom_render
+    assert app[INIT_RENDER_STATE_KEY] is default_init
+    assert app[UPDATE_STATE_KEY] is default_update
 
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):
