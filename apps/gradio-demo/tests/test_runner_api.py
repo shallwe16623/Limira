@@ -115,6 +115,11 @@ class ZipFailWriter(ResearchArchiveWriter):
         raise RuntimeError("zip unavailable")
 
 
+class StartFailWriter(ResearchArchiveWriter):
+    def start(self, *args, **kwargs):
+        raise RuntimeError("Authorization: Bearer setupsecret123456")
+
+
 class StreamClaimRaceStore(TaskStore):
     def __init__(self, db_path):
         super().__init__(db_path)
@@ -309,6 +314,50 @@ async def test_runner_api_persists_host_only_model_summary(tmp_path, monkeypatch
         assert "secret-token" not in serialized_model_summary
         assert "query-secret" not in serialized_model_summary
         assert "/v1" not in serialized_model_summary
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_stream_setup_failure_finalizes_claimed_task(tmp_path):
+    client, store = await make_client(tmp_path, writer_cls=StartFailWriter)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        events_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 500
+        assert await events_response.json() == {"error": "stream_setup_failed"}
+
+        status_response = await client.get(
+            f"/mirothinker/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        status_payload = await status_response.json()
+        serialized_status = json.dumps(status_payload)
+        assert status_payload["status"] == "failed"
+        assert status_payload["archive_status"] == "failed"
+        assert status_payload["download_url"] is None
+        assert status_payload["completed_at"] is not None
+        assert status_payload["error"] == "Authorization: [REDACTED]"
+        assert "setupsecret123456" not in serialized_status
+
+        record = store.get_task(task_id)
+        assert record.status == "failed"
+        assert record.archive_status == "failed"
+        assert record.archive_dir is None
+        assert record.archive_zip_path is None
+        assert "setupsecret123456" not in json.dumps(record.to_dict())
+
+        retry_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert retry_response.status == 409
+        assert await retry_response.json() == {"error": "task_already_finished"}
     finally:
         await client.close()
 

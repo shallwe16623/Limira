@@ -196,16 +196,12 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
     record = claimed_record
 
     writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
-    writer.start(
-        task_id=record.task_id,
-        query=record.query,
-        user_id=record.user_id,
-        model_summary=record.model_summary,
-        start_time=started_at,
-    )
-    state = request.app[INIT_RENDER_STATE_KEY]()
     status = "completed"
     error = None
+    state: dict[str, Any] = {}
+    writer_started = False
+    response_prepared = False
+    setup_failed_before_response = False
 
     response = web.StreamResponse(
         status=200,
@@ -215,14 +211,25 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             "Connection": "keep-alive",
         },
     )
-    await response.prepare(request)
-
-    async def disconnect_check() -> bool:
-        return _task_cancel_requested(request.app, record.task_id) or request.app[
-            TRANSPORT_CLOSING_KEY
-        ](request)
 
     try:
+        writer.start(
+            task_id=record.task_id,
+            query=record.query,
+            user_id=record.user_id,
+            model_summary=record.model_summary,
+            start_time=started_at,
+        )
+        writer_started = True
+        state = request.app[INIT_RENDER_STATE_KEY]()
+        await response.prepare(request)
+        response_prepared = True
+
+        async def disconnect_check() -> bool:
+            return _task_cancel_requested(request.app, record.task_id) or request.app[
+                TRANSPORT_CLOSING_KEY
+            ](request)
+
         async for message in request.app[STREAM_EVENTS_KEY](
             record.task_id,
             record.query,
@@ -244,51 +251,73 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
         _request_task_cancel(request.app, record.task_id)
         status = "cancelled"
         error = str(exc) or "client disconnected"
+        setup_failed_before_response = not response_prepared
     except Exception as exc:
         status = "failed"
         error = str(exc)
-        try:
-            await _write_sse(
-                response,
-                {
-                    "task_id": record.task_id,
-                    "type": "error",
-                    "timestamp": clock(),
-                    "payload": {"error": scrub_secrets(error)},
-                },
-            )
-        except Exception:
-            pass
+        setup_failed_before_response = not response_prepared
+        if response_prepared:
+            try:
+                await _write_sse(
+                    response,
+                    {
+                        "task_id": record.task_id,
+                        "type": "error",
+                        "timestamp": clock(),
+                        "payload": {"error": scrub_secrets(error)},
+                    },
+                )
+            except Exception:
+                pass
     finally:
-        report_markdown = None
-        if status == "completed":
-            report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
-
         end_time = clock()
-        archive_result = writer.complete(
-            state=state,
-            status=status,
-            error=error,
-            report_markdown=report_markdown,
-            end_time=end_time,
-        )
-        store.update_task(
-            record.task_id,
-            status=status,
-            archive_status=archive_result.archive_status,
-            archive_dir=str(archive_result.archive_dir),
-            archive_zip_path=str(archive_result.archive_zip_path)
-            if archive_result.archive_zip_path
-            else None,
-            completed_at=end_time,
-            error=scrub_secrets(error),
-            warnings=archive_result.warnings,
-        )
+        if writer_started:
+            report_markdown = None
+            if status == "completed":
+                report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
+
+            archive_result = writer.complete(
+                state=state,
+                status=status,
+                error=error,
+                report_markdown=report_markdown,
+                end_time=end_time,
+            )
+            store.update_task(
+                record.task_id,
+                status=status,
+                archive_status=archive_result.archive_status,
+                archive_dir=str(archive_result.archive_dir),
+                archive_zip_path=str(archive_result.archive_zip_path)
+                if archive_result.archive_zip_path
+                else None,
+                completed_at=end_time,
+                error=scrub_secrets(error),
+                warnings=archive_result.warnings,
+            )
+        else:
+            store.update_task(
+                record.task_id,
+                status=status,
+                archive_status="failed",
+                archive_dir=None,
+                archive_zip_path=None,
+                completed_at=end_time,
+                error=scrub_secrets(error),
+                warnings=["stream setup failed before archive writer started"],
+            )
         _clear_task_cancel(request.app, record.task_id)
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
+        if response_prepared:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+
+    if setup_failed_before_response:
+        raise web.HTTPInternalServerError(
+            text=json.dumps({"error": "stream_setup_failed"}),
+            content_type="application/json",
+        )
 
     return response
 
