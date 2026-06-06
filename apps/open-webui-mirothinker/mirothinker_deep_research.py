@@ -89,6 +89,11 @@ class MiroThinkerRunnerClient:
                 headers=self._headers(user_id),
                 timeout=self.config.request_timeout_seconds,
             ) as response:
+                if response.status_code == 409:
+                    await response.aread()
+                    return
+                if response.status_code not in {200}:
+                    await response.aread()
                 await self._ensure_success(response, {200})
                 async for line in response.aiter_lines():
                     event = parse_sse_line(line)

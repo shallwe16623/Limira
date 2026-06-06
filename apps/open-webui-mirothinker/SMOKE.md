@@ -2,7 +2,7 @@
 
 This checklist is the real Open WebUI runtime gate for the installable Pipe Function in this directory.
 
-Current status: externally blocked in this repository because no Open WebUI runtime, browser session, or Open WebUI source tree is present here. The fake-runner harness verifies the repository-owned integration contract, but it does not replace this manual runtime smoke.
+Current status: passed in a local Open WebUI runtime on 2026-06-06. See `smoke-results/2026-06-06-round4-open-webui-runtime-smoke.md`.
 
 ## Prerequisites
 

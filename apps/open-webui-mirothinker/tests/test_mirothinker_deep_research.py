@@ -21,6 +21,7 @@ USER_B = {"id": "user-b", "name": "User B"}
 class FakeRunner:
     final_status: str = "completed"
     archive_status: str = "ready"
+    events_status_code: int = 200
     stream_events: list[dict[str, Any]] = field(default_factory=list)
     user_a_task_id: str = "task-user-a"
     requests: list[httpx.Request] = field(default_factory=list)
@@ -59,6 +60,10 @@ class FakeRunner:
             return json_response(404, {"error": "not_found"})
 
         if request.method == "GET" and path.endswith("/events"):
+            if self.events_status_code != 200:
+                return json_response(
+                    self.events_status_code, {"error": "terminal_task"}
+                )
             content = "".join(
                 f"data: {json.dumps(event)}\n\n" for event in self.events()
             )
@@ -238,4 +243,19 @@ async def test_failed_and_cancelled_ready_archive_use_diagnostic_download_text(s
     output, _events = await collect_pipe(pipe, {"query": "research"})
 
     assert f"Research status: `{status}`" in output
+    assert "Download Diagnostic ZIP: https://open-webui.example/runner/" in output
+
+
+@pytest.mark.asyncio
+async def test_terminal_events_conflict_polls_final_cancelled_status():
+    fake_runner = FakeRunner(
+        final_status="cancelled",
+        archive_status="ready",
+        events_status_code=409,
+    )
+    pipe = configured_pipe(fake_runner)
+
+    output, _events = await collect_pipe(pipe, {"query": "research"})
+
+    assert "Research status: `cancelled`" in output
     assert "Download Diagnostic ZIP: https://open-webui.example/runner/" in output
