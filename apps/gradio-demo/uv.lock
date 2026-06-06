@@ -599,16 +599,16 @@ wheels = [
 
 [[package]]
 name = "e2b-code-interpreter"
-version = "1.5.2"
+version = "1.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
     { name = "e2b" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ee/85/b4a1c9427b45818d4c3773ed967ec1fcc2d7b677e096d8051303889adc2d/e2b_code_interpreter-1.5.2.tar.gz", hash = "sha256:3bd6ea70596290e85aaf0a2f19f28bf37a5e73d13086f5e6a0080bb591c5a547", size = 10006, upload-time = "2025-07-07T14:58:28.676Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1c/6a/2bc78bd39c16c2430ecb9ac80ce708bac3bd3153ed114cc70fe9528132dc/e2b_code_interpreter-1.2.1.tar.gz", hash = "sha256:bb01075b6ddb9c1a10774da521e8aa32e7fac710d23b9d8fbe8224d0e04b866b", size = 9276, upload-time = "2025-04-18T22:59:02.831Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f5/4a/7dc5c673c47418e1b38594ab3b022ee20ea1bf3ff8f8aa8273d6ddc99532/e2b_code_interpreter-1.5.2-py3-none-any.whl", hash = "sha256:5c3188d8f25226b28fef4b255447cc6a4c36afb748bdd5180b45be486d5169f3", size = 12873, upload-time = "2025-07-07T14:58:27.622Z" },
+    { url = "https://files.pythonhosted.org/packages/48/82/009b7600afcb0b983d0b19547d0227c060409aa203f1446993db8299f1c6/e2b_code_interpreter-1.2.1-py3-none-any.whl", hash = "sha256:9d60e8b3756fc3c04c04285e2106dcb19305a18a01894aeb4b06d2c400e03e2e", size = 12047, upload-time = "2025-04-18T22:59:01.41Z" },
 ]
 
 [[package]]
@@ -1212,6 +1212,15 @@ wheels = [
 ]
 
 [[package]]
+name = "json-repair"
+version = "0.60.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/a6/d69888cb4ffde30e80db1e6c32caaadd2f984a80067d5ea72c2cb3f61c3f/json_repair-0.60.1.tar.gz", hash = "sha256:841661cdd2df507c9a4e189097f38ca6bc372e06d4b4e36d72e590f68176c290", size = 49451, upload-time = "2026-06-03T17:28:44.451Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/1f/2a2b5eea8ef5762a86ad3f8fddddaaba2c0d76dd44e644b9158900868bec/json_repair-0.60.1-py3-none-any.whl", hash = "sha256:ba6ff974f2a8bef2f7768144a7f03f870a816443f03da27a49cdd0ec31a78049", size = 48045, upload-time = "2026-06-03T17:28:43.038Z" },
+]
+
+[[package]]
 name = "jsonlines"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1520,6 +1529,7 @@ dependencies = [
     { name = "hydra-core" },
     { name = "ipdb" },
     { name = "jinja2" },
+    { name = "json-repair" },
     { name = "jsonlines" },
     { name = "mammoth" },
     { name = "markdownify" },
@@ -1543,6 +1553,7 @@ dependencies = [
     { name = "rich" },
     { name = "speechrecognition" },
     { name = "tenacity" },
+    { name = "tencentcloud-sdk-python" },
     { name = "tiktoken" },
     { name = "transformers" },
     { name = "wikipedia" },
@@ -1556,13 +1567,14 @@ requires-dist = [
     { name = "colorama", specifier = ">=0.4.6" },
     { name = "datasets", specifier = ">=3.5.0" },
     { name = "duckduckgo-search", specifier = ">=6.3.7" },
-    { name = "e2b-code-interpreter", specifier = ">=1.2.1" },
+    { name = "e2b-code-interpreter", specifier = "==1.2.1" },
     { name = "fastmcp" },
     { name = "google-genai" },
     { name = "huggingface-hub", specifier = ">=0.28.0" },
     { name = "hydra-core" },
     { name = "ipdb", specifier = ">=0.13.13" },
     { name = "jinja2", specifier = ">=3.1.4" },
+    { name = "json-repair", specifier = ">=0.49.0" },
     { name = "jsonlines", specifier = ">=4.0.0" },
     { name = "mammoth", specifier = ">=1.9.0" },
     { name = "markdownify", specifier = ">=0.14.1" },
@@ -1586,6 +1598,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.9.4" },
     { name = "speechrecognition" },
     { name = "tenacity", specifier = ">=9.1.2" },
+    { name = "tencentcloud-sdk-python", specifier = ">=3.0.1451" },
     { name = "tiktoken", specifier = ">=0.9.0" },
     { name = "transformers", specifier = ">=4.51.3" },
     { name = "wikipedia" },
@@ -1617,6 +1630,7 @@ dependencies = [
     { name = "mcp" },
     { name = "mutagen" },
     { name = "playwright" },
+    { name = "redis" },
     { name = "requests" },
     { name = "wikipedia" },
 ]
@@ -1624,13 +1638,14 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp" },
-    { name = "e2b-code-interpreter", specifier = ">=1.2.1" },
+    { name = "e2b-code-interpreter", specifier = "==1.2.1" },
     { name = "fastmcp", specifier = ">=0.1.0" },
     { name = "google-genai" },
     { name = "markitdown-mcp", specifier = ">=0.0.1a3" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "mutagen" },
     { name = "playwright", specifier = ">=1.40.0" },
+    { name = "redis" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "wikipedia" },
 ]
@@ -2664,6 +2679,15 @@ wheels = [
 ]
 
 [[package]]
+name = "redis"
+version = "8.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/ae/ed461cca5780b5fc8b9fe8ca0ed98d89508645fb9d880c24cc42c087678f/redis-8.0.0.tar.gz", hash = "sha256:a00c5355432051ac14e593b8b197fc76c887ee12d55a0984f69328a1115fdc49", size = 5101591, upload-time = "2026-05-28T12:45:13.5Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/e3/b519734372d305bd547534a9f32e4ce9f98552af753dce72cf3483a0ff0b/redis-8.0.0-py3-none-any.whl", hash = "sha256:c938c18338585009f0bc310f4c7e4e4b4d37639356c4ac072cedf3af570c8dc7", size = 499870, upload-time = "2026-05-28T12:45:11.697Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.36.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3066,6 +3090,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/0a/d4/2b0cd0fe285e14b36db076e78c93766ff1d529d70408bd1d2a5a84f1d929/tenacity-9.1.2.tar.gz", hash = "sha256:1169d376c297e7de388d18b4481760d478b0e99a777cad3a9c86e556f4b697cb", size = 48036, upload-time = "2025-04-02T08:25:09.966Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/30/643397144bfbfec6f6ef821f36f33e57d35946c44a2352d3c9f0ae847619/tenacity-9.1.2-py3-none-any.whl", hash = "sha256:f77bf36710d8b73a50b2dd155c97b870017ad21afe6ab300326b0371b3b05138", size = 28248, upload-time = "2025-04-02T08:25:07.678Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python"
+version = "3.1.110"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8b/57/b73150e4500a9b583f86205b2c5fe3e972039e2da062c9452bf8b4736edd/tencentcloud_sdk_python-3.1.110.tar.gz", hash = "sha256:8e7d246e501dbaec59bd8fd919c7d1ddd3ae3ccf9ec18b85f9f19fcb1dcb722e", size = 15147801, upload-time = "2026-06-04T20:29:26.574Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/20/fb/3ce319b9e024ffa79bb62775387cf4956dc5dd9bf34e7cb5d1cea5f16626/tencentcloud_sdk_python-3.1.110-py2.py3-none-any.whl", hash = "sha256:18d0b81e27f8126785d88ba6dfeab631c6d1388f397f113ff45b47ec747d2813", size = 16051519, upload-time = "2026-06-04T20:29:08.537Z" },
 ]
 
 [[package]]
