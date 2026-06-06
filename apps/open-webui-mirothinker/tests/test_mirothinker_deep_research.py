@@ -10,6 +10,7 @@ from mirothinker_deep_research import (
     USER_ID_HEADER,
     Pipe,
     RunnerApiError,
+    same_base_url,
 )
 
 
@@ -238,7 +239,12 @@ async def test_pending_archive_disables_download():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "download_base_url",
-    ["", "http://runner.local/", "http://token@runner.local/"],
+    [
+        "",
+        "http://runner.local/",
+        "http://runner.local:80/",
+        "http://token@runner.local/",
+    ],
 )
 async def test_ready_archive_requires_explicit_download_proxy(download_base_url):
     fake_runner = FakeRunner()
@@ -250,6 +256,13 @@ async def test_ready_archive_requires_explicit_download_proxy(download_base_url)
     assert "Archive download disabled: `proxy_required`." in output
     assert "Download Trace ZIP" not in output
     assert "/archive.zip" not in output
+
+
+def test_same_base_url_normalizes_default_ports():
+    assert same_base_url("http://runner.local", "http://runner.local:80")
+    assert same_base_url("https://runner.local", "https://runner.local:443")
+    assert not same_base_url("http://runner.local", "http://runner.local:8081")
+    assert not same_base_url("https://runner.local", "https://runner.local:8443")
 
 
 @pytest.mark.asyncio

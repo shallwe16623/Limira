@@ -475,10 +475,13 @@ def same_base_url(left: str, right: str) -> bool:
 
 def normalized_base_url(value: str) -> tuple[str, str, str]:
     parsed = urlparse(value.strip())
+    scheme = parsed.scheme.lower()
     host = (parsed.hostname or parsed.netloc).lower()
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    port = parsed.port
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    netloc = f"{host}:{port}" if port and port != default_port else host
     return (
-        parsed.scheme.lower(),
+        scheme,
         netloc,
         parsed.path.rstrip("/"),
     )

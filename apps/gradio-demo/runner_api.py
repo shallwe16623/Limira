@@ -281,48 +281,65 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                 pass
     finally:
         end_time = clock()
-        if writer_started:
-            report_markdown = None
-            if status == "completed":
-                report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
+        try:
+            if writer_started:
+                report_markdown = None
+                if status == "completed":
+                    report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
 
-            archive_result = writer.complete(
-                state=state,
-                status=status,
-                error=error,
-                report_markdown=report_markdown,
-                end_time=end_time,
-            )
-            store.update_task(
-                record.task_id,
-                status=status,
-                archive_status=archive_result.archive_status,
-                archive_dir=str(archive_result.archive_dir),
-                archive_zip_path=str(archive_result.archive_zip_path)
-                if archive_result.archive_zip_path
-                else None,
-                completed_at=end_time,
-                error=scrub_secrets(error),
-                warnings=archive_result.warnings,
-            )
-        else:
-            store.update_task(
-                record.task_id,
-                status=status,
-                archive_status="failed",
-                archive_dir=None,
-                archive_zip_path=None,
-                completed_at=end_time,
-                error=scrub_secrets(error),
-                warnings=["stream setup failed before archive writer started"],
-            )
-        _clear_active_task(request.app, record.task_id)
-        _clear_task_cancel(request.app, record.task_id)
-        if response_prepared:
-            try:
-                await response.write_eof()
-            except Exception:
-                pass
+                try:
+                    archive_result = writer.complete(
+                        state=state,
+                        status=status,
+                        error=error,
+                        report_markdown=report_markdown,
+                        end_time=end_time,
+                    )
+                    archive_updates = {
+                        "archive_status": archive_result.archive_status,
+                        "archive_dir": str(archive_result.archive_dir),
+                        "archive_zip_path": str(archive_result.archive_zip_path)
+                        if archive_result.archive_zip_path
+                        else None,
+                        "warnings": archive_result.warnings,
+                    }
+                except Exception as exc:
+                    archive_updates = {
+                        "archive_status": "failed",
+                        "archive_dir": str(writer.archive_dir)
+                        if writer.archive_dir
+                        else None,
+                        "archive_zip_path": None,
+                        "warnings": [
+                            scrub_secrets(f"archive finalization failed: {exc}")
+                        ],
+                    }
+                store.update_task(
+                    record.task_id,
+                    status=status,
+                    completed_at=end_time,
+                    error=scrub_secrets(error),
+                    **archive_updates,
+                )
+            else:
+                store.update_task(
+                    record.task_id,
+                    status=status,
+                    archive_status="failed",
+                    archive_dir=None,
+                    archive_zip_path=None,
+                    completed_at=end_time,
+                    error=scrub_secrets(error),
+                    warnings=["stream setup failed before archive writer started"],
+                )
+        finally:
+            _clear_active_task(request.app, record.task_id)
+            _clear_task_cancel(request.app, record.task_id)
+            if response_prepared:
+                try:
+                    await response.write_eof()
+                except Exception:
+                    pass
 
     if setup_failed_before_response:
         raise web.HTTPInternalServerError(
