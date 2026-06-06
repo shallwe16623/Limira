@@ -174,7 +174,21 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
     store: TaskStore = request.app[TASK_STORE_KEY]
     clock: Callable[[], str] = request.app[CLOCK_KEY]
     started_at = clock()
-    record = store.update_task(record.task_id, status="running", started_at=started_at)
+    claimed_record = store.claim_queued_task(record.task_id, started_at=started_at)
+    if not claimed_record:
+        current_record = store.get_task(record.task_id)
+        if not current_record:
+            raise web.HTTPNotFound(text=json.dumps({"error": "not_found"}))
+        if current_record.status in FINAL_TASK_STATUSES:
+            raise web.HTTPConflict(
+                text=json.dumps({"error": "task_already_finished"}),
+                content_type="application/json",
+            )
+        raise web.HTTPConflict(
+            text=json.dumps({"error": "task_already_running"}),
+            content_type="application/json",
+        )
+    record = claimed_record
 
     writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
     writer.start(

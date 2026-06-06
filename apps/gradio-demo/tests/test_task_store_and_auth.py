@@ -67,6 +67,33 @@ def test_task_store_enforces_unique_task_id(tmp_path):
         )
 
 
+def test_task_store_claims_queued_task_once(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-a",
+        user_id="user-a",
+        query="first",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+
+    claimed = store.claim_queued_task(
+        "task-a",
+        started_at="2026-06-06T12:01:00+00:00",
+    )
+    duplicate_claim = store.claim_queued_task(
+        "task-a",
+        started_at="2026-06-06T12:02:00+00:00",
+    )
+
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.started_at == "2026-06-06T12:01:00+00:00"
+    assert duplicate_claim is None
+    current = store.get_task("task-a")
+    assert current.status == "running"
+    assert current.started_at == "2026-06-06T12:01:00+00:00"
+
+
 def test_task_store_rejects_invalid_status_updates(tmp_path):
     store = TaskStore(tmp_path / "tasks.sqlite3")
     store.create_task(

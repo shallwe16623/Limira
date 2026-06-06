@@ -235,6 +235,23 @@ async def test_pending_archive_disables_download():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download_base_url",
+    ["", "http://runner.local/", "http://token@runner.local/"],
+)
+async def test_ready_archive_requires_explicit_download_proxy(download_base_url):
+    fake_runner = FakeRunner()
+    pipe = configured_pipe(fake_runner)
+    pipe.valves.DOWNLOAD_BASE_URL = download_base_url
+
+    output, _events = await collect_pipe(pipe, {"query": "research"})
+
+    assert "Archive download disabled: `proxy_required`." in output
+    assert "Download Trace ZIP" not in output
+    assert "/archive.zip" not in output
+
+
+@pytest.mark.asyncio
 async def test_show_text_tool_call_events_are_rendered():
     fake_runner = FakeRunner(
         stream_events=[

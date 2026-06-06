@@ -141,6 +141,20 @@ class TaskStore:
             raise KeyError(task_id)
         return record
 
+    def claim_queued_task(self, task_id: str, *, started_at: str) -> TaskRecord | None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE mirothinker_research_tasks
+                SET status = ?, started_at = ?
+                WHERE task_id = ? AND status = ?
+                """,
+                ("running", started_at, task_id, "queued"),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:

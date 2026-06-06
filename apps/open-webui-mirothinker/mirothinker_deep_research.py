@@ -12,7 +12,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from pydantic import BaseModel, Field
@@ -117,8 +117,21 @@ class MiroThinkerRunnerClient:
         raw_url = task_status.get("download_url")
         if not isinstance(raw_url, str) or not raw_url:
             return None
-        base_url = self.config.download_base_url or self.config.base_url
+        base_url = self._download_proxy_base_url()
+        if not base_url:
+            return None
         return absolute_url(base_url, raw_url)
+
+    def download_disabled_reason(self, task_status: dict[str, Any]) -> str:
+        archive_status = str(task_status.get("archive_status") or "unknown")
+        if archive_status != "ready":
+            return archive_status
+        raw_url = task_status.get("download_url")
+        if not isinstance(raw_url, str) or not raw_url:
+            return "missing"
+        if not self._download_proxy_base_url():
+            return "proxy_required"
+        return "unavailable"
 
     async def _request_json(
         self,
@@ -171,6 +184,14 @@ class MiroThinkerRunnerClient:
     def _default_client_factory(self) -> httpx.AsyncClient:
         return httpx.AsyncClient()
 
+    def _download_proxy_base_url(self) -> str | None:
+        download_base_url = self.config.download_base_url.strip()
+        if not download_base_url:
+            return None
+        if same_base_url(download_base_url, self.config.base_url):
+            return None
+        return download_base_url
+
 
 class Pipe:
     class Valves(BaseModel):
@@ -186,8 +207,8 @@ class Pipe:
         DOWNLOAD_BASE_URL: str = Field(
             default="",
             description=(
-                "Optional browser-reachable base URL for archive download links. "
-                "Defaults to RUNNER_BASE_URL."
+                "Required browser-reachable trusted proxy base URL for archive "
+                "links. Leave blank to disable archive links."
             ),
         )
         REQUEST_TIMEOUT_SECONDS: float = Field(
@@ -411,7 +432,6 @@ def render_final_response(
     report_text: str,
 ) -> str:
     status = str(task_status.get("status") or "unknown")
-    archive_status = str(task_status.get("archive_status") or "unknown")
     sections = ["\n\n---\n", f"Research status: `{status}`\n"]
     if report_text:
         sections.append("\nFinal report preview:\n\n")
@@ -427,10 +447,26 @@ def render_final_response(
         )
         sections.append(f"\n{label}: {download_url}\n")
     else:
-        sections.append(f"\nArchive download disabled: `{archive_status}`.\n")
+        disabled_reason = client.download_disabled_reason(task_status)
+        sections.append(f"\nArchive download disabled: `{disabled_reason}`.\n")
     return "".join(sections)
 
 
 def absolute_url(base_url: str, path: str) -> str:
     base = base_url.rstrip("/") + "/"
     return urljoin(base, path.lstrip("/"))
+
+
+def same_base_url(left: str, right: str) -> bool:
+    return normalized_base_url(left) == normalized_base_url(right)
+
+
+def normalized_base_url(value: str) -> tuple[str, str, str]:
+    parsed = urlparse(value.strip())
+    host = (parsed.hostname or parsed.netloc).lower()
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return (
+        parsed.scheme.lower(),
+        netloc,
+        parsed.path.rstrip("/"),
+    )

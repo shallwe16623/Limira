@@ -25,7 +25,7 @@ Set these admin Valves:
 
 - `RUNNER_BASE_URL`: internal Runner API URL, for example `http://mirothinker-runner:8081`.
 - `RUNNER_SERVICE_TOKEN`: value matching Runner API `MIROTHINKER_SERVICE_TOKEN`.
-- `DOWNLOAD_BASE_URL`: browser-reachable trusted proxy URL for archive downloads, or the Runner URL for local/dev use.
+- `DOWNLOAD_BASE_URL`: browser-reachable trusted proxy URL for archive downloads. Do not set this to the Runner API URL; direct browser clicks cannot send Runner API service headers.
 - `REQUEST_TIMEOUT_SECONDS`: start with `60`.
 
 Do not expose `RUNNER_SERVICE_TOKEN` to browser JavaScript or user-configurable fields.
@@ -39,7 +39,7 @@ Do not expose `RUNNER_SERVICE_TOKEN` to browser JavaScript or user-configurable 
 3. Submit a research query.
 4. Confirm the message shows progress/status updates.
 5. Confirm the final response includes `Research status: completed`.
-6. Confirm `Download Trace ZIP` appears only after `archive_status == ready`.
+6. Confirm `Download Trace ZIP` appears only after `archive_status == ready` and the trusted download proxy is configured.
 7. Download the archive and confirm it contains only:
    - `trace.json`
    - `report.md`
@@ -57,6 +57,13 @@ Do not expose `RUNNER_SERVICE_TOKEN` to browser JavaScript or user-configurable 
 1. Run against a fake or controlled Runner task where `archive_status == pending`.
 2. Confirm no archive URL is shown.
 3. Confirm the response says archive download is disabled or pending.
+
+### Missing Download Proxy Disabled
+
+1. Leave `DOWNLOAD_BASE_URL` blank or set it to the same value as `RUNNER_BASE_URL`.
+2. Run against a fake or controlled Runner task where `archive_status == ready`.
+3. Confirm no archive URL is shown.
+4. Confirm the response says archive download is disabled with `proxy_required`.
 
 ### Failed Diagnostic Archive
 
