@@ -4,7 +4,7 @@ import zipfile
 import pytest
 
 import archive_writer
-from archive_writer import ResearchArchiveWriter, scrub_secrets
+from archive_writer import ResearchArchiveWriter, base_url_host, scrub_secrets
 
 
 def test_complete_success_creates_expected_archive(tmp_path):
@@ -113,6 +113,26 @@ def test_failed_task_without_report_gets_diagnostic_report(tmp_path):
     assert metadata["error"] == "Bearer [REDACTED]"
 
 
+def test_cancelled_task_without_report_gets_diagnostic_report(tmp_path):
+    writer = ResearchArchiveWriter(tmp_path, clock=lambda: "2026-06-06T12:00:00+00:00")
+    writer.start("cancelled-task", "query", "user-a")
+    writer.record_event({"event": "tool_call", "data": {"tool_name": "search"}})
+
+    result = writer.complete(status="cancelled", error="Authorization: ApiKey abc def")
+
+    assert result.archive_status == "ready"
+    report = (result.archive_dir / "report.md").read_text(encoding="utf-8")
+    metadata = json.loads(
+        (result.archive_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+
+    assert "MiroThinker Research Cancelled" in report
+    assert "Captured events: 1" in report
+    assert "abc def" not in report
+    assert metadata["status"] == "cancelled"
+    assert metadata["error"] == "Authorization: [REDACTED]"
+
+
 def test_start_rejects_path_traversal_task_id(tmp_path):
     writer = ResearchArchiveWriter(tmp_path)
 
@@ -161,3 +181,56 @@ def test_scrub_secrets_recurses_through_nested_values():
     assert "eyJaaaaaaaaaaaa" not in scrubbed_text
     assert scrubbed["headers"]["Authorization"] == "[REDACTED]"
     assert scrubbed["headers"]["Cookie"] == "[REDACTED]"
+
+
+def test_base_url_host_removes_userinfo_path_query_and_fragment():
+    assert (
+        base_url_host("https://user:secret@api.example.com/path?api_key=x#frag")
+        == "api.example.com"
+    )
+    assert base_url_host("api.example.com/path?token=x") == "api.example.com"
+    assert base_url_host("user:secret@api.example.com/path") == "api.example.com"
+
+
+def test_summarize_model_normalizes_caller_supplied_base_url_host(tmp_path):
+    writer = ResearchArchiveWriter(tmp_path, clock=lambda: "2026-06-06T12:00:00+00:00")
+    writer.start(
+        "host-test",
+        "query",
+        "user-a",
+        model_summary={
+            "provider": "openai",
+            "model": "gpt",
+            "base_url_host": "user:secret@api.example.com/path?token=x",
+        },
+    )
+
+    result = writer.complete(status="completed", report_markdown="done")
+    metadata = json.loads(
+        (result.archive_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+
+    assert metadata["model"]["base_url_host"] == "api.example.com"
+    assert "secret" not in json.dumps(metadata)
+    assert "path" not in json.dumps(metadata)
+    assert "token" not in json.dumps(metadata)
+
+
+def test_scrub_secrets_redacts_full_authorization_string_values():
+    payload = {
+        "basic": "Authorization: Basic dXNlcjpzZWNyZXQ=",
+        "api_header": "Authorization: ApiKey abc def",
+        "bearer": "Authorization: Bearer abc.def.ghi",
+        "delimited": "Authorization: ApiKey abc def; next=value",
+    }
+
+    scrubbed = scrub_secrets(payload)
+    scrubbed_text = json.dumps(scrubbed)
+
+    assert "dXNlcjpzZWNyZXQ" not in scrubbed_text
+    assert "abc def" not in scrubbed_text
+    assert "abc.def.ghi" not in scrubbed_text
+    assert scrubbed["basic"] == "Authorization: [REDACTED]"
+    assert scrubbed["api_header"] == "Authorization: [REDACTED]"
+    assert scrubbed["bearer"] == "Authorization: [REDACTED]"
+    assert scrubbed["delimited"] == "Authorization: [REDACTED]; next=value"

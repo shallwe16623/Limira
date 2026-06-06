@@ -34,10 +34,10 @@ SENSITIVE_ENV_NAMES = {
     "tencentcloud_secret_key",
 }
 
+AUTHORIZATION_HEADER = re.compile(r"(?im)(\bAuthorization\s*[:=]\s*)([^\r\n;,]+)")
+COOKIE_HEADER = re.compile(r"(?im)(\b(?:Set-)?Cookie\s*[:=]\s*)([^\r\n]+)")
 SECRET_PATTERNS = (
     re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
-    re.compile(r"(Authorization\s*[:=]\s*)([^\s,;]+)", re.IGNORECASE),
-    re.compile(r"((?:Set-)?Cookie\s*[:=]\s*)([^\n\r]+)", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){1,2}\b"),
     re.compile(
@@ -47,7 +47,7 @@ SECRET_PATTERNS = (
         r")\s*[:=]\s*['\"]?[^'\"\s,;]+",
         re.IGNORECASE,
     ),
-    re.compile(r"\b[A-Za-z0-9_+/=-]{32,}\b"),
+    re.compile(r"\b[A-Za-z0-9_+/=]{40,}\b"),
 )
 
 
@@ -91,13 +91,10 @@ def is_sensitive_key(key: Any) -> bool:
 
 
 def scrub_string(value: str) -> str:
-    scrubbed = value
+    scrubbed = AUTHORIZATION_HEADER.sub(r"\1" + REDACTED, value)
+    scrubbed = COOKIE_HEADER.sub(r"\1" + REDACTED, scrubbed)
     for pattern in SECRET_PATTERNS:
-        if pattern.pattern.startswith("(Authorization"):
-            scrubbed = pattern.sub(r"\1" + REDACTED, scrubbed)
-        elif pattern.pattern.startswith("((?:Set-)?Cookie"):
-            scrubbed = pattern.sub(r"\1" + REDACTED, scrubbed)
-        elif pattern.pattern.startswith(r"\b("):
+        if pattern.pattern.startswith(r"\b("):
             scrubbed = pattern.sub(lambda m: f"{m.group(1)}={REDACTED}", scrubbed)
         elif pattern.pattern.startswith("Bearer"):
             scrubbed = pattern.sub(f"Bearer {REDACTED}", scrubbed)
@@ -119,24 +116,23 @@ def scrub_secrets(value: Any) -> Any:
     return value
 
 
-def base_url_host(base_url: str | None) -> str | None:
-    if not base_url:
+def base_url_host(base_url: Any) -> str | None:
+    if not isinstance(base_url, str) or not base_url:
         return None
-    parsed = urlparse(base_url)
-    if parsed.netloc:
-        return parsed.netloc
-    if parsed.scheme:
-        return parsed.path or None
-    return base_url.split("/", 1)[0] or None
+    candidate = base_url.strip()
+    parsed = urlparse(candidate)
+    if not parsed.hostname and "://" not in candidate:
+        parsed = urlparse(f"//{candidate}")
+    return parsed.hostname
 
 
 def summarize_model(model_summary: dict[str, Any] | None) -> dict[str, Any]:
     model_summary = scrub_secrets(model_summary or {})
-    base_url = model_summary.get("base_url")
+    base_url = model_summary.get("base_url_host") or model_summary.get("base_url")
     return {
         "provider": model_summary.get("provider"),
         "model": model_summary.get("model") or model_summary.get("model_name"),
-        "base_url_host": model_summary.get("base_url_host") or base_url_host(base_url),
+        "base_url_host": base_url_host(base_url),
     }
 
 
@@ -276,7 +272,7 @@ class ResearchArchiveWriter:
         if report_markdown:
             return report_markdown
         if status == "completed":
-            return "*No report content was provided.*"
+            raise ValueError("completed archives require rendered report markdown")
 
         lines = [
             f"# MiroThinker Research {status.title()}",
