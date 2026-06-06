@@ -47,6 +47,15 @@ def update_state(state, message):
     return state
 
 
+def update_state_with_structured_secret(state, message):
+    if message.get("event") == "message":
+        data = message.get("data", {})
+        state["chunks"].append((data.get("delta") or {}).get("content", ""))
+        if "token" in data:
+            state["chunks"].append(f"token={data['token']}")
+    return state
+
+
 def render_markdown(state):
     return "# Research Summary\n" + "".join(state["chunks"])
 
@@ -64,6 +73,16 @@ async def completed_stream(task_id, query, _unused, disconnect_check=None):
     yield {
         "event": "message",
         "data": {"delta": {"content": "final from state"}},
+    }
+
+
+async def structured_secret_stream(task_id, query, _unused, disconnect_check=None):
+    yield {
+        "event": "message",
+        "data": {
+            "delta": {"content": "safe visible content\n"},
+            "token": "tiny-leak-value",
+        },
     }
 
 
@@ -154,6 +173,7 @@ async def make_client(
     writer_cls=ResearchArchiveWriter,
     transport_closing=None,
     task_store=None,
+    update_state_func=update_state,
     render_markdown_func=render_markdown,
 ):
     store = task_store or TaskStore(tmp_path / "tasks.sqlite3")
@@ -163,7 +183,7 @@ async def make_client(
         service_token="shared",
         stream_events=stream_events,
         init_render_state=init_state,
-        update_state_with_event=update_state,
+        update_state_with_event=update_state_func,
         render_markdown=render_markdown_func,
         transport_closing=transport_closing,
         archive_writer_cls=writer_cls,
@@ -324,6 +344,59 @@ async def test_runner_api_persists_host_only_model_summary(tmp_path, monkeypatch
         assert "secret-token" not in serialized_model_summary
         assert "query-secret" not in serialized_model_summary
         assert "/v1" not in serialized_model_summary
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_scrubs_structured_secrets_before_report_rendering(
+    tmp_path,
+):
+    client, store = await make_client(
+        tmp_path,
+        stream_events=structured_secret_stream,
+        update_state_func=update_state_with_structured_secret,
+    )
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        events_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        sse_payload = await events_response.text()
+
+        status_response = await client.get(
+            f"/mirothinker/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        status_payload = await status_response.json()
+        assert status_payload["status"] == "completed"
+        assert status_payload["archive_status"] == "ready"
+
+        record = store.get_task(task_id)
+        archive_dir = Path(record.archive_dir)
+        artifact_text = "\n".join(
+            [
+                sse_payload,
+                (archive_dir / "trace.json").read_text(encoding="utf-8"),
+                (archive_dir / "metadata.json").read_text(encoding="utf-8"),
+                (archive_dir / "report.md").read_text(encoding="utf-8"),
+                (archive_dir / "report.html").read_text(encoding="utf-8"),
+            ]
+        )
+        with zipfile.ZipFile(record.archive_zip_path) as archive:
+            zip_text = "\n".join(
+                archive.read(name).decode("utf-8") for name in archive.namelist()
+            )
+
+        assert "tiny-leak-value" not in artifact_text
+        assert "tiny-leak-value" not in zip_text
+        assert "token=[REDACTED]" in artifact_text
+        assert '"token": "[REDACTED]"' in artifact_text
+        assert "safe visible content" in artifact_text
     finally:
         await client.close()
 

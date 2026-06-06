@@ -249,7 +249,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             normalized = normalize_stream_event(record.task_id, message, clock())
             if normalized["type"] != "heartbeat":
                 writer.record_event(normalized)
-                state = request.app[UPDATE_STATE_KEY](state, message)
+                state = request.app[UPDATE_STATE_KEY](state, scrub_secrets(message))
                 if normalized["type"] == "error":
                     status = "failed"
                     error = _event_error(normalized)
