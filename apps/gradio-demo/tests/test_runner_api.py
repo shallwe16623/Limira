@@ -51,6 +51,10 @@ def render_markdown(state):
     return "# Research Summary\n" + "".join(state["chunks"])
 
 
+def render_markdown_failure(state):
+    raise RuntimeError("Authorization: Bearer rendersecret123456")
+
+
 async def completed_stream(task_id, query, _unused, disconnect_check=None):
     assert task_id
     assert query == "test query"
@@ -150,6 +154,7 @@ async def make_client(
     writer_cls=ResearchArchiveWriter,
     transport_closing=None,
     task_store=None,
+    render_markdown_func=render_markdown,
 ):
     store = task_store or TaskStore(tmp_path / "tasks.sqlite3")
     app = create_app(
@@ -159,7 +164,7 @@ async def make_client(
         stream_events=stream_events,
         init_render_state=init_state,
         update_state_with_event=update_state,
-        render_markdown=render_markdown,
+        render_markdown=render_markdown_func,
         transport_closing=transport_closing,
         archive_writer_cls=writer_cls,
         clock=Clock(),
@@ -408,6 +413,58 @@ async def test_runner_api_archive_finalization_failure_finalizes_claimed_task(
         assert record.archive_dir is not None
         assert record.archive_zip_path is None
         assert "finalsecret123456" not in json.dumps(record.to_dict())
+
+        retry_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert retry_response.status == 409
+        assert await retry_response.json() == {"error": "task_already_finished"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_renderer_failure_finalizes_claimed_task(tmp_path):
+    client, store = await make_client(
+        tmp_path,
+        render_markdown_func=render_markdown_failure,
+    )
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        events_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        await events_response.text()
+
+        status_response = await client.get(
+            f"/mirothinker/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        status_payload = await status_response.json()
+        serialized_status = json.dumps(status_payload)
+
+        assert status_payload["status"] == "completed"
+        assert status_payload["archive_status"] == "failed"
+        assert status_payload["download_url"] is None
+        assert status_payload["completed_at"] is not None
+        assert status_payload["error"] is None
+        assert status_payload["warnings"] == [
+            "report rendering failed: Authorization: [REDACTED]"
+        ]
+        assert "rendersecret123456" not in serialized_status
+        assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
+        assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
+
+        record = store.get_task(task_id)
+        assert record.status == "completed"
+        assert record.archive_status == "failed"
+        assert record.archive_zip_path is None
+        assert "rendersecret123456" not in json.dumps(record.to_dict())
 
         retry_response = await client.get(
             f"/mirothinker/tasks/{task_id}/events",
@@ -733,6 +790,78 @@ async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
         assert "MiroThinker Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_queued_cancel_start_failure_sets_archive_failed(tmp_path):
+    client, store = await make_client(tmp_path, writer_cls=StartFailWriter)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        cancel_response = await client.post(
+            f"/mirothinker/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
+        cancel_payload = await cancel_response.json()
+        serialized_payload = json.dumps(cancel_payload)
+
+        assert cancel_payload["cancel_requested"] is True
+        assert cancel_payload["status"] == "cancelled"
+        assert cancel_payload["archive_status"] == "failed"
+        assert cancel_payload["download_url"] is None
+        assert cancel_payload["error"] == "task cancelled before stream started"
+        assert cancel_payload["warnings"] == [
+            "queued cancellation archive finalization failed: Authorization: [REDACTED]"
+        ]
+        assert "setupsecret123456" not in serialized_payload
+        assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
+
+        record = store.get_task(task_id)
+        assert record.status == "cancelled"
+        assert record.archive_status == "failed"
+        assert record.archive_dir is None
+        assert record.archive_zip_path is None
+        assert "setupsecret123456" not in json.dumps(record.to_dict())
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_queued_cancel_complete_failure_sets_archive_failed(tmp_path):
+    client, store = await make_client(tmp_path, writer_cls=CompleteFailWriter)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        cancel_response = await client.post(
+            f"/mirothinker/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
+        cancel_payload = await cancel_response.json()
+        serialized_payload = json.dumps(cancel_payload)
+
+        assert cancel_payload["cancel_requested"] is True
+        assert cancel_payload["status"] == "cancelled"
+        assert cancel_payload["archive_status"] == "failed"
+        assert cancel_payload["download_url"] is None
+        assert cancel_payload["error"] == "task cancelled before stream started"
+        assert cancel_payload["warnings"] == [
+            "queued cancellation archive finalization failed: Authorization: [REDACTED]"
+        ]
+        assert "finalsecret123456" not in serialized_payload
+        assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
+
+        record = store.get_task(task_id)
+        assert record.status == "cancelled"
+        assert record.archive_status == "failed"
+        assert record.archive_dir is not None
+        assert record.archive_zip_path is None
+        assert "finalsecret123456" not in json.dumps(record.to_dict())
     finally:
         await client.close()
 

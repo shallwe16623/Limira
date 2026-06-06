@@ -284,26 +284,14 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
         try:
             if writer_started:
                 report_markdown = None
-                if status == "completed":
-                    report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
-
+                render_error = None
                 try:
-                    archive_result = writer.complete(
-                        state=state,
-                        status=status,
-                        error=error,
-                        report_markdown=report_markdown,
-                        end_time=end_time,
-                    )
-                    archive_updates = {
-                        "archive_status": archive_result.archive_status,
-                        "archive_dir": str(archive_result.archive_dir),
-                        "archive_zip_path": str(archive_result.archive_zip_path)
-                        if archive_result.archive_zip_path
-                        else None,
-                        "warnings": archive_result.warnings,
-                    }
+                    if status == "completed":
+                        report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
                 except Exception as exc:
+                    render_error = exc
+
+                if render_error:
                     archive_updates = {
                         "archive_status": "failed",
                         "archive_dir": str(writer.archive_dir)
@@ -311,9 +299,37 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                         else None,
                         "archive_zip_path": None,
                         "warnings": [
-                            scrub_secrets(f"archive finalization failed: {exc}")
+                            scrub_secrets(f"report rendering failed: {render_error}")
                         ],
                     }
+                else:
+                    try:
+                        archive_result = writer.complete(
+                            state=state,
+                            status=status,
+                            error=error,
+                            report_markdown=report_markdown,
+                            end_time=end_time,
+                        )
+                        archive_updates = {
+                            "archive_status": archive_result.archive_status,
+                            "archive_dir": str(archive_result.archive_dir),
+                            "archive_zip_path": str(archive_result.archive_zip_path)
+                            if archive_result.archive_zip_path
+                            else None,
+                            "warnings": archive_result.warnings,
+                        }
+                    except Exception as exc:
+                        archive_updates = {
+                            "archive_status": "failed",
+                            "archive_dir": str(writer.archive_dir)
+                            if writer.archive_dir
+                            else None,
+                            "archive_zip_path": None,
+                            "warnings": [
+                                scrub_secrets(f"archive finalization failed: {exc}")
+                            ],
+                        }
                 store.update_task(
                     record.task_id,
                     status=status,
@@ -510,31 +526,46 @@ def _finalize_queued_cancellation(
         return current_record or record
 
     writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
-    writer.start(
-        task_id=claimed_record.task_id,
-        query=claimed_record.query,
-        user_id=claimed_record.user_id,
-        model_summary=claimed_record.model_summary,
-        start_time=cancelled_at,
-    )
-    end_time = clock()
-    archive_result = writer.complete(
-        state={},
-        status="cancelled",
-        error=error,
-        end_time=end_time,
-    )
-    _clear_task_cancel(request.app, claimed_record.task_id)
-    return store.update_task(
-        claimed_record.task_id,
-        archive_status=archive_result.archive_status,
-        archive_dir=str(archive_result.archive_dir),
-        archive_zip_path=str(archive_result.archive_zip_path)
-        if archive_result.archive_zip_path
-        else None,
-        completed_at=end_time,
-        warnings=archive_result.warnings,
-    )
+    try:
+        writer.start(
+            task_id=claimed_record.task_id,
+            query=claimed_record.query,
+            user_id=claimed_record.user_id,
+            model_summary=claimed_record.model_summary,
+            start_time=cancelled_at,
+        )
+        end_time = clock()
+        archive_result = writer.complete(
+            state={},
+            status="cancelled",
+            error=error,
+            end_time=end_time,
+        )
+        updated = store.update_task(
+            claimed_record.task_id,
+            archive_status=archive_result.archive_status,
+            archive_dir=str(archive_result.archive_dir),
+            archive_zip_path=str(archive_result.archive_zip_path)
+            if archive_result.archive_zip_path
+            else None,
+            completed_at=end_time,
+            warnings=archive_result.warnings,
+        )
+    except Exception as exc:
+        end_time = clock()
+        updated = store.update_task(
+            claimed_record.task_id,
+            archive_status="failed",
+            archive_dir=str(writer.archive_dir) if writer.archive_dir else None,
+            archive_zip_path=None,
+            completed_at=end_time,
+            warnings=[
+                scrub_secrets(f"queued cancellation archive finalization failed: {exc}")
+            ],
+        )
+    finally:
+        _clear_task_cancel(request.app, claimed_record.task_id)
+    return updated
 
 
 def _task_response(record: TaskRecord) -> dict[str, Any]:
