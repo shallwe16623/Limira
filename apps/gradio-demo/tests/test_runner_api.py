@@ -8,7 +8,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from archive_writer import ResearchArchiveWriter
-from runner_api import CANCELLED_TASKS_KEY, create_app
+from runner_api import ACTIVE_TASKS_KEY, CANCELLED_TASKS_KEY, create_app
 from task_store import TaskStore
 
 
@@ -562,6 +562,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
             )
         )
         await asyncio.wait_for(probe.started.wait(), timeout=1)
+        assert task_id in client.server.app[ACTIVE_TASKS_KEY]
 
         cancel_response = await client.post(
             f"/mirothinker/tasks/{task_id}/cancel",
@@ -591,6 +592,60 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
         assert "MiroThinker Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
+        assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        claimed = store.claim_queued_task(
+            task_id,
+            started_at="2026-06-06T12:30:00+00:00",
+        )
+        assert claimed is not None
+        assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
+
+        cancel_response = await client.post(
+            f"/mirothinker/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
+        cancel_payload = await cancel_response.json()
+
+        assert cancel_payload["cancel_requested"] is True
+        assert cancel_payload["status"] == "cancelled"
+        assert cancel_payload["archive_status"] == "ready"
+        assert cancel_payload["download_url"] == (
+            f"/mirothinker/tasks/{task_id}/archive.zip"
+        )
+        assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
+        assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
+
+        record = store.get_task(task_id)
+        assert record.status == "cancelled"
+        assert record.archive_status == "ready"
+        assert record.completed_at is not None
+        archive_dir = Path(record.archive_dir)
+        metadata = json.loads((archive_dir / "metadata.json").read_text())
+        assert metadata["status"] == "cancelled"
+        assert metadata["error"] == (
+            "task cancelled because no active stream worker was registered"
+        )
+        report = (archive_dir / "report.md").read_text(encoding="utf-8")
+        assert "MiroThinker Research Cancelled" in report
+        assert_zip_members(record.archive_zip_path)
+
+        retry_response = await client.get(
+            f"/mirothinker/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert retry_response.status == 409
+        assert await retry_response.json() == {"error": "task_already_finished"}
     finally:
         await client.close()
 

@@ -22,6 +22,7 @@ class FakeRunner:
     final_status: str = "completed"
     archive_status: str = "ready"
     events_status_code: int = 200
+    events_error: str = "task_already_finished"
     stream_events: list[dict[str, Any]] = field(default_factory=list)
     user_a_task_id: str = "task-user-a"
     requests: list[httpx.Request] = field(default_factory=list)
@@ -62,7 +63,7 @@ class FakeRunner:
         if request.method == "GET" and path.endswith("/events"):
             if self.events_status_code != 200:
                 return json_response(
-                    self.events_status_code, {"error": "terminal_task"}
+                    self.events_status_code, {"error": self.events_error}
                 )
             content = "".join(
                 f"data: {json.dumps(event)}\n\n" for event in self.events()
@@ -310,6 +311,7 @@ async def test_terminal_events_conflict_polls_final_cancelled_status():
         final_status="cancelled",
         archive_status="ready",
         events_status_code=409,
+        events_error="task_already_finished",
     )
     pipe = configured_pipe(fake_runner)
 
@@ -317,3 +319,20 @@ async def test_terminal_events_conflict_polls_final_cancelled_status():
 
     assert "Research status: `cancelled`" in output
     assert "Download Diagnostic ZIP: https://open-webui.example/runner/" in output
+
+
+@pytest.mark.asyncio
+async def test_running_events_conflict_is_not_treated_as_terminal():
+    fake_runner = FakeRunner(
+        final_status="running",
+        archive_status="pending",
+        events_status_code=409,
+        events_error="task_already_running",
+    )
+    pipe = configured_pipe(fake_runner)
+
+    with pytest.raises(RunnerApiError) as exc_info:
+        await collect_pipe(pipe, {"query": "research"})
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.error == "task_already_running"

@@ -43,6 +43,7 @@ UPDATE_STATE_KEY = web.AppKey("update_state_with_event", object)
 RENDER_MARKDOWN_KEY = web.AppKey("render_markdown", object)
 TRANSPORT_CLOSING_KEY = web.AppKey("transport_closing", object)
 CANCELLED_TASKS_KEY = web.AppKey("cancelled_tasks", set[str])
+ACTIVE_TASKS_KEY = web.AppKey("active_tasks", set[str])
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -88,6 +89,7 @@ def create_app(
     app[RENDER_MARKDOWN_KEY] = render_markdown
     app[TRANSPORT_CLOSING_KEY] = transport_closing or _transport_closing
     app[CANCELLED_TASKS_KEY] = set()
+    app[ACTIVE_TASKS_KEY] = set()
 
     app.router.add_post("/mirothinker/research", start_research)
     app.router.add_get("/mirothinker/tasks/{task_id}", get_task_status)
@@ -154,6 +156,13 @@ async def cancel_task(request: web.Request) -> web.Response:
     if record.status in FINAL_TASK_STATUSES:
         return web.json_response(_task_response(record))
 
+    if record.status == "running" and not _task_has_active_worker(
+        request.app,
+        record.task_id,
+    ):
+        record = _finalize_running_without_worker_cancellation(request, record)
+        return web.json_response({**_task_response(record), "cancel_requested": True})
+
     _request_task_cancel(request.app, record.task_id)
     if record.status == "queued":
         record = _finalize_queued_cancellation(request, record)
@@ -194,6 +203,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             content_type="application/json",
         )
     record = claimed_record
+    _register_active_task(request.app, record.task_id)
 
     writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
     status = "completed"
@@ -306,6 +316,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                 error=scrub_secrets(error),
                 warnings=["stream setup failed before archive writer started"],
             )
+        _clear_active_task(request.app, record.task_id)
         _clear_task_cancel(request.app, record.task_id)
         if response_prepared:
             try:
@@ -388,9 +399,77 @@ def _task_cancel_requested(app: web.Application, task_id: str) -> bool:
     return task_id in app[CANCELLED_TASKS_KEY]
 
 
+def _register_active_task(app: web.Application, task_id: str) -> None:
+    app[ACTIVE_TASKS_KEY].add(task_id)
+
+
+def _clear_active_task(app: web.Application, task_id: str) -> None:
+    app[ACTIVE_TASKS_KEY].discard(task_id)
+
+
+def _task_has_active_worker(app: web.Application, task_id: str) -> bool:
+    return task_id in app[ACTIVE_TASKS_KEY]
+
+
 def _transport_closing(request: web.Request) -> bool:
     transport = request.transport
     return transport is None or transport.is_closing()
+
+
+def _finalize_running_without_worker_cancellation(
+    request: web.Request,
+    record: TaskRecord,
+) -> TaskRecord:
+    clock: Callable[[], str] = request.app[CLOCK_KEY]
+    cancelled_at = clock()
+    error = "task cancelled because no active stream worker was registered"
+    store: TaskStore = request.app[TASK_STORE_KEY]
+    writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
+
+    try:
+        writer.start(
+            task_id=record.task_id,
+            query=record.query,
+            user_id=record.user_id,
+            model_summary=record.model_summary,
+            start_time=record.started_at or cancelled_at,
+        )
+        end_time = clock()
+        archive_result = writer.complete(
+            state={},
+            status="cancelled",
+            error=error,
+            end_time=end_time,
+        )
+        updated = store.update_task(
+            record.task_id,
+            status="cancelled",
+            archive_status=archive_result.archive_status,
+            archive_dir=str(archive_result.archive_dir),
+            archive_zip_path=str(archive_result.archive_zip_path)
+            if archive_result.archive_zip_path
+            else None,
+            completed_at=end_time,
+            error=scrub_secrets(error),
+            warnings=archive_result.warnings,
+        )
+    except Exception as exc:
+        end_time = clock()
+        final_error = f"{error}; archive finalization failed: {exc}"
+        updated = store.update_task(
+            record.task_id,
+            status="cancelled",
+            archive_status="failed",
+            archive_dir=None,
+            archive_zip_path=None,
+            completed_at=end_time,
+            error=scrub_secrets(final_error),
+            warnings=["cancelled running task without active stream worker"],
+        )
+
+    _clear_active_task(request.app, record.task_id)
+    _clear_task_cancel(request.app, record.task_id)
+    return updated
 
 
 def _finalize_queued_cancellation(

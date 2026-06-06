@@ -91,7 +91,9 @@ class MiroThinkerRunnerClient:
             ) as response:
                 if response.status_code == 409:
                     await response.aread()
-                    return
+                    if response_error_code(response) == "task_already_finished":
+                        return
+                    await self._ensure_success(response, {200})
                 if response.status_code not in {200}:
                     await response.aread()
                 await self._ensure_success(response, {200})
@@ -337,6 +339,16 @@ def required_str(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise RunnerApiError(502, f"runner response missing {key}")
     return value
+
+
+def response_error_code(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+        return payload["error"]
+    return None
 
 
 async def emit_status(
