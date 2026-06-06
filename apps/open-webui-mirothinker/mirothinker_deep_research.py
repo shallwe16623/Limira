@@ -8,6 +8,7 @@ requirements: httpx,pydantic
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -234,13 +235,17 @@ class Pipe:
         __metadata__: dict[str, Any] | None = None,
         __event_emitter__: EventEmitter | None = None,
     ) -> AsyncIterator[str]:
-        async for chunk in self.run_research(
+        research = self.run_research(
             body=body,
             user_context=__user__,
             metadata=__metadata__,
             event_emitter=__event_emitter__,
-        ):
-            yield chunk
+        )
+        try:
+            async for chunk in research:
+                yield chunk
+        finally:
+            await research.aclose()
 
     async def run_research(
         self,
@@ -253,35 +258,48 @@ class Pipe:
         user_id = open_webui_user_id(user_context)
         query = extract_query(body, metadata)
         client = self._client()
+        task_id = None
+        final_status_fetched = False
 
-        await emit_status(event_emitter, "Starting MiroThinker research", done=False)
-        task = await client.start_research(query=query, user_id=user_id)
-        task_id = required_str(task, "task_id")
+        try:
+            await emit_status(
+                event_emitter, "Starting MiroThinker research", done=False
+            )
+            task = await client.start_research(query=query, user_id=user_id)
+            task_id = required_str(task, "task_id")
 
-        yield "## MiroThinker Deep Research\n\n"
-        yield f"Task `{task_id}` started.\n\n"
+            yield "## MiroThinker Deep Research\n\n"
+            yield f"Task `{task_id}` started.\n\n"
 
-        report_chunks: list[str] = []
-        async for event in client.stream_events(task_id=task_id, user_id=user_id):
-            description = event_description(event)
-            await emit_status(event_emitter, description, done=False)
-            visible_text = visible_event_text(event)
-            if visible_text:
-                report_chunks.append(visible_text)
-                yield visible_text
+            report_chunks: list[str] = []
+            async for event in client.stream_events(task_id=task_id, user_id=user_id):
+                description = event_description(event)
+                await emit_status(event_emitter, description, done=False)
+                visible_text = visible_event_text(event)
+                if visible_text:
+                    report_chunks.append(visible_text)
+                    yield visible_text
 
-        task_status = await client.get_task_status(task_id=task_id, user_id=user_id)
-        final_text = render_final_response(
-            client=client,
-            task_status=task_status,
-            report_text="".join(report_chunks).strip(),
-        )
-        await emit_status(
-            event_emitter,
-            f"MiroThinker research {task_status.get('status', 'finished')}",
-            done=True,
-        )
-        yield final_text
+            task_status = await client.get_task_status(task_id=task_id, user_id=user_id)
+            final_status_fetched = True
+            final_text = render_final_response(
+                client=client,
+                task_status=task_status,
+                report_text="".join(report_chunks).strip(),
+            )
+            await emit_status(
+                event_emitter,
+                f"MiroThinker research {task_status.get('status', 'finished')}",
+                done=True,
+            )
+            yield final_text
+        finally:
+            if task_id and not final_status_fetched:
+                await best_effort_cancel_task(
+                    client=client,
+                    task_id=task_id,
+                    user_id=user_id,
+                )
 
     async def cancel_research(
         self,
@@ -339,6 +357,36 @@ def required_str(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise RunnerApiError(502, f"runner response missing {key}")
     return value
+
+
+async def best_effort_cancel_task(
+    *,
+    client: MiroThinkerRunnerClient,
+    task_id: str,
+    user_id: str,
+) -> None:
+    cancel_request = asyncio.create_task(
+        client.cancel_task(task_id=task_id, user_id=user_id)
+    )
+    try:
+        await asyncio.shield(cancel_request)
+    except asyncio.CancelledError:
+        if cancel_request.done():
+            consume_task_result(cancel_request)
+            return
+        cancel_request.add_done_callback(consume_task_result)
+        raise
+    except Exception:
+        pass
+
+
+def consume_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
 def response_error_code(response: httpx.Response) -> str | None:

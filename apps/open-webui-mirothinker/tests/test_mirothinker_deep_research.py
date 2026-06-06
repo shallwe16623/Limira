@@ -24,6 +24,7 @@ class FakeRunner:
     archive_status: str = "ready"
     events_status_code: int = 200
     events_error: str = "task_already_finished"
+    events_exception: str | None = None
     stream_events: list[dict[str, Any]] = field(default_factory=list)
     user_a_task_id: str = "task-user-a"
     requests: list[httpx.Request] = field(default_factory=list)
@@ -62,6 +63,8 @@ class FakeRunner:
             return json_response(404, {"error": "not_found"})
 
         if request.method == "GET" and path.endswith("/events"):
+            if self.events_exception:
+                raise httpx.ConnectError(self.events_exception, request=request)
             if self.events_status_code != 200:
                 return json_response(
                     self.events_status_code, {"error": self.events_error}
@@ -157,6 +160,14 @@ async def collect_pipe(pipe: Pipe, body: dict[str, Any], user=USER_A):
     return "".join(chunks), events
 
 
+def cancel_requests(fake_runner: FakeRunner) -> list[httpx.Request]:
+    return [
+        request
+        for request in fake_runner.requests
+        if request.method == "POST" and request.url.path.endswith("/cancel")
+    ]
+
+
 @pytest.mark.asyncio
 async def test_user_a_start_progress_final_and_download_ready():
     fake_runner = FakeRunner()
@@ -182,6 +193,46 @@ async def test_user_a_start_progress_final_and_download_ready():
     start_body = json.loads(start_request.content.decode())
     assert start_body["query"] == "research from metadata"
     assert "user_id" not in start_body
+    assert not cancel_requests(fake_runner)
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_after_start_cancels_runner_task():
+    fake_runner = FakeRunner(events_exception="events connection failed")
+    pipe = configured_pipe(fake_runner)
+
+    with pytest.raises(httpx.ConnectError):
+        await collect_pipe(pipe, {"query": "research"})
+
+    requests = cancel_requests(fake_runner)
+    assert len(requests) == 1
+    assert requests[0].url.path == "/mirothinker/tasks/task-user-a/cancel"
+    assert requests[0].headers[USER_ID_HEADER] == "user-a"
+    assert requests[0].headers[SERVICE_TOKEN_HEADER] == "shared-token"
+
+
+@pytest.mark.asyncio
+async def test_generator_close_after_start_cancels_runner_task():
+    fake_runner = FakeRunner()
+    pipe = configured_pipe(fake_runner)
+
+    async def emit(_event):
+        return None
+
+    generator = pipe.pipe(
+        {"query": "research"},
+        __user__=USER_A,
+        __metadata__={"user_prompt": "research from metadata"},
+        __event_emitter__=emit,
+    )
+    first_chunk = await generator.__anext__()
+    assert "MiroThinker Deep Research" in first_chunk
+
+    await generator.aclose()
+
+    requests = cancel_requests(fake_runner)
+    assert len(requests) == 1
+    assert requests[0].url.path == "/mirothinker/tasks/task-user-a/cancel"
 
 
 @pytest.mark.asyncio
