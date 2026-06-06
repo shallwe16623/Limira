@@ -8,7 +8,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from archive_writer import ResearchArchiveWriter
-from runner_api import create_app
+from runner_api import CANCELLED_TASKS_KEY, create_app
 from task_store import TaskStore
 
 
@@ -115,13 +115,33 @@ class ZipFailWriter(ResearchArchiveWriter):
         raise RuntimeError("zip unavailable")
 
 
+class StreamClaimRaceStore(TaskStore):
+    def __init__(self, db_path):
+        super().__init__(db_path)
+        self.claimed_during_cancel = False
+
+    def cancel_queued_task(self, task_id, *, started_at, completed_at, error):
+        claimed = self.claim_queued_task(
+            task_id,
+            started_at="2026-06-06T12:59:59+00:00",
+        )
+        self.claimed_during_cancel = claimed is not None
+        return super().cancel_queued_task(
+            task_id,
+            started_at=started_at,
+            completed_at=completed_at,
+            error=error,
+        )
+
+
 async def make_client(
     tmp_path,
     stream_events=completed_stream,
     writer_cls=ResearchArchiveWriter,
     transport_closing=None,
+    task_store=None,
 ):
-    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store = task_store or TaskStore(tmp_path / "tasks.sqlite3")
     app = create_app(
         task_store=store,
         archive_root=tmp_path / "archives",
@@ -495,6 +515,66 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
         assert "MiroThinker Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        cancel_response = await client.post(
+            f"/mirothinker/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
+        cancel_payload = await cancel_response.json()
+        assert cancel_payload["cancel_requested"] is True
+        assert cancel_payload["status"] == "cancelled"
+        assert cancel_payload["archive_status"] == "ready"
+        assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
+
+        record = store.get_task(task_id)
+        archive_dir = Path(record.archive_dir)
+        metadata = json.loads((archive_dir / "metadata.json").read_text())
+        assert metadata["status"] == "cancelled"
+        assert metadata["error"] == "task cancelled before stream started"
+        report = (archive_dir / "report.md").read_text(encoding="utf-8")
+        assert "MiroThinker Research Cancelled" in report
+        assert_zip_members(record.archive_zip_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_queued_cancel_keeps_signal_when_stream_claim_wins(tmp_path):
+    store = StreamClaimRaceStore(tmp_path / "tasks.sqlite3")
+    client, _store = await make_client(tmp_path, task_store=store)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+
+        cancel_response = await client.post(
+            f"/mirothinker/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
+        cancel_payload = await cancel_response.json()
+
+        assert store.claimed_during_cancel is True
+        assert cancel_payload["cancel_requested"] is True
+        assert cancel_payload["status"] == "running"
+        assert cancel_payload["archive_status"] == "pending"
+        assert task_id in client.server.app[CANCELLED_TASKS_KEY]
+
+        record = store.get_task(task_id)
+        assert record.status == "running"
+        assert record.archive_status == "pending"
+        assert record.archive_dir is None
+        assert record.started_at == "2026-06-06T12:59:59+00:00"
     finally:
         await client.close()
 

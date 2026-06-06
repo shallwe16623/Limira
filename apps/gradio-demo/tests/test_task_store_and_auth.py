@@ -94,6 +94,55 @@ def test_task_store_claims_queued_task_once(tmp_path):
     assert current.started_at == "2026-06-06T12:01:00+00:00"
 
 
+def test_task_store_cancels_only_still_queued_tasks(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-a",
+        user_id="user-a",
+        query="first",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    store.create_task(
+        task_id="task-b",
+        user_id="user-a",
+        query="second",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+
+    cancelled = store.cancel_queued_task(
+        "task-a",
+        started_at="2026-06-06T12:01:00+00:00",
+        completed_at="2026-06-06T12:01:01+00:00",
+        error="task cancelled before stream started",
+    )
+    stream_claim_after_cancel = store.claim_queued_task(
+        "task-a",
+        started_at="2026-06-06T12:02:00+00:00",
+    )
+
+    stream_claim = store.claim_queued_task(
+        "task-b",
+        started_at="2026-06-06T12:03:00+00:00",
+    )
+    cancel_after_stream_claim = store.cancel_queued_task(
+        "task-b",
+        started_at="2026-06-06T12:04:00+00:00",
+        completed_at="2026-06-06T12:04:01+00:00",
+        error="late cancel",
+    )
+
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    assert cancelled.error == "task cancelled before stream started"
+    assert stream_claim_after_cancel is None
+    assert stream_claim is not None
+    assert stream_claim.status == "running"
+    assert cancel_after_stream_claim is None
+    current = store.get_task("task-b")
+    assert current.status == "running"
+    assert current.started_at == "2026-06-06T12:03:00+00:00"
+
+
 def test_task_store_rejects_invalid_status_updates(tmp_path):
     store = TaskStore(tmp_path / "tasks.sqlite3")
     store.create_task(

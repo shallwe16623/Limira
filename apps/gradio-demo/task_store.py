@@ -155,6 +155,27 @@ class TaskStore:
                 return None
         return self.get_task(task_id)
 
+    def cancel_queued_task(
+        self,
+        task_id: str,
+        *,
+        started_at: str,
+        completed_at: str,
+        error: str,
+    ) -> TaskRecord | None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE mirothinker_research_tasks
+                SET status = ?, started_at = ?, completed_at = ?, error = ?
+                WHERE task_id = ? AND status = ?
+                """,
+                ("cancelled", started_at, completed_at, error, task_id, "queued"),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:

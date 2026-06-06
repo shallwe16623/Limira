@@ -365,15 +365,28 @@ def _finalize_queued_cancellation(
 ) -> TaskRecord:
     clock: Callable[[], str] = request.app[CLOCK_KEY]
     cancelled_at = clock()
+    error = "task cancelled before stream started"
+    store: TaskStore = request.app[TASK_STORE_KEY]
+    claimed_record = store.cancel_queued_task(
+        record.task_id,
+        started_at=cancelled_at,
+        completed_at=cancelled_at,
+        error=scrub_secrets(error),
+    )
+    if not claimed_record:
+        current_record = store.get_task(record.task_id)
+        if current_record and current_record.status in FINAL_TASK_STATUSES:
+            _clear_task_cancel(request.app, record.task_id)
+        return current_record or record
+
     writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
     writer.start(
-        task_id=record.task_id,
-        query=record.query,
-        user_id=record.user_id,
-        model_summary=record.model_summary,
+        task_id=claimed_record.task_id,
+        query=claimed_record.query,
+        user_id=claimed_record.user_id,
+        model_summary=claimed_record.model_summary,
         start_time=cancelled_at,
     )
-    error = "task cancelled before stream started"
     end_time = clock()
     archive_result = writer.complete(
         state={},
@@ -381,19 +394,15 @@ def _finalize_queued_cancellation(
         error=error,
         end_time=end_time,
     )
-    _clear_task_cancel(request.app, record.task_id)
-    store: TaskStore = request.app[TASK_STORE_KEY]
+    _clear_task_cancel(request.app, claimed_record.task_id)
     return store.update_task(
-        record.task_id,
-        status="cancelled",
+        claimed_record.task_id,
         archive_status=archive_result.archive_status,
         archive_dir=str(archive_result.archive_dir),
         archive_zip_path=str(archive_result.archive_zip_path)
         if archive_result.archive_zip_path
         else None,
-        started_at=cancelled_at,
         completed_at=end_time,
-        error=scrub_secrets(error),
         warnings=archive_result.warnings,
     )
 
