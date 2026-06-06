@@ -7,7 +7,12 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from archive_writer import ResearchArchiveWriter, scrub_secrets, utc_now_iso
+from archive_writer import (
+    ResearchArchiveWriter,
+    base_url_host,
+    scrub_secrets,
+    utc_now_iso,
+)
 from auth_adapter import (
     AuthContext,
     AuthError,
@@ -466,7 +471,7 @@ def _model_summary_from_env() -> dict[str, Any]:
     return {
         "provider": os.getenv("DEFAULT_LLM_PROVIDER"),
         "model": os.getenv("DEFAULT_MODEL_NAME"),
-        "base_url": os.getenv("BASE_URL"),
+        "base_url_host": base_url_host(os.getenv("BASE_URL")),
     }
 
 

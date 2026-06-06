@@ -287,6 +287,33 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runner_api_persists_host_only_model_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEFAULT_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEFAULT_MODEL_NAME", "deepseek-chat")
+    monkeypatch.setenv(
+        "BASE_URL",
+        "https://user:secret-token@api.deepseek.com/v1?api_key=query-secret#frag",
+    )
+    client, store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        record = store.get_task(start_payload["task_id"])
+        serialized_model_summary = json.dumps(record.model_summary)
+
+        assert record.model_summary == {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "base_url_host": "api.deepseek.com",
+        }
+        assert "base_url" not in record.model_summary
+        assert "secret-token" not in serialized_model_summary
+        assert "query-secret" not in serialized_model_summary
+        assert "/v1" not in serialized_model_summary
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_runner_api_rejects_foreign_user_and_not_ready_download(tmp_path):
     client, _store = await make_client(tmp_path)
     try:
