@@ -220,3 +220,7 @@ data/
 .DS_Store
 
 apps/collect-trace/scripts/*/*.sh
+# local runtime artifacts
+.webui_secret_key
+apps/gradio-demo/archives/
+apps/gradio-demo/runner_tasks.sqlite3
