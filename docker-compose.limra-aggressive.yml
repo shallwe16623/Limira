@@ -49,6 +49,8 @@ services:
     environment:
       MIROTHINKER_RUNNER_PORT: "8091"
       RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?set RUNNER_SERVICE_TOKEN}
+      RUNNER_TASK_STORE_BACKEND: postgres
+      RUNNER_DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
       DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000

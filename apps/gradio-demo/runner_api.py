@@ -20,7 +20,7 @@ from auth_adapter import (
     authenticate_headers,
     reject_body_user_id,
 )
-from task_store import TaskRecord, TaskStore
+from task_store import TaskRecord, TaskStore, create_task_store_from_env
 
 
 MAX_QUERY_CHARS = 20_000
@@ -33,7 +33,7 @@ GradioHelpers = tuple[
     Callable[[dict[str, Any]], str],
 ]
 
-TASK_STORE_KEY = web.AppKey("task_store", TaskStore)
+TASK_STORE_KEY = web.AppKey("task_store", object)
 ARCHIVE_ROOT_KEY = web.AppKey("archive_root", Path)
 SERVICE_TOKEN_KEY = web.AppKey("service_token", str | None)
 ARCHIVE_WRITER_KEY = web.AppKey("archive_writer_cls", type)
@@ -63,9 +63,7 @@ def create_app(
     clock: Callable[[], str] = utc_now_iso,
 ) -> web.Application:
     app = web.Application()
-    app[TASK_STORE_KEY] = task_store or TaskStore(
-        Path(__file__).parent / "runner_tasks.sqlite3"
-    )
+    app[TASK_STORE_KEY] = task_store or create_task_store_from_env()
     app[ARCHIVE_ROOT_KEY] = archive_root or (Path(__file__).parent / "archives")
     app[SERVICE_TOKEN_KEY] = service_token if service_token is not None else os.getenv(
         "RUNNER_SERVICE_TOKEN"

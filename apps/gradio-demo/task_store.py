@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -7,6 +8,10 @@ from typing import Any
 
 TASK_STATUSES = {"queued", "running", "completed", "failed", "cancelled"}
 ARCHIVE_STATUSES = {"pending", "ready", "failed"}
+RUNNER_TASK_STORE_BACKEND_ENV = "RUNNER_TASK_STORE_BACKEND"
+RUNNER_DATABASE_URL_ENV = "RUNNER_DATABASE_URL"
+RUNNER_ALLOW_SQLITE_TASK_STORE_ENV = "RUNNER_ALLOW_SQLITE_TASK_STORE"
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -251,3 +256,308 @@ class TaskStore:
         if value is None:
             return default
         return json.loads(value)
+
+
+class PostgresTaskStore:
+    TASK_COLUMNS = """
+        task_id,
+        owner_user_id,
+        query,
+        status,
+        archive_status,
+        runner_task_id,
+        archive_object_key,
+        archive_zip_sha256,
+        created_at,
+        started_at,
+        completed_at,
+        error,
+        model_summary,
+        metadata
+    """
+    CREATE_TASK_SQL = f"""
+        INSERT INTO limra_research_tasks (
+            task_id,
+            owner_user_id,
+            query,
+            status,
+            archive_status,
+            runner_task_id,
+            created_at,
+            model_summary,
+            metadata
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            'queued',
+            'pending',
+            %s,
+            %s,
+            CAST(%s AS jsonb),
+            CAST(%s AS jsonb)
+        )
+        RETURNING {TASK_COLUMNS}
+    """
+    GET_TASK_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limra_research_tasks
+        WHERE task_id = %s
+    """
+    LIST_USER_TASKS_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limra_research_tasks
+        WHERE owner_user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+    """
+    CLAIM_QUEUED_TASK_SQL = f"""
+        UPDATE limra_research_tasks
+        SET status = 'running',
+            started_at = %s
+        WHERE task_id = %s
+          AND status = 'queued'
+        RETURNING {TASK_COLUMNS}
+    """
+    CANCEL_QUEUED_TASK_SQL = f"""
+        UPDATE limra_research_tasks
+        SET status = 'cancelled',
+            started_at = %s,
+            completed_at = %s,
+            error = %s,
+            archive_status = 'failed'
+        WHERE task_id = %s
+          AND status = 'queued'
+        RETURNING {TASK_COLUMNS}
+    """
+
+    def __init__(self, database_url: str, *, connection_factory: Any | None = None):
+        if not _is_postgres_database_url(database_url):
+            raise RuntimeError("runner_postgres_database_url_required")
+        self.database_url = database_url
+        self._connection_factory = connection_factory
+
+    @classmethod
+    def sql_contract(cls) -> str:
+        return "\n".join(
+            value
+            for name, value in cls.__dict__.items()
+            if name.endswith("_SQL") and isinstance(value, str)
+        )
+
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        query: str,
+        created_at: str,
+        model_summary: dict[str, Any] | None = None,
+    ) -> TaskRecord:
+        row = self._fetch_one(
+            self.CREATE_TASK_SQL,
+            (
+                task_id,
+                user_id,
+                query,
+                task_id,
+                created_at,
+                _serialize_json(model_summary or {}),
+                _serialize_json(_runner_metadata()),
+            ),
+        )
+        if not row:
+            raise RuntimeError("runner_task_insert_failed")
+        return self._row_to_record(row)
+
+    def get_task(self, task_id: str) -> TaskRecord | None:
+        row = self._fetch_one(self.GET_TASK_SQL, (task_id,))
+        return self._row_to_record(row) if row else None
+
+    def list_user_tasks(self, user_id: str, limit: int = 100) -> list[TaskRecord]:
+        rows = self._fetch_all(self.LIST_USER_TASKS_SQL, (user_id, limit))
+        return [self._row_to_record(row) for row in rows]
+
+    def user_owns_task(self, task_id: str, user_id: str) -> bool:
+        record = self.get_task(task_id)
+        return bool(record and record.user_id == user_id)
+
+    def update_task(self, task_id: str, **updates: Any) -> TaskRecord:
+        allowed = {
+            "status",
+            "archive_status",
+            "archive_dir",
+            "archive_zip_path",
+            "started_at",
+            "completed_at",
+            "error",
+            "model_summary",
+            "warnings",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"unsupported task update fields: {sorted(unknown)}")
+        if "status" in updates and updates["status"] not in TASK_STATUSES:
+            raise ValueError(f"unsupported task status: {updates['status']}")
+        if (
+            "archive_status" in updates
+            and updates["archive_status"] not in ARCHIVE_STATUSES
+        ):
+            raise ValueError(f"unsupported archive status: {updates['archive_status']}")
+        if not updates:
+            record = self.get_task(task_id)
+            if not record:
+                raise KeyError(task_id)
+            return record
+
+        assignments = []
+        values = []
+        metadata_updates = {}
+        for field, value in updates.items():
+            if field == "model_summary":
+                assignments.append("model_summary = CAST(%s AS jsonb)")
+                values.append(_serialize_json(value or {}))
+            elif field in {"archive_dir", "archive_zip_path", "warnings"}:
+                metadata_updates[field] = value
+            else:
+                assignments.append(f"{field} = %s")
+                values.append(value)
+        if metadata_updates:
+            assignments.append("metadata = metadata || CAST(%s AS jsonb)")
+            values.append(_serialize_json(metadata_updates))
+
+        sql = f"""
+            UPDATE limra_research_tasks
+            SET {", ".join(assignments)}
+            WHERE task_id = %s
+            RETURNING {self.TASK_COLUMNS}
+        """
+        row = self._fetch_one(sql, (*values, task_id))
+        if not row:
+            raise KeyError(task_id)
+        return self._row_to_record(row)
+
+    def claim_queued_task(self, task_id: str, *, started_at: str) -> TaskRecord | None:
+        row = self._fetch_one(self.CLAIM_QUEUED_TASK_SQL, (started_at, task_id))
+        return self._row_to_record(row) if row else None
+
+    def cancel_queued_task(
+        self,
+        task_id: str,
+        *,
+        started_at: str,
+        completed_at: str,
+        error: str,
+    ) -> TaskRecord | None:
+        row = self._fetch_one(
+            self.CANCEL_QUEUED_TASK_SQL,
+            (started_at, completed_at, error, task_id),
+        )
+        return self._row_to_record(row) if row else None
+
+    def _connect(self) -> Any:
+        if self._connection_factory is not None:
+            return self._connection_factory()
+
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("psycopg_required_for_runner_postgres_task_store") from exc
+        return psycopg.connect(self.database_url, row_factory=dict_row)
+
+    def _fetch_one(self, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            cursor = conn.execute(sql, params)
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def _fetch_all(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            cursor = conn.execute(sql, params)
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _row_to_record(self, row: dict[str, Any]) -> TaskRecord:
+        metadata = _deserialize_json(row.get("metadata"), default={})
+        warnings = metadata.get("warnings", [])
+        if not isinstance(warnings, list):
+            warnings = [str(warnings)]
+        return TaskRecord(
+            task_id=str(row["task_id"]),
+            user_id=str(row["owner_user_id"]),
+            query=str(row["query"]),
+            status=str(row["status"]),
+            archive_status=str(row["archive_status"]),
+            archive_dir=_optional_string(metadata.get("archive_dir")),
+            archive_zip_path=_optional_string(metadata.get("archive_zip_path")),
+            created_at=_iso_value(row["created_at"]),
+            started_at=_iso_value(row.get("started_at")),
+            completed_at=_iso_value(row.get("completed_at")),
+            error=_optional_string(row.get("error")),
+            model_summary=_deserialize_json(row.get("model_summary"), default={}),
+            warnings=warnings,
+        )
+
+
+def create_task_store_from_env(
+    env: Any = os.environ,
+    *,
+    sqlite_path: Path | str | None = None,
+) -> TaskStore | PostgresTaskStore:
+    backend = str(env.get(RUNNER_TASK_STORE_BACKEND_ENV, "postgres")).strip().lower()
+    if backend in {"postgres", "postgresql"}:
+        database_url = str(
+            env.get(RUNNER_DATABASE_URL_ENV) or env.get("DATABASE_URL") or ""
+        )
+        if not database_url:
+            raise RuntimeError("runner_postgres_database_url_missing")
+        return PostgresTaskStore(database_url)
+
+    if backend in {"sqlite", "local-sqlite", "local_sqlite"}:
+        allow_sqlite = str(env.get(RUNNER_ALLOW_SQLITE_TASK_STORE_ENV, ""))
+        if allow_sqlite.strip().lower() not in TRUTHY_ENV_VALUES:
+            raise RuntimeError("runner_sqlite_task_store_requires_explicit_fallback")
+        return TaskStore(sqlite_path or Path(__file__).parent / "runner_tasks.sqlite3")
+
+    raise RuntimeError(f"unsupported_runner_task_store_backend:{backend}")
+
+
+def _runner_metadata() -> dict[str, Any]:
+    return {
+        "runner_archive_dir": None,
+        "archive_dir": None,
+        "archive_zip_path": None,
+        "warnings": [],
+    }
+
+
+def _serialize_json(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
+def _deserialize_json(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    return json.loads(str(value))
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _iso_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _is_postgres_database_url(database_url: str) -> bool:
+    return database_url.startswith(("postgresql://", "postgresql+", "postgres://"))

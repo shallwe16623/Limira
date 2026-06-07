@@ -11,6 +11,7 @@ dependencies = [
     "miroflow-agent",
     "aiohttp>=3.12.15",
     "gradio>=5.42.0",
+    "psycopg[binary]>=3.2.9",
 ]
 
 [build-system]

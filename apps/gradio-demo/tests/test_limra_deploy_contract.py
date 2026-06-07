@@ -53,6 +53,9 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert runner["build"]["dockerfile"] == "deploy/limra/runner.Dockerfile"
     assert runner["environment"]["MIROTHINKER_RUNNER_PORT"] == "8091"
     assert "${RUNNER_SERVICE_TOKEN" in runner["environment"]["RUNNER_SERVICE_TOKEN"]
+    assert runner["environment"]["RUNNER_TASK_STORE_BACKEND"] == "postgres"
+    assert runner["environment"]["RUNNER_DATABASE_URL"].startswith("postgresql://")
+    assert "RUNNER_ALLOW_SQLITE_TASK_STORE" not in runner["environment"]
 
     web = services["limra-web"]
     assert web["build"]["context"] == "apps/limra-web"
@@ -83,6 +86,9 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         "MINIO_API_PORT",
         "MINIO_CONSOLE_PORT",
         "RUNNER_SERVICE_TOKEN",
+        "RUNNER_TASK_STORE_BACKEND",
+        "RUNNER_DATABASE_URL",
+        "RUNNER_ALLOW_SQLITE_TASK_STORE",
         "POSTGRES_DB",
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
@@ -117,6 +123,9 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert env["LIMRA_REPOSITORY_BACKEND"] == "postgres"
     assert env["LIMRA_DATABASE_URL"].startswith("postgresql://")
     assert env["LIMRA_ALLOW_IN_MEMORY_REPOSITORY"] == "false"
+    assert env["RUNNER_TASK_STORE_BACKEND"] == "postgres"
+    assert env["RUNNER_DATABASE_URL"].startswith("postgresql://")
+    assert env["RUNNER_ALLOW_SQLITE_TASK_STORE"] == "false"
 
     secret_keys = [
         key
