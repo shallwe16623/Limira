@@ -51,8 +51,7 @@ CREATE TABLE IF NOT EXISTS limra_evidence_items (
     human_confirmed BOOLEAN NOT NULL DEFAULT false,
     embedding vector(1536),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT uq_limra_entities_task_entity UNIQUE (task_id, entity_id)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_evidence_items_task_collected
@@ -88,7 +87,8 @@ CREATE TABLE IF NOT EXISTS limra_entities (
     geometry geometry(Geometry, 4326),
     confidence NUMERIC(4, 3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_entities_task_entity UNIQUE (task_id, entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_entities_task_type_name

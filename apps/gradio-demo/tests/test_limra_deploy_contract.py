@@ -123,6 +123,7 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
 def test_limra_migration_creates_required_extensions_tables_and_indexes():
     sql = MIGRATION_FILE.read_text(encoding="utf-8")
     lowered = sql.lower()
+    tables = _parse_create_tables(sql)
 
     for extension in ("postgis", "vector"):
         assert f"create extension if not exists {extension}" in lowered
@@ -139,16 +140,36 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
     }
     for table in required_tables:
         assert re.search(rf"create table if not exists\s+{table}\b", lowered)
+        assert table in tables
 
     assert "geometry(geometry, 4326)" in lowered
     assert "embedding vector(1536)" in lowered
     assert "using gist (geometry)" in lowered
     assert "using ivfflat (embedding vector_cosine_ops)" in lowered
-    assert "constraint uq_limra_entities_task_entity unique (task_id, entity_id)" in lowered
-    assert "constraint fk_limra_entity_relations_source_same_task" in lowered
-    assert "foreign key (task_id, source_entity_id)" in lowered
-    assert "constraint fk_limra_entity_relations_target_same_task" in lowered
-    assert "foreign key (task_id, target_entity_id)" in lowered
+    assert (
+        "constraint uq_limra_entities_task_entity unique (task_id, entity_id)"
+        in tables["limra_entities"]["body"]
+    )
+    assert (
+        "constraint uq_limra_entities_task_entity"
+        not in tables["limra_evidence_items"]["body"]
+    )
+    assert (
+        "constraint fk_limra_entity_relations_source_same_task"
+        in tables["limra_entity_relations"]["body"]
+    )
+    assert (
+        "foreign key (task_id, source_entity_id)"
+        in tables["limra_entity_relations"]["body"]
+    )
+    assert (
+        "constraint fk_limra_entity_relations_target_same_task"
+        in tables["limra_entity_relations"]["body"]
+    )
+    assert (
+        "foreign key (task_id, target_entity_id)"
+        in tables["limra_entity_relations"]["body"]
+    )
 
     for status in ("queued", "running", "completed", "failed", "cancelled"):
         assert f"'{status}'" in lowered
@@ -182,6 +203,34 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
         "conflicts_with",
     ):
         assert f"'{relation_type}'" in lowered
+
+
+def test_limra_migration_constraints_reference_existing_table_columns():
+    tables = _parse_create_tables(MIGRATION_FILE.read_text(encoding="utf-8"))
+
+    for table_name, table in tables.items():
+        columns = table["columns"]
+        for constraint in table["constraints"]:
+            for pattern in (r"\bunique\s*\(([^)]+)\)", r"\bforeign key\s*\(([^)]+)\)"):
+                for match in re.finditer(pattern, constraint):
+                    referenced = _column_list(match.group(1))
+                    assert referenced <= columns, (
+                        f"{table_name} constraint references missing local columns: "
+                        f"{sorted(referenced - columns)} in {constraint}"
+                    )
+
+    relations = tables["limra_entity_relations"]
+    assert {"task_id", "source_entity_id", "target_entity_id"} <= relations["columns"]
+    assert any(
+        "foreign key (task_id, source_entity_id)" in constraint
+        and "references limra_entities (task_id, entity_id)" in constraint
+        for constraint in relations["constraints"]
+    )
+    assert any(
+        "foreign key (task_id, target_entity_id)" in constraint
+        and "references limra_entities (task_id, entity_id)" in constraint
+        for constraint in relations["constraints"]
+    )
 
 
 def test_limra_runtime_artifacts_are_ignored():
@@ -257,3 +306,77 @@ def _extract_host_port(port: str | dict) -> str:
     if default_match:
         return default_match.group(1)
     return port.split(":", 1)[0]
+
+
+def _parse_create_tables(sql: str) -> dict[str, dict]:
+    lowered = sql.lower()
+    tables: dict[str, dict] = {}
+    for match in re.finditer(r"create table if not exists\s+([a-z0-9_]+)\s*\(", lowered):
+        table_name = match.group(1)
+        body_start = match.end()
+        body_end = _matching_paren_index(lowered, body_start - 1)
+        body = lowered[body_start:body_end]
+        elements = _split_top_level(body)
+        columns = set()
+        constraints = []
+        for element in elements:
+            stripped = element.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("constraint "):
+                constraints.append(_normalize_sql(stripped))
+                continue
+            columns.add(stripped.split(None, 1)[0].strip('"'))
+        tables[table_name] = {
+            "body": _normalize_sql(body),
+            "columns": columns,
+            "constraints": constraints,
+        }
+    return tables
+
+
+def _matching_paren_index(text: str, open_index: int) -> int:
+    depth = 0
+    in_quote = False
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "'":
+            in_quote = not in_quote
+        if in_quote:
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError("unmatched parenthesis in SQL")
+
+
+def _split_top_level(body: str) -> list[str]:
+    parts = []
+    start = 0
+    depth = 0
+    in_quote = False
+    for index, char in enumerate(body):
+        if char == "'":
+            in_quote = not in_quote
+        if in_quote:
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(body[start:index])
+            start = index + 1
+    parts.append(body[start:])
+    return parts
+
+
+def _column_list(raw: str) -> set[str]:
+    return {column.strip().strip('"') for column in raw.split(",")}
+
+
+def _normalize_sql(raw: str) -> str:
+    return re.sub(r"\s+", " ", raw.strip())
