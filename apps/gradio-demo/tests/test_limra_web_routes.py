@@ -6,7 +6,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -444,39 +445,61 @@ async def test_s3_object_storage_put_uses_server_key_bucket_and_metadata():
 
 
 @pytest.mark.asyncio
-async def test_placeholder_object_routes_reject_browser_supplied_object_keys():
-    user = limra.LimraUser("user-a")
-    storage = limra.InMemoryLimraObjectStorage()
-    upload_file = limra.UploadFile(file=io.BytesIO(b"pdf"), filename="evidence.pdf")
+async def test_upload_route_rejects_object_key_aliases_on_actual_http_surface():
+    app, _repo = _limra_asgi_app()
 
-    with pytest.raises(HTTPException) as rejected_upload:
-        await limra.upload_document(
-            upload_file,
-            object_key="users/user-a/uploads/evil.pdf",
-            user=user,
-            object_storage=storage,
-        )
-    assert rejected_upload.value.status_code == 400
-    assert rejected_upload.value.detail == "object_key_server_generated"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        for alias in sorted(limra.OBJECT_KEY_FORBIDDEN_FIELDS):
+            query_response = await client.post(
+                "/api/limra/uploads",
+                params={alias: "users/user-a/uploads/evil.pdf"},
+                files={"file": ("evidence.txt", b"evidence", "text/plain")},
+            )
+            assert query_response.status_code == 400, alias
+            assert query_response.json()["detail"] == "object_key_server_generated"
 
-    repo = limra.InMemoryLimraTaskRepository()
-    task = repo.create_task(
+            form_response = await client.post(
+                "/api/limra/uploads",
+                data={alias: "users/user-a/uploads/evil.pdf"},
+                files={"file": ("evidence.txt", b"evidence", "text/plain")},
+            )
+            assert form_response.status_code == 400, alias
+            assert form_response.json()["detail"] == "object_key_server_generated"
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
+    app, repo = _limra_asgi_app()
+    repo.create_task(
         task_id="task-a",
-        owner_user_id=user.id,
+        owner_user_id="user-a",
         query="report",
         scenario=None,
         runner_task_id="runner-task-a",
     )
-    with pytest.raises(HTTPException) as rejected_pdf:
-        await limra.export_task_pdf(
-            task.task_id,
-            {"objectKey": "users/user-a/reports/evil.pdf"},
-            user=user,
-            repo=repo,
-            object_storage=storage,
-        )
-    assert rejected_pdf.value.status_code == 400
-    assert rejected_pdf.value.detail == "object_key_server_generated"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        for alias in sorted(limra.OBJECT_KEY_FORBIDDEN_FIELDS):
+            query_response = await client.post(
+                "/api/limra/tasks/task-a/reports/pdf",
+                params={alias: "users/user-a/reports/evil.pdf"},
+                json={},
+            )
+            assert query_response.status_code == 400, alias
+            assert query_response.json()["detail"] == "object_key_server_generated"
+
+            json_response = await client.post(
+                "/api/limra/tasks/task-a/reports/pdf",
+                json={alias: "users/user-a/reports/evil.pdf"},
+            )
+            assert json_response.status_code == 400, alias
+            assert json_response.json()["detail"] == "object_key_server_generated"
 
 
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
@@ -1432,6 +1455,17 @@ def _assert_no_browser_leak(payload):
     text = str(payload)
     for forbidden in limra.FORBIDDEN_BROWSER_SUBSTRINGS:
         assert forbidden not in text
+
+
+def _limra_asgi_app():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    app = FastAPI()
+    app.include_router(limra.router, prefix="/api/limra")
+    app.dependency_overrides[limra.get_current_limra_user] = lambda: limra.LimraUser("user-a")
+    app.dependency_overrides[limra.get_task_repository] = lambda: repo
+    app.dependency_overrides[limra.get_object_storage] = lambda: storage
+    return app, repo
 
 
 class FakeRedisClient:

@@ -1597,36 +1597,30 @@ async def admin_download_task_archive(
 
 @router.post("/uploads", status_code=501)
 async def upload_document(
+    request: Request,
     file: UploadFile,
-    object_key: str | None = None,
-    objectKey: str | None = None,
-    s3_key: str | None = None,
-    minio_object_key: str | None = None,
     user: LimraUser = Depends(get_current_limra_user),
     object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> dict[str, str]:
     _ = object_storage
-    _reject_browser_supplied_object_key_fields(
-        {
-            "object_key": object_key,
-            "objectKey": objectKey,
-            "s3_key": s3_key,
-            "minio_object_key": minio_object_key,
-        }
-    )
+    await _reject_browser_supplied_object_key_request(request)
     return {"error": "upload_not_implemented", "user_id": user.id, "filename": file.filename or ""}
 
 
 @router.post("/tasks/{task_id}/reports/pdf", status_code=501)
 async def export_task_pdf(
     task_id: str,
+    request: Request,
     form_data: dict[str, Any] | None = None,
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
     object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> dict[str, str]:
     _ = object_storage
-    _reject_browser_supplied_object_key_fields(form_data or {})
+    await _reject_browser_supplied_object_key_request(
+        request,
+        extra_fields=form_data or {},
+    )
     _get_owned_task(repo, task_id, user)
     return {"error": "pdf_export_not_implemented"}
 
@@ -2574,6 +2568,33 @@ def _reject_browser_supplied_object_key_fields(fields: Mapping[str, Any]) -> Non
     )
     if forbidden:
         raise HTTPException(status_code=400, detail="object_key_server_generated")
+
+
+async def _reject_browser_supplied_object_key_request(
+    request: Request,
+    *,
+    extra_fields: Mapping[str, Any] | None = None,
+) -> None:
+    _reject_browser_supplied_object_key_fields(request.query_params)
+    if extra_fields:
+        _reject_browser_supplied_object_key_fields(extra_fields)
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    if content_type in {"multipart/form-data", "application/x-www-form-urlencoded"}:
+        try:
+            form_data = await request.form()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid_form_payload") from exc
+        _reject_browser_supplied_object_key_fields(form_data)
+        return
+
+    if content_type == "application/json":
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, Mapping):
+            _reject_browser_supplied_object_key_fields(payload)
 
 
 def _assert_browser_safe(payload: Any) -> Any:
