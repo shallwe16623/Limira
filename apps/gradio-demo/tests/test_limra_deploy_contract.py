@@ -7,6 +7,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_FILE = ROOT / "docker-compose.limra-aggressive.yml"
 ENV_EXAMPLE = ROOT / ".env.example"
+LIMRA_WEB_ENV = ROOT / "apps/limra-web/backend/open_webui/env.py"
+LIMRA_WEB_MAIN = ROOT / "apps/limra-web/backend/open_webui/main.py"
 MIGRATION_FILE = (
     ROOT / "deploy/limra/postgres/migrations/001_limra_osint_schema.sql"
 )
@@ -118,6 +120,23 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         assert "Bearer " not in value
         assert not value.startswith("sk-")
         assert not value.startswith("eyJ")
+
+
+def test_limra_runtime_product_name_is_not_rewritten_to_open_webui():
+    env_py = LIMRA_WEB_ENV.read_text(encoding="utf-8")
+    main_py = LIMRA_WEB_MAIN.read_text(encoding="utf-8")
+
+    assert "WEBUI_NAME = os.getenv('WEBUI_NAME', 'limra')" in env_py
+    assert "WEBUI_NAME += ' (Open WebUI)'" not in env_py
+    assert "if WEBUI_NAME != 'Open WebUI'" not in env_py
+    assert "WEBUI_FAVICON_URL = '/static/favicon.png'" in env_py
+
+    assert "title='limra'" in main_py
+    assert "'name': app.state.WEBUI_NAME" in main_py
+    assert "'short_name': app.state.WEBUI_NAME" in main_py
+    assert "<ShortName>{app.state.WEBUI_NAME}</ShortName>" in main_py
+    assert "<Description>Search {app.state.WEBUI_NAME}</Description>" in main_py
+    assert "limra (Open WebUI)" not in main_py
 
 
 def test_limra_migration_creates_required_extensions_tables_and_indexes():

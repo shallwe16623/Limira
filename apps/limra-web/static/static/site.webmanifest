@@ -1,6 +1,6 @@
 {
-  "name": "Open WebUI",
-  "short_name": "WebUI",
+  "name": "limra",
+  "short_name": "limra",
   "icons": [
     {
       "src": "/static/web-app-manifest-192x192.png",

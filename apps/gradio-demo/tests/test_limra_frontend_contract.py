@@ -7,8 +7,11 @@ LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
 SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
 APP_HTML = LIMRA_WEB_ROOT / "src" / "app.html"
+AUTH_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "auth" / "+page.svelte"
 LAYOUT = LIMRA_WEB_ROOT / "src" / "routes" / "+layout.svelte"
 MANIFEST = LIMRA_WEB_ROOT / "backend" / "open_webui" / "static" / "site.webmanifest"
+STATIC_MANIFEST = LIMRA_WEB_ROOT / "static" / "static" / "site.webmanifest"
+OPENSEARCH = LIMRA_WEB_ROOT / "static" / "opensearch.xml"
 PACKAGE_JSON = LIMRA_WEB_ROOT / "package.json"
 PACKAGE_LOCK = LIMRA_WEB_ROOT / "package-lock.json"
 
@@ -77,17 +80,40 @@ def test_limra_sidebar_navigation_is_first_class_authenticated_entry():
 
 def test_reviewed_user_visible_brand_surfaces_use_limra():
     app_html = _read(APP_HTML)
+    auth = _read(AUTH_PAGE)
     layout = _read(LAYOUT)
     manifest_text = _read(MANIFEST)
     manifest = json.loads(manifest_text)
+    static_manifest_text = _read(STATIC_MANIFEST)
+    static_manifest = json.loads(static_manifest_text)
+    opensearch = _read(OPENSEARCH)
+    sidebar = _read(SIDEBAR)
 
     assert "<title>limra</title>" in app_html
     assert manifest["name"] == "limra"
     assert manifest["short_name"] == "limra"
+    assert static_manifest["name"] == "limra"
+    assert static_manifest["short_name"] == "limra"
+    assert "<ShortName>limra</ShortName>" in opensearch
+    assert "<Description>Search limra</Description>" in opensearch
     assert " • limra" in layout
 
-    for source in [app_html, layout, manifest_text, _read(SIDEBAR)]:
+    assert "<title>{$WEBUI_NAME}</title>" in layout
+    assert 'title={$WEBUI_NAME}' in layout
+    assert 'content={$WEBUI_NAME}' in layout
+    assert "<title>\n\t\t{`${$WEBUI_NAME}`}\n\t</title>" in auth
+    assert "Signing in to {{WEBUI_NAME}}" in auth
+    assert "Sign in to {{WEBUI_NAME}}" in auth
+    assert "Sign up to {{WEBUI_NAME}}" in auth
+    assert 'alt="{$WEBUI_NAME} logo"' in auth
+    assert 'id="sidebar-webui-name"' in sidebar
+    assert "{$WEBUI_NAME}" in sidebar
+
+    for source in [app_html, auth, layout, manifest_text, static_manifest_text, opensearch, sidebar]:
         assert "Open WebUI" not in source
+        assert "limra (Open WebUI)" not in source
+    for served_asset in [manifest_text, static_manifest_text, opensearch]:
+        assert "WebUI" not in served_asset
 
 
 def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():
