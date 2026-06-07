@@ -469,6 +469,29 @@ async def test_upload_route_rejects_object_key_aliases_on_actual_http_surface():
             assert form_response.status_code == 400, alias
             assert form_response.json()["detail"] == "object_key_server_generated"
 
+        empty_query_response = await client.post(
+            "/api/limra/uploads",
+            params={"object_key": ""},
+            files={"file": ("evidence.txt", b"evidence", "text/plain")},
+        )
+        assert empty_query_response.status_code == 400
+        assert empty_query_response.json()["detail"] == "object_key_server_generated"
+
+        duplicate_query_response = await client.post(
+            "/api/limra/uploads?object_key=users/user-a/uploads/evil.pdf&object_key=",
+            files={"file": ("evidence.txt", b"evidence", "text/plain")},
+        )
+        assert duplicate_query_response.status_code == 400
+        assert duplicate_query_response.json()["detail"] == "object_key_server_generated"
+
+        empty_form_response = await client.post(
+            "/api/limra/uploads",
+            data={"object_key": ""},
+            files={"file": ("evidence.txt", b"evidence", "text/plain")},
+        )
+        assert empty_form_response.status_code == 400
+        assert empty_form_response.json()["detail"] == "object_key_server_generated"
+
 
 @pytest.mark.asyncio
 async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
@@ -500,6 +523,28 @@ async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
             )
             assert json_response.status_code == 400, alias
             assert json_response.json()["detail"] == "object_key_server_generated"
+
+        empty_query_response = await client.post(
+            "/api/limra/tasks/task-a/reports/pdf",
+            params={"object_key": ""},
+            json={},
+        )
+        assert empty_query_response.status_code == 400
+        assert empty_query_response.json()["detail"] == "object_key_server_generated"
+
+        duplicate_query_response = await client.post(
+            "/api/limra/tasks/task-a/reports/pdf?object_key=users/user-a/reports/evil.pdf&object_key=",
+            json={},
+        )
+        assert duplicate_query_response.status_code == 400
+        assert duplicate_query_response.json()["detail"] == "object_key_server_generated"
+
+        empty_json_response = await client.post(
+            "/api/limra/tasks/task-a/reports/pdf",
+            json={"object_key": ""},
+        )
+        assert empty_json_response.status_code == 400
+        assert empty_json_response.json()["detail"] == "object_key_server_generated"
 
 
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
@@ -1462,9 +1507,19 @@ def _limra_asgi_app():
     storage = limra.InMemoryLimraObjectStorage()
     app = FastAPI()
     app.include_router(limra.router, prefix="/api/limra")
-    app.dependency_overrides[limra.get_current_limra_user] = lambda: limra.LimraUser("user-a")
-    app.dependency_overrides[limra.get_task_repository] = lambda: repo
-    app.dependency_overrides[limra.get_object_storage] = lambda: storage
+
+    async def current_user_override():
+        return limra.LimraUser("user-a")
+
+    async def task_repository_override():
+        return repo
+
+    async def object_storage_override():
+        return storage
+
+    app.dependency_overrides[limra.get_current_limra_user] = current_user_override
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+    app.dependency_overrides[limra.get_object_storage] = object_storage_override
     return app, repo
 
 

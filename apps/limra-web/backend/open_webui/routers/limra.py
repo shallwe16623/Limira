@@ -2561,11 +2561,7 @@ def _safe_object_extension(
 
 
 def _reject_browser_supplied_object_key_fields(fields: Mapping[str, Any]) -> None:
-    forbidden = sorted(
-        field
-        for field in OBJECT_KEY_FORBIDDEN_FIELDS
-        if field in fields and fields[field] not in {None, ""}
-    )
+    forbidden = sorted(field for field in OBJECT_KEY_FORBIDDEN_FIELDS if field in fields)
     if forbidden:
         raise HTTPException(status_code=400, detail="object_key_server_generated")
 
