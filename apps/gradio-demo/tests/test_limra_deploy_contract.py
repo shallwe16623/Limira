@@ -73,6 +73,8 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert web["environment"]["LIMRA_REPOSITORY_BACKEND"] == "postgres"
     assert web["environment"]["LIMRA_DATABASE_URL"].startswith("postgresql://")
     assert "LIMRA_ALLOW_IN_MEMORY_REPOSITORY" not in web["environment"]
+    assert web["environment"]["LIMRA_RUNTIME_STATE_BACKEND"] == "redis"
+    assert "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE" not in web["environment"]
 
 
 def test_limra_env_example_has_required_placeholders_without_real_secrets():
@@ -95,6 +97,8 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         "LIMRA_REPOSITORY_BACKEND",
         "LIMRA_DATABASE_URL",
         "LIMRA_ALLOW_IN_MEMORY_REPOSITORY",
+        "LIMRA_RUNTIME_STATE_BACKEND",
+        "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE",
         "DATABASE_URL",
         "REDIS_URL",
         "MINIO_ROOT_USER",
@@ -123,6 +127,8 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert env["LIMRA_REPOSITORY_BACKEND"] == "postgres"
     assert env["LIMRA_DATABASE_URL"].startswith("postgresql://")
     assert env["LIMRA_ALLOW_IN_MEMORY_REPOSITORY"] == "false"
+    assert env["LIMRA_RUNTIME_STATE_BACKEND"] == "redis"
+    assert env["LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE"] == "false"
     assert env["RUNNER_TASK_STORE_BACKEND"] == "postgres"
     assert env["RUNNER_DATABASE_URL"].startswith("postgresql://")
     assert env["RUNNER_ALLOW_SQLITE_TASK_STORE"] == "false"

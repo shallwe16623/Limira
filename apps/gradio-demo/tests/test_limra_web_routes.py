@@ -302,6 +302,29 @@ def test_limra_repository_factory_requires_explicit_memory_fallback(monkeypatch)
     assert isinstance(repo, limra.InMemoryLimraTaskRepository)
 
 
+def test_limra_runtime_state_factory_requires_redis_or_explicit_memory(monkeypatch):
+    monkeypatch.setenv("LIMRA_RUNTIME_STATE_BACKEND", "redis")
+    with pytest.raises(RuntimeError, match="limra_redis_runtime_state_missing"):
+        limra.create_limra_runtime_state_from_env(redis_client=None)
+
+    redis = FakeRedisClient()
+    runtime_state = limra.create_limra_runtime_state_from_env(redis_client=redis)
+    assert isinstance(runtime_state, limra.RedisLimraRuntimeState)
+    assert runtime_state.redis_client is redis
+
+    monkeypatch.setenv("LIMRA_RUNTIME_STATE_BACKEND", "memory")
+    monkeypatch.delenv("LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE", raising=False)
+    with pytest.raises(
+        RuntimeError,
+        match="limra_in_memory_runtime_state_requires_explicit_fallback",
+    ):
+        limra.create_limra_runtime_state_from_env(redis_client=None)
+
+    monkeypatch.setenv("LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE", "true")
+    runtime_state = limra.create_limra_runtime_state_from_env(redis_client=None)
+    assert isinstance(runtime_state, limra.InMemoryLimraRuntimeState)
+
+
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     sql = limra.PostgresLimraTaskRepository.sql_contract().lower()
 
@@ -538,6 +561,7 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
@@ -571,6 +595,63 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_records_runtime_state_to_redis():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(
+        redis,
+        key_prefix="test:limra:runtime",
+        ttl_seconds=120,
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "running", "archive_status": "pending"},
+            },
+            {
+                "type": "evidence_collected",
+                "payload": {"title": "Runtime source"},
+            },
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "redis runtime state"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    key = runtime_state.task_key(task_id)
+    runtime_hash = redis.hashes[key]
+    assert events[-1]["payload"]["status"] == "completed"
+    assert json.loads(runtime_hash["owner_user_id"]) == "user-a"
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert json.loads(runtime_hash["last_event_type"]) == "status"
+    assert key in {call["key"] for call in redis.hset_calls}
+    assert redis.expire_calls[-1] == {"key": key, "seconds": 120}
+
+
+@pytest.mark.asyncio
 async def test_completed_task_event_reattach_is_terminal_and_does_not_call_runner():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")
@@ -592,6 +673,7 @@ async def test_completed_task_event_reattach_is_terminal_and_does_not_call_runne
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
@@ -639,6 +721,7 @@ async def test_eventsource_reconnect_after_completion_does_not_regress_task():
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     first_events = _parse_sse_chunks([chunk async for chunk in first_response.body_iterator])
 
@@ -647,6 +730,7 @@ async def test_eventsource_reconnect_after_completion_does_not_regress_task():
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     second_events = _parse_sse_chunks([chunk async for chunk in second_response.body_iterator])
 
@@ -684,6 +768,7 @@ async def test_runner_stream_conflict_uses_authoritative_status_instead_of_faili
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
@@ -722,6 +807,7 @@ async def test_runner_stream_running_conflict_stays_running_without_failed_regre
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
@@ -752,6 +838,7 @@ async def test_event_proxy_cancellation_does_not_mark_task_completed():
         user=user,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
@@ -788,6 +875,7 @@ async def test_event_proxy_keeps_artifacts_user_scoped():
         user=user_a,
         repo=repo,
         research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
     )
     _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
@@ -857,6 +945,22 @@ def _assert_no_browser_leak(payload):
     text = str(payload)
     for forbidden in limra.FORBIDDEN_BROWSER_SUBSTRINGS:
         assert forbidden not in text
+
+
+class FakeRedisClient:
+    def __init__(self):
+        self.hashes = {}
+        self.hset_calls = []
+        self.expire_calls = []
+
+    async def hset(self, key, *, mapping):
+        self.hset_calls.append({"key": key, "mapping": dict(mapping)})
+        self.hashes.setdefault(key, {}).update(mapping)
+        return len(mapping)
+
+    async def expire(self, key, seconds):
+        self.expire_calls.append({"key": key, "seconds": seconds})
+        return True
 
 
 class FakeLimraPostgresEngine:

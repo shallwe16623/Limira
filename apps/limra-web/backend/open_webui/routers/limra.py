@@ -55,6 +55,10 @@ ARTIFACT_EVENT_TYPES = {
 LIMRA_REPOSITORY_BACKEND_ENV = "LIMRA_REPOSITORY_BACKEND"
 LIMRA_DATABASE_URL_ENV = "LIMRA_DATABASE_URL"
 LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV = "LIMRA_ALLOW_IN_MEMORY_REPOSITORY"
+LIMRA_RUNTIME_STATE_BACKEND_ENV = "LIMRA_RUNTIME_STATE_BACKEND"
+LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE_ENV = "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE"
+LIMRA_RUNTIME_STATE_KEY_PREFIX_ENV = "LIMRA_RUNTIME_STATE_KEY_PREFIX"
+LIMRA_RUNTIME_STATE_TTL_SECONDS_ENV = "LIMRA_RUNTIME_STATE_TTL_SECONDS"
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 router = APIRouter()
@@ -164,6 +168,14 @@ class RunnerResearchClientProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class LimraRuntimeState(Protocol):
+    async def update_task_runtime(
+        self,
+        task_id: str,
+        fields: dict[str, Any],
+    ) -> None: ...
+
+
 class InMemoryLimraTaskRepository:
     def __init__(self) -> None:
         self.tasks: dict[str, LimraTask] = {}
@@ -220,6 +232,53 @@ class InMemoryLimraTaskRepository:
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
         return {bucket: list(items) for bucket, items in task_artifacts.items()}
+
+
+class InMemoryLimraRuntimeState:
+    def __init__(self) -> None:
+        self.task_runtime: dict[str, dict[str, Any]] = {}
+
+    async def update_task_runtime(
+        self,
+        task_id: str,
+        fields: dict[str, Any],
+    ) -> None:
+        task_state = self.task_runtime.setdefault(task_id, {})
+        task_state.update(fields)
+
+
+class RedisLimraRuntimeState:
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        key_prefix: str = "limra:runtime",
+        ttl_seconds: int = 86_400,
+    ) -> None:
+        if redis_client is None:
+            raise RuntimeError("limra_redis_runtime_state_missing")
+        self.redis_client = redis_client
+        self.key_prefix = key_prefix.rstrip(":")
+        self.ttl_seconds = ttl_seconds
+
+    async def update_task_runtime(
+        self,
+        task_id: str,
+        fields: dict[str, Any],
+    ) -> None:
+        key = self.task_key(task_id)
+        mapping = {
+            field: json.dumps(value, ensure_ascii=False)
+            for field, value in fields.items()
+            if value is not None
+        }
+        if not mapping:
+            return
+        await _maybe_await(self.redis_client.hset(key, mapping=mapping))
+        await _maybe_await(self.redis_client.expire(key, self.ttl_seconds))
+
+    def task_key(self, task_id: str) -> str:
+        return f"{self.key_prefix}:task:{task_id}"
 
 
 class PostgresLimraTaskRepository:
@@ -835,17 +894,50 @@ class PostgresLimraTaskRepository:
 def create_limra_task_repository_from_env(env: Any = os.environ) -> LimraTaskRepository:
     backend = str(env.get(LIMRA_REPOSITORY_BACKEND_ENV, "postgres")).strip().lower()
     if backend in {"postgres", "postgresql"}:
-        database_url = str(env.get(LIMRA_DATABASE_URL_ENV) or env.get("DATABASE_URL") or "")
+        database_url = str(
+            env.get(LIMRA_DATABASE_URL_ENV) or env.get("DATABASE_URL") or ""
+        )
         if not database_url:
             raise RuntimeError("limra_postgres_database_url_missing")
         return PostgresLimraTaskRepository(database_url)
 
     if backend in {"memory", "in-memory", "in_memory"}:
-        if str(env.get(LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV, "")).strip().lower() not in TRUTHY_ENV_VALUES:
+        allow_memory = str(env.get(LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV, ""))
+        if allow_memory.strip().lower() not in TRUTHY_ENV_VALUES:
             raise RuntimeError("limra_in_memory_repository_requires_explicit_fallback")
         return InMemoryLimraTaskRepository()
 
     raise RuntimeError(f"unsupported_limra_repository_backend:{backend}")
+
+
+def create_limra_runtime_state_from_env(
+    *,
+    redis_client: Any | None,
+    env: Any = os.environ,
+) -> LimraRuntimeState:
+    backend = str(env.get(LIMRA_RUNTIME_STATE_BACKEND_ENV, "redis")).strip().lower()
+    if backend == "redis":
+        if redis_client is None:
+            raise RuntimeError("limra_redis_runtime_state_missing")
+        return RedisLimraRuntimeState(
+            redis_client,
+            key_prefix=str(
+                env.get(LIMRA_RUNTIME_STATE_KEY_PREFIX_ENV) or "limra:runtime"
+            ),
+            ttl_seconds=_runtime_state_ttl_seconds(
+                env.get(LIMRA_RUNTIME_STATE_TTL_SECONDS_ENV)
+            ),
+        )
+
+    if backend in {"memory", "in-memory", "in_memory"}:
+        allow_memory = str(env.get(LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE_ENV, ""))
+        if allow_memory.strip().lower() not in TRUTHY_ENV_VALUES:
+            raise RuntimeError(
+                "limra_in_memory_runtime_state_requires_explicit_fallback"
+            )
+        return InMemoryLimraRuntimeState()
+
+    raise RuntimeError(f"unsupported_limra_runtime_state_backend:{backend}")
 
 
 class RunnerResearchClient:
@@ -1024,6 +1116,16 @@ def get_research_client(request: Request) -> RunnerResearchClientProtocol:
     return client
 
 
+def get_runtime_state(request: Request) -> LimraRuntimeState:
+    runtime_state = getattr(request.app.state, "limra_runtime_state", None)
+    if runtime_state is None:
+        runtime_state = create_limra_runtime_state_from_env(
+            redis_client=getattr(request.app.state, "redis", None),
+        )
+        request.app.state.limra_runtime_state = runtime_state
+    return runtime_state
+
+
 @router.post("/research", status_code=202)
 async def create_research_task(
     form_data: dict[str, Any],
@@ -1101,10 +1203,11 @@ async def get_task_events(
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
     research_client: RunnerResearchClientProtocol = Depends(get_research_client),
+    runtime_state: LimraRuntimeState = Depends(get_runtime_state),
 ) -> StreamingResponse:
     task = _get_owned_task(repo, task_id, user)
     return StreamingResponse(
-        _limra_event_stream(task, user, repo, research_client),
+        _limra_event_stream(task, user, repo, research_client, runtime_state),
         media_type="text/event-stream",
     )
 
@@ -1222,14 +1325,32 @@ async def _limra_event_stream(
     user: LimraUser,
     repo: LimraTaskRepository,
     research_client: RunnerResearchClientProtocol,
+    runtime_state: LimraRuntimeState,
 ) -> AsyncIterator[bytes]:
     current = repo.get_task(task.task_id) or task
     if current.status in FINAL_TASK_STATUSES:
-        yield _sse_bytes(_assert_browser_safe(_terminal_status_event(current)))
+        terminal_event = _terminal_status_event(current)
+        await _record_runtime_event(runtime_state, task.task_id, terminal_event)
+        await _mark_runtime_stream_closed(
+            runtime_state,
+            task.task_id,
+            "terminal_reattach",
+        )
+        yield _sse_bytes(_assert_browser_safe(terminal_event))
         return
 
-    repo.update_task(task.task_id, status="running")
+    current = repo.update_task(task.task_id, status="running")
+    await runtime_state.update_task_runtime(
+        task.task_id,
+        {
+            "owner_user_id": user.id,
+            "status": current.status,
+            "archive_status": current.archive_status,
+            "stream_state": "open",
+        },
+    )
     saw_terminal_status = False
+    stream_close_reason = "stream_exhausted"
 
     try:
         async for runner_event in research_client.stream_events(task=task, user=user):
@@ -1237,10 +1358,14 @@ async def _limra_event_stream(
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
+            await _record_runtime_event(runtime_state, task.task_id, event)
 
             yield _sse_bytes(_assert_browser_safe(event))
             if warning:
+                await _record_runtime_event(runtime_state, task.task_id, warning)
                 yield _sse_bytes(_assert_browser_safe(warning))
+            if applied_status in FINAL_TASK_STATUSES:
+                stream_close_reason = f"terminal_{applied_status}"
 
         if not saw_terminal_status:
             status_event = await _authoritative_runner_status_event(
@@ -1250,8 +1375,14 @@ async def _limra_event_stream(
                 research_client,
             )
             if status_event:
+                await _record_runtime_event(runtime_state, task.task_id, status_event)
+                stream_close_reason = _stream_close_reason_from_event(
+                    status_event,
+                    stream_close_reason,
+                )
                 yield _sse_bytes(_assert_browser_safe(status_event))
     except RunnerStreamConflict as exc:
+        stream_close_reason = "runner_stream_conflict"
         status_event = await _authoritative_runner_status_event(
             repo,
             task,
@@ -1260,19 +1391,36 @@ async def _limra_event_stream(
             reason=exc.reason,
         )
         if status_event:
+            await _record_runtime_event(runtime_state, task.task_id, status_event)
+            stream_close_reason = _stream_close_reason_from_event(
+                status_event,
+                stream_close_reason,
+            )
             yield _sse_bytes(_assert_browser_safe(status_event))
     except asyncio.CancelledError:
+        stream_close_reason = "event_stream_cancelled"
         repo.update_task(
             task.task_id,
             status="cancelled",
             archive_status="failed",
             error="event_stream_cancelled",
         )
+        await runtime_state.update_task_runtime(
+            task.task_id,
+            {
+                "status": "cancelled",
+                "archive_status": "failed",
+                "error": "event_stream_cancelled",
+            },
+        )
         return
     except HTTPException as exc:
+        stream_close_reason = "http_exception"
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
-            yield _sse_bytes(_assert_browser_safe(_terminal_status_event(current)))
+            terminal_event = _terminal_status_event(current)
+            await _record_runtime_event(runtime_state, task.task_id, terminal_event)
+            yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
         repo.update_task(
             task.task_id,
@@ -1280,19 +1428,20 @@ async def _limra_event_stream(
             archive_status="failed",
             error=str(exc.detail),
         )
-        yield _sse_bytes(
-            _assert_browser_safe(
-                {
-                    "task_id": task.task_id,
-                    "type": "error",
-                    "payload": {"error": exc.detail},
-                }
-            )
-        )
+        error_event = {
+            "task_id": task.task_id,
+            "type": "error",
+            "payload": {"error": exc.detail},
+        }
+        await _record_runtime_event(runtime_state, task.task_id, error_event)
+        yield _sse_bytes(_assert_browser_safe(error_event))
     except Exception as exc:
+        stream_close_reason = "limra_event_proxy_failed"
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
-            yield _sse_bytes(_assert_browser_safe(_terminal_status_event(current)))
+            terminal_event = _terminal_status_event(current)
+            await _record_runtime_event(runtime_state, task.task_id, terminal_event)
+            yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
         repo.update_task(
             task.task_id,
@@ -1300,14 +1449,18 @@ async def _limra_event_stream(
             archive_status="failed",
             error=str(exc),
         )
-        yield _sse_bytes(
-            _assert_browser_safe(
-                {
-                    "task_id": task.task_id,
-                    "type": "error",
-                    "payload": {"error": "limra_event_proxy_failed"},
-                }
-            )
+        error_event = {
+            "task_id": task.task_id,
+            "type": "error",
+            "payload": {"error": "limra_event_proxy_failed"},
+        }
+        await _record_runtime_event(runtime_state, task.task_id, error_event)
+        yield _sse_bytes(_assert_browser_safe(error_event))
+    finally:
+        await _mark_runtime_stream_closed(
+            runtime_state,
+            task.task_id,
+            stream_close_reason,
         )
 
 
@@ -1394,6 +1547,62 @@ def _terminal_status_event(task: LimraTask, *, reason: str | None = None) -> dic
         "type": "status",
         "payload": payload,
     }
+
+
+async def _record_runtime_event(
+    runtime_state: LimraRuntimeState,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    event_type = str(event.get("type") or "runner_event")
+    payload = event.get("payload")
+    fields: dict[str, Any] = {
+        "last_event_type": event_type,
+        "last_event": event,
+    }
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        archive_status = payload.get("archive_status")
+        data = payload.get("data")
+        if not status and isinstance(data, dict):
+            status = data.get("status")
+        if not archive_status and isinstance(data, dict):
+            archive_status = data.get("archive_status")
+        if status:
+            fields["status"] = str(status)
+        if archive_status:
+            fields["archive_status"] = str(archive_status)
+        if payload.get("terminal") is not None:
+            fields["terminal"] = bool(payload.get("terminal"))
+        if payload.get("warning"):
+            fields["last_warning"] = str(payload["warning"])
+        if payload.get("error"):
+            fields["error"] = str(payload["error"])
+    await runtime_state.update_task_runtime(task_id, fields)
+
+
+async def _mark_runtime_stream_closed(
+    runtime_state: LimraRuntimeState,
+    task_id: str,
+    reason: str,
+) -> None:
+    await runtime_state.update_task_runtime(
+        task_id,
+        {
+            "stream_state": "closed",
+            "stream_close_reason": reason,
+        },
+    )
+
+
+def _stream_close_reason_from_event(event: dict[str, Any], default: str) -> str:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return default
+    status = payload.get("status")
+    if status in FINAL_TASK_STATUSES:
+        return f"terminal_{status}"
+    return default
 
 
 def _normalize_runner_event(task: LimraTask, event: dict[str, Any]) -> dict[str, Any]:
@@ -1646,6 +1855,24 @@ def _json_loads(value: Any) -> Any:
         except json.JSONDecodeError:
             return value
     return value
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _runtime_state_ttl_seconds(value: Any) -> int:
+    if value in (None, ""):
+        return 86_400
+    try:
+        ttl_seconds = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("limra_runtime_state_ttl_seconds_invalid") from None
+    if ttl_seconds <= 0:
+        raise RuntimeError("limra_runtime_state_ttl_seconds_invalid")
+    return ttl_seconds
 
 
 def _list_of_strings(value: Any) -> list[str]:
