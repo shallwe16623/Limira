@@ -214,6 +214,19 @@ logs/
 # Data directory - exclude everything except README
 data/
 
+# limra / MiroThinker local runtime artifacts
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+apps/gradio-demo/archives/
+apps/gradio-demo/runner_tasks.sqlite3
+apps/gradio-demo/runtime/
+apps/gradio-demo/.limra-cache/
+limra-runtime/
+postgres-data/
+redis-data/
+minio-data/
+
 
 .idea/
 

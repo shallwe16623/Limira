@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>limra</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f8fb;
+        --panel: #ffffff;
+        --line: #d9dee8;
+        --text: #172033;
+        --muted: #5e6b82;
+        --accent: #0d7f72;
+        --accent-dark: #075f56;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      .shell {
+        display: grid;
+        grid-template-columns: minmax(320px, 1fr) minmax(320px, 420px);
+        min-height: 100vh;
+      }
+
+      .chat,
+      .drawer {
+        min-width: 0;
+        padding: 20px;
+      }
+
+      .chat {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 14px;
+      }
+
+      .brand {
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      .status {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .stream {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        gap: 12px;
+        overflow: auto;
+      }
+
+      .message {
+        max-width: 760px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 14px;
+        line-height: 1.5;
+      }
+
+      .composer {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        border-top: 1px solid var(--line);
+        padding-top: 14px;
+      }
+
+      textarea {
+        min-height: 72px;
+        resize: vertical;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px;
+        color: var(--text);
+        font: inherit;
+      }
+
+      button {
+        align-self: end;
+        border: 0;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        cursor: default;
+        font: inherit;
+        font-weight: 700;
+        padding: 12px 16px;
+      }
+
+      button:focus-visible,
+      textarea:focus-visible,
+      .tab:focus-visible {
+        outline: 3px solid rgba(13, 127, 114, 0.25);
+        outline-offset: 2px;
+      }
+
+      .drawer {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        border-left: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      .tabs {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .tab {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #f9fafc;
+        color: var(--text);
+        padding: 9px 8px;
+        text-align: center;
+        text-decoration: none;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .tab:first-child {
+        border-color: var(--accent);
+        color: var(--accent-dark);
+      }
+
+      .artifact {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px;
+      }
+
+      .artifact h2 {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+
+      .artifact p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      @media (max-width: 860px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+
+        .drawer {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="chat" aria-label="limra research">
+        <header>
+          <div class="brand">limra</div>
+          <div class="status">Ready</div>
+        </header>
+        <div class="stream">
+          <article class="message">No active research run.</article>
+        </div>
+        <form class="composer">
+          <textarea aria-label="Research query" placeholder="Research query"></textarea>
+          <button type="button">Send</button>
+        </form>
+      </section>
+      <aside class="drawer" aria-label="Artifacts">
+        <nav class="tabs" aria-label="Artifact tabs">
+          <a class="tab" href="#evidence">Evidence</a>
+          <a class="tab" href="#entities">Entities</a>
+          <a class="tab" href="#graph">Graph</a>
+          <a class="tab" href="#timeline">Timeline</a>
+          <a class="tab" href="#map">Map</a>
+          <a class="tab" href="#report">Report</a>
+        </nav>
+        <section id="evidence" class="artifact">
+          <h2>Evidence</h2>
+          <p>No evidence records yet.</p>
+        </section>
+        <section id="entities" class="artifact">
+          <h2>Entities</h2>
+          <p>No entities yet.</p>
+        </section>
+        <section id="graph" class="artifact">
+          <h2>Graph</h2>
+          <p>No relations yet.</p>
+        </section>
+        <section id="timeline" class="artifact">
+          <h2>Timeline</h2>
+          <p>No timeline events yet.</p>
+        </section>
+        <section id="map" class="artifact">
+          <h2>Map</h2>
+          <p>No map features yet.</p>
+        </section>
+        <section id="report" class="artifact">
+          <h2>Report</h2>
+          <p>No report sections yet.</p>
+        </section>
+      </aside>
+    </main>
+  </body>
+</html>
