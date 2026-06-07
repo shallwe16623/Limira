@@ -446,7 +446,7 @@ async def test_s3_object_storage_put_uses_server_key_bucket_and_metadata():
 
 @pytest.mark.asyncio
 async def test_upload_route_rejects_object_key_aliases_on_actual_http_surface():
-    app, _repo = _limra_asgi_app()
+    app, _repo, _storage = _limra_asgi_app()
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -494,8 +494,115 @@ async def test_upload_route_rejects_object_key_aliases_on_actual_http_surface():
 
 
 @pytest.mark.asyncio
+async def test_upload_route_stores_text_original_and_document_record():
+    app, repo, storage = _limra_asgi_app()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/uploads",
+            files={"file": ("evidence.txt", b"hello limra", "text/plain")},
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["filename"] == "evidence.txt"
+    assert payload["content_type"] == "text/plain"
+    assert payload["byte_size"] == len(b"hello limra")
+    assert payload["extracted_text_chars"] == len("hello limra")
+    assert "object_key" not in payload
+    assert "minio_object_key" not in payload
+
+    document = repo.get_user_document(payload["document_id"], "user-a")
+    assert document is not None
+    assert document.owner_user_id == "user-a"
+    assert document.task_id is None
+    assert document.extracted_text == "hello limra"
+    assert document.minio_bucket == storage.bucket
+    assert document.object_key in storage.objects
+    stored = storage.objects[document.object_key]
+    assert stored["data"] == b"hello limra"
+    assert stored["content_type"] == "text/plain"
+    assert stored["metadata"]["document_id"] == document.document_id
+    assert stored["metadata"]["owner_user_id"] == "user-a"
+    _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
+async def test_upload_route_links_only_owned_tasks():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="owned task",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.create_task(
+        task_id="task-b",
+        owner_user_id="user-b",
+        query="foreign task",
+        scenario=None,
+        runner_task_id="runner-task-b",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        owned_response = await client.post(
+            "/api/limra/uploads",
+            params={"task_id": "task-a"},
+            files={"file": ("owned.md", b"# owned", "text/markdown")},
+        )
+        forbidden_response = await client.post(
+            "/api/limra/uploads",
+            params={"task_id": "task-b"},
+            files={"file": ("foreign.md", b"# foreign", "text/markdown")},
+        )
+
+    assert owned_response.status_code == 201
+    payload = owned_response.json()
+    assert payload["task_id"] == "task-a"
+    document = repo.get_user_document(payload["document_id"], "user-a")
+    assert document is not None
+    assert document.task_id == "task-a"
+    assert "/tasks/task-a/uploads/" in document.object_key
+    assert forbidden_response.status_code == 404
+    assert len(storage.objects) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_route_stores_pdf_with_extracted_text(monkeypatch):
+    app, repo, storage = _limra_asgi_app()
+    monkeypatch.setattr(limra, "_extract_pdf_text", lambda data: "pdf extracted text")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/uploads",
+            files={"file": ("brief.pdf", b"%PDF-1.7", "application/pdf")},
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["filename"] == "brief.pdf"
+    assert payload["content_type"] == "application/pdf"
+    assert payload["extracted_text_chars"] == len("pdf extracted text")
+    document = repo.get_user_document(payload["document_id"], "user-a")
+    assert document is not None
+    assert document.extracted_text == "pdf extracted text"
+    assert document.object_key.endswith(f"/uploads/{document.document_id}.pdf")
+    assert storage.objects[document.object_key]["data"] == b"%PDF-1.7"
+
+
+@pytest.mark.asyncio
 async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
-    app, repo = _limra_asgi_app()
+    app, repo, _storage = _limra_asgi_app()
     repo.create_task(
         task_id="task-a",
         owner_user_id="user-a",
@@ -558,6 +665,7 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
         "limra_entity_relations",
         "limra_timeline_events",
         "limra_generated_reports",
+        "limra_uploaded_documents",
     ):
         assert table in sql
 
@@ -587,6 +695,10 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     assert "cast(:event_time_end as timestamptz)" in sql
     assert "st_geomfromgeojson(:geometry_geojson)" in sql
     assert "st_geomfromtext(:geometry_wkt)" in sql
+    assert "insert into limra_uploaded_documents" in sql
+    assert "returning" in sql
+    assert "object_key" in sql
+    assert "extracted_text" in sql
     assert "archive_object_key" in sql
     assert "archive_zip_sha256" in sql
 
@@ -716,6 +828,48 @@ def test_postgres_repository_artifact_params_include_temporal_and_geometry_field
         "type": "Point",
         "coordinates": [32.55, 29.97],
     }
+
+
+def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-doc",
+        owner_user_id="user-a",
+        query="document query",
+        scenario=None,
+        runner_task_id="runner-doc",
+    )
+
+    document = repo.record_uploaded_document(
+        document_id="doc-001",
+        owner_user_id="user-a",
+        task_id="task-doc",
+        original_filename="brief.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket="limra-artifacts",
+        object_key="limra/users/hash/tasks/task-doc/uploads/doc-001.txt",
+        extracted_text="brief text",
+        language=None,
+        metadata={"sha256": "abc123"},
+    )
+
+    assert document.document_id == "doc-001"
+    assert document.task_id == "task-doc"
+    assert document.owner_user_id == "user-a"
+    assert document.object_key.endswith("/uploads/doc-001.txt")
+    assert document.extracted_text == "brief text"
+    assert document.metadata == {"sha256": "abc123"}
+    assert engine.uploaded_documents["doc-001"]["minio_bucket"] == "limra-artifacts"
+
+    owned = repo.get_user_document("doc-001", "user-a")
+    assert owned is not None
+    assert owned.original_filename == "brief.txt"
+    assert repo.get_user_document("doc-001", "user-b") is None
 
 
 @pytest.mark.asyncio
@@ -1520,7 +1674,7 @@ def _limra_asgi_app():
     app.dependency_overrides[limra.get_current_limra_user] = current_user_override
     app.dependency_overrides[limra.get_task_repository] = task_repository_override
     app.dependency_overrides[limra.get_object_storage] = object_storage_override
-    return app, repo
+    return app, repo, storage
 
 
 class FakeRedisClient:
@@ -1592,6 +1746,7 @@ class FakeLimraPostgresEngine:
     def __init__(self):
         self.tasks = {}
         self.artifact_events = {}
+        self.uploaded_documents = {}
         self.typed_inserts = {
             "limra_evidence_items": [],
             "limra_entities": [],
@@ -1659,6 +1814,29 @@ class FakeLimraPostgresEngine:
                 if task_id == params["task_id"]
             ]
             return FakeLimraPostgresResult(rows)
+
+        if "insert into limra_uploaded_documents" in sql:
+            row = {
+                "document_id": params["document_id"],
+                "task_id": params["task_id"],
+                "owner_user_id": params["owner_user_id"],
+                "original_filename": params["original_filename"],
+                "content_type": params["content_type"],
+                "byte_size": params["byte_size"],
+                "minio_bucket": params["minio_bucket"],
+                "object_key": params["object_key"],
+                "extracted_text": params["extracted_text"],
+                "language": params["language"],
+                "metadata": params["metadata"],
+            }
+            self.uploaded_documents[params["document_id"]] = row
+            return FakeLimraPostgresResult([row])
+
+        if "from limra_uploaded_documents" in sql:
+            row = self.uploaded_documents.get(params["document_id"])
+            if row and row["owner_user_id"] != params["owner_user_id"]:
+                row = None
+            return FakeLimraPostgresResult([row] if row else [])
 
         for table in self.typed_inserts:
             if f"insert into {table}" in sql:

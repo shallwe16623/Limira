@@ -140,6 +140,32 @@ class LimraTask:
         }
 
 
+@dataclass
+class LimraUploadedDocument:
+    document_id: str
+    owner_user_id: str
+    task_id: str | None
+    original_filename: str
+    content_type: str | None
+    byte_size: int
+    minio_bucket: str
+    object_key: str
+    extracted_text: str | None = None
+    language: str | None = None
+    metadata: dict[str, Any] | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "document_id": self.document_id,
+            "task_id": self.task_id,
+            "filename": self.original_filename,
+            "content_type": self.content_type,
+            "byte_size": self.byte_size,
+            "language": self.language,
+            "extracted_text_chars": len(self.extracted_text or ""),
+        }
+
+
 class RunnerStreamConflict(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -171,6 +197,28 @@ class LimraTaskRepository(Protocol):
     ) -> None: ...
 
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]: ...
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraUploadedDocument: ...
+
+    def get_user_document(
+        self,
+        document_id: str,
+        owner_user_id: str,
+    ) -> LimraUploadedDocument | None: ...
 
 
 class RunnerResearchClientProtocol(Protocol):
@@ -252,6 +300,7 @@ class InMemoryLimraTaskRepository:
     def __init__(self) -> None:
         self.tasks: dict[str, LimraTask] = {}
         self.artifacts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self.uploaded_documents: dict[str, LimraUploadedDocument] = {}
 
     def create_task(
         self,
@@ -304,6 +353,47 @@ class InMemoryLimraTaskRepository:
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
         return {bucket: list(items) for bucket, items in task_artifacts.items()}
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraUploadedDocument:
+        document = LimraUploadedDocument(
+            document_id=document_id,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            original_filename=original_filename,
+            content_type=content_type,
+            byte_size=byte_size,
+            minio_bucket=minio_bucket,
+            object_key=object_key,
+            extracted_text=extracted_text,
+            language=language,
+            metadata=dict(metadata or {}),
+        )
+        self.uploaded_documents[document_id] = document
+        return document
+
+    def get_user_document(
+        self,
+        document_id: str,
+        owner_user_id: str,
+    ) -> LimraUploadedDocument | None:
+        document = self.uploaded_documents.get(document_id)
+        if not document or document.owner_user_id != owner_user_id:
+            return None
+        return document
 
 
 class InMemoryLimraRuntimeState:
@@ -592,6 +682,19 @@ class PostgresLimraTaskRepository:
         error,
         model_summary
     """
+    DOCUMENT_COLUMNS = """
+        document_id,
+        task_id,
+        owner_user_id,
+        original_filename,
+        content_type,
+        byte_size,
+        minio_bucket,
+        object_key,
+        extracted_text,
+        language,
+        metadata
+    """
     INSERT_TASK_SQL = f"""
         INSERT INTO limra_research_tasks (
             task_id,
@@ -866,6 +969,51 @@ class PostgresLimraTaskRepository:
             metadata = EXCLUDED.metadata,
             updated_at = now()
     """
+    INSERT_UPLOADED_DOCUMENT_SQL = f"""
+        INSERT INTO limra_uploaded_documents (
+            document_id,
+            task_id,
+            owner_user_id,
+            original_filename,
+            content_type,
+            byte_size,
+            minio_bucket,
+            object_key,
+            extracted_text,
+            language,
+            metadata
+        )
+        VALUES (
+            :document_id,
+            :task_id,
+            :owner_user_id,
+            :original_filename,
+            :content_type,
+            :byte_size,
+            :minio_bucket,
+            :object_key,
+            :extracted_text,
+            :language,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (document_id) DO UPDATE SET
+            task_id = EXCLUDED.task_id,
+            original_filename = EXCLUDED.original_filename,
+            content_type = EXCLUDED.content_type,
+            byte_size = EXCLUDED.byte_size,
+            minio_bucket = EXCLUDED.minio_bucket,
+            object_key = EXCLUDED.object_key,
+            extracted_text = EXCLUDED.extracted_text,
+            language = EXCLUDED.language,
+            metadata = EXCLUDED.metadata
+        RETURNING {DOCUMENT_COLUMNS}
+    """
+    SELECT_USER_UPLOADED_DOCUMENT_SQL = f"""
+        SELECT {DOCUMENT_COLUMNS}
+        FROM limra_uploaded_documents
+        WHERE document_id = :document_id
+          AND owner_user_id = :owner_user_id
+    """
 
     def __init__(self, database_url: str, *, engine_factory: Any | None = None) -> None:
         if not _is_postgres_database_url(database_url):
@@ -1010,6 +1158,52 @@ class PostgresLimraTaskRepository:
             if isinstance(payload, dict):
                 artifacts[ARTIFACT_BUCKETS[artifact_type]].append(payload)
         return artifacts
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraUploadedDocument:
+        row = self._fetch_one(
+            self.INSERT_UPLOADED_DOCUMENT_SQL,
+            {
+                "document_id": document_id,
+                "owner_user_id": owner_user_id,
+                "task_id": task_id,
+                "original_filename": original_filename,
+                "content_type": content_type,
+                "byte_size": byte_size,
+                "minio_bucket": minio_bucket,
+                "object_key": object_key,
+                "extracted_text": extracted_text,
+                "language": language,
+                "metadata": _json_dumps(metadata or {}),
+            },
+        )
+        if not row:
+            raise RuntimeError("limra_uploaded_document_insert_failed")
+        return _uploaded_document_from_row(row)
+
+    def get_user_document(
+        self,
+        document_id: str,
+        owner_user_id: str,
+    ) -> LimraUploadedDocument | None:
+        row = self._fetch_one(
+            self.SELECT_USER_UPLOADED_DOCUMENT_SQL,
+            {"document_id": document_id, "owner_user_id": owner_user_id},
+        )
+        return _uploaded_document_from_row(row) if row else None
 
     def _record_typed_artifact(
         self,
@@ -1595,16 +1789,68 @@ async def admin_download_task_archive(
     return await _download_archive(task, user, archive_client)
 
 
-@router.post("/uploads", status_code=501)
+@router.post("/uploads", status_code=201)
 async def upload_document(
     request: Request,
     file: UploadFile,
+    task_id: str | None = None,
     user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
     object_storage: LimraObjectStorage = Depends(get_object_storage),
-) -> dict[str, str]:
-    _ = object_storage
+) -> dict[str, Any]:
     await _reject_browser_supplied_object_key_request(request)
-    return {"error": "upload_not_implemented", "user_id": user.id, "filename": file.filename or ""}
+    if task_id:
+        _get_owned_task(repo, task_id, user)
+
+    filename = _safe_original_filename(file.filename)
+    content_type = _uploaded_content_type(file.content_type, filename)
+    try:
+        await file.seek(0)
+    except Exception:
+        pass
+    data = await file.read()
+    extracted_text = _extract_uploaded_document_text(
+        data,
+        filename=filename,
+        content_type=content_type,
+    )
+    document_id = str(uuid.uuid4())
+    object_key = build_limra_object_key(
+        owner_user_id=user.id,
+        category="uploads",
+        task_id=task_id,
+        filename=filename,
+        object_id=document_id,
+    )
+    stored = await object_storage.put_object(
+        object_key=object_key,
+        data=data,
+        content_type=content_type,
+        metadata={
+            "document_id": document_id,
+            "owner_user_id": user.id,
+            "task_id": task_id or "",
+            "original_filename": filename,
+            "content_type": content_type,
+        },
+    )
+    document = repo.record_uploaded_document(
+        document_id=document_id,
+        owner_user_id=user.id,
+        task_id=task_id,
+        original_filename=filename,
+        content_type=content_type,
+        byte_size=stored.size_bytes,
+        minio_bucket=stored.bucket,
+        object_key=stored.object_key,
+        extracted_text=extracted_text,
+        language=None,
+        metadata={
+            "sha256": stored.sha256,
+            "upload_source": "api",
+        },
+    )
+    return _assert_browser_safe(document.public_dict())
 
 
 @router.post("/tasks/{task_id}/reports/pdf", status_code=501)
@@ -2244,6 +2490,22 @@ def _task_from_row(row: dict[str, Any]) -> LimraTask:
     )
 
 
+def _uploaded_document_from_row(row: dict[str, Any]) -> LimraUploadedDocument:
+    return LimraUploadedDocument(
+        document_id=str(row["document_id"]),
+        owner_user_id=str(row["owner_user_id"]),
+        task_id=_optional_string(row.get("task_id")),
+        original_filename=str(row.get("original_filename") or ""),
+        content_type=_optional_string(row.get("content_type")),
+        byte_size=int(row.get("byte_size") or 0),
+        minio_bucket=str(row.get("minio_bucket") or ""),
+        object_key=str(row.get("object_key") or ""),
+        extracted_text=_optional_string(row.get("extracted_text")),
+        language=_optional_string(row.get("language")),
+        metadata=_json_loads(row.get("metadata")) or {},
+    )
+
+
 def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
     key_by_type = {
         "evidence": "evidence_id",
@@ -2558,6 +2820,70 @@ def _safe_object_extension(
     if candidate in OBJECT_KEY_ALLOWED_EXTENSIONS:
         return candidate
     return ".bin"
+
+
+def _safe_original_filename(filename: str | None) -> str:
+    basename = (filename or "upload.bin").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    basename = basename.strip()[:255]
+    return basename or "upload.bin"
+
+
+def _uploaded_content_type(content_type: str | None, filename: str) -> str:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized:
+        return normalized
+    lower_name = filename.lower()
+    if lower_name.endswith(".pdf"):
+        return "application/pdf"
+    if lower_name.endswith(".md"):
+        return "text/markdown"
+    if lower_name.endswith(".csv"):
+        return "text/csv"
+    if lower_name.endswith(".txt"):
+        return "text/plain"
+    return "application/octet-stream"
+
+
+def _extract_uploaded_document_text(
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+) -> str:
+    lower_name = filename.lower()
+    if content_type == "application/pdf" or lower_name.endswith(".pdf"):
+        return _extract_pdf_text(data)
+    if content_type.startswith("text/") or lower_name.endswith((".txt", ".md", ".csv")):
+        return _decode_text_upload(data)
+    raise HTTPException(status_code=415, detail="unsupported_upload_type")
+
+
+def _decode_text_upload(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid_pdf_upload") from exc
+
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text.strip():
+            pages.append(page_text.strip())
+    return "\n\n".join(pages)
 
 
 def _reject_browser_supplied_object_key_fields(fields: Mapping[str, Any]) -> None:
