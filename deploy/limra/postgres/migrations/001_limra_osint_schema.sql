@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS limra_evidence_items (
     human_confirmed BOOLEAN NOT NULL DEFAULT false,
     embedding vector(1536),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_entities_task_entity UNIQUE (task_id, entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_evidence_items_task_collected
@@ -99,8 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_limra_entities_geometry
 CREATE TABLE IF NOT EXISTS limra_entity_relations (
     relation_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
-    source_entity_id TEXT REFERENCES limra_entities (entity_id) ON DELETE SET NULL,
-    target_entity_id TEXT REFERENCES limra_entities (entity_id) ON DELETE SET NULL,
+    source_entity_id TEXT,
+    target_entity_id TEXT,
     relation_type TEXT NOT NULL CHECK (
         relation_type IN (
             'sanctions',
@@ -117,7 +118,15 @@ CREATE TABLE IF NOT EXISTS limra_entity_relations (
     evidence_refs TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     confidence NUMERIC(4, 3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT fk_limra_entity_relations_source_same_task
+        FOREIGN KEY (task_id, source_entity_id)
+        REFERENCES limra_entities (task_id, entity_id)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_limra_entity_relations_target_same_task
+        FOREIGN KEY (task_id, target_entity_id)
+        REFERENCES limra_entities (task_id, entity_id)
+        ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_entity_relations_task_type

@@ -53,6 +53,11 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert "${RUNNER_SERVICE_TOKEN" in runner["environment"]["RUNNER_SERVICE_TOKEN"]
 
     web = services["limra-web"]
+    assert web["build"]["context"] == "apps/limra-web"
+    assert web["build"]["dockerfile"] == "Dockerfile"
+    assert "image" not in web
+    assert web["environment"]["PORT"] == "8080"
+    assert web["environment"]["WEBUI_NAME"] == "limra"
     assert web["environment"]["LIMRA_API_BASE_URL"] == "/api/limra"
     assert web["environment"]["LIMRA_RUNNER_INTERNAL_URL"] == (
         "http://limra-runner:8091"
@@ -139,6 +144,11 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
     assert "embedding vector(1536)" in lowered
     assert "using gist (geometry)" in lowered
     assert "using ivfflat (embedding vector_cosine_ops)" in lowered
+    assert "constraint uq_limra_entities_task_entity unique (task_id, entity_id)" in lowered
+    assert "constraint fk_limra_entity_relations_source_same_task" in lowered
+    assert "foreign key (task_id, source_entity_id)" in lowered
+    assert "constraint fk_limra_entity_relations_target_same_task" in lowered
+    assert "foreign key (task_id, target_entity_id)" in lowered
 
     for status in ("queued", "running", "completed", "failed", "cancelled"):
         assert f"'{status}'" in lowered
@@ -195,15 +205,28 @@ def test_limra_deploy_helper_files_exist_and_are_executable_where_needed():
         ROOT / "deploy/limra/postgres.Dockerfile",
         ROOT / "deploy/limra/runner.Dockerfile",
         ROOT / "deploy/limra/nginx.conf",
-        ROOT / "deploy/limra/web-placeholder.nginx.conf",
-        ROOT / "deploy/limra/web-placeholder/index.html",
         ROOT / "deploy/limra/minio/init-bucket.sh",
+        ROOT / "apps/limra-web/Dockerfile",
+        ROOT / "apps/limra-web/package.json",
+        ROOT / "apps/limra-web/backend/open_webui/main.py",
+        ROOT / "apps/limra-web/backend/open_webui/routers/limra.py",
     ]
     for path in required_files:
         assert path.exists(), path
 
     init_script = ROOT / "deploy/limra/minio/init-bucket.sh"
     assert init_script.stat().st_mode & 0o111
+
+
+def test_limra_web_is_real_open_webui_vendor_path_not_placeholder():
+    limra_web = ROOT / "apps/limra-web"
+    assert (limra_web / "src/routes").is_dir()
+    assert (limra_web / "backend/open_webui/routers").is_dir()
+    assert not (ROOT / "deploy/limra/web-placeholder/index.html").exists()
+    assert "open-webui" in (limra_web / "package.json").read_text(encoding="utf-8")
+    main_py = (limra_web / "backend/open_webui/main.py").read_text(encoding="utf-8")
+    assert "limra.router" in main_py
+    assert "prefix='/api/limra'" in main_py
 
 
 def _read_env_example() -> dict[str, str]:
