@@ -58,6 +58,20 @@ def test_limra_artifact_drawer_tabs_and_reference_controls_are_present():
     assert "[{String(ref)}]" in page
 
 
+def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():
+    page = _read(LIMRA_PAGE)
+
+    assert "const eventPayload = taskEvent.payload && typeof taskEvent.payload === 'object' ? taskEvent.payload : {};" in page
+    assert "const nextStatus = taskEvent.status ?? eventPayload.status;" in page
+    assert "eventPayload.message" in page
+    assert "eventPayload.summary" in page
+    assert "const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);" in page
+    assert "if (isTerminalStatus(nextStatus))" in page
+    assert "eventSource?.close();" in page
+    assert "eventSource = null;" in page
+    assert "void refreshTask(id);" in page
+
+
 def test_limra_graph_and_map_use_required_frontend_libraries_with_empty_states():
     page = _read(LIMRA_PAGE)
 

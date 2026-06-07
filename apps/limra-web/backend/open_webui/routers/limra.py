@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -98,6 +99,12 @@ class LimraTask:
         }
 
 
+class RunnerStreamConflict(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class LimraTaskRepository(Protocol):
     def create_task(
         self,
@@ -140,6 +147,13 @@ class RunnerResearchClientProtocol(Protocol):
         task: LimraTask,
         user: LimraUser,
     ) -> AsyncIterator[dict[str, Any]]: ...
+
+    async def get_task_status(
+        self,
+        *,
+        task: LimraTask,
+        user: LimraUser,
+    ) -> dict[str, Any]: ...
 
 
 class InMemoryLimraTaskRepository:
@@ -257,9 +271,35 @@ class RunnerResearchClient:
                 headers=runner_service_headers(user, self.service_token),
             ) as response:
                 if response.status_code >= 400:
+                    detail = await _runner_error_detail(response)
+                    if response.status_code == 409:
+                        raise RunnerStreamConflict(detail)
                     raise HTTPException(status_code=502, detail="runner_event_stream_failed")
                 async for event in _iter_sse_json(response):
                     yield event
+
+    async def get_task_status(
+        self,
+        *,
+        task: LimraTask,
+        user: LimraUser,
+    ) -> dict[str, Any]:
+        if not self.runner_url:
+            raise HTTPException(status_code=503, detail="runner_url_not_configured")
+        if not task.runner_task_id:
+            raise HTTPException(status_code=500, detail="runner_task_id_missing")
+
+        url = f"{self.runner_url}/mirothinker/tasks/{task.runner_task_id}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                url,
+                headers=runner_service_headers(user, self.service_token),
+            )
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="runner_task_not_found")
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="runner_task_status_failed")
+        return response.json()
 
 
 class RunnerArchiveClient:
@@ -528,26 +568,63 @@ async def _limra_event_stream(
     repo: LimraTaskRepository,
     research_client: RunnerResearchClientProtocol,
 ) -> AsyncIterator[bytes]:
+    current = repo.get_task(task.task_id) or task
+    if current.status in FINAL_TASK_STATUSES:
+        yield _sse_bytes(_assert_browser_safe(_terminal_status_event(current)))
+        return
+
     repo.update_task(task.task_id, status="running")
-    status = "completed"
+    saw_terminal_status = False
 
     try:
         async for runner_event in research_client.stream_events(task=task, user=user):
             event = _normalize_runner_event(task, runner_event)
-            _apply_task_status_from_event(repo, task.task_id, event)
+            applied_status = _apply_task_status_from_event(repo, task.task_id, event)
+            saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
 
             yield _sse_bytes(_assert_browser_safe(event))
             if warning:
                 yield _sse_bytes(_assert_browser_safe(warning))
 
-            current_task = repo.get_task(task.task_id)
-            task_status = current_task.status if current_task else None
-            if task_status in {"failed", "cancelled"}:
-                status = task_status
+        if not saw_terminal_status:
+            status_event = await _authoritative_runner_status_event(
+                repo,
+                task,
+                user,
+                research_client,
+            )
+            if status_event:
+                yield _sse_bytes(_assert_browser_safe(status_event))
+    except RunnerStreamConflict as exc:
+        status_event = await _authoritative_runner_status_event(
+            repo,
+            task,
+            user,
+            research_client,
+            reason=exc.reason,
+        )
+        if status_event:
+            yield _sse_bytes(_assert_browser_safe(status_event))
+    except asyncio.CancelledError:
+        repo.update_task(
+            task.task_id,
+            status="cancelled",
+            archive_status="failed",
+            error="event_stream_cancelled",
+        )
+        return
     except HTTPException as exc:
-        status = "failed"
-        repo.update_task(task.task_id, status="failed", error=str(exc.detail))
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            yield _sse_bytes(_assert_browser_safe(_terminal_status_event(current)))
+            return
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error=str(exc.detail),
+        )
         yield _sse_bytes(
             _assert_browser_safe(
                 {
@@ -558,8 +635,16 @@ async def _limra_event_stream(
             )
         )
     except Exception as exc:
-        status = "failed"
-        repo.update_task(task.task_id, status="failed", error=str(exc))
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            yield _sse_bytes(_assert_browser_safe(_terminal_status_event(current)))
+            return
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error=str(exc),
+        )
         yield _sse_bytes(
             _assert_browser_safe(
                 {
@@ -569,14 +654,91 @@ async def _limra_event_stream(
                 }
             )
         )
-    finally:
+
+
+async def _authoritative_runner_status_event(
+    repo: LimraTaskRepository,
+    task: LimraTask,
+    user: LimraUser,
+    research_client: RunnerResearchClientProtocol,
+    *,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    try:
+        runner_status = await research_client.get_task_status(task=task, user=user)
+    except HTTPException as exc:
         current = repo.get_task(task.task_id)
-        if current and current.status not in FINAL_TASK_STATUSES:
-            repo.update_task(
-                task.task_id,
-                status=status,
-                archive_status="ready" if status == "completed" else "failed",
-            )
+        if current and current.status in FINAL_TASK_STATUSES:
+            return _terminal_status_event(current, reason=reason)
+        return {
+            "task_id": task.task_id,
+            "type": "status",
+            "payload": {
+                "status": current.status if current else task.status,
+                "archive_status": current.archive_status if current else task.archive_status,
+                "status_source": "limra",
+                "warning": exc.detail,
+                **({"reason": reason} if reason else {}),
+            },
+        }
+
+    current = _apply_authoritative_runner_status(repo, task.task_id, runner_status)
+    payload: dict[str, Any] = {
+        "status": current.status,
+        "archive_status": current.archive_status,
+        "terminal": current.status in FINAL_TASK_STATUSES,
+        "status_source": "runner",
+    }
+    if reason:
+        payload["reason"] = reason
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
+
+
+def _apply_authoritative_runner_status(
+    repo: LimraTaskRepository,
+    task_id: str,
+    runner_status: dict[str, Any],
+) -> LimraTask:
+    current = repo.get_task(task_id)
+    if not current:
+        raise KeyError(task_id)
+
+    status = runner_status.get("status")
+    if status not in {"queued", "running", "completed", "failed", "cancelled"}:
+        return current
+
+    updates: dict[str, Any] = {"status": status}
+    archive_status = runner_status.get("archive_status")
+    if archive_status in {"pending", "ready", "failed"}:
+        updates["archive_status"] = archive_status
+    elif status == "completed":
+        updates["archive_status"] = "ready"
+    elif status in {"failed", "cancelled"}:
+        updates["archive_status"] = "failed"
+    if runner_status.get("error"):
+        updates["error"] = str(runner_status["error"])
+    return repo.update_task(task_id, **updates)
+
+
+def _terminal_status_event(task: LimraTask, *, reason: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": task.status,
+        "archive_status": task.archive_status,
+        "terminal": True,
+    }
+    if task.error:
+        payload["error"] = task.error
+    if reason:
+        payload["reason"] = reason
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
 
 
 def _normalize_runner_event(task: LimraTask, event: dict[str, Any]) -> dict[str, Any]:
@@ -601,25 +763,33 @@ def _apply_task_status_from_event(
     repo: LimraTaskRepository,
     task_id: str,
     event: dict[str, Any],
-) -> None:
+) -> str | None:
     event_type = event.get("type")
     payload = event.get("payload")
     status = None
+    archive_status = None
     if event_type == "error":
         status = "failed"
     elif isinstance(payload, dict):
         status = payload.get("status")
+        archive_status = payload.get("archive_status")
         data = payload.get("data")
         if not status and isinstance(data, dict):
             status = data.get("status")
+        if not archive_status and isinstance(data, dict):
+            archive_status = data.get("archive_status")
 
     if status in {"queued", "running", "completed", "failed", "cancelled"}:
         updates: dict[str, Any] = {"status": status}
-        if status == "completed":
+        if archive_status in {"pending", "ready", "failed"}:
+            updates["archive_status"] = archive_status
+        elif status == "completed":
             updates["archive_status"] = "ready"
         elif status in {"failed", "cancelled"}:
             updates["archive_status"] = "failed"
         repo.update_task(task_id, **updates)
+        return str(status)
+    return None
 
 
 def _record_artifact_from_event(
@@ -731,6 +901,17 @@ async def _iter_sse_json(response: httpx.Response) -> AsyncIterator[dict[str, An
             data_lines.append(line.removeprefix("data:").strip())
     if data_lines:
         yield _parse_sse_data("\n".join(data_lines))
+
+
+async def _runner_error_detail(response: httpx.Response) -> str:
+    try:
+        body = await response.aread()
+        parsed = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        return f"runner_http_{response.status_code}"
+    if isinstance(parsed, dict):
+        return str(parsed.get("error") or parsed.get("detail") or f"runner_http_{response.status_code}")
+    return f"runner_http_{response.status_code}"
 
 
 def _parse_sse_data(data: str) -> dict[str, Any]:

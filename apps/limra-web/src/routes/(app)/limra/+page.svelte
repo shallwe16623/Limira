@@ -26,6 +26,7 @@
 	};
 
 	const artifactTabs: ArtifactTab[] = ['Evidence', 'Entities', 'Graph', 'Timeline', 'Map', 'Report'];
+	const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 
 	const emptyArtifacts = (): ArtifactState => ({
 		evidence: [],
@@ -137,21 +138,57 @@
 		eventSource = new EventSource(`/api/limra/tasks/${id}/events`);
 
 		eventSource.onmessage = (event) => {
-			const payload = parsePayload(event.data);
-			const eventType = payload.event ?? payload.type ?? 'task_update';
-			const content = payload.message ?? payload.summary ?? payload.status ?? JSON.stringify(payload);
+			const taskEvent = parsePayload(event.data);
+			const eventPayload = taskEvent.payload && typeof taskEvent.payload === 'object' ? taskEvent.payload : {};
+			const eventType = taskEvent.event ?? taskEvent.type ?? 'task_update';
+			const nextStatus = taskEvent.status ?? eventPayload.status;
+			const content =
+				taskEvent.message ??
+				taskEvent.summary ??
+				taskEvent.status ??
+				eventPayload.message ??
+				eventPayload.summary ??
+				eventPayload.status ??
+				JSON.stringify(Object.keys(eventPayload).length ? eventPayload : taskEvent);
 
-			status = payload.status ?? status;
+			status = nextStatus ?? status;
 			appendMessage('assistant', `${eventType}: ${content}`);
 
-			if (eventType.includes('evidence') || eventType.includes('entity') || eventType.includes('timeline') || eventType.includes('report')) {
+			if (isArtifactEvent(eventType)) {
 				void loadArtifacts(id);
+			}
+			if (isTerminalStatus(nextStatus)) {
+				eventSource?.close();
+				eventSource = null;
+				void loadArtifacts(id);
+				void refreshTask(id);
 			}
 		};
 
 		eventSource.onerror = () => {
 			status = status === 'ready' ? status : 'stream reconnecting';
 		};
+	};
+
+	const isArtifactEvent = (eventType: string) =>
+		eventType.includes('evidence') ||
+		eventType.includes('entity') ||
+		eventType.includes('timeline') ||
+		eventType.includes('report');
+
+	const isTerminalStatus = (value: unknown) => typeof value === 'string' && terminalStatuses.has(value);
+
+	const refreshTask = async (id = taskId) => {
+		if (!id) {
+			return;
+		}
+
+		try {
+			const task = await apiJson(`/api/limra/tasks/${id}`);
+			status = task.status ?? status;
+		} catch (error) {
+			errorMessage = error instanceof Error ? error.message : 'Unable to refresh task.';
+		}
 	};
 
 	const loadArtifacts = async (id = taskId) => {

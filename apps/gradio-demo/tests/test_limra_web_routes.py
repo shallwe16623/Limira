@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import zipfile
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -26,11 +27,25 @@ class FakeArchiveClient:
 
 
 class FakeResearchClient:
-    def __init__(self, *, runner_task_id="runner-task-a", events=None):
+    def __init__(
+        self,
+        *,
+        runner_task_id="runner-task-a",
+        events=None,
+        status_payload=None,
+        stream_exception=None,
+    ):
         self.runner_task_id = runner_task_id
         self.events = events or []
+        self.status_payload = status_payload or {
+            "task_id": runner_task_id,
+            "status": "completed",
+            "archive_status": "ready",
+        }
+        self.stream_exception = stream_exception
         self.create_calls = []
         self.stream_calls = []
+        self.status_calls = []
 
     async def create_research_task(self, *, query, scenario, user):
         self.create_calls.append(
@@ -49,8 +64,14 @@ class FakeResearchClient:
 
     async def stream_events(self, *, task, user):
         self.stream_calls.append({"task": task, "user": user})
+        if self.stream_exception:
+            raise self.stream_exception
         for event in self.events:
             yield event
+
+    async def get_task_status(self, *, task, user):
+        self.status_calls.append({"task": task, "user": user})
+        return dict(self.status_payload)
 
 
 @pytest.mark.asyncio
@@ -302,8 +323,11 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
         "record_research_artifact",
         "relation_extracted",
         "artifact_warning",
+        "status",
     ]
     assert all(event["task_id"] == task_id for event in events)
+    assert events[-1]["payload"]["status"] == "completed"
+    assert events[-1]["payload"]["status_source"] == "runner"
     _assert_no_browser_leak(events)
 
     task = repo.get_task(task_id)
@@ -319,6 +343,197 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     assert artifacts["report_sections"][0]["confidence"] == 0.8
     assert artifacts["relations"] == []
     _assert_no_browser_leak(artifacts)
+
+
+@pytest.mark.asyncio
+async def test_completed_task_event_reattach_is_terminal_and_does_not_call_runner():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("final reattach must not call runner stream")
+    )
+    created = await limra.create_research_task(
+        {"query": "completed query"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    assert research.stream_calls == []
+    assert research.status_calls == []
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_eventsource_reconnect_after_completion_does_not_regress_task():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            }
+        ],
+        stream_exception=None,
+    )
+    created = await limra.create_research_task(
+        {"query": "finish once"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    first_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    first_events = _parse_sse_chunks([chunk async for chunk in first_response.body_iterator])
+
+    second_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    second_events = _parse_sse_chunks([chunk async for chunk in second_response.body_iterator])
+
+    assert first_events[-1]["payload"]["status"] == "completed"
+    assert second_events[-1]["payload"]["status"] == "completed"
+    assert second_events[-1]["payload"]["terminal"] is True
+    assert len(research.stream_calls) == 1
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_conflict_uses_authoritative_status_instead_of_failing():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(
+        stream_exception=limra.RunnerStreamConflict("task_already_finished"),
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "completed",
+            "archive_status": "ready",
+        },
+    )
+    created = await limra.create_research_task(
+        {"query": "reattach via runner conflict"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events[-1]["type"] == "status"
+    assert events[-1]["payload"]["status"] == "completed"
+    assert events[-1]["payload"]["archive_status"] == "ready"
+    assert events[-1]["payload"]["reason"] == "task_already_finished"
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert repo.get_task(task_id).error is None
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_running_conflict_stays_running_without_failed_regression():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(
+        stream_exception=limra.RunnerStreamConflict("task_already_running"),
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "running",
+            "archive_status": "pending",
+        },
+    )
+    created = await limra.create_research_task(
+        {"query": "active duplicate stream"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events[-1]["payload"]["status"] == "running"
+    assert events[-1]["payload"]["archive_status"] == "pending"
+    assert events[-1]["payload"]["reason"] == "task_already_running"
+    assert repo.get_task(task_id).status == "running"
+    assert repo.get_task(task_id).archive_status == "pending"
+    assert repo.get_task(task_id).error is None
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_cancellation_does_not_mark_task_completed():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(stream_exception=asyncio.CancelledError())
+    created = await limra.create_research_task(
+        {"query": "cancelled stream"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == []
+    assert repo.get_task(task_id).status == "cancelled"
+    assert repo.get_task(task_id).archive_status == "failed"
+    assert repo.get_task(task_id).error == "event_stream_cancelled"
 
 
 @pytest.mark.asyncio
