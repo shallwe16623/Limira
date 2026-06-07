@@ -178,7 +178,7 @@ from open_webui.config import (
     ENABLE_IMAGE_EDIT,
     ENABLE_IMAGE_GENERATION,
     ENABLE_IMAGE_PROMPT_GENERATION,
-    # WebUI (LDAP)
+    # limra (LDAP)
     ENABLE_LDAP,
     ENABLE_LDAP_GROUP_CREATION,
     # LDAP Group Management
@@ -188,7 +188,7 @@ from open_webui.config import (
     ENABLE_MEMORIES,
     ENABLE_MESSAGE_RATING,
     ENABLE_NOTES,
-    # WebUI (OAuth)
+    # limra (OAuth)
     ENABLE_OAUTH_ROLE_MANAGEMENT,
     # Ollama
     ENABLE_OLLAMA_API,
@@ -395,7 +395,7 @@ from open_webui.config import (
     WEB_SEARCH_RESULT_COUNT,
     WEB_SEARCH_TRUST_ENV,
     WEBHOOK_URL,
-    # WebUI
+    # limra
     WEBUI_AUTH,
     WEBUI_BANNERS,
     WEBUI_NAME,
@@ -630,7 +630,7 @@ https://github.com/open-webui/open-webui
         print(banner)
     except UnicodeEncodeError:
         # Stdout can't encode the box-drawing banner (Windows cp1252, redirected/headless stdout); fall back to ASCII.
-        print(f'Open WebUI v{VERSION} - building the best AI user interface.\nhttps://github.com/open-webui/open-webui')
+        print(f'limra v{VERSION} - building the best AI user interface.\nhttps://github.com/open-webui/open-webui')
 
 
 @asynccontextmanager
@@ -758,7 +758,7 @@ app = FastAPI(
 # Used by readiness checks to gate traffic until startup work is done.
 app.state.startup_complete = False
 
-# For Open WebUI OIDC/OAuth2
+# For limra OIDC/OAuth2
 oauth_manager = OAuthManager(app)
 app.state.oauth_manager = oauth_manager
 
@@ -2245,7 +2245,7 @@ async def generate_messages(
     pipeline, then converts the response back to Anthropic Messages format.
 
     Supports both streaming and non-streaming requests.
-    All models configured in Open WebUI are accessible via this endpoint.
+    All models configured in limra are accessible via this endpoint.
 
     Authentication: Supports both standard Authorization header and
     Anthropic's x-api-key header (via middleware translation).
@@ -2597,7 +2597,7 @@ async def get_app_changelog():
 @app.get('/api/usage')
 async def get_current_usage(user=Depends(get_verified_user)):
     """
-    Get current usage statistics for Open WebUI.
+    Get current usage statistics for limra.
     This is an experimental endpoint and subject to change.
     """
     try:

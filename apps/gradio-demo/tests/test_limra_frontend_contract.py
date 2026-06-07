@@ -7,21 +7,29 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
 SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
+LIB_ROOT = LIMRA_WEB_ROOT / "src" / "lib"
+CONSTANTS = LIB_ROOT / "constants.ts"
 APP_HTML = LIMRA_WEB_ROOT / "src" / "app.html"
 AUTH_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "auth" / "+page.svelte"
 LAYOUT = LIMRA_WEB_ROOT / "src" / "routes" / "+layout.svelte"
 MANIFEST = LIMRA_WEB_ROOT / "backend" / "open_webui" / "static" / "site.webmanifest"
 STATIC_MANIFEST = LIMRA_WEB_ROOT / "static" / "static" / "site.webmanifest"
 OPENSEARCH = LIMRA_WEB_ROOT / "static" / "opensearch.xml"
+BACKEND_MAIN = LIMRA_WEB_ROOT / "backend" / "open_webui" / "main.py"
+BACKEND_INIT = LIMRA_WEB_ROOT / "backend" / "open_webui" / "__init__.py"
+BACKEND_OAUTH = LIMRA_WEB_ROOT / "backend" / "open_webui" / "utils" / "oauth.py"
 PACKAGE_JSON = LIMRA_WEB_ROOT / "package.json"
 PACKAGE_LOCK = LIMRA_WEB_ROOT / "package-lock.json"
 USER_VISIBLE_BRAND_SCAN_PATHS = [
     LIMRA_WEB_ROOT / "src" / "routes",
-    SIDEBAR,
+    LIB_ROOT,
     APP_HTML,
+    BACKEND_MAIN,
+    BACKEND_INIT,
     LIMRA_WEB_ROOT / "backend" / "open_webui" / "constants.py",
     LIMRA_WEB_ROOT / "backend" / "open_webui" / "routers" / "audio.py",
     LIMRA_WEB_ROOT / "backend" / "open_webui" / "routers" / "openai.py",
+    BACKEND_OAUTH,
     MANIFEST,
     STATIC_MANIFEST,
     OPENSEARCH,
@@ -110,6 +118,7 @@ def test_reviewed_user_visible_brand_surfaces_use_limra():
     app_html = _read(APP_HTML)
     auth = _read(AUTH_PAGE)
     layout = _read(LAYOUT)
+    constants = _read(CONSTANTS)
     manifest_text = _read(MANIFEST)
     manifest = json.loads(manifest_text)
     static_manifest_text = _read(STATIC_MANIFEST)
@@ -124,6 +133,7 @@ def test_reviewed_user_visible_brand_surfaces_use_limra():
     assert static_manifest["short_name"] == "limra"
     assert "<ShortName>limra</ShortName>" in opensearch
     assert "<Description>Search limra</Description>" in opensearch
+    assert "export const APP_NAME = 'limra';" in constants
     assert " • limra" in layout
 
     assert "<title>{$WEBUI_NAME}</title>" in layout
@@ -148,10 +158,28 @@ def test_user_visible_runtime_brand_sources_do_not_expose_open_webui():
     violations = []
     for path in _brand_scan_files():
         source = _read(path)
-        if "Open WebUI" in source or "Open-WebUI" in source or VISIBLE_WEBUI_PATTERN.search(source):
+        if (
+            "Open WebUI" in source
+            or "Open-WebUI" in source
+            or "Open_WebUI" in source
+            or "OpenWebUI" in source
+            or VISIBLE_WEBUI_PATTERN.search(source)
+        ):
             violations.append(str(path.relative_to(REPO_ROOT)))
 
     assert violations == []
+
+
+def test_runtime_backend_metadata_uses_limra_brand():
+    backend_init = _read(BACKEND_INIT)
+    backend_main = _read(BACKEND_MAIN)
+    backend_oauth = _read(BACKEND_OAUTH)
+
+    assert "typer.echo(f'limra version: {VERSION}')" in backend_init
+    assert "print(f'limra v{VERSION} - building the best AI user interface." in backend_main
+    assert "All models configured in limra are accessible via this endpoint." in backend_main
+    assert "Get current usage statistics for limra." in backend_main
+    assert "client_name='limra'" in backend_oauth
 
 
 def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():
