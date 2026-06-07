@@ -75,6 +75,12 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert "LIMRA_ALLOW_IN_MEMORY_REPOSITORY" not in web["environment"]
     assert web["environment"]["LIMRA_RUNTIME_STATE_BACKEND"] == "redis"
     assert "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE" not in web["environment"]
+    assert web["environment"]["LIMRA_OBJECT_STORAGE_BACKEND"] == "s3"
+    assert web["environment"]["LIMRA_OBJECT_BUCKET"] == "${MINIO_BUCKET:-limra-artifacts}"
+    assert "LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE" not in web["environment"]
+    assert web["environment"]["S3_ENDPOINT_URL"] == "http://minio:9000"
+    assert web["environment"]["AWS_ACCESS_KEY_ID"] == "${MINIO_ROOT_USER:-limra_minio}"
+    assert "${MINIO_ROOT_PASSWORD" in web["environment"]["AWS_SECRET_ACCESS_KEY"]
 
 
 def test_limra_env_example_has_required_placeholders_without_real_secrets():
@@ -99,6 +105,10 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         "LIMRA_ALLOW_IN_MEMORY_REPOSITORY",
         "LIMRA_RUNTIME_STATE_BACKEND",
         "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE",
+        "LIMRA_OBJECT_STORAGE_BACKEND",
+        "LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE",
+        "LIMRA_OBJECT_BUCKET",
+        "LIMRA_OBJECT_KEY_PREFIX",
         "DATABASE_URL",
         "REDIS_URL",
         "MINIO_ROOT_USER",
@@ -129,6 +139,10 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert env["LIMRA_ALLOW_IN_MEMORY_REPOSITORY"] == "false"
     assert env["LIMRA_RUNTIME_STATE_BACKEND"] == "redis"
     assert env["LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE"] == "false"
+    assert env["LIMRA_OBJECT_STORAGE_BACKEND"] == "s3"
+    assert env["LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE"] == "false"
+    assert env["LIMRA_OBJECT_BUCKET"] == "limra-artifacts"
+    assert env["LIMRA_OBJECT_KEY_PREFIX"] == "limra"
     assert env["RUNNER_TASK_STORE_BACKEND"] == "postgres"
     assert env["RUNNER_DATABASE_URL"].startswith("postgresql://")
     assert env["RUNNER_ALLOW_SQLITE_TASK_STORE"] == "false"

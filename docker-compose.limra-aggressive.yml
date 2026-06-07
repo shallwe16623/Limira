@@ -27,10 +27,14 @@ services:
       LIMRA_REPOSITORY_BACKEND: postgres
       LIMRA_DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
       LIMRA_RUNTIME_STATE_BACKEND: redis
+      LIMRA_OBJECT_STORAGE_BACKEND: s3
+      LIMRA_OBJECT_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
       DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       S3_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-limra_minio}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-limra_minio_dev_password}
     networks:
       - limra
 

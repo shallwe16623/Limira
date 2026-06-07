@@ -325,6 +325,160 @@ def test_limra_runtime_state_factory_requires_redis_or_explicit_memory(monkeypat
     assert isinstance(runtime_state, limra.InMemoryLimraRuntimeState)
 
 
+def test_limra_object_storage_factory_requires_s3_or_explicit_memory(monkeypatch):
+    for key in (
+        "LIMRA_OBJECT_BUCKET",
+        "S3_BUCKET",
+        "MINIO_BUCKET",
+        "S3_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LIMRA_OBJECT_STORAGE_BACKEND", "s3")
+
+    with pytest.raises(RuntimeError, match="limra_object_bucket_missing"):
+        limra.create_limra_object_storage_from_env(s3_client=FakeS3Client())
+
+    monkeypatch.setenv("LIMRA_OBJECT_BUCKET", "limra-artifacts")
+    with pytest.raises(RuntimeError, match="limra_s3_endpoint_url_missing"):
+        limra.create_limra_object_storage_from_env(s3_client=FakeS3Client())
+
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://minio:9000")
+    with pytest.raises(RuntimeError, match="limra_s3_credentials_missing"):
+        limra.create_limra_object_storage_from_env(s3_client=FakeS3Client())
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "limra_minio")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "replace-with-local-minio-password")
+    storage = limra.create_limra_object_storage_from_env(s3_client=FakeS3Client())
+    assert isinstance(storage, limra.S3LimraObjectStorage)
+    assert storage.bucket == "limra-artifacts"
+    assert storage.endpoint_url == "http://minio:9000"
+
+    monkeypatch.setenv("LIMRA_OBJECT_STORAGE_BACKEND", "memory")
+    monkeypatch.delenv("LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE", raising=False)
+    with pytest.raises(
+        RuntimeError,
+        match="limra_in_memory_object_storage_requires_explicit_fallback",
+    ):
+        limra.create_limra_object_storage_from_env()
+
+    monkeypatch.setenv("LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE", "true")
+    storage = limra.create_limra_object_storage_from_env()
+    assert isinstance(storage, limra.InMemoryLimraObjectStorage)
+
+
+def test_limra_object_keys_are_server_generated_owner_scoped_and_safe():
+    key = limra.build_limra_object_key(
+        owner_user_id="analyst@example.com",
+        category="uploads",
+        task_id="../task/alpha",
+        filename="../../secret.env",
+        object_id="../browser-supplied-key",
+        key_prefix="../limra",
+    )
+
+    assert key.startswith("limra/users/")
+    assert "/tasks/task-alpha/uploads/" in key
+    assert key.endswith("browser-supplied-key.bin")
+    assert "analyst@example.com" not in key
+    assert "secret.env" not in key
+    assert ".." not in key
+    assert not key.startswith("/")
+
+    report_key = limra.build_limra_object_key(
+        owner_user_id="analyst@example.com",
+        category="reports",
+        task_id="task-a",
+        extension="html",
+        object_id="report-a",
+    )
+    assert report_key.endswith("/reports/report-a.html")
+
+    with pytest.raises(ValueError, match="unsupported_limra_object_category"):
+        limra.build_limra_object_key(
+            owner_user_id="analyst@example.com",
+            category="secrets",
+        )
+
+
+@pytest.mark.asyncio
+async def test_s3_object_storage_put_uses_server_key_bucket_and_metadata():
+    s3 = FakeS3Client()
+    storage = limra.S3LimraObjectStorage(
+        bucket="limra-artifacts",
+        endpoint_url="http://minio:9000",
+        access_key_id="limra_minio",
+        secret_access_key="replace-with-local-minio-password",
+        s3_client=s3,
+    )
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="archives",
+        task_id="task-a",
+        filename="archive.zip",
+        object_id="archive-a",
+    )
+
+    stored = await storage.put_object(
+        object_key=object_key,
+        data=b"archive-bytes",
+        content_type="application/zip",
+        metadata={"task_id": "task-a", "none": None, "unsafe key": "value"},
+    )
+
+    assert stored.object_key == object_key
+    assert stored.bucket == "limra-artifacts"
+    assert stored.size_bytes == len(b"archive-bytes")
+    assert stored.sha256
+    assert stored.metadata == {"task_id": "task-a", "unsafe-key": "value"}
+    assert s3.put_calls == [
+        {
+            "Bucket": "limra-artifacts",
+            "Key": object_key,
+            "Body": b"archive-bytes",
+            "ContentType": "application/zip",
+            "Metadata": {"task_id": "task-a", "unsafe-key": "value"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_placeholder_object_routes_reject_browser_supplied_object_keys():
+    user = limra.LimraUser("user-a")
+    storage = limra.InMemoryLimraObjectStorage()
+    upload_file = limra.UploadFile(file=io.BytesIO(b"pdf"), filename="evidence.pdf")
+
+    with pytest.raises(HTTPException) as rejected_upload:
+        await limra.upload_document(
+            upload_file,
+            object_key="users/user-a/uploads/evil.pdf",
+            user=user,
+            object_storage=storage,
+        )
+    assert rejected_upload.value.status_code == 400
+    assert rejected_upload.value.detail == "object_key_server_generated"
+
+    repo = limra.InMemoryLimraTaskRepository()
+    task = repo.create_task(
+        task_id="task-a",
+        owner_user_id=user.id,
+        query="report",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    with pytest.raises(HTTPException) as rejected_pdf:
+        await limra.export_task_pdf(
+            task.task_id,
+            {"objectKey": "users/user-a/reports/evil.pdf"},
+            user=user,
+            repo=repo,
+            object_storage=storage,
+        )
+    assert rejected_pdf.value.status_code == 400
+    assert rejected_pdf.value.detail == "object_key_server_generated"
+
+
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     sql = limra.PostgresLimraTaskRepository.sql_contract().lower()
 
@@ -1329,6 +1483,15 @@ class FakeRedisClient:
             await self.expire(key, ttl_seconds)
             return 1
         raise AssertionError(f"unexpected redis eval script: {script}")
+
+
+class FakeS3Client:
+    def __init__(self):
+        self.put_calls = []
+
+    def put_object(self, **kwargs):
+        self.put_calls.append(dict(kwargs))
+        return {"ETag": '"fake"'}
 
 
 def _pairs_to_mapping(values):

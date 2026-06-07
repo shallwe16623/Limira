@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import os
+import re
 import uuid
 import zipfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
@@ -59,7 +61,34 @@ LIMRA_RUNTIME_STATE_BACKEND_ENV = "LIMRA_RUNTIME_STATE_BACKEND"
 LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE_ENV = "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE"
 LIMRA_RUNTIME_STATE_KEY_PREFIX_ENV = "LIMRA_RUNTIME_STATE_KEY_PREFIX"
 LIMRA_RUNTIME_STATE_TTL_SECONDS_ENV = "LIMRA_RUNTIME_STATE_TTL_SECONDS"
+LIMRA_OBJECT_STORAGE_BACKEND_ENV = "LIMRA_OBJECT_STORAGE_BACKEND"
+LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE_ENV = "LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE"
+LIMRA_OBJECT_BUCKET_ENV = "LIMRA_OBJECT_BUCKET"
+LIMRA_OBJECT_KEY_PREFIX_ENV = "LIMRA_OBJECT_KEY_PREFIX"
+LIMRA_OBJECT_STORAGE_ENDPOINT_ENV = "S3_ENDPOINT_URL"
+LIMRA_OBJECT_ACCESS_KEY_ENV = "AWS_ACCESS_KEY_ID"
+LIMRA_OBJECT_SECRET_KEY_ENV = "AWS_SECRET_ACCESS_KEY"
+LIMRA_OBJECT_REGION_ENV = "AWS_REGION"
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+OBJECT_KEY_FORBIDDEN_FIELDS = {
+    "object_key",
+    "objectKey",
+    "s3_key",
+    "s3Key",
+    "minio_object_key",
+    "minioObjectKey",
+}
+OBJECT_KEY_CATEGORIES = {"uploads", "reports", "archives", "media"}
+OBJECT_KEY_ALLOWED_EXTENSIONS = {
+    ".bin",
+    ".csv",
+    ".html",
+    ".json",
+    ".md",
+    ".pdf",
+    ".txt",
+    ".zip",
+}
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -196,6 +225,27 @@ class LimraRuntimeState(Protocol):
         stream_id: str,
         fields: dict[str, Any],
     ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class LimraStoredObject:
+    object_key: str
+    bucket: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    metadata: dict[str, str]
+
+
+class LimraObjectStorage(Protocol):
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimraStoredObject: ...
 
 
 class InMemoryLimraTaskRepository:
@@ -421,6 +471,100 @@ class RedisLimraRuntimeState:
 
     def task_key(self, task_id: str) -> str:
         return f"{self.key_prefix}:task:{task_id}"
+
+
+class InMemoryLimraObjectStorage:
+    def __init__(self, *, bucket: str = "limra-memory") -> None:
+        self.bucket = bucket
+        self.objects: dict[str, dict[str, Any]] = {}
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimraStoredObject:
+        stored = _stored_object(
+            object_key=object_key,
+            bucket=self.bucket,
+            data=data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        self.objects[object_key] = {
+            "data": bytes(data),
+            "content_type": content_type,
+            "metadata": stored.metadata,
+            "sha256": stored.sha256,
+        }
+        return stored
+
+
+class S3LimraObjectStorage:
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        endpoint_url: str,
+        access_key_id: str,
+        secret_access_key: str,
+        region_name: str | None = None,
+        s3_client: Any | None = None,
+    ) -> None:
+        if not bucket:
+            raise RuntimeError("limra_object_bucket_missing")
+        if not endpoint_url:
+            raise RuntimeError("limra_s3_endpoint_url_missing")
+        if not access_key_id or not secret_access_key:
+            raise RuntimeError("limra_s3_credentials_missing")
+        self.bucket = bucket
+        self.endpoint_url = endpoint_url
+        self.access_key_id = access_key_id
+        self.secret_access_key = secret_access_key
+        self.region_name = region_name
+        self.s3_client = s3_client or self._create_s3_client()
+
+    def _create_s3_client(self) -> Any:
+        try:
+            import boto3
+        except Exception as exc:  # pragma: no cover - depends on runtime image
+            raise RuntimeError("limra_s3_client_dependency_missing") from exc
+        client_kwargs = {
+            "endpoint_url": self.endpoint_url,
+            "aws_access_key_id": self.access_key_id,
+            "aws_secret_access_key": self.secret_access_key,
+        }
+        if self.region_name:
+            client_kwargs["region_name"] = self.region_name
+        return boto3.client("s3", **client_kwargs)
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimraStoredObject:
+        stored = _stored_object(
+            object_key=object_key,
+            bucket=self.bucket,
+            data=data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        await _maybe_await(
+            self.s3_client.put_object(
+                Bucket=self.bucket,
+                Key=object_key,
+                Body=bytes(data),
+                ContentType=stored.content_type,
+                Metadata=stored.metadata,
+            )
+        )
+        return stored
 
 
 class PostgresLimraTaskRepository:
@@ -1082,6 +1226,44 @@ def create_limra_runtime_state_from_env(
     raise RuntimeError(f"unsupported_limra_runtime_state_backend:{backend}")
 
 
+def create_limra_object_storage_from_env(
+    env: Any = os.environ,
+    *,
+    s3_client: Any | None = None,
+) -> LimraObjectStorage:
+    backend = str(env.get(LIMRA_OBJECT_STORAGE_BACKEND_ENV, "s3")).strip().lower()
+    if backend in {"s3", "minio"}:
+        bucket = str(
+            env.get(LIMRA_OBJECT_BUCKET_ENV)
+            or env.get("S3_BUCKET")
+            or env.get("MINIO_BUCKET")
+            or ""
+        ).strip()
+        endpoint_url = str(env.get(LIMRA_OBJECT_STORAGE_ENDPOINT_ENV) or "").strip()
+        access_key_id = str(env.get(LIMRA_OBJECT_ACCESS_KEY_ENV) or "").strip()
+        secret_access_key = str(env.get(LIMRA_OBJECT_SECRET_KEY_ENV) or "").strip()
+        region_name = str(env.get(LIMRA_OBJECT_REGION_ENV) or "").strip() or None
+        return S3LimraObjectStorage(
+            bucket=bucket,
+            endpoint_url=endpoint_url,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            region_name=region_name,
+            s3_client=s3_client,
+        )
+
+    if backend in {"memory", "in-memory", "in_memory"}:
+        allow_memory = str(env.get(LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE_ENV, ""))
+        if allow_memory.strip().lower() not in TRUTHY_ENV_VALUES:
+            raise RuntimeError(
+                "limra_in_memory_object_storage_requires_explicit_fallback"
+            )
+        bucket = str(env.get(LIMRA_OBJECT_BUCKET_ENV) or "limra-memory").strip()
+        return InMemoryLimraObjectStorage(bucket=bucket or "limra-memory")
+
+    raise RuntimeError(f"unsupported_limra_object_storage_backend:{backend}")
+
+
 class RunnerResearchClient:
     def __init__(
         self,
@@ -1268,6 +1450,14 @@ def get_runtime_state(request: Request) -> LimraRuntimeState:
     return runtime_state
 
 
+def get_object_storage(request: Request) -> LimraObjectStorage:
+    object_storage = getattr(request.app.state, "limra_object_storage", None)
+    if object_storage is None:
+        object_storage = create_limra_object_storage_from_env()
+        request.app.state.limra_object_storage = object_storage
+    return object_storage
+
+
 @router.post("/research", status_code=202)
 async def create_research_task(
     form_data: dict[str, Any],
@@ -1408,17 +1598,35 @@ async def admin_download_task_archive(
 @router.post("/uploads", status_code=501)
 async def upload_document(
     file: UploadFile,
+    object_key: str | None = None,
+    objectKey: str | None = None,
+    s3_key: str | None = None,
+    minio_object_key: str | None = None,
     user: LimraUser = Depends(get_current_limra_user),
+    object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> dict[str, str]:
+    _ = object_storage
+    _reject_browser_supplied_object_key_fields(
+        {
+            "object_key": object_key,
+            "objectKey": objectKey,
+            "s3_key": s3_key,
+            "minio_object_key": minio_object_key,
+        }
+    )
     return {"error": "upload_not_implemented", "user_id": user.id, "filename": file.filename or ""}
 
 
 @router.post("/tasks/{task_id}/reports/pdf", status_code=501)
 async def export_task_pdf(
     task_id: str,
+    form_data: dict[str, Any] | None = None,
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
+    object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> dict[str, str]:
+    _ = object_storage
+    _reject_browser_supplied_object_key_fields(form_data or {})
     _get_owned_task(repo, task_id, user)
     return {"error": "pdf_export_not_implemented"}
 
@@ -2274,6 +2482,98 @@ def _allowed_relation_types() -> set[str]:
         "mentions",
         "conflicts_with",
     }
+
+
+def build_limra_object_key(
+    *,
+    owner_user_id: str,
+    category: str,
+    task_id: str | None = None,
+    filename: str | None = None,
+    extension: str | None = None,
+    object_id: str | None = None,
+    key_prefix: str | None = None,
+) -> str:
+    normalized_category = category.strip().lower()
+    if normalized_category not in OBJECT_KEY_CATEGORIES:
+        raise ValueError(f"unsupported_limra_object_category:{category}")
+    owner_digest = hashlib.sha256(owner_user_id.encode("utf-8")).hexdigest()[:24]
+    prefix = _safe_object_segment(
+        key_prefix if key_prefix is not None else os.getenv(LIMRA_OBJECT_KEY_PREFIX_ENV, "limra"),
+        fallback="limra",
+    )
+    object_segment = _safe_object_segment(object_id or uuid.uuid4().hex, fallback=uuid.uuid4().hex)
+    suffix = _safe_object_extension(filename=filename, extension=extension)
+    parts = [prefix, "users", owner_digest]
+    if task_id:
+        parts.extend(["tasks", _safe_object_segment(task_id, fallback="task")])
+    parts.extend([normalized_category, f"{object_segment}{suffix}"])
+    return "/".join(parts)
+
+
+def _stored_object(
+    *,
+    object_key: str,
+    bucket: str,
+    data: bytes,
+    content_type: str,
+    metadata: Mapping[str, Any] | None,
+) -> LimraStoredObject:
+    if not object_key or object_key.startswith("/") or "/../" in f"/{object_key}/":
+        raise ValueError("invalid_limra_object_key")
+    data_bytes = bytes(data)
+    return LimraStoredObject(
+        object_key=object_key,
+        bucket=bucket,
+        content_type=content_type or "application/octet-stream",
+        size_bytes=len(data_bytes),
+        sha256=hashlib.sha256(data_bytes).hexdigest(),
+        metadata=_object_metadata(metadata or {}),
+    )
+
+
+def _object_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
+    clean: dict[str, str] = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        clean_key = re.sub(r"[^A-Za-z0-9_.-]", "-", str(key)).strip("-_.")[:64]
+        if not clean_key:
+            continue
+        clean[clean_key] = str(value)[:1024]
+    return clean
+
+
+def _safe_object_segment(value: str, *, fallback: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", str(value)).strip(".-/")
+    return safe[:120] or fallback
+
+
+def _safe_object_extension(
+    *,
+    filename: str | None = None,
+    extension: str | None = None,
+) -> str:
+    candidate = extension or ""
+    if not candidate and filename:
+        basename = str(filename).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        _, candidate = os.path.splitext(basename)
+    if candidate and not candidate.startswith("."):
+        candidate = f".{candidate}"
+    candidate = candidate.lower()
+    if candidate in OBJECT_KEY_ALLOWED_EXTENSIONS:
+        return candidate
+    return ".bin"
+
+
+def _reject_browser_supplied_object_key_fields(fields: Mapping[str, Any]) -> None:
+    forbidden = sorted(
+        field
+        for field in OBJECT_KEY_FORBIDDEN_FIELDS
+        if field in fields and fields[field] not in {None, ""}
+    )
+    if forbidden:
+        raise HTTPException(status_code=400, detail="object_key_server_generated")
 
 
 def _assert_browser_safe(payload: Any) -> Any:
