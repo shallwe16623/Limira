@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 
 from auth_adapter import AuthError, authenticate_headers, reject_body_user_id
+from runner_api import SERVICE_TOKEN_KEY, create_app
 from task_store import TaskStore
 
 
@@ -194,3 +195,21 @@ def test_auth_adapter_rejects_invalid_or_body_user_id():
     with pytest.raises(AuthError) as body_user:
         reject_body_user_id({"query": "x", "user_id": "attacker"})
     assert body_user.value.status == 400
+
+
+def test_runner_app_uses_runner_service_token_env_fallback(tmp_path, monkeypatch):
+    async def stream_events(*_args, **_kwargs):
+        if False:
+            yield {}
+
+    monkeypatch.setenv("RUNNER_SERVICE_TOKEN", "shared-from-compose-env")
+    app = create_app(
+        task_store=TaskStore(tmp_path / "tasks.sqlite3"),
+        archive_root=tmp_path / "archives",
+        stream_events=stream_events,
+        init_render_state=lambda: {},
+        update_state_with_event=lambda state, _message: state,
+        render_markdown=lambda _state: "# report",
+    )
+
+    assert app[SERVICE_TOKEN_KEY] == "shared-from-compose-env"

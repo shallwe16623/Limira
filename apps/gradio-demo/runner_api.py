@@ -67,7 +67,9 @@ def create_app(
         Path(__file__).parent / "runner_tasks.sqlite3"
     )
     app[ARCHIVE_ROOT_KEY] = archive_root or (Path(__file__).parent / "archives")
-    app[SERVICE_TOKEN_KEY] = service_token
+    app[SERVICE_TOKEN_KEY] = service_token if service_token is not None else os.getenv(
+        "RUNNER_SERVICE_TOKEN"
+    )
     app[ARCHIVE_WRITER_KEY] = archive_writer_cls
     app[CLOCK_KEY] = clock
 

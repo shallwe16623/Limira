@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import zipfile
 from pathlib import Path
@@ -24,21 +25,62 @@ class FakeArchiveClient:
         return self.archive_bytes
 
 
+class FakeResearchClient:
+    def __init__(self, *, runner_task_id="runner-task-a", events=None):
+        self.runner_task_id = runner_task_id
+        self.events = events or []
+        self.create_calls = []
+        self.stream_calls = []
+
+    async def create_research_task(self, *, query, scenario, user):
+        self.create_calls.append(
+            {
+                "query": query,
+                "scenario": scenario,
+                "user": user,
+            }
+        )
+        return {
+            "task_id": self.runner_task_id,
+            "status": "queued",
+            "stream_url": f"/mirothinker/tasks/{self.runner_task_id}/events",
+            "task_url": f"/mirothinker/tasks/{self.runner_task_id}",
+        }
+
+    async def stream_events(self, *, task, user):
+        self.stream_calls.append({"task": task, "user": user})
+        for event in self.events:
+            yield event
+
+
 @pytest.mark.asyncio
 async def test_create_research_uses_limra_namespace_and_rejects_body_user_id():
     repo = limra.InMemoryLimraTaskRepository()
+    research = FakeResearchClient()
     user = limra.LimraUser("user-a")
 
     payload = await limra.create_research_task(
-        {"query": "track sanctions"},
+        {"query": "track sanctions", "scenario": "sanctions"},
         request=None,
         user=user,
         repo=repo,
+        research_client=research,
     )
 
     assert payload["task_url"].startswith("/api/limra/tasks/")
     assert payload["events_url"].startswith("/api/limra/tasks/")
     assert payload["artifacts_url"].startswith("/api/limra/tasks/")
+    assert payload["scenario"] == "sanctions"
+    assert payload["query"] == "track sanctions"
+    assert research.create_calls == [
+        {
+            "query": "track sanctions",
+            "scenario": "sanctions",
+            "user": user,
+        }
+    ]
+    task = repo.get_task(payload["task_id"])
+    assert task.runner_task_id == "runner-task-a"
     _assert_no_browser_leak(payload)
 
     with pytest.raises(HTTPException) as rejected:
@@ -47,6 +89,7 @@ async def test_create_research_uses_limra_namespace_and_rejects_body_user_id():
             request=None,
             user=user,
             repo=repo,
+            research_client=research,
         )
     assert rejected.value.status_code == 400
 
@@ -55,6 +98,7 @@ async def test_create_research_uses_limra_namespace_and_rejects_body_user_id():
 async def test_user_isolation_for_task_status_and_archive_download():
     repo = limra.InMemoryLimraTaskRepository()
     archive = FakeArchiveClient()
+    research = FakeResearchClient()
     user_a = limra.LimraUser("user-a")
     user_b = limra.LimraUser("user-b")
 
@@ -63,6 +107,7 @@ async def test_user_isolation_for_task_status_and_archive_download():
         request=None,
         user=user_a,
         repo=repo,
+        research_client=research,
     )
     task_id = created["task_id"]
     repo.tasks[task_id].archive_status = "ready"
@@ -104,6 +149,7 @@ async def test_user_isolation_for_task_status_and_archive_download():
 async def test_admin_access_requires_explicit_admin_route():
     repo = limra.InMemoryLimraTaskRepository()
     archive = FakeArchiveClient()
+    research = FakeResearchClient()
     user = limra.LimraUser("user-a")
     admin = limra.LimraUser("admin-user", role="admin")
 
@@ -112,6 +158,7 @@ async def test_admin_access_requires_explicit_admin_route():
         request=None,
         user=user,
         repo=repo,
+        research_client=research,
     )
     task_id = created["task_id"]
     repo.tasks[task_id].archive_status = "ready"
@@ -136,12 +183,14 @@ async def test_admin_access_requires_explicit_admin_route():
 @pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limra.InMemoryLimraTaskRepository()
+    research = FakeResearchClient()
     user = limra.LimraUser("user-a")
     created = await limra.create_research_task(
         {"query": "query"},
         request=None,
         user=user,
         repo=repo,
+        research_client=research,
     )
     task_id = created["task_id"]
 
@@ -178,6 +227,144 @@ def test_runner_service_headers_are_server_side_only():
     }
 
 
+@pytest.mark.asyncio
+async def test_event_proxy_streams_runner_events_and_populates_artifacts():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {"status": "running"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "evidence_collected",
+                "payload": {
+                    "title": "Export control notice",
+                    "summary": "Policy update",
+                    "source_url": "https://example.test/source",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "entity_extracted",
+                "payload": {
+                    "entity_id": "ENT-001",
+                    "name": "United States",
+                    "entity_type": "country",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "title": "Assessment",
+                        "markdown": "Finding references [EVID-001]",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.8,
+                    "notes": "draft",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "relation_extracted",
+                "payload": "not-a-dict",
+            },
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "semiconductor export controls"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "status",
+        "evidence_collected",
+        "entity_extracted",
+        "record_research_artifact",
+        "relation_extracted",
+        "artifact_warning",
+    ]
+    assert all(event["task_id"] == task_id for event in events)
+    _assert_no_browser_leak(events)
+
+    task = repo.get_task(task_id)
+    assert task.status == "completed"
+    assert task.archive_status == "ready"
+    assert research.stream_calls[0]["task"].runner_task_id == "runner-task-a"
+
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["evidence"][0]["title"] == "Export control notice"
+    assert artifacts["entities"][0]["entity_id"] == "ENT-001"
+    assert artifacts["report_sections"][0]["evidence_refs"] == ["EVID-001"]
+    assert artifacts["report_sections"][0]["confidence"] == 0.8
+    assert artifacts["relations"] == []
+    _assert_no_browser_leak(artifacts)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_keeps_artifacts_user_scoped():
+    repo = limra.InMemoryLimraTaskRepository()
+    user_a = limra.LimraUser("user-a")
+    user_b = limra.LimraUser("user-b")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "evidence_collected",
+                "payload": {"evidence_id": "EVID-777", "title": "private"},
+            }
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "private query"},
+        request=None,
+        user=user_a,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limra.get_task_events(
+        task_id,
+        user=user_a,
+        repo=repo,
+        research_client=research,
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    with pytest.raises(HTTPException) as forbidden:
+        await limra.get_task_artifacts(task_id, user=user_b, repo=repo)
+    assert forbidden.value.status_code == 404
+
+
+def test_runner_research_client_uses_server_side_headers(monkeypatch):
+    monkeypatch.setenv("LIMRA_RUNNER_INTERNAL_URL", "http://internal-runner")
+    monkeypatch.setenv("LIMRA_RUNNER_SERVICE_TOKEN", "server-only-token")
+
+    client = limra.RunnerResearchClient()
+    assert client.runner_url == "http://internal-runner"
+    assert client.service_token == "server-only-token"
+
+
 def test_limra_router_defines_required_browser_facing_paths():
     route_contract = {
         ("/research", "POST"),
@@ -212,6 +399,18 @@ def _archive_zip(*, extra_member: bool = False) -> bytes:
         if extra_member:
             archive.writestr(".env", "RUNNER_SERVICE_TOKEN=secret")
     return buffer.getvalue()
+
+
+def _parse_sse_chunks(chunks):
+    text = b"".join(
+        chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+        for chunk in chunks
+    ).decode("utf-8")
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in text.splitlines()
+        if line.startswith("data: ")
+    ]
 
 
 def _assert_no_browser_leak(payload):
