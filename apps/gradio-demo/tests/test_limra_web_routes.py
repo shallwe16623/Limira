@@ -770,6 +770,56 @@ async def test_terminal_task_reattach_records_terminal_runtime_state_to_redis():
 
 
 @pytest.mark.asyncio
+async def test_terminal_reattach_does_not_close_foreign_active_runtime_lease():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("terminal reattach must not stream")
+    )
+    created = await limra.create_research_task(
+        {"query": "terminal while active stream still owns lease"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    assert await runtime_state.try_open_stream(
+        task_id,
+        owner_user_id="user-a",
+        stream_id="active-stream",
+        fields={"status": "running", "archive_status": "pending"},
+    )
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["payload"]["terminal"] is True
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["stream_state"]) == "open"
+    assert json.loads(runtime_hash["stream_id"]) == "active-stream"
+    assert not await runtime_state.try_open_stream(
+        task_id,
+        owner_user_id="user-a",
+        stream_id="new-stream",
+        fields={"status": "running", "archive_status": "pending"},
+    )
+    assert research.stream_calls == []
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_duplicate_active_stream_uses_runtime_lease_without_runner_call():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")
@@ -858,6 +908,80 @@ async def test_event_proxy_cancellation_closes_matching_runtime_stream():
     assert json.loads(runtime_hash["terminal"]) is True
     assert json.loads(runtime_hash["stream_state"]) == "closed"
     assert json.loads(runtime_hash["stream_close_reason"]) == "event_stream_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_http_exception_records_failed_terminal_runtime_state():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = FakeResearchClient(
+        stream_exception=HTTPException(status_code=503, detail="runner_unavailable")
+    )
+    created = await limra.create_research_task(
+        {"query": "http exception redis state"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["payload"]["error"] == "runner_unavailable"
+    assert json.loads(runtime_hash["status"]) == "failed"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "runner_unavailable"
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "http_exception"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_generic_exception_records_failed_terminal_runtime_state():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = FakeResearchClient(stream_exception=RuntimeError("private failure"))
+    created = await limra.create_research_task(
+        {"query": "generic exception redis state"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["payload"]["error"] == "limra_event_proxy_failed"
+    assert json.loads(runtime_hash["status"]) == "failed"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "limra_event_proxy_failed"
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "limra_event_proxy_failed"
 
 
 @pytest.mark.asyncio

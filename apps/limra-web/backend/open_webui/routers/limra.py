@@ -1473,10 +1473,9 @@ async def _limra_event_stream(
     if current.status in FINAL_TASK_STATUSES:
         terminal_event = _terminal_status_event(current)
         await _record_runtime_event(runtime_state, task.task_id, terminal_event)
-        await _mark_runtime_stream_closed(
+        await _mark_terminal_reattach_closed(
             runtime_state,
             task.task_id,
-            "terminal_reattach",
         )
         yield _sse_bytes(_assert_browser_safe(terminal_event))
         return
@@ -1771,11 +1770,32 @@ async def _record_runtime_event(
             fields["last_warning"] = str(payload["warning"])
         if payload.get("error"):
             fields["error"] = str(payload["error"])
-    elif event_type == "error":
+    if event_type == "error":
         fields["status"] = "failed"
         fields["archive_status"] = "failed"
         fields["terminal"] = True
+        if isinstance(payload, dict) and payload.get("error"):
+            fields["error"] = str(payload["error"])
+        elif payload:
+            fields["error"] = str(payload)
     await runtime_state.update_task_runtime(task_id, fields)
+
+
+async def _mark_terminal_reattach_closed(
+    runtime_state: LimraRuntimeState,
+    task_id: str,
+) -> None:
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    if (
+        runtime_snapshot.get("stream_state") == "open"
+        and runtime_snapshot.get("stream_id")
+    ):
+        return
+    await _mark_runtime_stream_closed(
+        runtime_state,
+        task_id,
+        "terminal_reattach",
+    )
 
 
 async def _mark_runtime_stream_closed(
