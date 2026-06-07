@@ -285,8 +285,8 @@ class PostgresLimraTaskRepository:
     """
     INSERT_ARTIFACT_EVENT_SQL = """
         INSERT INTO limra_artifact_events (
-            artifact_id,
             task_id,
+            local_artifact_id,
             artifact_type,
             bucket,
             payload,
@@ -296,8 +296,8 @@ class PostgresLimraTaskRepository:
             source_event_type
         )
         VALUES (
-            :artifact_id,
             :task_id,
+            :local_artifact_id,
             :artifact_type,
             :bucket,
             CAST(:payload AS jsonb),
@@ -306,7 +306,7 @@ class PostgresLimraTaskRepository:
             :notes,
             :source_event_type
         )
-        ON CONFLICT (artifact_id) DO UPDATE SET
+        ON CONFLICT (task_id, artifact_type, local_artifact_id) DO UPDATE SET
             payload = EXCLUDED.payload,
             evidence_refs = EXCLUDED.evidence_refs,
             confidence = EXCLUDED.confidence,
@@ -317,7 +317,7 @@ class PostgresLimraTaskRepository:
         SELECT artifact_type, payload
         FROM limra_artifact_events
         WHERE task_id = :task_id
-        ORDER BY created_at ASC, artifact_id ASC
+        ORDER BY created_at ASC, local_artifact_id ASC
     """
     INSERT_EVIDENCE_SQL = """
         INSERT INTO limra_evidence_items (
@@ -326,6 +326,7 @@ class PostgresLimraTaskRepository:
             source_url,
             source_title,
             publisher,
+            published_at,
             original_text,
             translated_text,
             summary,
@@ -345,6 +346,7 @@ class PostgresLimraTaskRepository:
             :source_url,
             :source_title,
             :publisher,
+            CAST(:published_at AS timestamptz),
             :original_text,
             :translated_text,
             :summary,
@@ -358,11 +360,22 @@ class PostgresLimraTaskRepository:
             :human_confirmed,
             CAST(:metadata AS jsonb)
         )
-        ON CONFLICT (evidence_id) DO UPDATE SET
+        ON CONFLICT (task_id, evidence_id) DO UPDATE SET
             source_url = EXCLUDED.source_url,
             source_title = EXCLUDED.source_title,
+            publisher = EXCLUDED.publisher,
+            published_at = EXCLUDED.published_at,
+            original_text = EXCLUDED.original_text,
+            translated_text = EXCLUDED.translated_text,
             summary = EXCLUDED.summary,
+            language = EXCLUDED.language,
+            credibility = EXCLUDED.credibility,
             confidence = EXCLUDED.confidence,
+            cross_verification = EXCLUDED.cross_verification,
+            conflict_notes = EXCLUDED.conflict_notes,
+            tool_name = EXCLUDED.tool_name,
+            model_name = EXCLUDED.model_name,
+            human_confirmed = EXCLUDED.human_confirmed,
             metadata = EXCLUDED.metadata
     """
     INSERT_ENTITY_SQL = """
@@ -373,6 +386,7 @@ class PostgresLimraTaskRepository:
             display_name,
             canonical_name,
             country_code,
+            geometry,
             confidence,
             metadata
         )
@@ -383,14 +397,22 @@ class PostgresLimraTaskRepository:
             :display_name,
             :canonical_name,
             :country_code,
+            CASE
+                WHEN :geometry_geojson IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromGeoJSON(:geometry_geojson), 4326)
+                WHEN :geometry_wkt IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromText(:geometry_wkt), 4326)
+                ELSE NULL
+            END,
             :confidence,
             CAST(:metadata AS jsonb)
         )
-        ON CONFLICT (entity_id) DO UPDATE SET
+        ON CONFLICT (task_id, entity_id) DO UPDATE SET
             entity_type = EXCLUDED.entity_type,
             display_name = EXCLUDED.display_name,
             canonical_name = EXCLUDED.canonical_name,
             country_code = EXCLUDED.country_code,
+            geometry = EXCLUDED.geometry,
             confidence = EXCLUDED.confidence,
             metadata = EXCLUDED.metadata
     """
@@ -415,7 +437,7 @@ class PostgresLimraTaskRepository:
             :confidence,
             CAST(:metadata AS jsonb)
         )
-        ON CONFLICT (relation_id) DO UPDATE SET
+        ON CONFLICT (task_id, relation_id) DO UPDATE SET
             source_entity_id = EXCLUDED.source_entity_id,
             target_entity_id = EXCLUDED.target_entity_id,
             relation_type = EXCLUDED.relation_type,
@@ -429,7 +451,10 @@ class PostgresLimraTaskRepository:
             task_id,
             event_title,
             event_type,
+            event_time,
+            event_time_end,
             location_name,
+            geometry,
             risk_level,
             confidence,
             evidence_refs,
@@ -440,16 +465,28 @@ class PostgresLimraTaskRepository:
             :task_id,
             :event_title,
             :event_type,
+            CAST(:event_time AS timestamptz),
+            CAST(:event_time_end AS timestamptz),
             :location_name,
+            CASE
+                WHEN :geometry_geojson IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromGeoJSON(:geometry_geojson), 4326)
+                WHEN :geometry_wkt IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromText(:geometry_wkt), 4326)
+                ELSE NULL
+            END,
             :risk_level,
             :confidence,
             :evidence_refs,
             CAST(:metadata AS jsonb)
         )
-        ON CONFLICT (timeline_event_id) DO UPDATE SET
+        ON CONFLICT (task_id, timeline_event_id) DO UPDATE SET
             event_title = EXCLUDED.event_title,
             event_type = EXCLUDED.event_type,
+            event_time = EXCLUDED.event_time,
+            event_time_end = EXCLUDED.event_time_end,
             location_name = EXCLUDED.location_name,
+            geometry = EXCLUDED.geometry,
             risk_level = EXCLUDED.risk_level,
             confidence = EXCLUDED.confidence,
             evidence_refs = EXCLUDED.evidence_refs,
@@ -476,7 +513,7 @@ class PostgresLimraTaskRepository:
             :creator_user_id,
             CAST(:metadata AS jsonb)
         )
-        ON CONFLICT (report_id) DO UPDATE SET
+        ON CONFLICT (task_id, report_id) DO UPDATE SET
             markdown = EXCLUDED.markdown,
             html = EXCLUDED.html,
             evidence_refs = EXCLUDED.evidence_refs,
@@ -601,8 +638,8 @@ class PostgresLimraTaskRepository:
         artifact_id = _artifact_primary_id(artifact_type, artifact)
         bucket = ARTIFACT_BUCKETS[artifact_type]
         event_params = {
-            "artifact_id": artifact_id,
             "task_id": task_id,
+            "local_artifact_id": artifact_id,
             "artifact_type": artifact_type,
             "bucket": bucket,
             "payload": _json_dumps(artifact),
@@ -660,6 +697,13 @@ class PostgresLimraTaskRepository:
             "source_url": artifact.get("source_url") or artifact.get("url"),
             "source_title": artifact.get("source_title") or artifact.get("title"),
             "publisher": artifact.get("publisher"),
+            "published_at": _temporal_value(
+                artifact,
+                "published_at",
+                "published_time",
+                "published",
+                "published_date",
+            ),
             "original_text": artifact.get("original_text") or artifact.get("text"),
             "translated_text": artifact.get("translated_text"),
             "summary": artifact.get("summary"),
@@ -691,6 +735,7 @@ class PostgresLimraTaskRepository:
             "display_name": str(display_name),
             "canonical_name": artifact.get("canonical_name"),
             "country_code": artifact.get("country_code"),
+            **_geometry_params(artifact),
             "confidence": _optional_float(artifact.get("confidence")),
             "metadata": _json_dumps(artifact),
         }
@@ -730,7 +775,23 @@ class PostgresLimraTaskRepository:
                 or artifact_id
             ),
             "event_type": artifact.get("event_type") or artifact_type,
-            "location_name": artifact.get("location_name") or artifact.get("location"),
+            "event_time": _temporal_value(
+                artifact,
+                "event_time",
+                "time",
+                "timestamp",
+                "date",
+            ),
+            "event_time_end": _temporal_value(
+                artifact,
+                "event_time_end",
+                "time_end",
+                "end_time",
+                "end_date",
+            ),
+            "location_name": artifact.get("location_name")
+            or _location_text(artifact.get("location")),
+            **_geometry_params(artifact),
             "risk_level": risk_level,
             "confidence": _optional_float(artifact.get("confidence")),
             "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
@@ -1612,8 +1673,94 @@ def _optional_string(value: Any) -> str | None:
     return str(value)
 
 
+def _temporal_value(artifact: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = artifact.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _geometry_params(artifact: dict[str, Any]) -> dict[str, str | None]:
+    geometry = (
+        artifact.get("geometry")
+        or artifact.get("geojson")
+        or artifact.get("wkt")
+        or artifact.get("point")
+    )
+
+    if isinstance(geometry, str):
+        stripped = geometry.strip()
+        if stripped.startswith("{"):
+            return {"geometry_geojson": stripped, "geometry_wkt": None}
+        if stripped:
+            return {"geometry_geojson": None, "geometry_wkt": stripped}
+
+    if isinstance(geometry, dict):
+        if geometry.get("type") and geometry.get("coordinates") is not None:
+            return {
+                "geometry_geojson": _json_dumps(geometry),
+                "geometry_wkt": None,
+            }
+        coordinate_pair = _coordinate_pair(geometry)
+        if coordinate_pair:
+            return {
+                "geometry_geojson": _json_dumps(
+                    {"type": "Point", "coordinates": coordinate_pair}
+                ),
+                "geometry_wkt": None,
+            }
+
+    if isinstance(geometry, (list, tuple)):
+        coordinate_pair = _coordinate_pair({"coordinates": geometry})
+        if coordinate_pair:
+            return {
+                "geometry_geojson": _json_dumps(
+                    {"type": "Point", "coordinates": coordinate_pair}
+                ),
+                "geometry_wkt": None,
+            }
+
+    coordinate_pair = _coordinate_pair(artifact)
+    if not coordinate_pair and isinstance(artifact.get("location"), dict):
+        coordinate_pair = _coordinate_pair(artifact["location"])
+    if coordinate_pair:
+        return {
+            "geometry_geojson": _json_dumps(
+                {"type": "Point", "coordinates": coordinate_pair}
+            ),
+            "geometry_wkt": None,
+        }
+
+    return {"geometry_geojson": None, "geometry_wkt": None}
+
+
+def _coordinate_pair(value: dict[str, Any]) -> list[float] | None:
+    coordinates = value.get("coordinates")
+    if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+        lon, lat = coordinates[0], coordinates[1]
+    else:
+        lon = value.get("lon", value.get("lng", value.get("longitude")))
+        lat = value.get("lat", value.get("latitude"))
+    try:
+        if lon is None or lat is None:
+            return None
+        return [float(lon), float(lat)]
+    except (TypeError, ValueError):
+        return None
+
+
+def _location_text(value: Any) -> str | None:
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return None
+    return str(value)
+
+
 def _sql_text(sql: str) -> Any:
-    from sqlalchemy import text
+    try:
+        from sqlalchemy import text
+    except ImportError:
+        return sql
 
     return text(sql)
 

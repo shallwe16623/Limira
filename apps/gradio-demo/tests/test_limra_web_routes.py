@@ -329,8 +329,148 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
 
     assert "select artifact_type, payload" in sql
     assert "on conflict" in sql
+    assert "on conflict (task_id, artifact_type, local_artifact_id)" in sql
+    assert "on conflict (task_id, evidence_id)" in sql
+    assert "on conflict (task_id, entity_id)" in sql
+    assert "on conflict (task_id, relation_id)" in sql
+    assert "on conflict (task_id, timeline_event_id)" in sql
+    assert "on conflict (task_id, report_id)" in sql
+    assert "on conflict (artifact_id)" not in sql
+    assert "on conflict (evidence_id)" not in sql
+    assert "cast(:published_at as timestamptz)" in sql
+    assert "cast(:event_time as timestamptz)" in sql
+    assert "cast(:event_time_end as timestamptz)" in sql
+    assert "st_geomfromgeojson(:geometry_geojson)" in sql
+    assert "st_geomfromtext(:geometry_wkt)" in sql
     assert "archive_object_key" in sql
     assert "archive_zip_sha256" in sql
+
+
+def test_postgres_repository_preserves_task_local_artifact_refs_by_task():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    for task_id, owner in (("task-a", "user-a"), ("task-b", "user-b")):
+        repo.create_task(
+            task_id=task_id,
+            owner_user_id=owner,
+            query=f"{task_id} query",
+            scenario=None,
+            runner_task_id=f"runner-{task_id}",
+        )
+
+    for task_id, suffix in (("task-a", "A"), ("task-b", "B")):
+        repo.record_artifact(
+            task_id,
+            "evidence",
+            {"evidence_id": "EVID-001", "title": f"Evidence {suffix}"},
+        )
+        repo.record_artifact(
+            task_id,
+            "entity",
+            {
+                "entity_id": "ENT-001",
+                "entity_type": "country",
+                "display_name": f"Entity {suffix}",
+            },
+        )
+        repo.record_artifact(
+            task_id,
+            "relation",
+            {"relation_id": "REL-001", "relation_type": "mentions"},
+        )
+        repo.record_artifact(
+            task_id,
+            "report_section",
+            {"section_id": "REPORT-001", "markdown": f"Report {suffix}"},
+        )
+
+    task_a_artifacts = repo.get_artifacts("task-a")
+    task_b_artifacts = repo.get_artifacts("task-b")
+
+    assert task_a_artifacts["evidence"][0]["title"] == "Evidence A"
+    assert task_b_artifacts["evidence"][0]["title"] == "Evidence B"
+    assert task_a_artifacts["entities"][0]["display_name"] == "Entity A"
+    assert task_b_artifacts["entities"][0]["display_name"] == "Entity B"
+    assert task_a_artifacts["report_sections"][0]["markdown"] == "Report A"
+    assert task_b_artifacts["report_sections"][0]["markdown"] == "Report B"
+    assert ("task-a", "evidence", "EVID-001") in engine.artifact_events
+    assert ("task-b", "evidence", "EVID-001") in engine.artifact_events
+
+
+def test_postgres_repository_artifact_params_include_temporal_and_geometry_fields():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-geo",
+        owner_user_id="user-a",
+        query="geo query",
+        scenario=None,
+        runner_task_id="runner-geo",
+    )
+    repo.record_artifact(
+        "task-geo",
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "dated source",
+            "published_at": "2026-01-02T03:04:05Z",
+        },
+    )
+    repo.record_artifact(
+        "task-geo",
+        "timeline_event",
+        {
+            "event_id": "TIME-001",
+            "title": "port disruption",
+            "event_time": "2026-02-01T00:00:00Z",
+            "event_time_end": "2026-02-02T00:00:00Z",
+            "geometry": {"type": "Point", "coordinates": [32.55, 29.97]},
+        },
+    )
+    repo.record_artifact(
+        "task-geo",
+        "map_feature",
+        {
+            "feature_id": "MAP-001",
+            "title": "shipping lane",
+            "geometry": "LINESTRING(32.5 29.9, 33.0 30.1)",
+        },
+    )
+    repo.record_artifact(
+        "task-geo",
+        "entity",
+        {
+            "entity_id": "ENT-001",
+            "entity_type": "location",
+            "display_name": "Suez Canal",
+            "lat": 29.97,
+            "lon": 32.55,
+        },
+    )
+
+    evidence_params = engine.typed_inserts["limra_evidence_items"][0]
+    timeline_params = engine.typed_inserts["limra_timeline_events"][0]
+    map_params = engine.typed_inserts["limra_timeline_events"][1]
+    entity_params = engine.typed_inserts["limra_entities"][0]
+
+    assert evidence_params["published_at"] == "2026-01-02T03:04:05Z"
+    assert timeline_params["event_time"] == "2026-02-01T00:00:00Z"
+    assert timeline_params["event_time_end"] == "2026-02-02T00:00:00Z"
+    assert json.loads(timeline_params["geometry_geojson"]) == {
+        "type": "Point",
+        "coordinates": [32.55, 29.97],
+    }
+    assert map_params["geometry_wkt"] == "LINESTRING(32.5 29.9, 33.0 30.1)"
+    assert json.loads(entity_params["geometry_geojson"]) == {
+        "type": "Point",
+        "coordinates": [32.55, 29.97],
+    }
 
 
 @pytest.mark.asyncio
@@ -717,3 +857,97 @@ def _assert_no_browser_leak(payload):
     text = str(payload)
     for forbidden in limra.FORBIDDEN_BROWSER_SUBSTRINGS:
         assert forbidden not in text
+
+
+class FakeLimraPostgresEngine:
+    def __init__(self):
+        self.tasks = {}
+        self.artifact_events = {}
+        self.typed_inserts = {
+            "limra_evidence_items": [],
+            "limra_entities": [],
+            "limra_entity_relations": [],
+            "limra_timeline_events": [],
+            "limra_generated_reports": [],
+        }
+
+    def begin(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, params):
+        sql = str(statement).lower()
+        if "insert into limra_research_tasks" in sql:
+            row = {
+                "task_id": params["task_id"],
+                "owner_user_id": params["owner_user_id"],
+                "query": params["query"],
+                "status": "queued",
+                "archive_status": "pending",
+                "runner_task_id": params["runner_task_id"],
+                "archive_object_key": None,
+                "archive_zip_sha256": None,
+                "scenario": params["scenario"],
+                "error": None,
+                "model_summary": {},
+            }
+            self.tasks[params["task_id"]] = row
+            return FakeLimraPostgresResult([row])
+
+        if "select owner_user_id from limra_research_tasks" in sql:
+            row = self.tasks.get(params["task_id"])
+            return FakeLimraPostgresResult(
+                [{"owner_user_id": row["owner_user_id"]}] if row else []
+            )
+
+        if "from limra_research_tasks" in sql:
+            row = self.tasks.get(params["task_id"])
+            if row and params.get("owner_user_id") and row["owner_user_id"] != params["owner_user_id"]:
+                row = None
+            return FakeLimraPostgresResult([row] if row else [])
+
+        if "insert into limra_artifact_events" in sql:
+            key = (
+                params["task_id"],
+                params["artifact_type"],
+                params["local_artifact_id"],
+            )
+            self.artifact_events[key] = {
+                "artifact_type": params["artifact_type"],
+                "payload": params["payload"],
+            }
+            return FakeLimraPostgresResult([])
+
+        if "from limra_artifact_events" in sql:
+            rows = [
+                row
+                for (task_id, _artifact_type, _local_id), row in self.artifact_events.items()
+                if task_id == params["task_id"]
+            ]
+            return FakeLimraPostgresResult(rows)
+
+        for table in self.typed_inserts:
+            if f"insert into {table}" in sql:
+                self.typed_inserts[table].append(dict(params))
+                return FakeLimraPostgresResult([])
+
+        return FakeLimraPostgresResult([])
+
+
+class FakeLimraPostgresResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self.rows[0] if self.rows else None
+
+    def all(self):
+        return list(self.rows)

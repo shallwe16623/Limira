@@ -179,6 +179,34 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
         "constraint uq_limra_entities_task_entity unique (task_id, entity_id)"
         in tables["limra_entities"]["body"]
     )
+    assert "artifact_event_id text primary key" in tables["limra_artifact_events"]["body"]
+    assert (
+        "constraint uq_limra_artifact_events_task_local unique "
+        "(task_id, artifact_type, local_artifact_id)"
+        in tables["limra_artifact_events"]["body"]
+    )
+    assert "evidence_storage_id text primary key" in tables["limra_evidence_items"]["body"]
+    assert (
+        "constraint uq_limra_evidence_items_task_evidence unique "
+        "(task_id, evidence_id)"
+        in tables["limra_evidence_items"]["body"]
+    )
+    assert "entity_storage_id text primary key" in tables["limra_entities"]["body"]
+    assert (
+        "constraint uq_limra_entity_relations_task_relation unique "
+        "(task_id, relation_id)"
+        in tables["limra_entity_relations"]["body"]
+    )
+    assert (
+        "constraint uq_limra_timeline_events_task_event unique "
+        "(task_id, timeline_event_id)"
+        in tables["limra_timeline_events"]["body"]
+    )
+    assert (
+        "constraint uq_limra_generated_reports_task_report unique "
+        "(task_id, report_id)"
+        in tables["limra_generated_reports"]["body"]
+    )
     assert (
         "constraint uq_limra_entities_task_entity"
         not in tables["limra_evidence_items"]["body"]

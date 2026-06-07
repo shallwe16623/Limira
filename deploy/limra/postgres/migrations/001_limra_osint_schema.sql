@@ -31,8 +31,9 @@ CREATE INDEX IF NOT EXISTS idx_limra_research_tasks_status_created
     ON limra_research_tasks (status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS limra_artifact_events (
-    artifact_id TEXT PRIMARY KEY,
+    artifact_event_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
+    local_artifact_id TEXT NOT NULL,
     artifact_type TEXT NOT NULL CHECK (
         artifact_type IN (
             'evidence',
@@ -60,14 +61,17 @@ CREATE TABLE IF NOT EXISTS limra_artifact_events (
     confidence NUMERIC(4, 3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     notes TEXT,
     source_event_type TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_artifact_events_task_local
+        UNIQUE (task_id, artifact_type, local_artifact_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_artifact_events_task_type_created
     ON limra_artifact_events (task_id, artifact_type, created_at);
 
 CREATE TABLE IF NOT EXISTS limra_evidence_items (
-    evidence_id TEXT PRIMARY KEY,
+    evidence_storage_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    evidence_id TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
     source_url TEXT,
     source_title TEXT,
@@ -87,7 +91,9 @@ CREATE TABLE IF NOT EXISTS limra_evidence_items (
     human_confirmed BOOLEAN NOT NULL DEFAULT false,
     embedding vector(1536),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_evidence_items_task_evidence
+        UNIQUE (task_id, evidence_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_evidence_items_task_collected
@@ -100,7 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_limra_evidence_items_embedding
     ON limra_evidence_items USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 
 CREATE TABLE IF NOT EXISTS limra_entities (
-    entity_id TEXT PRIMARY KEY,
+    entity_storage_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    entity_id TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
     entity_type TEXT NOT NULL CHECK (
         entity_type IN (
@@ -134,7 +141,8 @@ CREATE INDEX IF NOT EXISTS idx_limra_entities_geometry
     ON limra_entities USING gist (geometry);
 
 CREATE TABLE IF NOT EXISTS limra_entity_relations (
-    relation_id TEXT PRIMARY KEY,
+    relation_storage_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    relation_id TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
     source_entity_id TEXT,
     target_entity_id TEXT,
@@ -155,6 +163,8 @@ CREATE TABLE IF NOT EXISTS limra_entity_relations (
     confidence NUMERIC(4, 3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_entity_relations_task_relation
+        UNIQUE (task_id, relation_id),
     CONSTRAINT fk_limra_entity_relations_source_same_task
         FOREIGN KEY (task_id, source_entity_id)
         REFERENCES limra_entities (task_id, entity_id)
@@ -172,7 +182,8 @@ CREATE INDEX IF NOT EXISTS idx_limra_entity_relations_source_target
     ON limra_entity_relations (source_entity_id, target_entity_id);
 
 CREATE TABLE IF NOT EXISTS limra_timeline_events (
-    timeline_event_id TEXT PRIMARY KEY,
+    timeline_event_storage_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    timeline_event_id TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
     event_title TEXT NOT NULL,
     event_type TEXT,
@@ -186,7 +197,9 @@ CREATE TABLE IF NOT EXISTS limra_timeline_events (
     confidence NUMERIC(4, 3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     evidence_refs TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_timeline_events_task_event
+        UNIQUE (task_id, timeline_event_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_timeline_events_task_time
@@ -196,7 +209,8 @@ CREATE INDEX IF NOT EXISTS idx_limra_timeline_events_geometry
     ON limra_timeline_events USING gist (geometry);
 
 CREATE TABLE IF NOT EXISTS limra_generated_reports (
-    report_id TEXT PRIMARY KEY,
+    report_storage_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    report_id TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
     report_type TEXT NOT NULL,
     markdown TEXT NOT NULL,
@@ -206,7 +220,9 @@ CREATE TABLE IF NOT EXISTS limra_generated_reports (
     creator_user_id TEXT NOT NULL,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_limra_generated_reports_task_report
+        UNIQUE (task_id, report_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_limra_generated_reports_task_created
