@@ -333,9 +333,10 @@ class PostgresTaskStore:
     """
 
     def __init__(self, database_url: str, *, connection_factory: Any | None = None):
-        if not _is_postgres_database_url(database_url):
+        normalized_database_url = _normalize_postgres_database_url(database_url)
+        if normalized_database_url is None:
             raise RuntimeError("runner_postgres_database_url_required")
-        self.database_url = database_url
+        self.database_url = normalized_database_url
         self._connection_factory = connection_factory
 
     @classmethod
@@ -560,4 +561,13 @@ def _iso_value(value: Any) -> str | None:
 
 
 def _is_postgres_database_url(database_url: str) -> bool:
-    return database_url.startswith(("postgresql://", "postgresql+", "postgres://"))
+    return _normalize_postgres_database_url(database_url) is not None
+
+
+def _normalize_postgres_database_url(database_url: str) -> str | None:
+    if database_url.startswith(("postgresql://", "postgres://")):
+        return database_url
+    for scheme in ("postgresql+psycopg://", "postgresql+psycopg2://"):
+        if database_url.startswith(scheme):
+            return f"postgresql://{database_url.removeprefix(scheme)}"
+    return None

@@ -190,6 +190,36 @@ def test_runner_task_store_factory_requires_explicit_sqlite_fallback(tmp_path, m
     assert store.db_path == str(tmp_path / "tasks.sqlite3")
 
 
+def test_runner_postgres_task_store_normalizes_supported_sqlalchemy_urls(monkeypatch):
+    from psycopg.conninfo import conninfo_to_dict
+
+    raw_postgresql = PostgresTaskStore("postgresql://limra:test@postgres:5432/limra")
+    legacy_postgres = PostgresTaskStore("postgres://limra:test@postgres:5432/limra")
+    psycopg_url = PostgresTaskStore("postgresql+psycopg://limra:test@postgres:5432/limra")
+    psycopg2_url = PostgresTaskStore("postgresql+psycopg2://limra:test@postgres:5432/limra")
+
+    assert raw_postgresql.database_url == "postgresql://limra:test@postgres:5432/limra"
+    assert legacy_postgres.database_url == "postgres://limra:test@postgres:5432/limra"
+    assert psycopg_url.database_url == "postgresql://limra:test@postgres:5432/limra"
+    assert psycopg2_url.database_url == "postgresql://limra:test@postgres:5432/limra"
+    assert conninfo_to_dict(psycopg_url.database_url)["dbname"] == "limra"
+    assert conninfo_to_dict(psycopg2_url.database_url)["dbname"] == "limra"
+
+    monkeypatch.setenv("RUNNER_TASK_STORE_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "RUNNER_DATABASE_URL",
+        "postgresql+psycopg://limra:test@postgres:5432/limra",
+    )
+    store = create_task_store_from_env()
+    assert isinstance(store, PostgresTaskStore)
+    assert store.database_url == "postgresql://limra:test@postgres:5432/limra"
+
+
+def test_runner_postgres_task_store_rejects_unsupported_postgresql_plus_urls():
+    with pytest.raises(RuntimeError, match="runner_postgres_database_url_required"):
+        PostgresTaskStore("postgresql+asyncpg://limra:test@postgres:5432/limra")
+
+
 def test_postgres_task_store_sql_targets_limra_research_tasks():
     sql = PostgresTaskStore.sql_contract().lower()
 
