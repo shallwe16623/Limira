@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import uuid
 import zipfile
@@ -51,8 +52,13 @@ ARTIFACT_EVENT_TYPES = {
     "verification_result": "verification",
     "report_section_generated": "report_section",
 }
+LIMRA_REPOSITORY_BACKEND_ENV = "LIMRA_REPOSITORY_BACKEND"
+LIMRA_DATABASE_URL_ENV = "LIMRA_DATABASE_URL"
+LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV = "LIMRA_ALLOW_IN_MEMORY_REPOSITORY"
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
 class ResearchRequest(BaseModel):
@@ -78,6 +84,8 @@ class LimraTask:
     status: str = "queued"
     archive_status: str = "pending"
     runner_task_id: str | None = None
+    archive_object_key: str | None = None
+    archive_zip_sha256: str | None = None
     scenario: str | None = None
     error: str | None = None
     model_summary: dict[str, Any] | None = None
@@ -212,6 +220,571 @@ class InMemoryLimraTaskRepository:
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
         return {bucket: list(items) for bucket, items in task_artifacts.items()}
+
+
+class PostgresLimraTaskRepository:
+    POSTGRES_ARTIFACT_TABLES = {
+        "limra_research_tasks",
+        "limra_artifact_events",
+        "limra_evidence_items",
+        "limra_entities",
+        "limra_entity_relations",
+        "limra_timeline_events",
+        "limra_generated_reports",
+        "limra_uploaded_documents",
+        "limra_media_assets",
+    }
+    TASK_COLUMNS = """
+        task_id,
+        owner_user_id,
+        query,
+        status,
+        archive_status,
+        runner_task_id,
+        archive_object_key,
+        archive_zip_sha256,
+        scenario,
+        error,
+        model_summary
+    """
+    INSERT_TASK_SQL = f"""
+        INSERT INTO limra_research_tasks (
+            task_id,
+            owner_user_id,
+            query,
+            status,
+            archive_status,
+            runner_task_id,
+            scenario,
+            model_summary,
+            metadata
+        )
+        VALUES (
+            :task_id,
+            :owner_user_id,
+            :query,
+            'queued',
+            'pending',
+            :runner_task_id,
+            :scenario,
+            CAST(:model_summary AS jsonb),
+            CAST(:metadata AS jsonb)
+        )
+        RETURNING {TASK_COLUMNS}
+    """
+    SELECT_TASK_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limra_research_tasks
+        WHERE task_id = :task_id
+    """
+    SELECT_USER_TASK_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limra_research_tasks
+        WHERE task_id = :task_id
+          AND owner_user_id = :owner_user_id
+    """
+    INSERT_ARTIFACT_EVENT_SQL = """
+        INSERT INTO limra_artifact_events (
+            artifact_id,
+            task_id,
+            artifact_type,
+            bucket,
+            payload,
+            evidence_refs,
+            confidence,
+            notes,
+            source_event_type
+        )
+        VALUES (
+            :artifact_id,
+            :task_id,
+            :artifact_type,
+            :bucket,
+            CAST(:payload AS jsonb),
+            :evidence_refs,
+            :confidence,
+            :notes,
+            :source_event_type
+        )
+        ON CONFLICT (artifact_id) DO UPDATE SET
+            payload = EXCLUDED.payload,
+            evidence_refs = EXCLUDED.evidence_refs,
+            confidence = EXCLUDED.confidence,
+            notes = EXCLUDED.notes,
+            source_event_type = EXCLUDED.source_event_type
+    """
+    SELECT_ARTIFACT_EVENTS_SQL = """
+        SELECT artifact_type, payload
+        FROM limra_artifact_events
+        WHERE task_id = :task_id
+        ORDER BY created_at ASC, artifact_id ASC
+    """
+    INSERT_EVIDENCE_SQL = """
+        INSERT INTO limra_evidence_items (
+            evidence_id,
+            task_id,
+            source_url,
+            source_title,
+            publisher,
+            original_text,
+            translated_text,
+            summary,
+            language,
+            credibility,
+            confidence,
+            cross_verification,
+            conflict_notes,
+            tool_name,
+            model_name,
+            human_confirmed,
+            metadata
+        )
+        VALUES (
+            :evidence_id,
+            :task_id,
+            :source_url,
+            :source_title,
+            :publisher,
+            :original_text,
+            :translated_text,
+            :summary,
+            :language,
+            :credibility,
+            :confidence,
+            CAST(:cross_verification AS jsonb),
+            :conflict_notes,
+            :tool_name,
+            :model_name,
+            :human_confirmed,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (evidence_id) DO UPDATE SET
+            source_url = EXCLUDED.source_url,
+            source_title = EXCLUDED.source_title,
+            summary = EXCLUDED.summary,
+            confidence = EXCLUDED.confidence,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_ENTITY_SQL = """
+        INSERT INTO limra_entities (
+            entity_id,
+            task_id,
+            entity_type,
+            display_name,
+            canonical_name,
+            country_code,
+            confidence,
+            metadata
+        )
+        VALUES (
+            :entity_id,
+            :task_id,
+            :entity_type,
+            :display_name,
+            :canonical_name,
+            :country_code,
+            :confidence,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (entity_id) DO UPDATE SET
+            entity_type = EXCLUDED.entity_type,
+            display_name = EXCLUDED.display_name,
+            canonical_name = EXCLUDED.canonical_name,
+            country_code = EXCLUDED.country_code,
+            confidence = EXCLUDED.confidence,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_RELATION_SQL = """
+        INSERT INTO limra_entity_relations (
+            relation_id,
+            task_id,
+            source_entity_id,
+            target_entity_id,
+            relation_type,
+            evidence_refs,
+            confidence,
+            metadata
+        )
+        VALUES (
+            :relation_id,
+            :task_id,
+            :source_entity_id,
+            :target_entity_id,
+            :relation_type,
+            :evidence_refs,
+            :confidence,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (relation_id) DO UPDATE SET
+            source_entity_id = EXCLUDED.source_entity_id,
+            target_entity_id = EXCLUDED.target_entity_id,
+            relation_type = EXCLUDED.relation_type,
+            evidence_refs = EXCLUDED.evidence_refs,
+            confidence = EXCLUDED.confidence,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_TIMELINE_SQL = """
+        INSERT INTO limra_timeline_events (
+            timeline_event_id,
+            task_id,
+            event_title,
+            event_type,
+            location_name,
+            risk_level,
+            confidence,
+            evidence_refs,
+            metadata
+        )
+        VALUES (
+            :timeline_event_id,
+            :task_id,
+            :event_title,
+            :event_type,
+            :location_name,
+            :risk_level,
+            :confidence,
+            :evidence_refs,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (timeline_event_id) DO UPDATE SET
+            event_title = EXCLUDED.event_title,
+            event_type = EXCLUDED.event_type,
+            location_name = EXCLUDED.location_name,
+            risk_level = EXCLUDED.risk_level,
+            confidence = EXCLUDED.confidence,
+            evidence_refs = EXCLUDED.evidence_refs,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_REPORT_SECTION_SQL = """
+        INSERT INTO limra_generated_reports (
+            report_id,
+            task_id,
+            report_type,
+            markdown,
+            html,
+            evidence_refs,
+            creator_user_id,
+            metadata
+        )
+        VALUES (
+            :report_id,
+            :task_id,
+            'section',
+            :markdown,
+            :html,
+            :evidence_refs,
+            :creator_user_id,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (report_id) DO UPDATE SET
+            markdown = EXCLUDED.markdown,
+            html = EXCLUDED.html,
+            evidence_refs = EXCLUDED.evidence_refs,
+            creator_user_id = EXCLUDED.creator_user_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = now()
+    """
+
+    def __init__(self, database_url: str, *, engine_factory: Any | None = None) -> None:
+        if not _is_postgres_database_url(database_url):
+            raise RuntimeError("limra_postgres_database_url_required")
+        self.database_url = database_url
+        self._engine_factory = engine_factory
+        self._engine: Any | None = None
+
+    @classmethod
+    def sql_contract(cls) -> str:
+        return "\n".join(
+            value
+            for name, value in cls.__dict__.items()
+            if name.endswith("_SQL") and isinstance(value, str)
+        )
+
+    @property
+    def engine(self) -> Any:
+        if self._engine is None:
+            if self._engine_factory is not None:
+                self._engine = self._engine_factory(self.database_url)
+            else:
+                from sqlalchemy import create_engine
+
+                self._engine = create_engine(self.database_url, pool_pre_ping=True)
+        return self._engine
+
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        owner_user_id: str,
+        query: str,
+        scenario: str | None,
+        runner_task_id: str | None,
+    ) -> LimraTask:
+        row = self._fetch_one(
+            self.INSERT_TASK_SQL,
+            {
+                "task_id": task_id,
+                "owner_user_id": owner_user_id,
+                "query": query,
+                "runner_task_id": runner_task_id,
+                "scenario": scenario,
+                "model_summary": _json_dumps({}),
+                "metadata": _json_dumps({"repository": "postgres"}),
+            },
+        )
+        if not row:
+            raise RuntimeError("limra_task_insert_failed")
+        return _task_from_row(row)
+
+    def get_task(self, task_id: str) -> LimraTask | None:
+        row = self._fetch_one(self.SELECT_TASK_SQL, {"task_id": task_id})
+        return _task_from_row(row) if row else None
+
+    def get_user_task(self, task_id: str, owner_user_id: str) -> LimraTask | None:
+        row = self._fetch_one(
+            self.SELECT_USER_TASK_SQL,
+            {"task_id": task_id, "owner_user_id": owner_user_id},
+        )
+        return _task_from_row(row) if row else None
+
+    def update_task(self, task_id: str, **updates: Any) -> LimraTask:
+        allowed = {
+            "status",
+            "archive_status",
+            "runner_task_id",
+            "archive_object_key",
+            "archive_zip_sha256",
+            "scenario",
+            "error",
+            "model_summary",
+        }
+        values = {key: value for key, value in updates.items() if key in allowed}
+        if not values:
+            task = self.get_task(task_id)
+            if not task:
+                raise KeyError(task_id)
+            return task
+
+        assignments: list[str] = []
+        params: dict[str, Any] = {"task_id": task_id}
+        for key, value in values.items():
+            if key == "model_summary":
+                assignments.append(f"{key} = CAST(:{key} AS jsonb)")
+                params[key] = _json_dumps(value or {})
+            else:
+                assignments.append(f"{key} = :{key}")
+                params[key] = value
+
+        status = values.get("status")
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, now())")
+        elif status in FINAL_TASK_STATUSES:
+            assignments.append("completed_at = COALESCE(completed_at, now())")
+
+        sql = f"""
+            UPDATE limra_research_tasks
+            SET {", ".join(assignments)}
+            WHERE task_id = :task_id
+            RETURNING {self.TASK_COLUMNS}
+        """
+        row = self._fetch_one(sql, params)
+        if not row:
+            raise KeyError(task_id)
+        return _task_from_row(row)
+
+    def record_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+    ) -> None:
+        artifact_id = _artifact_primary_id(artifact_type, artifact)
+        bucket = ARTIFACT_BUCKETS[artifact_type]
+        event_params = {
+            "artifact_id": artifact_id,
+            "task_id": task_id,
+            "artifact_type": artifact_type,
+            "bucket": bucket,
+            "payload": _json_dumps(artifact),
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "notes": _optional_string(artifact.get("notes")),
+            "source_event_type": _optional_string(artifact.get("source_event_type")),
+        }
+        self._execute(self.INSERT_ARTIFACT_EVENT_SQL, event_params)
+        try:
+            self._record_typed_artifact(task_id, artifact_type, artifact, artifact_id)
+        except Exception:
+            log.exception("Failed to persist typed limra artifact %s", artifact_id)
+
+    def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
+        artifacts = _empty_artifact_buckets()
+        rows = self._fetch_all(self.SELECT_ARTIFACT_EVENTS_SQL, {"task_id": task_id})
+        for row in rows:
+            artifact_type = row.get("artifact_type")
+            if artifact_type not in ARTIFACT_BUCKETS:
+                continue
+            payload = _json_loads(row.get("payload"))
+            if isinstance(payload, dict):
+                artifacts[ARTIFACT_BUCKETS[artifact_type]].append(payload)
+        return artifacts
+
+    def _record_typed_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+        artifact_id: str,
+    ) -> None:
+        if artifact_type == "evidence":
+            self._execute(self.INSERT_EVIDENCE_SQL, self._evidence_params(task_id, artifact))
+        elif artifact_type == "entity":
+            self._execute(self.INSERT_ENTITY_SQL, self._entity_params(task_id, artifact))
+        elif artifact_type == "relation":
+            self._execute(self.INSERT_RELATION_SQL, self._relation_params(task_id, artifact))
+        elif artifact_type in {"timeline_event", "map_feature"}:
+            self._execute(
+                self.INSERT_TIMELINE_SQL,
+                self._timeline_params(task_id, artifact_type, artifact, artifact_id),
+            )
+        elif artifact_type == "report_section":
+            self._execute(
+                self.INSERT_REPORT_SECTION_SQL,
+                self._report_section_params(task_id, artifact),
+            )
+
+    def _evidence_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evidence_id": str(artifact["evidence_id"]),
+            "task_id": task_id,
+            "source_url": artifact.get("source_url") or artifact.get("url"),
+            "source_title": artifact.get("source_title") or artifact.get("title"),
+            "publisher": artifact.get("publisher"),
+            "original_text": artifact.get("original_text") or artifact.get("text"),
+            "translated_text": artifact.get("translated_text"),
+            "summary": artifact.get("summary"),
+            "language": artifact.get("language"),
+            "credibility": _optional_float(artifact.get("credibility")),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "cross_verification": _json_dumps(artifact.get("cross_verification") or {}),
+            "conflict_notes": artifact.get("conflict_notes"),
+            "tool_name": artifact.get("tool_name"),
+            "model_name": artifact.get("model_name"),
+            "human_confirmed": bool(artifact.get("human_confirmed", False)),
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _entity_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        entity_type = str(artifact.get("entity_type") or artifact.get("type") or "event")
+        if entity_type not in _allowed_entity_types():
+            entity_type = "event"
+        display_name = (
+            artifact.get("display_name")
+            or artifact.get("name")
+            or artifact.get("title")
+            or artifact["entity_id"]
+        )
+        return {
+            "entity_id": str(artifact["entity_id"]),
+            "task_id": task_id,
+            "entity_type": entity_type,
+            "display_name": str(display_name),
+            "canonical_name": artifact.get("canonical_name"),
+            "country_code": artifact.get("country_code"),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _relation_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        relation_type = str(artifact.get("relation_type") or artifact.get("type") or "mentions")
+        if relation_type not in _allowed_relation_types():
+            relation_type = "mentions"
+        return {
+            "relation_id": str(artifact["relation_id"]),
+            "task_id": task_id,
+            "source_entity_id": artifact.get("source_entity_id"),
+            "target_entity_id": artifact.get("target_entity_id"),
+            "relation_type": relation_type,
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _timeline_params(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+        artifact_id: str,
+    ) -> dict[str, Any]:
+        risk_level = str(artifact.get("risk_level") or "unknown")
+        if risk_level not in {"unknown", "low", "medium", "high", "critical"}:
+            risk_level = "unknown"
+        return {
+            "timeline_event_id": artifact_id,
+            "task_id": task_id,
+            "event_title": str(
+                artifact.get("event_title")
+                or artifact.get("title")
+                or artifact.get("name")
+                or artifact_id
+            ),
+            "event_type": artifact.get("event_type") or artifact_type,
+            "location_name": artifact.get("location_name") or artifact.get("location"),
+            "risk_level": risk_level,
+            "confidence": _optional_float(artifact.get("confidence")),
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "metadata": _json_dumps({**artifact, "artifact_type": artifact_type}),
+        }
+
+    def _report_section_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        owner = self._task_owner_user_id(task_id) or "limra"
+        return {
+            "report_id": str(artifact["section_id"]),
+            "task_id": task_id,
+            "markdown": artifact.get("markdown") or artifact.get("content") or "",
+            "html": artifact.get("html"),
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "creator_user_id": owner,
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _task_owner_user_id(self, task_id: str) -> str | None:
+        row = self._fetch_one(
+            "SELECT owner_user_id FROM limra_research_tasks WHERE task_id = :task_id",
+            {"task_id": task_id},
+        )
+        return str(row["owner_user_id"]) if row and row.get("owner_user_id") else None
+
+    def _fetch_one(self, sql: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        with self.engine.begin() as connection:
+            row = connection.execute(_sql_text(sql), params).mappings().first()
+        return dict(row) if row else None
+
+    def _fetch_all(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        with self.engine.begin() as connection:
+            rows = connection.execute(_sql_text(sql), params).mappings().all()
+        return [dict(row) for row in rows]
+
+    def _execute(self, sql: str, params: dict[str, Any]) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(_sql_text(sql), params)
+
+
+def create_limra_task_repository_from_env(env: Any = os.environ) -> LimraTaskRepository:
+    backend = str(env.get(LIMRA_REPOSITORY_BACKEND_ENV, "postgres")).strip().lower()
+    if backend in {"postgres", "postgresql"}:
+        database_url = str(env.get(LIMRA_DATABASE_URL_ENV) or env.get("DATABASE_URL") or "")
+        if not database_url:
+            raise RuntimeError("limra_postgres_database_url_missing")
+        return PostgresLimraTaskRepository(database_url)
+
+    if backend in {"memory", "in-memory", "in_memory"}:
+        if str(env.get(LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV, "")).strip().lower() not in TRUTHY_ENV_VALUES:
+            raise RuntimeError("limra_in_memory_repository_requires_explicit_fallback")
+        return InMemoryLimraTaskRepository()
+
+    raise RuntimeError(f"unsupported_limra_repository_backend:{backend}")
 
 
 class RunnerResearchClient:
@@ -369,7 +942,7 @@ async def get_current_limra_admin(user=Depends(_open_webui_admin_dependency())) 
 def get_task_repository(request: Request) -> LimraTaskRepository:
     repo = getattr(request.app.state, "limra_task_repository", None)
     if repo is None:
-        repo = InMemoryLimraTaskRepository()
+        repo = create_limra_task_repository_from_env()
         request.app.state.limra_task_repository = repo
     return repo
 
@@ -402,21 +975,42 @@ async def create_research_task(
         raise HTTPException(status_code=400, detail="user_id_not_allowed")
     request_data = ResearchRequest.model_validate(form_data)
     query = request_data.query.strip()
-    runner_payload = await research_client.create_research_task(
-        query=query,
-        scenario=request_data.scenario,
-        user=user,
-    )
-    runner_task_id = _runner_task_id_from_payload(runner_payload)
     task_id = str(uuid.uuid4())
     task = repo.create_task(
         task_id=task_id,
         owner_user_id=user.id,
         query=query,
         scenario=request_data.scenario,
-        runner_task_id=runner_task_id,
+        runner_task_id=None,
     )
-    repo.update_task(task.task_id, status=str(runner_payload.get("status") or "queued"))
+    try:
+        runner_payload = await research_client.create_research_task(
+            query=query,
+            scenario=request_data.scenario,
+            user=user,
+        )
+        runner_task_id = _runner_task_id_from_payload(runner_payload)
+        task = repo.update_task(
+            task.task_id,
+            runner_task_id=runner_task_id,
+            status=str(runner_payload.get("status") or "queued"),
+        )
+    except HTTPException as exc:
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error=str(exc.detail),
+        )
+        raise
+    except Exception as exc:
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error="runner_research_start_failed",
+        )
+        raise HTTPException(status_code=502, detail="runner_research_start_failed") from exc
     return _assert_browser_safe(
         {
             "task_id": task.task_id,
@@ -940,6 +1534,121 @@ def _empty_artifact_buckets() -> dict[str, list[dict[str, Any]]]:
         "map_features": [],
         "verifications": [],
         "report_sections": [],
+    }
+
+
+def _task_from_row(row: dict[str, Any]) -> LimraTask:
+    return LimraTask(
+        task_id=str(row["task_id"]),
+        owner_user_id=str(row["owner_user_id"]),
+        query=str(row["query"]),
+        status=str(row.get("status") or "queued"),
+        archive_status=str(row.get("archive_status") or "pending"),
+        runner_task_id=_optional_string(row.get("runner_task_id")),
+        archive_object_key=_optional_string(row.get("archive_object_key")),
+        archive_zip_sha256=_optional_string(row.get("archive_zip_sha256")),
+        scenario=_optional_string(row.get("scenario")),
+        error=_optional_string(row.get("error")),
+        model_summary=_json_loads(row.get("model_summary")) or {},
+    )
+
+
+def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
+    key_by_type = {
+        "evidence": "evidence_id",
+        "entity": "entity_id",
+        "relation": "relation_id",
+        "timeline_event": "event_id",
+        "map_feature": "feature_id",
+        "verification": "verification_id",
+        "report_section": "section_id",
+    }
+    key = key_by_type.get(artifact_type)
+    value = artifact.get(key) if key else None
+    if value:
+        return str(value)
+    return f"{artifact_type}-{uuid.uuid4()}"
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
+def _json_loads(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _list_of_strings(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item is not None]
+    return [str(value)]
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _sql_text(sql: str) -> Any:
+    from sqlalchemy import text
+
+    return text(sql)
+
+
+def _is_postgres_database_url(database_url: str) -> bool:
+    return database_url.startswith(("postgresql://", "postgresql+", "postgres://"))
+
+
+def _allowed_entity_types() -> set[str]:
+    return {
+        "country",
+        "agency",
+        "company",
+        "person",
+        "policy",
+        "bill",
+        "sanction_target",
+        "technology",
+        "project",
+        "location",
+        "event",
+    }
+
+
+def _allowed_relation_types() -> set[str]:
+    return {
+        "sanctions",
+        "regulates",
+        "affects_industry",
+        "owns",
+        "partners_with",
+        "located_in",
+        "supply_chain_dependency",
+        "mentions",
+        "conflicts_with",
     }
 
 

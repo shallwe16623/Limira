@@ -30,6 +30,42 @@ CREATE INDEX IF NOT EXISTS idx_limra_research_tasks_owner_created
 CREATE INDEX IF NOT EXISTS idx_limra_research_tasks_status_created
     ON limra_research_tasks (status, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS limra_artifact_events (
+    artifact_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
+    artifact_type TEXT NOT NULL CHECK (
+        artifact_type IN (
+            'evidence',
+            'entity',
+            'relation',
+            'timeline_event',
+            'map_feature',
+            'verification',
+            'report_section'
+        )
+    ),
+    bucket TEXT NOT NULL CHECK (
+        bucket IN (
+            'evidence',
+            'entities',
+            'relations',
+            'timeline_events',
+            'map_features',
+            'verifications',
+            'report_sections'
+        )
+    ),
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evidence_refs TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    confidence NUMERIC(4, 3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
+    notes TEXT,
+    source_event_type TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_limra_artifact_events_task_type_created
+    ON limra_artifact_events (task_id, artifact_type, created_at);
+
 CREATE TABLE IF NOT EXISTS limra_evidence_items (
     evidence_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,

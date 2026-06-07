@@ -116,6 +116,36 @@ async def test_create_research_uses_limra_namespace_and_rejects_body_user_id():
 
 
 @pytest.mark.asyncio
+async def test_create_research_records_failed_web_task_when_runner_start_fails():
+    repo = limra.InMemoryLimraTaskRepository()
+    research = FakeResearchClient()
+    user = limra.LimraUser("user-a")
+
+    async def fail_create_research_task(*_args, **_kwargs):
+        raise HTTPException(status_code=503, detail="runner_unavailable")
+
+    research.create_research_task = fail_create_research_task
+
+    with pytest.raises(HTTPException) as failed:
+        await limra.create_research_task(
+            {"query": "runner fails after web task is allocated"},
+            request=None,
+            user=user,
+            repo=repo,
+            research_client=research,
+        )
+
+    assert failed.value.status_code == 503
+    assert len(repo.tasks) == 1
+    task = next(iter(repo.tasks.values()))
+    assert task.owner_user_id == "user-a"
+    assert task.status == "failed"
+    assert task.archive_status == "failed"
+    assert task.error == "runner_unavailable"
+    assert task.runner_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_user_isolation_for_task_status_and_archive_download():
     repo = limra.InMemoryLimraTaskRepository()
     archive = FakeArchiveClient()
@@ -246,6 +276,61 @@ def test_runner_service_headers_are_server_side_only():
         "X-OpenWebUI-User-Role": "admin",
         "X-MiroThinker-Service-Token": "server-only-token",
     }
+
+
+def test_limra_repository_factory_requires_explicit_memory_fallback(monkeypatch):
+    monkeypatch.delenv("LIMRA_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("LIMRA_REPOSITORY_BACKEND", "postgres")
+
+    with pytest.raises(RuntimeError, match="limra_postgres_database_url_missing"):
+        limra.create_limra_task_repository_from_env()
+
+    monkeypatch.setenv("LIMRA_DATABASE_URL", "postgresql://limra:test@postgres:5432/limra")
+    repo = limra.create_limra_task_repository_from_env()
+    assert isinstance(repo, limra.PostgresLimraTaskRepository)
+    assert repo.database_url == "postgresql://limra:test@postgres:5432/limra"
+    assert repo._engine is None
+
+    monkeypatch.setenv("LIMRA_REPOSITORY_BACKEND", "memory")
+    monkeypatch.delenv("LIMRA_ALLOW_IN_MEMORY_REPOSITORY", raising=False)
+    with pytest.raises(RuntimeError, match="limra_in_memory_repository_requires_explicit_fallback"):
+        limra.create_limra_task_repository_from_env()
+
+    monkeypatch.setenv("LIMRA_ALLOW_IN_MEMORY_REPOSITORY", "true")
+    repo = limra.create_limra_task_repository_from_env()
+    assert isinstance(repo, limra.InMemoryLimraTaskRepository)
+
+
+def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
+    sql = limra.PostgresLimraTaskRepository.sql_contract().lower()
+
+    for table in (
+        "limra_research_tasks",
+        "limra_artifact_events",
+        "limra_evidence_items",
+        "limra_entities",
+        "limra_entity_relations",
+        "limra_timeline_events",
+        "limra_generated_reports",
+    ):
+        assert table in sql
+
+    for artifact_type in (
+        "evidence",
+        "entity",
+        "relation",
+        "timeline_event",
+        "map_feature",
+        "verification",
+        "report_section",
+    ):
+        assert artifact_type in limra.ARTIFACT_BUCKETS
+
+    assert "select artifact_type, payload" in sql
+    assert "on conflict" in sql
+    assert "archive_object_key" in sql
+    assert "archive_zip_sha256" in sql
 
 
 @pytest.mark.asyncio

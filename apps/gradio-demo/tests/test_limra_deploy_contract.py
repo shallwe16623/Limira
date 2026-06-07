@@ -67,6 +67,9 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert "${RUNNER_SERVICE_TOKEN" in web["environment"][
         "LIMRA_RUNNER_SERVICE_TOKEN"
     ]
+    assert web["environment"]["LIMRA_REPOSITORY_BACKEND"] == "postgres"
+    assert web["environment"]["LIMRA_DATABASE_URL"].startswith("postgresql://")
+    assert "LIMRA_ALLOW_IN_MEMORY_REPOSITORY" not in web["environment"]
 
 
 def test_limra_env_example_has_required_placeholders_without_real_secrets():
@@ -83,6 +86,9 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         "POSTGRES_DB",
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
+        "LIMRA_REPOSITORY_BACKEND",
+        "LIMRA_DATABASE_URL",
+        "LIMRA_ALLOW_IN_MEMORY_REPOSITORY",
         "DATABASE_URL",
         "REDIS_URL",
         "MINIO_ROOT_USER",
@@ -108,6 +114,9 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert env["REDIS_PORT"] == "6380"
     assert env["MINIO_API_PORT"] == "9002"
     assert env["MINIO_CONSOLE_PORT"] == "9003"
+    assert env["LIMRA_REPOSITORY_BACKEND"] == "postgres"
+    assert env["LIMRA_DATABASE_URL"].startswith("postgresql://")
+    assert env["LIMRA_ALLOW_IN_MEMORY_REPOSITORY"] == "false"
 
     secret_keys = [
         key
@@ -149,6 +158,7 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
 
     required_tables = {
         "limra_research_tasks",
+        "limra_artifact_events",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
