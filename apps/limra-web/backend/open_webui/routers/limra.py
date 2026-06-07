@@ -169,11 +169,33 @@ class RunnerResearchClientProtocol(Protocol):
 
 
 class LimraRuntimeState(Protocol):
+    async def get_task_runtime(
+        self,
+        task_id: str,
+    ) -> dict[str, Any]: ...
+
+    async def try_open_stream(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool: ...
+
     async def update_task_runtime(
         self,
         task_id: str,
         fields: dict[str, Any],
     ) -> None: ...
+
+    async def close_stream(
+        self,
+        task_id: str,
+        *,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool: ...
 
 
 class InMemoryLimraTaskRepository:
@@ -238,6 +260,33 @@ class InMemoryLimraRuntimeState:
     def __init__(self) -> None:
         self.task_runtime: dict[str, dict[str, Any]] = {}
 
+    async def get_task_runtime(
+        self,
+        task_id: str,
+    ) -> dict[str, Any]:
+        return dict(self.task_runtime.get(task_id, {}))
+
+    async def try_open_stream(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        task_state = self.task_runtime.setdefault(task_id, {})
+        if task_state.get("stream_state") == "open":
+            return False
+        task_state.update(
+            {
+                **fields,
+                "owner_user_id": owner_user_id,
+                "stream_id": stream_id,
+                "stream_state": "open",
+            }
+        )
+        return True
+
     async def update_task_runtime(
         self,
         task_id: str,
@@ -246,8 +295,48 @@ class InMemoryLimraRuntimeState:
         task_state = self.task_runtime.setdefault(task_id, {})
         task_state.update(fields)
 
+    async def close_stream(
+        self,
+        task_id: str,
+        *,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        task_state = self.task_runtime.setdefault(task_id, {})
+        if task_state.get("stream_id") not in {None, stream_id}:
+            return False
+        task_state.update(fields)
+        task_state["stream_state"] = "closed"
+        return True
+
 
 class RedisLimraRuntimeState:
+    TRY_OPEN_STREAM_SCRIPT = """
+    -- limra_try_open_stream
+    local stream_state = redis.call("HGET", KEYS[1], "stream_state")
+    if stream_state == '"open"' then
+        return 0
+    end
+    for index = 2, #ARGV, 2 do
+        redis.call("HSET", KEYS[1], ARGV[index], ARGV[index + 1])
+    end
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+    return 1
+    """
+
+    CLOSE_STREAM_SCRIPT = """
+    -- limra_close_stream
+    local current_stream_id = redis.call("HGET", KEYS[1], "stream_id")
+    if current_stream_id and current_stream_id ~= ARGV[2] then
+        return 0
+    end
+    for index = 3, #ARGV, 2 do
+        redis.call("HSET", KEYS[1], ARGV[index], ARGV[index + 1])
+    end
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+    return 1
+    """
+
     def __init__(
         self,
         redis_client: Any,
@@ -261,21 +350,74 @@ class RedisLimraRuntimeState:
         self.key_prefix = key_prefix.rstrip(":")
         self.ttl_seconds = ttl_seconds
 
+    async def get_task_runtime(
+        self,
+        task_id: str,
+    ) -> dict[str, Any]:
+        key = self.task_key(task_id)
+        raw_state = await _maybe_await(self.redis_client.hgetall(key))
+        return _runtime_hash_from_redis(raw_state)
+
+    async def try_open_stream(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        key = self.task_key(task_id)
+        mapping = _runtime_mapping(
+            {
+                **fields,
+                "owner_user_id": owner_user_id,
+                "stream_id": stream_id,
+                "stream_state": "open",
+            }
+        )
+        result = await _maybe_await(
+            self.redis_client.eval(
+                self.TRY_OPEN_STREAM_SCRIPT,
+                1,
+                key,
+                self.ttl_seconds,
+                *_flatten_runtime_mapping(mapping),
+            )
+        )
+        return bool(result)
+
     async def update_task_runtime(
         self,
         task_id: str,
         fields: dict[str, Any],
     ) -> None:
         key = self.task_key(task_id)
-        mapping = {
-            field: json.dumps(value, ensure_ascii=False)
-            for field, value in fields.items()
-            if value is not None
-        }
+        mapping = _runtime_mapping(fields)
         if not mapping:
             return
         await _maybe_await(self.redis_client.hset(key, mapping=mapping))
         await _maybe_await(self.redis_client.expire(key, self.ttl_seconds))
+
+    async def close_stream(
+        self,
+        task_id: str,
+        *,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        key = self.task_key(task_id)
+        mapping = _runtime_mapping({"stream_state": "closed", **fields})
+        result = await _maybe_await(
+            self.redis_client.eval(
+                self.CLOSE_STREAM_SCRIPT,
+                1,
+                key,
+                self.ttl_seconds,
+                json.dumps(stream_id, ensure_ascii=False),
+                *_flatten_runtime_mapping(mapping),
+            )
+        )
+        return bool(result)
 
     def task_key(self, task_id: str) -> str:
         return f"{self.key_prefix}:task:{task_id}"
@@ -1339,6 +1481,25 @@ async def _limra_event_stream(
         yield _sse_bytes(_assert_browser_safe(terminal_event))
         return
 
+    stream_id = str(uuid.uuid4())
+    opened = await runtime_state.try_open_stream(
+        task.task_id,
+        owner_user_id=user.id,
+        stream_id=stream_id,
+        fields={
+            "status": "running",
+            "archive_status": current.archive_status,
+        },
+    )
+    if not opened:
+        runtime_snapshot = await runtime_state.get_task_runtime(task.task_id)
+        yield _sse_bytes(
+            _assert_browser_safe(
+                _active_stream_status_event(current, runtime_snapshot)
+            )
+        )
+        return
+
     current = repo.update_task(task.task_id, status="running")
     await runtime_state.update_task_runtime(
         task.task_id,
@@ -1346,6 +1507,7 @@ async def _limra_event_stream(
             "owner_user_id": user.id,
             "status": current.status,
             "archive_status": current.archive_status,
+            "stream_id": stream_id,
             "stream_state": "open",
         },
     )
@@ -1359,6 +1521,11 @@ async def _limra_event_stream(
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
             await _record_runtime_event(runtime_state, task.task_id, event)
+            if applied_status in FINAL_TASK_STATUSES:
+                await runtime_state.update_task_runtime(
+                    task.task_id,
+                    {"terminal": True},
+                )
 
             yield _sse_bytes(_assert_browser_safe(event))
             if warning:
@@ -1410,6 +1577,7 @@ async def _limra_event_stream(
             {
                 "status": "cancelled",
                 "archive_status": "failed",
+                "terminal": True,
                 "error": "event_stream_cancelled",
             },
         )
@@ -1461,6 +1629,7 @@ async def _limra_event_stream(
             runtime_state,
             task.task_id,
             stream_close_reason,
+            stream_id=stream_id,
         )
 
 
@@ -1549,6 +1718,28 @@ def _terminal_status_event(task: LimraTask, *, reason: str | None = None) -> dic
     }
 
 
+def _active_stream_status_event(
+    task: LimraTask,
+    runtime_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    status = runtime_snapshot.get("status") or task.status
+    archive_status = runtime_snapshot.get("archive_status") or task.archive_status
+    payload: dict[str, Any] = {
+        "status": status,
+        "archive_status": archive_status,
+        "stream_state": runtime_snapshot.get("stream_state") or "open",
+        "status_source": "limra_runtime_state",
+        "reason": "stream_already_open",
+    }
+    if runtime_snapshot.get("terminal") is not None:
+        payload["terminal"] = bool(runtime_snapshot["terminal"])
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
+
+
 async def _record_runtime_event(
     runtime_state: LimraRuntimeState,
     task_id: str,
@@ -1574,10 +1765,16 @@ async def _record_runtime_event(
             fields["archive_status"] = str(archive_status)
         if payload.get("terminal") is not None:
             fields["terminal"] = bool(payload.get("terminal"))
+        if status in FINAL_TASK_STATUSES:
+            fields["terminal"] = True
         if payload.get("warning"):
             fields["last_warning"] = str(payload["warning"])
         if payload.get("error"):
             fields["error"] = str(payload["error"])
+    elif event_type == "error":
+        fields["status"] = "failed"
+        fields["archive_status"] = "failed"
+        fields["terminal"] = True
     await runtime_state.update_task_runtime(task_id, fields)
 
 
@@ -1585,14 +1782,16 @@ async def _mark_runtime_stream_closed(
     runtime_state: LimraRuntimeState,
     task_id: str,
     reason: str,
+    *,
+    stream_id: str | None = None,
 ) -> None:
-    await runtime_state.update_task_runtime(
-        task_id,
-        {
-            "stream_state": "closed",
-            "stream_close_reason": reason,
-        },
-    )
+    fields = {
+        "stream_close_reason": reason,
+    }
+    if stream_id is not None:
+        await runtime_state.close_stream(task_id, stream_id=stream_id, fields=fields)
+        return
+    await runtime_state.update_task_runtime(task_id, {"stream_state": "closed", **fields})
 
 
 def _stream_close_reason_from_event(event: dict[str, Any], default: str) -> str:
@@ -1855,6 +2054,37 @@ def _json_loads(value: Any) -> Any:
         except json.JSONDecodeError:
             return value
     return value
+
+
+def _runtime_mapping(fields: dict[str, Any]) -> dict[str, str]:
+    return {
+        field: json.dumps(value, ensure_ascii=False)
+        for field, value in fields.items()
+        if value is not None
+    }
+
+
+def _flatten_runtime_mapping(mapping: dict[str, str]) -> list[str]:
+    flattened: list[str] = []
+    for field, value in mapping.items():
+        flattened.extend([field, value])
+    return flattened
+
+
+def _runtime_hash_from_redis(raw_state: Any) -> dict[str, Any]:
+    if not raw_state:
+        return {}
+    items = raw_state.items() if hasattr(raw_state, "items") else []
+    return {
+        _decode_redis_text(field): _json_loads(_decode_redis_text(value))
+        for field, value in items
+    }
+
+
+def _decode_redis_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
 
 
 async def _maybe_await(value: Any) -> Any:
