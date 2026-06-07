@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 
@@ -14,10 +15,37 @@ STATIC_MANIFEST = LIMRA_WEB_ROOT / "static" / "static" / "site.webmanifest"
 OPENSEARCH = LIMRA_WEB_ROOT / "static" / "opensearch.xml"
 PACKAGE_JSON = LIMRA_WEB_ROOT / "package.json"
 PACKAGE_LOCK = LIMRA_WEB_ROOT / "package-lock.json"
+USER_VISIBLE_BRAND_SCAN_PATHS = [
+    LIMRA_WEB_ROOT / "src" / "routes",
+    SIDEBAR,
+    APP_HTML,
+    LIMRA_WEB_ROOT / "backend" / "open_webui" / "constants.py",
+    LIMRA_WEB_ROOT / "backend" / "open_webui" / "routers" / "audio.py",
+    LIMRA_WEB_ROOT / "backend" / "open_webui" / "routers" / "openai.py",
+    MANIFEST,
+    STATIC_MANIFEST,
+    OPENSEARCH,
+]
+TEXT_SUFFIXES = {".html", ".json", ".py", ".svelte", ".ts", ".xml"}
+VISIBLE_WEBUI_PATTERN = re.compile(r"(?<![A-Z_])\bWebUI\b(?![_A-Z])")
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _brand_scan_files():
+    files = []
+    for path in USER_VISIBLE_BRAND_SCAN_PATHS:
+        if path.is_dir():
+            files.extend(
+                candidate
+                for candidate in path.rglob("*")
+                if candidate.is_file() and candidate.suffix in TEXT_SUFFIXES
+            )
+        elif path.suffix in TEXT_SUFFIXES:
+            files.append(path)
+    return sorted(set(files))
 
 
 def test_limra_research_page_exists_inside_authenticated_app_shell():
@@ -114,6 +142,16 @@ def test_reviewed_user_visible_brand_surfaces_use_limra():
         assert "limra (Open WebUI)" not in source
     for served_asset in [manifest_text, static_manifest_text, opensearch]:
         assert "WebUI" not in served_asset
+
+
+def test_user_visible_runtime_brand_sources_do_not_expose_open_webui():
+    violations = []
+    for path in _brand_scan_files():
+        source = _read(path)
+        if "Open WebUI" in source or "Open-WebUI" in source or VISIBLE_WEBUI_PATTERN.search(source):
+            violations.append(str(path.relative_to(REPO_ROOT)))
+
+    assert violations == []
 
 
 def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():
