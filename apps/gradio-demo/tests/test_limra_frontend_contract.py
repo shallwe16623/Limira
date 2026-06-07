@@ -5,6 +5,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
+SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
+APP_HTML = LIMRA_WEB_ROOT / "src" / "app.html"
+LAYOUT = LIMRA_WEB_ROOT / "src" / "routes" / "+layout.svelte"
+MANIFEST = LIMRA_WEB_ROOT / "backend" / "open_webui" / "static" / "site.webmanifest"
 PACKAGE_JSON = LIMRA_WEB_ROOT / "package.json"
 PACKAGE_LOCK = LIMRA_WEB_ROOT / "package-lock.json"
 
@@ -56,6 +60,34 @@ def test_limra_artifact_drawer_tabs_and_reference_controls_are_present():
     assert "scrollToEvidence" in page
     assert "[{evidenceId(item, index)}]" in page
     assert "[{String(ref)}]" in page
+
+
+def test_limra_sidebar_navigation_is_first_class_authenticated_entry():
+    sidebar = _read(SIDEBAR)
+
+    assert "const DEFAULT_PINNED_ITEMS = ['limra', 'notes', 'workspace'];" in sidebar
+    assert "ensureLimraPinned($settings?.pinnedMenuItems ?? DEFAULT_PINNED_ITEMS)" in sidebar
+    assert "const ensureLimraPinned = (items) => (items.includes('limra') ? items : ['limra', ...items]);" in sidebar
+    assert "case 'limra':" in sidebar
+    assert "limra: { label: 'limra', href: '/limra', iconType: 'limra' }" in sidebar
+    assert 'id="sidebar-{itemId}-button"' in sidebar
+    assert "href={meta.href}" in sidebar
+    assert "goto(meta.href);" in sidebar
+
+
+def test_reviewed_user_visible_brand_surfaces_use_limra():
+    app_html = _read(APP_HTML)
+    layout = _read(LAYOUT)
+    manifest_text = _read(MANIFEST)
+    manifest = json.loads(manifest_text)
+
+    assert "<title>limra</title>" in app_html
+    assert manifest["name"] == "limra"
+    assert manifest["short_name"] == "limra"
+    assert " • limra" in layout
+
+    for source in [app_html, layout, manifest_text, _read(SIDEBAR)]:
+        assert "Open WebUI" not in source
 
 
 def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():
