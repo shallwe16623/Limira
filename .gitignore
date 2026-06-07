@@ -15,6 +15,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!apps/limra-web/src/lib/
+!apps/limra-web/src/lib/**
 lib64/
 parts/
 sdist/

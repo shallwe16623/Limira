@@ -254,7 +254,7 @@ if FROM_INIT_PY:
 if os.path.exists(f'{DATA_DIR}/ollama.db'):
     # Rename the file
     os.rename(f'{DATA_DIR}/ollama.db', f'{DATA_DIR}/webui.db')
-    log.info('Database migrated from Ollama-WebUI successfully.')
+    log.info('Database migrated from legacy Ollama web UI successfully.')
 else:
     pass
 
@@ -655,9 +655,9 @@ WEBUI_AUTH_TRUSTED_GROUPS_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_GROUPS_HEADER',
 WEBUI_AUTH_TRUSTED_ROLE_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_ROLE_HEADER', None)
 
 # Custom header name for API key authentication.  Defaults to 'x-api-key'.
-# Useful when Open WebUI sits behind a reverse proxy / API gateway that
+# Useful when limra sits behind a reverse proxy / API gateway that
 # already uses the Authorization header for its own authentication — set
-# this to a unique header (e.g. 'X-OpenWebUI-Key') so the middleware
+# this to a unique header (e.g. 'X-Limra-Key') so the middleware
 # checks the custom header instead and avoids the 401 short-circuit.
 CUSTOM_API_KEY_HEADER = os.getenv('CUSTOM_API_KEY_HEADER', 'x-api-key')
 
@@ -694,7 +694,7 @@ BYPASS_PYDUB_PREPROCESSING = os.getenv('BYPASS_PYDUB_PREPROCESSING', 'False').lo
 
 # When disabled (default), the OpenAI catch-all proxy endpoint (/{path:path})
 # is blocked. Enable only if you need direct passthrough to upstream OpenAI-
-# compatible APIs for endpoints not natively handled by Open WebUI.
+# compatible APIs for endpoints not natively handled by limra.
 ENABLE_OPENAI_API_PASSTHROUGH = os.getenv('ENABLE_OPENAI_API_PASSTHROUGH', 'False').lower() == 'true'
 
 WEBUI_AUTH_SIGNOUT_REDIRECT_URL = os.getenv('WEBUI_AUTH_SIGNOUT_REDIRECT_URL', None)
@@ -715,7 +715,7 @@ OAUTH_SESSION_TOKEN_ENCRYPTION_KEY = os.getenv('OAUTH_SESSION_TOKEN_ENCRYPTION_K
 OAUTH_MAX_SESSIONS_PER_USER = int(os.getenv('OAUTH_MAX_SESSIONS_PER_USER', '10'))
 
 # Token Exchange Configuration
-# Allows external apps to exchange OAuth tokens for OpenWebUI tokens
+# Allows external apps to exchange OAuth tokens for limra tokens
 ENABLE_OAUTH_TOKEN_EXCHANGE = os.getenv('ENABLE_OAUTH_TOKEN_EXCHANGE', 'False').lower() == 'true'
 
 # Back-Channel Logout Configuration

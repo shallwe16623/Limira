@@ -1,10 +1,12 @@
 import json
 import re
+import subprocess
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
+BACKEND_ROOT = LIMRA_WEB_ROOT / "backend" / "open_webui"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
 SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
 LIB_ROOT = LIMRA_WEB_ROOT / "src" / "lib"
@@ -15,9 +17,20 @@ LAYOUT = LIMRA_WEB_ROOT / "src" / "routes" / "+layout.svelte"
 MANIFEST = LIMRA_WEB_ROOT / "backend" / "open_webui" / "static" / "site.webmanifest"
 STATIC_MANIFEST = LIMRA_WEB_ROOT / "static" / "static" / "site.webmanifest"
 OPENSEARCH = LIMRA_WEB_ROOT / "static" / "opensearch.xml"
-BACKEND_MAIN = LIMRA_WEB_ROOT / "backend" / "open_webui" / "main.py"
-BACKEND_INIT = LIMRA_WEB_ROOT / "backend" / "open_webui" / "__init__.py"
-BACKEND_OAUTH = LIMRA_WEB_ROOT / "backend" / "open_webui" / "utils" / "oauth.py"
+BACKEND_MAIN = BACKEND_ROOT / "main.py"
+BACKEND_INIT = BACKEND_ROOT / "__init__.py"
+BACKEND_OAUTH = BACKEND_ROOT / "utils" / "oauth.py"
+BACKEND_AUTOMATIONS = BACKEND_ROOT / "utils" / "automations.py"
+BACKEND_AUTH_ROUTER = BACKEND_ROOT / "routers" / "auths.py"
+BACKEND_EXTERNAL_WEB_LOADER = BACKEND_ROOT / "retrieval" / "loaders" / "external_web.py"
+BACKEND_MISTRAL_LOADER = BACKEND_ROOT / "retrieval" / "loaders" / "mistral.py"
+BACKEND_PGVECTOR = BACKEND_ROOT / "retrieval" / "vector" / "dbs" / "pgvector.py"
+BACKEND_WEB_RETRIEVAL_FILES = [
+    BACKEND_ROOT / "retrieval" / "web" / "external.py",
+    BACKEND_ROOT / "retrieval" / "web" / "searxng.py",
+    BACKEND_ROOT / "retrieval" / "web" / "yacy.py",
+    BACKEND_ROOT / "retrieval" / "web" / "yandex.py",
+]
 PACKAGE_JSON = LIMRA_WEB_ROOT / "package.json"
 PACKAGE_LOCK = LIMRA_WEB_ROOT / "package-lock.json"
 USER_VISIBLE_BRAND_SCAN_PATHS = [
@@ -30,12 +43,27 @@ USER_VISIBLE_BRAND_SCAN_PATHS = [
     LIMRA_WEB_ROOT / "backend" / "open_webui" / "routers" / "audio.py",
     LIMRA_WEB_ROOT / "backend" / "open_webui" / "routers" / "openai.py",
     BACKEND_OAUTH,
+    BACKEND_AUTOMATIONS,
+    BACKEND_AUTH_ROUTER,
+    BACKEND_EXTERNAL_WEB_LOADER,
+    BACKEND_MISTRAL_LOADER,
+    BACKEND_PGVECTOR,
+    *BACKEND_WEB_RETRIEVAL_FILES,
     MANIFEST,
     STATIC_MANIFEST,
     OPENSEARCH,
 ]
 TEXT_SUFFIXES = {".html", ".json", ".py", ".svelte", ".ts", ".xml"}
 VISIBLE_WEBUI_PATTERN = re.compile(r"(?<![A-Z_])\bWebUI\b(?![_A-Z])")
+BACKEND_BRAND_PATTERN = re.compile(r"Open WebUI|Open-WebUI|Open_WebUI|OpenWebUI|\bWebUI\b")
+BACKEND_COMPAT_BRAND_ALLOWLIST = (
+    "X-OpenWebUI-",
+    "OpenWebUI-User-",
+    "OpenWebUI-File-",
+)
+LIB_IMPORT_PATTERN = re.compile(r"['\"](\$lib/[^'\"]+)['\"]")
+FRONTEND_SOURCE_SUFFIXES = {".svelte", ".ts", ".js"}
+LIB_IMPORT_RESOLUTION_SUFFIXES = (".ts", ".js", ".svelte", ".json")
 
 
 def _read(path: Path) -> str:
@@ -54,6 +82,33 @@ def _brand_scan_files():
         elif path.suffix in TEXT_SUFFIXES:
             files.append(path)
     return sorted(set(files))
+
+
+def _tracked_files_under(*paths: Path) -> set[Path]:
+    relative_paths = [str(path.relative_to(REPO_ROOT)) for path in paths]
+    result = subprocess.run(
+        ["git", "ls-files", *relative_paths],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return {REPO_ROOT / line for line in result.stdout.splitlines() if line}
+
+
+def _resolve_lib_import(import_path: str) -> Path | None:
+    clean_import = import_path.split("?", 1)[0].split("#", 1)[0]
+    relative = clean_import.removeprefix("$lib/")
+    candidate = LIB_ROOT / relative
+
+    candidates = [candidate]
+    candidates.extend(Path(f"{candidate}{suffix}") for suffix in LIB_IMPORT_RESOLUTION_SUFFIXES)
+    candidates.extend(candidate / f"index{suffix}" for suffix in LIB_IMPORT_RESOLUTION_SUFFIXES)
+
+    for resolved in candidates:
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 def test_limra_research_page_exists_inside_authenticated_app_shell():
@@ -170,16 +225,71 @@ def test_user_visible_runtime_brand_sources_do_not_expose_open_webui():
     assert violations == []
 
 
+def test_tracked_limra_routes_only_import_tracked_lib_sources():
+    tracked_files = _tracked_files_under(LIMRA_WEB_ROOT / "src" / "routes", LIB_ROOT)
+    scanned_files = sorted(path for path in tracked_files if path.suffix in FRONTEND_SOURCE_SUFFIXES)
+
+    assert LIB_ROOT / "stores" / "index.ts" in tracked_files
+    assert LIB_ROOT / "utils" / "index.ts" in tracked_files
+    assert LIB_ROOT / "i18n" / "index.ts" in tracked_files
+    assert LIB_ROOT / "components" / "common" / "Spinner.svelte" in tracked_files
+    assert LIB_ROOT / "components" / "icons" / "Plus.svelte" in tracked_files
+
+    unresolved = []
+    untracked = []
+    for path in scanned_files:
+        for match in LIB_IMPORT_PATTERN.finditer(_read(path)):
+            import_path = match.group(1)
+            resolved = _resolve_lib_import(import_path)
+            if resolved is None:
+                unresolved.append(
+                    f"{path.relative_to(REPO_ROOT)} imports {import_path}, which does not resolve"
+                )
+            elif resolved not in tracked_files:
+                untracked.append(
+                    f"{path.relative_to(REPO_ROOT)} imports {import_path} -> "
+                    f"{resolved.relative_to(REPO_ROOT)}, which is not tracked"
+                )
+
+    assert unresolved == []
+    assert untracked == []
+
+
 def test_runtime_backend_metadata_uses_limra_brand():
     backend_init = _read(BACKEND_INIT)
     backend_main = _read(BACKEND_MAIN)
     backend_oauth = _read(BACKEND_OAUTH)
+    backend_automations = _read(BACKEND_AUTOMATIONS)
+    backend_auth = _read(BACKEND_AUTH_ROUTER)
+    backend_external_web_loader = _read(BACKEND_EXTERNAL_WEB_LOADER)
+    backend_mistral_loader = _read(BACKEND_MISTRAL_LOADER)
+    backend_pgvector = _read(BACKEND_PGVECTOR)
+    backend_web_retrieval = "\n".join(_read(path) for path in BACKEND_WEB_RETRIEVAL_FILES)
 
     assert "typer.echo(f'limra version: {VERSION}')" in backend_init
     assert "print(f'limra v{VERSION} - building the best AI user interface." in backend_main
     assert "All models configured in limra are accessible via this endpoint." in backend_main
     assert "Get current usage statistics for limra." in backend_main
     assert "client_name='limra'" in backend_oauth
+    assert "getattr(app.state, 'WEBUI_NAME', 'limra')" in backend_automations
+    assert "before restarting limra." in backend_pgvector
+    assert "limra (https://github.com/open-webui/open-webui) External Web Loader" in backend_external_web_loader
+    assert "limra-MistralLoader/2.0" in backend_mistral_loader
+    assert "limra (https://github.com/open-webui/open-webui) RAG Bot" in backend_web_retrieval
+    assert "Exchange an external OAuth provider token for a limra JWT." in backend_auth
+
+
+def test_backend_brand_references_are_only_internal_compatibility_identifiers():
+    violations = []
+    for path in sorted(BACKEND_ROOT.rglob("*.py")):
+        for line_number, line in enumerate(_read(path).splitlines(), start=1):
+            if not BACKEND_BRAND_PATTERN.search(line):
+                continue
+            if any(allowed in line for allowed in BACKEND_COMPAT_BRAND_ALLOWLIST):
+                continue
+            violations.append(f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}")
+
+    assert violations == []
 
 
 def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():

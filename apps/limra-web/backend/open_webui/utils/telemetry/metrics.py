@@ -1,8 +1,8 @@
-"""OpenTelemetry metrics bootstrap for Open WebUI.
+"""OpenTelemetry metrics bootstrap for limra.
 
 This module initialises a MeterProvider that sends metrics to an OTLP
 collector. The collector is responsible for exposing a Prometheus
-`/metrics` endpoint – WebUI does **not** expose it directly.
+`/metrics` endpoint – limra does **not** expose it directly.
 
 Metrics collected:
 
