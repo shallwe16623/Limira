@@ -3313,6 +3313,16 @@ async def _load_or_create_persisted_archive(
                 extra={"task_id": task.task_id, "user_id": user.id},
             )
             _clear_persisted_archive_metadata(task, repo=repo)
+        except ValueError:
+            log.warning(
+                "Persisted limra archive object key failed validation; regenerating",
+                extra={
+                    "task_id": task.task_id,
+                    "user_id": user.id,
+                    "reason": "invalid_archive_object_key",
+                },
+            )
+            _clear_persisted_archive_metadata(task, repo=repo)
 
     archive_bytes = _build_persisted_archive_zip(task, repo)
     validate_archive_zip(archive_bytes)

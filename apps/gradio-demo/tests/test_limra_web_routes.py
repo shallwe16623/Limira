@@ -379,6 +379,85 @@ async def test_archive_download_regenerates_invalid_persisted_archive_object():
 
 
 @pytest.mark.asyncio
+async def test_archive_download_regenerates_invalid_persisted_archive_object_key():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-archive-invalid-key",
+        owner_user_id=user.id,
+        query="archive invalid key",
+        scenario=None,
+        runner_task_id="runner-archive-invalid-key",
+    )
+    task.archive_status = "ready"
+    task.archive_object_key = "../bad.zip"
+    task.archive_zip_sha256 = "0" * 64
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert task.archive_object_key != "../bad.zip"
+    assert task.archive_object_key in storage.objects
+    assert ".." not in task.archive_object_key.split("/")
+    assert "/tasks/task-archive-invalid-key/archives/" in task.archive_object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    assert storage.objects[task.archive_object_key]["sha256"] == task.archive_zip_sha256
+    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist() == [
+        "metadata.json",
+        "report.html",
+        "report.md",
+        "trace.json",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_regenerates_invalid_persisted_archive_object_key():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task_id = "task-postgres-archive-invalid-key"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres archive invalid key",
+        scenario=None,
+        runner_task_id="runner-postgres-archive-invalid-key",
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key="../bad.zip",
+        archive_zip_sha256="0" * 64,
+    )
+
+    response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] != "../bad.zip"
+    assert persisted["archive_object_key"] in storage.objects
+    assert ".." not in persisted["archive_object_key"].split("/")
+    assert f"/tasks/{task_id}/archives/" in persisted["archive_object_key"]
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    assert storage.objects[persisted["archive_object_key"]]["sha256"] == persisted["archive_zip_sha256"]
+    metadata = json.loads(_archive_member_texts(response.body)["metadata.json"])
+    assert metadata["task"]["task_id"] == task_id
+
+
+@pytest.mark.asyncio
 async def test_archive_proxy_scrubs_allowed_text_members_before_download():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
