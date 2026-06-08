@@ -216,7 +216,7 @@ async def test_create_research_records_failed_web_task_when_runner_start_fails()
 
 
 @pytest.mark.asyncio
-async def test_create_research_hides_internal_runner_start_error_details_from_browser_and_task_state():
+async def test_create_research_hides_internal_runner_start_error_details_and_headers_from_browser_and_task_state():
     app, repo, _storage = _limra_asgi_app()
     internal_detail = (
         "runner create failed at http://10.20.30.40:8091/mirothinker/research "
@@ -233,7 +233,16 @@ async def test_create_research_hides_internal_runner_start_error_details_from_br
                     "user": user,
                 }
             )
-            raise HTTPException(status_code=503, detail=internal_detail)
+            raise HTTPException(
+                status_code=503,
+                detail=internal_detail,
+                headers={
+                    "X-MiroThinker-Service-Token": "server-only-token-123",
+                    "Authorization": "Bearer research-start-token-123",
+                    "Set-Cookie": "limra_session=research-start-cookie-123",
+                    "X-API-Key": "sk-researchheader123456",
+                },
+            )
 
     research = FailingResearchClient()
 
@@ -260,9 +269,17 @@ async def test_create_research_hides_internal_runner_start_error_details_from_br
     assert task.archive_status == "failed"
     assert task.error == "runner_research_start_failed"
     assert task.runner_task_id is None
+    for header in (
+        "x-mirothinker-service-token",
+        "authorization",
+        "set-cookie",
+        "x-api-key",
+    ):
+        assert header not in response.headers
     serialized = json.dumps(
         {
             "response": response.json(),
+            "headers": dict(response.headers),
             "task": task.public_dict(),
             "repo_error": task.error,
         },
@@ -272,6 +289,10 @@ async def test_create_research_hides_internal_runner_start_error_details_from_br
         "http://10.20.30.40:8091",
         "limra/users/hash",
         "sk-researchstartinternal123456",
+        "server-only-token-123",
+        "research-start-token-123",
+        "research-start-cookie-123",
+        "sk-researchheader123456",
         "OPENAI_API_KEY",
     ):
         assert leaked not in serialized

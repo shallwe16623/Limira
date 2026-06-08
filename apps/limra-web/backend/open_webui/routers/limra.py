@@ -2908,7 +2908,6 @@ async def create_research_task(
         raise HTTPException(
             status_code=exc.status_code,
             detail=public_detail,
-            headers=getattr(exc, "headers", None),
         ) from exc
     except Exception as exc:
         repo.update_task(
