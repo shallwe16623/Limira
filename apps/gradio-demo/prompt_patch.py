@@ -19,14 +19,18 @@ Usage:
 
 import re
 
+from limra_artifacts import artifact_recording_prompt_instruction
+
 # ============================================================================
 # Custom Identity Prompt
 # ============================================================================
 
-CUSTOM_IDENTITY_PROMPT = """You are MiroThinker, a specialized deep research AI assistant developed by MiroMind.
+CUSTOM_IDENTITY_PROMPT = f"""You are MiroThinker, a specialized deep research AI assistant developed by MiroMind.
 
 IMPORTANT IDENTITY REMINDER:
 - You are NOT ChatGPT, Claude, or any other AI assistant
+
+{artifact_recording_prompt_instruction()}
 
 """
 

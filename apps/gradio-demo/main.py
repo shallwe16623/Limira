@@ -12,6 +12,7 @@ from typing import AsyncGenerator, List, Optional
 import gradio as gr
 from dotenv import load_dotenv
 from hydra import compose, initialize_config_dir
+from limra_artifacts import artifact_event_from_tool_call
 from omegaconf import DictConfig
 from prompt_patch import apply_prompt_patch
 from src.config.settings import expose_sub_agents_as_tools
@@ -233,7 +234,11 @@ def filter_message(message: dict) -> dict:
     """
     Filter message to remove unnecessary information
     """
-    if message["event"] == "tool_call":
+    artifact_event = artifact_event_from_tool_call(message)
+    if artifact_event is not None:
+        return artifact_event
+
+    if message.get("event") == "tool_call":
         tool_name = message["data"].get("tool_name")
         tool_input = message["data"].get("tool_input")
         if (
