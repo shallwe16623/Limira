@@ -7,6 +7,9 @@ import prompt_patch
 import pytest
 from archive_writer import ResearchArchiveWriter
 from limra_artifacts import record_research_artifact
+from miroflow_tools.manager import ToolManager
+from omegaconf import OmegaConf
+from src.config.settings import create_mcp_server_parameters
 from src.logging.task_logger import TaskLog
 
 
@@ -199,3 +202,113 @@ def test_artifact_adapter_prompt_and_core_boundary_contract():
     assert "src.core" not in adapter_source
     assert "execute_task_pipeline" not in adapter_source
     assert "orchestrator" not in adapter_source
+
+    shared_adapter_source = (
+        Path(__file__).resolve().parents[3]
+        / "libs"
+        / "miroflow-tools"
+        / "src"
+        / "miroflow_tools"
+        / "limra_artifacts.py"
+    ).read_text(encoding="utf-8")
+    assert "src.core" not in shared_adapter_source
+    assert "execute_task_pipeline" not in shared_adapter_source
+    assert "orchestrator" not in shared_adapter_source
+
+
+def test_demo_config_registers_limra_artifact_recorder_server():
+    demo_agent_config_path = (
+        Path(__file__).resolve().parents[2]
+        / "miroflow-agent"
+        / "conf"
+        / "agent"
+        / "demo.yaml"
+    )
+    agent_cfg = OmegaConf.load(demo_agent_config_path).main_agent
+    assert "limra_artifact_recorder" in agent_cfg.tools
+
+    server_configs, tool_blacklist = create_mcp_server_parameters(
+        OmegaConf.create({}),
+        OmegaConf.create(
+            {
+                "tools": ["limra_artifact_recorder"],
+                "tool_blacklist": agent_cfg.tool_blacklist,
+            }
+        ),
+    )
+
+    server_names = {config["name"] for config in server_configs}
+    assert "limra_artifact_recorder" in server_names
+    limra_server = next(
+        config for config in server_configs if config["name"] == "limra_artifact_recorder"
+    )
+    assert limra_server["params"].args == [
+        "-m",
+        "miroflow_tools.dev_mcp_servers.limra_artifact_recorder",
+    ]
+    assert ("limra_artifact_recorder", "record_research_artifact") not in tool_blacklist
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_exposes_and_executes_limra_artifact_recorder():
+    agent_cfg = OmegaConf.create(
+        {"tools": ["limra_artifact_recorder"], "tool_blacklist": []}
+    )
+    server_configs, tool_blacklist = create_mcp_server_parameters(
+        OmegaConf.create({}),
+        agent_cfg,
+    )
+    manager = ToolManager(server_configs, tool_blacklist)
+
+    definitions = await manager.get_all_tool_definitions()
+
+    limra_definition = next(
+        server for server in definitions if server["name"] == "limra_artifact_recorder"
+    )
+    tools = {
+        tool.get("name"): tool
+        for tool in limra_definition["tools"]
+        if "error" not in tool
+    }
+    assert "record_research_artifact" in tools
+    schema_properties = tools["record_research_artifact"]["schema"]["properties"]
+    assert {
+        "artifact_type",
+        "payload",
+        "evidence_refs",
+        "confidence",
+        "notes",
+    }.issubset(schema_properties)
+
+    valid_result = await manager.execute_tool_call(
+        "limra_artifact_recorder",
+        "record_research_artifact",
+        {
+            "artifact_type": "evidence",
+            "payload": {"title": "Export notice"},
+            "evidence_refs": ["EVID-001"],
+            "confidence": 0.8,
+            "notes": "Authorization: Bearer mcpsecret123456",
+        },
+    )
+    assert "error" not in valid_result
+    valid_event = json.loads(valid_result["result"])
+    assert valid_event["type"] == "evidence_collected"
+    assert valid_event["payload"]["evidence_refs"] == ["EVID-001"]
+    assert valid_event["payload"]["notes"] == "Authorization: [REDACTED]"
+
+    warning_result = await manager.execute_tool_call(
+        "limra_artifact_recorder",
+        "record_research_artifact",
+        {
+            "artifact_type": "relation",
+            "payload": {"source_entity_id": "ENT-001"},
+            "confidence": 2,
+        },
+    )
+    assert "error" not in warning_result
+    warning_event = json.loads(warning_result["result"])
+    assert warning_event["type"] == "artifact_warning"
+    assert warning_event["payload"]["non_fatal"] is True
+    assert "relation requires target entity" in warning_event["payload"]["errors"]
+    assert "confidence must be between 0 and 1" in warning_event["payload"]["errors"]

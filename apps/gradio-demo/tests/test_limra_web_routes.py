@@ -1791,6 +1791,76 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
 
 
 @pytest.mark.asyncio
+async def test_record_research_artifact_tool_call_reaches_artifacts_and_archive_trace():
+    from main import filter_message
+
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    artifact_event = filter_message(
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_name": "record_research_artifact",
+                "tool_input": {
+                    "artifact_type": "evidence",
+                    "payload": {
+                        "title": "Port authority bulletin",
+                        "source_url": "https://example.test/port",
+                        "summary": "New inspection rule published",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.9,
+                    "notes": "MCP tool path",
+                },
+            },
+        }
+    )
+    research = FakeResearchClient(events=[artifact_event])
+
+    created = await limra.create_research_task(
+        {"query": "port inspection OSINT"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events[0]["type"] == "evidence_collected"
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["evidence"][0]["title"] == "Port authority bulletin"
+    assert artifacts["evidence"][0]["notes"] == "MCP tool path"
+    assert repo.get_task(task_id).archive_status == "ready"
+
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+
+    assert trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-001"
+    assert trace["artifacts"]["evidence"][0]["title"] == "Port authority bulletin"
+    assert trace["artifacts"]["evidence"][0]["source_event_type"] == (
+        "record_research_artifact"
+    )
+    assert repo.get_task(task_id).archive_object_key in storage.objects
+    _assert_no_browser_leak(trace)
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_records_runtime_state_to_redis():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")

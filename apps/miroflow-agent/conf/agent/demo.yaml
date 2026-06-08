@@ -9,6 +9,7 @@ main_agent:
   tools:
     - search_and_scrape_webpage
     - jina_scrape_llm_summary
+    - limra_artifact_recorder
     - tool-python
   tool_blacklist:
     - [ "search_and_scrape_webpage", "sogou_search" ]
