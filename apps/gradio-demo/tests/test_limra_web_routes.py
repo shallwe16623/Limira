@@ -920,6 +920,133 @@ async def test_postgres_archive_download_regenerates_reused_archive_with_undecod
 
 
 @pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_with_invalid_json_metadata_members():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-invalid-json-archive-reuse",
+        owner_user_id=user.id,
+        query="invalid json archive member",
+        scenario=None,
+        runner_task_id="runner-invalid-json-task",
+    )
+    raw_archive = _archive_zip_with_invalid_json_metadata_members(task.task_id)
+    raw_members = _archive_member_texts(raw_archive)
+    assert "runner_task_id=runner-invalid-json-123" in raw_members["metadata.json"]
+    assert "limra/users/hash" in raw_members["trace.json"]
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["task"]["task_id"] == task.task_id
+    assert trace["task"]["task_id"] == task.task_id
+    _assert_archive_hides_invalid_json_member_identifiers(response.body)
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+    _assert_archive_hides_invalid_json_member_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_regenerates_reused_archive_with_invalid_json_metadata_members():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task_id = "task-postgres-invalid-json-archive-reuse"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres invalid json archive member",
+        scenario=None,
+        runner_task_id="runner-postgres-invalid-json-task",
+    )
+    raw_archive = _archive_zip_with_invalid_json_metadata_members(task_id)
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task_id,
+        filename="archive.zip",
+        object_id=task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    assert json.loads(members["metadata.json"])["task"]["task_id"] == task_id
+    assert json.loads(members["trace.json"])["task"]["task_id"] == task_id
+    _assert_archive_hides_invalid_json_member_identifiers(response.body)
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] == stored.object_key
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == persisted["archive_zip_sha256"]
+    assert repaired["metadata"]["archive_sha256"] == persisted["archive_zip_sha256"]
+    _assert_archive_hides_invalid_json_member_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
 async def test_archive_download_regenerates_after_task_scoped_writes():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
@@ -6102,6 +6229,26 @@ def _archive_zip_with_undecodable_report_member() -> bytes:
     return buffer.getvalue()
 
 
+def _archive_zip_with_invalid_json_metadata_members(task_id: str) -> bytes:
+    buffer = io.BytesIO()
+    internal_metadata = (
+        "runner_task_id=runner-invalid-json-123\n"
+        "url=http://10.20.30.40:8091/mirothinker/tasks/runner-invalid-json-123\n"
+        f"object_key=limra/users/hash/tasks/{task_id}/archives/archive.zip\n"
+    )
+    internal_trace = (
+        "archive_object_key="
+        f"limra/users/hash/tasks/{task_id}/archives/archive.zip\n"
+        "runner_task_id=runner-invalid-json-123\n"
+    )
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", internal_metadata)
+        archive.writestr("report.html", "<!doctype html><main>safe report</main>")
+        archive.writestr("report.md", "# safe report")
+        archive.writestr("trace.json", internal_trace)
+    return buffer.getvalue()
+
+
 def _archive_member_texts(archive_bytes: bytes) -> dict[str, str]:
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
         return {
@@ -6163,6 +6310,24 @@ def _assert_archive_hides_internal_model_summary_identifiers(
         assert leaked not in serialized
     _assert_no_browser_leak(serialized)
     return metadata, trace
+
+
+def _assert_archive_hides_invalid_json_member_identifiers(archive_bytes: bytes) -> None:
+    members = _archive_member_texts(archive_bytes)
+    json.loads(members["metadata.json"])
+    json.loads(members["trace.json"])
+    serialized = json.dumps(members, ensure_ascii=False)
+    for leaked in (
+        "/mirothinker/",
+        "runner_task_id",
+        "runner-invalid-json-123",
+        "object_key",
+        "archive_object_key",
+        "limra/users/",
+        "http://10.20.30.40:8091",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(serialized)
 
 
 def _parse_sse_chunks(chunks):

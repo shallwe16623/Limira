@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover - exercised only when imported without dep
 
 
 ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
+ARCHIVE_JSON_MEMBERS = {"metadata.json", "trace.json"}
 ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 LIMRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
@@ -3481,8 +3482,8 @@ def _persisted_archive_reuse_failure_reason(
 ) -> str | None:
     try:
         validate_archive_zip(archive_bytes)
-    except HTTPException:
-        return "invalid_archive_zip"
+    except HTTPException as exc:
+        return str(exc.detail or "invalid_archive_zip")
     if not task.archive_zip_sha256:
         return "archive_sha_missing"
     actual_sha = hashlib.sha256(archive_bytes).hexdigest()
@@ -3764,13 +3765,9 @@ def validate_archive_zip(archive_bytes: bytes) -> None:
             if any(name.startswith("/") or ".." in name.split("/") for name in names):
                 raise HTTPException(status_code=502, detail="unsafe_archive_member")
             for member_name in ARCHIVE_MEMBER_ORDER:
-                try:
-                    archive.read(member_name).decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise HTTPException(
-                        status_code=502,
-                        detail="invalid_archive_member_encoding",
-                    ) from exc
+                text = _decode_archive_text_member(archive.read(member_name))
+                if member_name in ARCHIVE_JSON_MEMBERS:
+                    _parse_archive_json_member(text)
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
 
@@ -3790,6 +3787,11 @@ def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
                             scrubbed.encode("utf-8"),
                         )
                     except UnicodeDecodeError:
+                        if member_name in ARCHIVE_JSON_MEMBERS:
+                            raise HTTPException(
+                                status_code=502,
+                                detail="invalid_archive_member_encoding",
+                            )
                         fallback = _archive_member_decode_failure_text(member_name)
                         _write_archive_member(
                             target,
@@ -3812,7 +3814,18 @@ def _write_archive_member(
 
 
 def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
-    text = raw_member.decode("utf-8")
+    try:
+        text = raw_member.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if member_name in ARCHIVE_JSON_MEMBERS:
+            raise HTTPException(
+                status_code=502,
+                detail="invalid_archive_member_encoding",
+            ) from exc
+        raise
+    if member_name in ARCHIVE_JSON_MEMBERS:
+        payload = _parse_archive_json_member(text)
+        return _archive_json_text(payload, member_name=member_name)
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
@@ -3820,8 +3833,31 @@ def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
     return _archive_json_text(payload, member_name=member_name)
 
 
+def _decode_archive_text_member(raw_member: bytes) -> str:
+    try:
+        return raw_member.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="invalid_archive_member_encoding",
+        ) from exc
+
+
+def _parse_archive_json_member(text: str) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="invalid_archive_member_json",
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise HTTPException(status_code=502, detail="invalid_archive_member_json")
+    return payload
+
+
 def _archive_member_decode_failure_text(member_name: str) -> str:
-    if member_name in {"metadata.json", "trace.json"}:
+    if member_name in ARCHIVE_JSON_MEMBERS:
         return _archive_json_text(
             {"archive_member_error": "invalid_text_encoding"},
             member_name=member_name,
