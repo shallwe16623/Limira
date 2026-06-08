@@ -721,6 +721,11 @@ def test_limra_upload_embedding_config_defaults_disabled_and_validates_enabled()
         )
 
 
+def test_upload_embedding_dependencies_avoid_threadpool_for_default_route_path():
+    assert asyncio.iscoroutinefunction(limra.get_upload_embedding_config)
+    assert asyncio.iscoroutinefunction(limra.get_upload_embedding_provider)
+
+
 def test_limra_object_keys_are_server_generated_owner_scoped_and_safe():
     key = limra.build_limra_object_key(
         owner_user_id="analyst@example.com",

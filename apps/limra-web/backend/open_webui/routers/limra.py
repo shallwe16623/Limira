@@ -2400,7 +2400,7 @@ def get_object_storage(request: Request) -> LimraObjectStorage:
     return object_storage
 
 
-def get_upload_embedding_config(request: Request) -> LimraUploadEmbeddingConfig:
+async def get_upload_embedding_config(request: Request) -> LimraUploadEmbeddingConfig:
     config = getattr(request.app.state, "limra_upload_embedding_config", None)
     if config is None:
         config = create_limra_upload_embedding_config_from_env()
@@ -2408,7 +2408,7 @@ def get_upload_embedding_config(request: Request) -> LimraUploadEmbeddingConfig:
     return config
 
 
-def get_upload_embedding_provider(request: Request) -> LimraUploadEmbeddingProvider:
+async def get_upload_embedding_provider(request: Request) -> LimraUploadEmbeddingProvider:
     provider = getattr(request.app.state, "limra_upload_embedding_provider", None)
     if provider is None:
         provider = DisabledLimraUploadEmbeddingProvider()
