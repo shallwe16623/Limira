@@ -119,6 +119,36 @@ async def test_create_research_uses_limra_namespace_and_rejects_body_user_id():
 
 
 @pytest.mark.asyncio
+async def test_create_research_rejects_body_user_spoofing_on_actual_http_surface():
+    app, repo, _storage = _limra_asgi_app()
+    research = FakeResearchClient()
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limra.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        for forbidden_field in ("user_id", "owner_user_id"):
+            response = await client.post(
+                "/api/limra/research",
+                json={
+                    "query": "attempt request body identity spoofing",
+                    forbidden_field: "attacker",
+                },
+            )
+
+            assert response.status_code == 400
+            assert response.json() == {"detail": "user_id_not_allowed"}
+
+    assert repo.tasks == {}
+    assert research.create_calls == []
+
+
+@pytest.mark.asyncio
 async def test_demo_scenarios_are_browser_safe_and_artifact_oriented():
     payload = await limra.list_demo_scenarios(user=limra.LimraUser("user-a"))
 
