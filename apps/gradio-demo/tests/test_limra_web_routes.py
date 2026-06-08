@@ -5870,6 +5870,111 @@ async def test_completed_task_event_reattach_is_terminal_and_does_not_call_runne
 
 
 @pytest.mark.asyncio
+async def test_postgres_terminal_reattach_preserves_persisted_final_summary_surfaces():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("terminal final-answer reattach must not stream")
+    )
+    created = await limra.create_research_task(
+        {"query": "completed final summary query"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.record_artifact(
+        task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-001",
+            "title": "最终回答",
+            "markdown": "# Final answer\n\nPersisted answer survives reattach. [EVID-001]",
+            "evidence_refs": ["EVID-001"],
+            "source_event_type": "final_summary_show_text",
+        },
+    )
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    before_reports = repo.list_task_reports(task_id=task_id)
+    status_payload = await limra.get_task(task_id, user=user, repo=repo)
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    after_reports = repo.list_task_reports(task_id=task_id)
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert status_payload["status"] == "completed"
+    assert status_payload["archive_status"] == "ready"
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    assert research.stream_calls == []
+    assert research.status_calls == []
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_reattach"
+
+    assert [report.report_id for report in before_reports] == ["REPORT-001"]
+    assert [report.report_id for report in after_reports] == ["REPORT-001"]
+    assert after_reports[0].markdown == before_reports[0].markdown
+    assert after_reports[0].markdown.startswith("# Final answer")
+    assert len(artifacts["report_sections"]) == 1
+    assert artifacts["report_sections"][0]["section_id"] == "REPORT-001"
+    assert artifacts["report_sections"][0]["markdown"] == after_reports[0].markdown
+    assert artifacts["report_sections"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+    assert "# Final answer" in members["report.md"]
+    assert "Persisted answer survives reattach" in members["report.md"]
+    trace = json.loads(members["trace.json"])
+    assert trace["reports"][0]["report_id"] == "REPORT-001"
+    assert trace["artifact_events"][0]["type"] == "report_section_generated"
+    assert trace["artifact_events"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    _assert_no_browser_leak(
+        {
+            "status": status_payload,
+            "events": events,
+            "artifacts": artifacts,
+            "archive": members,
+        }
+    )
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_runner_conflict_hides_internal_reason_from_browser_runtime_state():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")
