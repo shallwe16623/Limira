@@ -857,6 +857,185 @@ def test_limra_standalone_frontend_preserves_cache_after_transient_restore_failu
     assert "暂未从后端确认" in checks["reportMessage"]
 
 
+def test_limra_standalone_frontend_clears_task_state_on_sign_out():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    app = LIMRA_STANDALONE_ROOT / "public" / "app.js"
+    script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const source = fs.readFileSync({str(app)!r}, 'utf8');
+        const storage = new Map();
+        function element() {{
+            return {{
+                textContent: '',
+                disabled: false,
+                innerHTML: '',
+                value: '',
+                autocomplete: '',
+                scrollTop: 0,
+                scrollHeight: 0,
+                classList: {{ toggle() {{}}, add() {{}}, remove() {{}} }},
+                parentElement: {{ classList: {{ toggle() {{}} }} }},
+                addEventListener() {{}},
+                querySelectorAll: () => []
+            }};
+        }}
+        const context = {{
+            console,
+            URL,
+            element,
+            FormData: class FormData {{}},
+            Headers: class Headers {{
+                set() {{}}
+            }},
+            EventSource: class EventSource {{}},
+            fetch: async () => ({{
+                ok: true,
+                status: 200,
+                headers: {{ get: () => 'application/json' }},
+                text: async () => JSON.stringify({{ ok: true }})
+            }}),
+            localStorage: {{
+                getItem: (key) => storage.get(key) || '',
+                setItem: (key, value) => storage.set(key, String(value)),
+                removeItem: (key) => storage.delete(key)
+            }},
+            window: {{
+                location: {{ href: 'http://127.0.0.1/' }},
+                setTimeout: () => 0
+            }},
+            document: {{
+                addEventListener: () => {{}},
+                querySelectorAll: () => []
+            }}
+        }};
+        (async () => {{
+            vm.createContext(context);
+            vm.runInContext(source, context);
+            await vm.runInContext(`(async () => {{
+                Object.assign(dom, {{
+                    authPanel: element(),
+                    workspace: element(),
+                    signOutButton: element(),
+                    sessionLabel: element(),
+                    signinModeButton: element(),
+                    signupModeButton: element(),
+                    nameInput: element(),
+                    authSubmitButton: element(),
+                    passwordInput: element(),
+                    scenarioSelect: element(),
+                    scenarioDetails: element(),
+                    statusLabel: element(),
+                    taskLabel: element(),
+                    submitResearchButton: element(),
+                    downloadArchiveButton: element(),
+                    reportMessage: element(),
+                    exportPdfButton: element(),
+                    downloadPdfButton: element(),
+                    messageList: element(),
+                    eventLog: element(),
+                    artifactTabs: element(),
+                    artifactContent: element(),
+                    uploadList: element(),
+                    uploadMessage: element()
+                }});
+
+                localStorage.setItem('limraToken', 'old-token');
+                localStorage.setItem('token', 'old-token');
+                localStorage.setItem(
+                    STORAGE_KEY,
+                    JSON.stringify({{
+                        taskId: 'old-task',
+                        latestReport: {{
+                            task_id: 'old-task',
+                            report_id: 'old-report',
+                            pdf_url: '/api/limra/tasks/old-task/reports/old-report/pdf'
+                        }}
+                    }})
+                );
+                state.user = {{ id: 'old-user', email: 'old@example.test', role: 'user' }};
+                state.token = 'old-token';
+                state.savedUserId = 'old-user';
+                state.taskId = 'old-task';
+                state.status = 'completed';
+                state.archiveStatus = 'ready';
+                state.archiveDownloadUrl = '/api/limra/tasks/old-task/archive.zip';
+                state.latestReport = {{
+                    task_id: 'old-task',
+                    report_id: 'old-report',
+                    pdf_url: '/api/limra/tasks/old-task/reports/old-report/pdf'
+                }};
+                state.finalReportText = 'old report';
+                state.artifacts = {{
+                    evidence: [{{ title: 'old evidence' }}],
+                    entities: [],
+                    relations: [],
+                    timeline_events: [],
+                    map_features: [],
+                    report_sections: [{{ title: 'old', markdown: 'old markdown' }}]
+                }};
+                state.uploads = [{{ document_id: 'old-document', filename: 'old.txt' }}];
+                state.uploadResults = [{{ document_id: 'old-result', filename: 'old-result.txt' }}];
+                state.restoreBlocked = true;
+
+                await signOut();
+
+                this.__limraSignOutChecks = {{
+                    user: state.user,
+                    token: state.token,
+                    savedUserId: state.savedUserId,
+                    taskId: state.taskId,
+                    status: state.status,
+                    archiveStatus: state.archiveStatus,
+                    archiveDownloadUrl: state.archiveDownloadUrl,
+                    restoreBlocked: state.restoreBlocked,
+                    latestReport: state.latestReport,
+                    finalReportText: state.finalReportText,
+                    reportSections: state.artifacts.report_sections.length,
+                    uploads: state.uploads.length,
+                    uploadResults: state.uploadResults.length,
+                    storageWorkspace: localStorage.getItem(STORAGE_KEY),
+                    storageLimraToken: localStorage.getItem('limraToken'),
+                    storageToken: localStorage.getItem('token')
+                }};
+            }})()`, context);
+            process.stdout.write(JSON.stringify(context.__limraSignOutChecks));
+        }})().catch((error) => {{
+            console.error(error);
+            process.exit(1);
+        }});
+    """
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    checks = json.loads(result.stdout)
+
+    assert checks["user"] is None
+    assert checks["token"] == ""
+    assert checks["savedUserId"] == ""
+    assert checks["taskId"] == ""
+    assert checks["status"] == "ready"
+    assert checks["archiveStatus"] == "pending"
+    assert checks["archiveDownloadUrl"] == ""
+    assert checks["restoreBlocked"] is False
+    assert checks["latestReport"] is None
+    assert checks["finalReportText"] == ""
+    assert checks["reportSections"] == 0
+    assert checks["uploads"] == 0
+    assert checks["uploadResults"] == 0
+    assert checks["storageWorkspace"] == ""
+    assert checks["storageLimraToken"] == ""
+    assert checks["storageToken"] == ""
+
+
 def test_limra_research_page_has_demo_scenario_selector():
     page = _read(LIMRA_PAGE)
 

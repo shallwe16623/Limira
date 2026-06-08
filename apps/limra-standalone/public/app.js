@@ -385,6 +385,7 @@ function resetWorkspaceState() {
 	state.messages = initialMessages();
 	state.events = [];
 	state.artifacts = emptyArtifacts();
+	state.uploads = [];
 	state.uploadResults = [];
 }
 
@@ -399,6 +400,7 @@ async function signOut() {
 	state.restoreBlocked = false;
 	state.user = null;
 	state.token = '';
+	resetWorkspaceState();
 	clearWorkspaceStorage();
 	localStorage.removeItem('limraToken');
 	localStorage.removeItem('token');
