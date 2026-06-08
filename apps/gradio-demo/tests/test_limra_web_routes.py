@@ -2411,6 +2411,90 @@ async def test_upload_search_falls_back_to_lexical_when_embedding_provider_fails
 
 
 @pytest.mark.asyncio
+async def test_postgres_upload_search_falls_back_to_lexical_when_embedding_provider_fails():
+    app, _repo, _storage = _limra_asgi_app()
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    provider = FakeFailingUploadEmbeddingProvider(RuntimeError("provider unavailable"))
+
+    async def task_repository_override():
+        return repo
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=2,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+    for document_id, owner_user_id, filename, text in (
+        ("doc-lexical", "user-a", "cobalt-fallback.txt", "Cobalt supply memo."),
+        ("doc-unmatched", "user-a", "nickel.txt", "Nickel market note."),
+        ("doc-foreign", "user-b", "foreign-cobalt.txt", "Cobalt foreign memo."),
+    ):
+        repo.record_uploaded_document(
+            document_id=document_id,
+            owner_user_id=owner_user_id,
+            task_id=None,
+            original_filename=filename,
+            content_type="text/plain",
+            byte_size=len(text),
+            minio_bucket="limra-artifacts",
+            object_key=f"limra/users/{owner_user_id}/uploads/{document_id}.txt",
+            extracted_text=text,
+            language=None,
+            metadata={},
+            embedding=[0.0, 1.0],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "cobalt"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [document["document_id"] for document in payload["documents"]] == [
+        "doc-lexical"
+    ]
+    assert payload["documents"][0]["matched_terms"] == ["cobalt"]
+    assert "Cobalt supply memo" in payload["documents"][0]["snippet"]
+    assert engine.vector_search_calls == []
+    assert provider.calls == [
+        {
+            "text": "cobalt",
+            "config": limra.LimraUploadEmbeddingConfig(
+                enabled=True,
+                provider="fake",
+                model="fake-model",
+                dimensions=2,
+            ),
+        }
+    ]
+    assert "embedding" not in json.dumps(payload)
+    assert "object_key" not in json.dumps(payload)
+    _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
 async def test_upload_search_rejects_embedding_dimension_mismatch():
     app, repo, storage = _limra_asgi_app()
     provider = FakeUploadEmbeddingProvider([1.0])
