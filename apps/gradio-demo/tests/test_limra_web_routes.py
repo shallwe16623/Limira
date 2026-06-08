@@ -1766,6 +1766,103 @@ async def test_upload_download_clears_missing_persisted_document_checksum():
 
 
 @pytest.mark.asyncio
+async def test_upload_download_clears_invalid_persisted_document_object_key():
+    app, repo, _storage = _limra_asgi_app()
+    expected_bytes = b"expected invalid-key document bytes"
+    document = repo.record_uploaded_document(
+        document_id="doc-invalid-key",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="invalid-key.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket="limra-artifacts",
+        object_key="../invalid-key.txt",
+        extracted_text="invalid key document",
+        language=None,
+        metadata={
+            "source": "legacy",
+            "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+        },
+        embedding=None,
+    )
+
+    assert document.public_dict()["download_url"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get("/api/limra/uploads/doc-invalid-key/download")
+        detail_response = await client.get("/api/limra/uploads/doc-invalid-key")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "document_object_not_found"
+    refreshed = repo.get_user_document("doc-invalid-key", "user-a")
+    assert refreshed is not None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "invalid_document_object_key",
+    }
+    assert refreshed.public_dict()["download_url"] is None
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["download_url"] is None
+    assert "object_key" not in detail
+
+
+@pytest.mark.asyncio
+async def test_upload_download_clears_malformed_persisted_document_checksum():
+    app, repo, storage = _limra_asgi_app()
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="malformed-sha.txt",
+        object_id="doc-malformed-sha",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=b"document bytes",
+        content_type="text/plain",
+        metadata={"document_id": "doc-malformed-sha"},
+    )
+    document = repo.record_uploaded_document(
+        document_id="doc-malformed-sha",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="malformed-sha.txt",
+        content_type="text/plain",
+        byte_size=len(b"document bytes"),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="malformed sha document",
+        language=None,
+        metadata={"source": "legacy", "sha256": "not-a-valid-sha"},
+        embedding=None,
+    )
+
+    assert document.public_dict()["download_url"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get("/api/limra/uploads/doc-malformed-sha/download")
+        detail_response = await client.get("/api/limra/uploads/doc-malformed-sha")
+
+    assert response.status_code == 404
+    refreshed = repo.get_user_document("doc-malformed-sha", "user-a")
+    assert refreshed is not None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "document_sha_malformed",
+    }
+    assert refreshed.public_dict()["download_url"] is None
+    assert detail_response.status_code == 200
+    assert detail_response.json()["download_url"] is None
+
+
+@pytest.mark.asyncio
 async def test_upload_search_is_owner_scoped_task_filterable_and_browser_safe():
     app, repo, storage = _limra_asgi_app()
     repo.create_task(
@@ -3101,6 +3198,116 @@ async def test_postgres_upload_download_clears_mismatched_persisted_document_obj
     persisted = json.loads(engine.uploaded_documents["doc-postgres-mismatch"]["metadata"])
     assert persisted["download_unavailable"] == "document_sha_mismatch"
     assert "sha256" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_invalid_persisted_document_object_key():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    expected_bytes = b"expected postgres invalid-key document bytes"
+    repo.record_uploaded_document(
+        document_id="doc-postgres-invalid-key",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="invalid-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key="../invalid-postgres.txt",
+        extracted_text="invalid postgres document",
+        language=None,
+        metadata={
+            "source": "legacy",
+            "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+        },
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_uploaded_document(
+            "doc-postgres-invalid-key",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-invalid-key", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "invalid_document_object_key",
+    }
+    persisted = json.loads(engine.uploaded_documents["doc-postgres-invalid-key"]["metadata"])
+    assert persisted == {
+        "source": "legacy",
+        "download_unavailable": "invalid_document_object_key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_malformed_persisted_document_checksum():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="malformed-postgres.txt",
+        object_id="doc-postgres-malformed-sha",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=b"postgres document bytes",
+        content_type="text/plain",
+        metadata={"document_id": "doc-postgres-malformed-sha"},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-postgres-malformed-sha",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="malformed-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(b"postgres document bytes"),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="malformed postgres document",
+        language=None,
+        metadata={"source": "legacy", "sha256": "not-a-valid-sha"},
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_uploaded_document(
+            "doc-postgres-malformed-sha",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-malformed-sha", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "document_sha_malformed",
+    }
+    persisted = json.loads(
+        engine.uploaded_documents["doc-postgres-malformed-sha"]["metadata"]
+    )
+    assert persisted == {
+        "source": "legacy",
+        "download_unavailable": "document_sha_malformed",
+    }
 
 
 def test_postgres_repository_searches_uploaded_documents_by_vector():
