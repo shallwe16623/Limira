@@ -2027,12 +2027,14 @@ def test_limra_secret_scrubber_redacts_nested_payloads_and_urls():
         "headers": {
             "Authorization": "Bearer report-bearer-secret-123456",
             "Cookie": "session=report-cookie-secret-123456",
+            "OPENAI_API_KEY=sk-headerkeysecret123456": "header key secret",
         },
         "nested": [
             "OPENAI_API_KEY=sk-reportopenai123456",
             {
                 "safe": "https://example.test/path?token=report-url-token-123456",
                 "jina_api_key": "nested-jina-secret-123456",
+                "Authorization: Bearer nested-key-secret-123456": "nested key secret",
             },
         ],
         "jwt": "eyJtrace.secret.payload",
@@ -2045,6 +2047,16 @@ def test_limra_secret_scrubber_redacts_nested_payloads_and_urls():
     assert text.count(limra.LIMRA_SECRET_REDACTION) >= 5
     assert "Authorization" in scrubbed["headers"]
     assert scrubbed["headers"]["Authorization"] == limra.LIMRA_SECRET_REDACTION
+    serialized = json.dumps(scrubbed, ensure_ascii=False)
+    assert "sk-headerkeysecret123456" not in serialized
+    assert "nested-key-secret-123456" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "Authorization: Bearer" not in serialized
+    assert limra.LIMRA_SECRET_REDACTION in scrubbed["headers"]
+    assert any(
+        str(key).startswith(limra.LIMRA_SECRET_REDACTION)
+        for key in scrubbed["nested"][1]
+    )
 
 
 @pytest.mark.asyncio
@@ -2654,6 +2666,8 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
         "OPENAI_API_KEY=sk-runnersecret123456",
         "Authorization: Bearer runner-secret-123456",
         "RUNNER_SERVICE_TOKEN=runner-service-secret-123456",
+        "OPENAI_API_KEY=sk-artifactkeysecret123456",
+        "Authorization: Bearer artifact-key-secret-123456",
     ]
     research = FakeResearchClient(
         events=[
@@ -2671,6 +2685,10 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
                     "source_url": (
                         "https://example.test/source?token=runner-query-secret-123456"
                     ),
+                    raw_secret_values[3]: "secret-bearing evidence key",
+                    "nested": {
+                        raw_secret_values[4]: "secret-bearing nested key",
+                    },
                 },
             },
             {
@@ -2689,6 +2707,7 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
                     "artifact_type": "report_section",
                     "payload": {
                         "title": "Assessment",
+                        raw_secret_values[4]: "secret-bearing report key",
                         "markdown": (
                             "Finding references [EVID-001]\n\n"
                             f"{raw_secret_values[1]}\n{raw_secret_values[2]}"
@@ -2807,6 +2826,8 @@ async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browse
         "RUNNER_SERVICE_TOKEN=status-runner-token-123456",
         "OPENAI_API_KEY=sk-timestampsecret123456",
         "Authorization: Bearer timestamp-secret-123456",
+        "OPENAI_API_KEY=sk-statuskeysecret123456",
+        "Authorization: Bearer error-key-secret-123456",
     ]
     research = FakeResearchClient(
         events=[
@@ -2817,6 +2838,7 @@ async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browse
                 "payload": {
                     "status": "running",
                     "error": f"{raw_secret_values[0]} {raw_secret_values[1]}",
+                    raw_secret_values[5]: "secret-bearing status key",
                 },
             },
             {
@@ -2825,6 +2847,7 @@ async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browse
                 "timestamp": f"{raw_secret_values[4]} {raw_secret_values[3]}",
                 "payload": {
                     "error": f"runner failed {raw_secret_values[2]}",
+                    raw_secret_values[6]: "secret-bearing error key",
                 },
             },
         ]

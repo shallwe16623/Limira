@@ -4689,10 +4689,11 @@ def scrub_limra_secrets(value: Any) -> Any:
     if isinstance(value, Mapping):
         scrubbed: dict[Any, Any] = {}
         for key, item in value.items():
+            scrubbed_key = _scrub_mapping_key(key)
             if _is_secret_field_name(key):
-                scrubbed[key] = LIMRA_SECRET_REDACTION
+                scrubbed[scrubbed_key] = LIMRA_SECRET_REDACTION
             else:
-                scrubbed[key] = scrub_limra_secrets(item)
+                scrubbed[scrubbed_key] = scrub_limra_secrets(item)
         return scrubbed
     if isinstance(value, list):
         return [scrub_limra_secrets(item) for item in value]
@@ -4714,6 +4715,15 @@ def _scrub_optional_text(value: Any) -> str | None:
     if value is None:
         return None
     return str(scrub_limra_secrets(str(value)))
+
+
+def _scrub_mapping_key(key: Any) -> Any:
+    scrubbed_key = scrub_limra_secrets(key)
+    try:
+        hash(scrubbed_key)
+    except TypeError:
+        return _scrub_secret_text(str(key))
+    return scrubbed_key
 
 
 def _is_secret_field_name(value: Any) -> bool:
