@@ -33,6 +33,16 @@
 		properties: Record<string, any>;
 	};
 
+	type GeneratedReport = {
+		report_id: string;
+		task_id: string;
+		report_type: string;
+		evidence_refs: string[];
+		pdf_url: string;
+		pdf_size_bytes?: number;
+		pdf_sha256?: string;
+	};
+
 	const artifactTabs: ArtifactTab[] = ['Evidence', 'Entities', 'Graph', 'Timeline', 'Map', 'Report'];
 	const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 
@@ -59,6 +69,9 @@
 	let mapInstance: any = null;
 	let scenarios: LimraScenario[] = [];
 	let selectedScenario = '';
+	let latestGeneratedReport: GeneratedReport | null = null;
+	let isExportingReport = false;
+	let reportMessage = '';
 
 	let messages: ChatMessage[] = [
 		{
@@ -148,6 +161,8 @@
 
 			taskId = task.task_id ?? task.id ?? '';
 			status = task.status ?? 'queued';
+			latestGeneratedReport = null;
+			reportMessage = '';
 			appendMessage('assistant', `Research task ${taskId || 'created'} is ${status}.`);
 
 			if (taskId) {
@@ -245,6 +260,44 @@
 		window.location.href = `/api/limra/tasks/${taskId}/archive.zip`;
 	};
 
+	const exportReportPdf = async () => {
+		if (!taskId || artifacts.report_sections.length === 0 || isExportingReport) {
+			return;
+		}
+
+		isExportingReport = true;
+		reportMessage = '';
+
+		try {
+			const report = await apiJson(`/api/limra/tasks/${taskId}/reports/pdf`, {
+				method: 'POST',
+				body: JSON.stringify({
+					report_id: `ui-${Date.now()}`,
+					report_type: 'final',
+					markdown: buildReportMarkdown(),
+					evidence_refs: reportEvidenceRefs()
+				})
+			});
+
+			latestGeneratedReport = report;
+			reportMessage = 'PDF ready.';
+		} catch (error) {
+			reportMessage = error instanceof Error ? error.message : 'Unable to export PDF.';
+		} finally {
+			isExportingReport = false;
+		}
+	};
+
+	const downloadGeneratedReportPdf = () => {
+		if (!taskId || !latestGeneratedReport?.report_id) {
+			return;
+		}
+
+		window.location.href =
+			latestGeneratedReport.pdf_url ??
+			`/api/limra/tasks/${taskId}/reports/${latestGeneratedReport.report_id}/pdf`;
+	};
+
 	const parsePayload = (raw: string) => {
 		try {
 			return JSON.parse(raw);
@@ -289,6 +342,36 @@
 				item[side === 'source' ? 'from' : 'to'] ??
 				''
 		);
+
+	const reportSectionTitle = (section: Record<string, any>, index: number) =>
+		String(section.title ?? section.report_type ?? `Report section ${index + 1}`);
+
+	const reportSectionText = (section: Record<string, any>) =>
+		String(section.markdown ?? section.text ?? section.summary ?? 'No report text available.');
+
+	const reportEvidenceRefs = () => {
+		const refs = new Set<string>();
+		for (const section of artifacts.report_sections) {
+			for (const ref of asArray(section.evidence_refs)) {
+				const normalized = String(ref).trim();
+				if (normalized) {
+					refs.add(normalized);
+				}
+			}
+		}
+		return [...refs];
+	};
+
+	const buildReportMarkdown = () =>
+		artifacts.report_sections
+			.map((section, index) => {
+				const refs = asArray(section.evidence_refs)
+					.map((ref) => String(ref).trim())
+					.filter(Boolean);
+				const refLine = refs.length ? `\n\nEvidence refs: ${refs.map((ref) => `[${ref}]`).join(' ')}` : '';
+				return `## ${reportSectionTitle(section, index)}\n\n${reportSectionText(section)}${refLine}`;
+			})
+			.join('\n\n');
 
 	const selectTab = async (tab: ArtifactTab) => {
 		activeTab = tab;
@@ -662,6 +745,37 @@
 					<div bind:this={mapContainer} class="map-canvas" aria-label="Artifact map"></div>
 				{/if}
 			{:else if activeTab === 'Report'}
+				<div class="report-toolbar">
+					<div class="report-summary">
+						<strong>PDF export</strong>
+						{#if latestGeneratedReport}
+							<span>{latestGeneratedReport.report_id}</span>
+						{:else}
+							<span>{reportSectionCount} sections</span>
+						{/if}
+					</div>
+					<div class="report-actions">
+						<button
+							type="button"
+							class="secondary-button"
+							disabled={!taskId || isExportingReport || artifacts.report_sections.length === 0}
+							on:click={exportReportPdf}
+						>
+							{isExportingReport ? 'Exporting...' : 'Export PDF'}
+						</button>
+						<button
+							type="button"
+							class="secondary-button"
+							disabled={!latestGeneratedReport?.report_id}
+							on:click={downloadGeneratedReportPdf}
+						>
+							Download PDF
+						</button>
+					</div>
+				</div>
+				{#if reportMessage}
+					<p class="report-message">{reportMessage}</p>
+				{/if}
 				{#if artifacts.report_sections.length === 0}
 					<div class="empty-state">
 						<strong>No report sections yet.</strong>
@@ -669,10 +783,10 @@
 					</div>
 				{:else}
 					<div class="artifact-list">
-						{#each artifacts.report_sections as section}
+						{#each artifacts.report_sections as section, index}
 							<article class="artifact-item">
-								<h3>{section.title ?? section.report_type ?? 'Report section'}</h3>
-								<p>{section.markdown ?? section.text ?? section.summary ?? 'No report text available.'}</p>
+								<h3>{reportSectionTitle(section, index)}</h3>
+								<p>{reportSectionText(section)}</p>
 								<div class="ref-row">
 									{#each asArray(section.evidence_refs) as ref}
 										<button type="button" class="ref-button" on:click={() => scrollToEvidence(String(ref))}>
@@ -1082,6 +1196,30 @@
 		margin-bottom: 0.5rem;
 	}
 
+	.report-toolbar,
+	.report-actions,
+	.report-summary {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.report-toolbar {
+		justify-content: space-between;
+		margin-bottom: 0.75rem;
+	}
+
+	.report-summary span,
+	.report-message {
+		color: #64748b;
+		font-size: 0.82rem;
+	}
+
+	.report-message {
+		margin: 0 0 0.75rem;
+	}
+
 	@media (max-width: 900px) {
 		.limra-research-page {
 			grid-template-columns: 1fr;
@@ -1102,6 +1240,8 @@
 		.workspace-header,
 		.drawer-header,
 		.scenario-select-row,
+		.report-toolbar,
+		.report-actions,
 		.form-actions {
 			align-items: stretch;
 			flex-direction: column;

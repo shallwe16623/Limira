@@ -132,6 +132,8 @@ def test_limra_research_page_uses_only_browser_facing_limra_api_paths():
         "`/api/limra/tasks/${id}/events`",
         "`/api/limra/tasks/${id}/artifacts`",
         "`/api/limra/tasks/${taskId}/archive.zip`",
+        "`/api/limra/tasks/${taskId}/reports/pdf`",
+        "`/api/limra/tasks/${taskId}/reports/${latestGeneratedReport.report_id}/pdf`",
     ]
     for path in required_paths:
         assert path in page
@@ -158,6 +160,28 @@ def test_limra_research_page_has_demo_scenario_selector():
     assert "Use scenario query" in page
     assert "scenario: selectedScenario || undefined" in page
     assert "osint-mvp" not in page
+
+
+def test_limra_research_page_has_report_pdf_export_controls():
+    page = _read(LIMRA_PAGE)
+
+    assert "type GeneratedReport" in page
+    assert "let latestGeneratedReport: GeneratedReport | null = null;" in page
+    assert "const exportReportPdf = async () =>" in page
+    assert "`/api/limra/tasks/${taskId}/reports/pdf`" in page
+    assert "report_id: `ui-${Date.now()}`" in page
+    assert "report_type: 'final'" in page
+    assert "markdown: buildReportMarkdown()" in page
+    assert "evidence_refs: reportEvidenceRefs()" in page
+    assert "html:" not in page
+    assert "object_key" not in page
+    assert "pdf_object_key" not in page
+    assert "const downloadGeneratedReportPdf = () =>" in page
+    assert "`/api/limra/tasks/${taskId}/reports/${latestGeneratedReport.report_id}/pdf`" in page
+    assert "Export PDF" in page
+    assert "Download PDF" in page
+    assert "disabled={!taskId || isExportingReport || artifacts.report_sections.length === 0}" in page
+    assert "disabled={!latestGeneratedReport?.report_id}" in page
 
 
 def test_limra_artifact_drawer_tabs_and_reference_controls_are_present():
