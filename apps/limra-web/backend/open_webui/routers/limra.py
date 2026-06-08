@@ -351,6 +351,11 @@ class LimraUploadedDocument:
     embedding: list[float] | None = None
 
     def public_dict(self) -> dict[str, Any]:
+        download_available = _is_valid_uploaded_document_download_metadata(
+            self.object_key,
+            (self.metadata or {}).get("sha256"),
+            (self.metadata or {}).get("download_unavailable"),
+        )
         return {
             "document_id": self.document_id,
             "task_id": self.task_id,
@@ -359,7 +364,9 @@ class LimraUploadedDocument:
             "byte_size": self.byte_size,
             "language": self.language,
             "extracted_text_chars": len(self.extracted_text or ""),
-            "download_url": f"/api/limra/uploads/{self.document_id}/download",
+            "download_url": f"/api/limra/uploads/{self.document_id}/download"
+            if download_available
+            else None,
         }
 
 
@@ -3137,10 +3144,48 @@ async def download_uploaded_document(
     object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> Response:
     document = _get_owned_document(repo, document_id, user)
+    metadata_failure = _uploaded_document_download_metadata_failure_reason(document)
+    if metadata_failure is not None:
+        if metadata_failure != "document_download_unavailable":
+            _mark_uploaded_document_download_unavailable(
+                document,
+                repo=repo,
+                reason=metadata_failure,
+            )
+        raise HTTPException(status_code=404, detail="document_object_not_found")
     try:
         data = await object_storage.get_object(object_key=document.object_key)
     except FileNotFoundError as exc:
+        _mark_uploaded_document_download_unavailable(
+            document,
+            repo=repo,
+            reason="document_object_missing",
+        )
         raise HTTPException(status_code=404, detail="document_object_not_found") from exc
+    except ValueError as exc:
+        _mark_uploaded_document_download_unavailable(
+            document,
+            repo=repo,
+            reason="invalid_document_object_key",
+        )
+        raise HTTPException(status_code=404, detail="document_object_not_found") from exc
+    reuse_failure = _uploaded_document_reuse_failure_reason(data, document=document)
+    if reuse_failure is not None:
+        log.warning(
+            "Persisted limra uploaded document object failed validation; clearing download metadata",
+            extra={
+                "document_id": document.document_id,
+                "task_id": document.task_id,
+                "user_id": document.owner_user_id,
+                "reason": reuse_failure,
+            },
+        )
+        _mark_uploaded_document_download_unavailable(
+            document,
+            repo=repo,
+            reason=reuse_failure,
+        )
+        raise HTTPException(status_code=404, detail="document_object_not_found")
     return Response(
         data,
         media_type=document.content_type or "application/octet-stream",
@@ -3431,6 +3476,77 @@ def _clear_report_pdf_metadata(
     )
     report.pdf_object_key = None
     report.metadata = metadata
+
+
+def _mark_uploaded_document_download_unavailable(
+    document: LimraUploadedDocument,
+    *,
+    repo: LimraTaskRepository,
+    reason: str,
+) -> None:
+    metadata = scrub_limra_secrets(
+        {
+            **_drop_uploaded_document_download_metadata(document.metadata or {}),
+            "download_unavailable": reason,
+        }
+    )
+    repo.record_uploaded_document(
+        document_id=document.document_id,
+        owner_user_id=document.owner_user_id,
+        task_id=document.task_id,
+        original_filename=document.original_filename,
+        content_type=document.content_type,
+        byte_size=document.byte_size,
+        minio_bucket=document.minio_bucket,
+        object_key=document.object_key,
+        extracted_text=document.extracted_text,
+        language=document.language,
+        metadata=metadata,
+        embedding=document.embedding,
+    )
+    document.metadata = metadata
+
+
+def _drop_uploaded_document_download_metadata(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in metadata.items()
+        if str(key) not in {"sha256", "download_unavailable"}
+    }
+
+
+def _uploaded_document_download_metadata_failure_reason(
+    document: LimraUploadedDocument,
+) -> str | None:
+    metadata = document.metadata or {}
+    if metadata.get("download_unavailable"):
+        return "document_download_unavailable"
+    if not _is_valid_limra_object_key(document.object_key):
+        return "invalid_document_object_key"
+    expected_sha = metadata.get("sha256")
+    if not isinstance(expected_sha, str) or not expected_sha.strip():
+        return "document_sha_missing"
+    if re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha.strip()) is None:
+        return "document_sha_malformed"
+    return None
+
+
+def _uploaded_document_reuse_failure_reason(
+    document_bytes: bytes,
+    document: LimraUploadedDocument,
+) -> str | None:
+    expected_sha = (document.metadata or {}).get("sha256")
+    if not isinstance(expected_sha, str) or not expected_sha.strip():
+        return "document_sha_missing"
+    expected_sha = expected_sha.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+        return "document_sha_malformed"
+    actual_sha = hashlib.sha256(document_bytes).hexdigest()
+    if actual_sha != expected_sha:
+        return "document_sha_mismatch"
+    return None
 
 
 def _persisted_report_pdf_reuse_failure_reason(
@@ -5089,6 +5205,19 @@ def _is_valid_report_pdf_metadata(
         _is_valid_limra_object_key(object_key)
         and isinstance(pdf_sha256, str)
         and re.fullmatch(r"[0-9a-fA-F]{64}", pdf_sha256.strip()) is not None
+    )
+
+
+def _is_valid_uploaded_document_download_metadata(
+    object_key: str | None,
+    sha256: Any,
+    download_unavailable: Any,
+) -> bool:
+    return (
+        not download_unavailable
+        and _is_valid_limra_object_key(object_key)
+        and isinstance(sha256, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", sha256.strip()) is not None
     )
 
 

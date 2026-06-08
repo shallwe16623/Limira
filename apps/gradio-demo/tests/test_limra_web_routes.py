@@ -1615,6 +1615,157 @@ async def test_upload_document_list_read_and_download_are_owner_scoped():
 
 
 @pytest.mark.asyncio
+async def test_upload_download_clears_missing_persisted_document_object():
+    app, repo, storage = _limra_asgi_app()
+    expected_bytes = b"expected document bytes"
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="missing.txt",
+        object_id="doc-missing",
+    )
+    document = repo.record_uploaded_document(
+        document_id="doc-missing",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="missing.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="missing document",
+        language=None,
+        metadata={"sha256": hashlib.sha256(expected_bytes).hexdigest()},
+        embedding=None,
+    )
+
+    assert document.public_dict()["download_url"].endswith("/doc-missing/download")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get("/api/limra/uploads/doc-missing/download")
+        detail_response = await client.get("/api/limra/uploads/doc-missing")
+        search_response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "missing"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "document_object_not_found"
+    refreshed = repo.get_user_document("doc-missing", "user-a")
+    assert refreshed is not None
+    assert refreshed.metadata["download_unavailable"] == "document_object_missing"
+    assert "sha256" not in refreshed.metadata
+    assert refreshed.public_dict()["download_url"] is None
+    assert detail_response.status_code == 200
+    assert detail_response.json()["download_url"] is None
+    assert search_response.status_code == 200
+    assert search_response.json()["documents"][0]["download_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_upload_download_clears_mismatched_persisted_document_object():
+    app, repo, storage = _limra_asgi_app()
+    expected_bytes = b"expected document bytes"
+    stale_bytes = b"stale document bytes"
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="mismatch.txt",
+        object_id="doc-mismatch",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=stale_bytes,
+        content_type="text/plain",
+        metadata={"document_id": "doc-mismatch"},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-mismatch",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="mismatch.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="mismatch document",
+        language=None,
+        metadata={"sha256": hashlib.sha256(expected_bytes).hexdigest()},
+        embedding=None,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get("/api/limra/uploads/doc-mismatch/download")
+        detail_response = await client.get("/api/limra/uploads/doc-mismatch")
+
+    assert response.status_code == 404
+    assert response.content != stale_bytes
+    refreshed = repo.get_user_document("doc-mismatch", "user-a")
+    assert refreshed is not None
+    assert refreshed.metadata["download_unavailable"] == "document_sha_mismatch"
+    assert "sha256" not in refreshed.metadata
+    assert refreshed.public_dict()["download_url"] is None
+    assert detail_response.status_code == 200
+    assert detail_response.json()["download_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_upload_download_clears_missing_persisted_document_checksum():
+    app, repo, storage = _limra_asgi_app()
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="missing-sha.txt",
+        object_id="doc-missing-sha",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=b"document bytes",
+        content_type="text/plain",
+        metadata={"document_id": "doc-missing-sha"},
+    )
+    document = repo.record_uploaded_document(
+        document_id="doc-missing-sha",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="missing-sha.txt",
+        content_type="text/plain",
+        byte_size=len(b"document bytes"),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="missing sha document",
+        language=None,
+        metadata={"source": "legacy"},
+        embedding=None,
+    )
+
+    assert document.public_dict()["download_url"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get("/api/limra/uploads/doc-missing-sha/download")
+        detail_response = await client.get("/api/limra/uploads/doc-missing-sha")
+
+    assert response.status_code == 404
+    refreshed = repo.get_user_document("doc-missing-sha", "user-a")
+    assert refreshed is not None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "document_sha_missing",
+    }
+    assert detail_response.status_code == 200
+    assert detail_response.json()["download_url"] is None
+
+
+@pytest.mark.asyncio
 async def test_upload_search_is_owner_scoped_task_filterable_and_browser_safe():
     app, repo, storage = _limra_asgi_app()
     repo.create_task(
@@ -2845,6 +2996,111 @@ def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
     ] == ["doc-001"]
     assert repo.list_user_documents(owner_user_id="user-a", task_id="task-other") == []
     assert repo.list_user_documents(owner_user_id="user-b") == []
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_missing_persisted_document_object():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    expected_bytes = b"expected postgres document bytes"
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="missing-postgres.txt",
+        object_id="doc-postgres-missing",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-postgres-missing",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="missing-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="missing postgres document",
+        language=None,
+        metadata={"sha256": hashlib.sha256(expected_bytes).hexdigest()},
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_uploaded_document(
+            "doc-postgres-missing",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-missing", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata["download_unavailable"] == "document_object_missing"
+    assert "sha256" not in refreshed.metadata
+    persisted = json.loads(engine.uploaded_documents["doc-postgres-missing"]["metadata"])
+    assert persisted["download_unavailable"] == "document_object_missing"
+    assert "sha256" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_mismatched_persisted_document_object():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    expected_bytes = b"expected postgres document bytes"
+    stale_bytes = b"stale postgres document bytes"
+    object_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="mismatch-postgres.txt",
+        object_id="doc-postgres-mismatch",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=stale_bytes,
+        content_type="text/plain",
+        metadata={"document_id": "doc-postgres-mismatch"},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-postgres-mismatch",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="mismatch-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="mismatch postgres document",
+        language=None,
+        metadata={"sha256": hashlib.sha256(expected_bytes).hexdigest()},
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_uploaded_document(
+            "doc-postgres-mismatch",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-mismatch", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata["download_unavailable"] == "document_sha_mismatch"
+    assert "sha256" not in refreshed.metadata
+    persisted = json.loads(engine.uploaded_documents["doc-postgres-mismatch"]["metadata"])
+    assert persisted["download_unavailable"] == "document_sha_mismatch"
+    assert "sha256" not in persisted
 
 
 def test_postgres_repository_searches_uploaded_documents_by_vector():
