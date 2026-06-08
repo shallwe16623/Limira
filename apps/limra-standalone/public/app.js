@@ -272,8 +272,11 @@ async function resumeWorkspace() {
 			'error',
 			`无法从后端恢复上次任务：${errorMessage(error)}`
 		);
-		state.archiveStatus = 'pending';
-		state.archiveDownloadUrl = '';
+		clearRestoredTaskState(error);
+		saveWorkspace();
+		renderStatus();
+		renderTabs();
+		renderReportControls();
 		await loadUploads();
 	}
 }
@@ -1129,6 +1132,19 @@ function renderReportControls() {
 	dom.downloadPdfButton.disabled = !reportPdfUrl(state.latestReport);
 }
 
+function clearRestoredTaskState(error) {
+	const rejectedTask = error?.status === 403 || error?.status === 404;
+	if (rejectedTask) {
+		state.taskId = '';
+		state.status = 'ready';
+	}
+	state.archiveStatus = 'pending';
+	state.archiveDownloadUrl = '';
+	state.latestReport = null;
+	state.finalReportText = '';
+	state.artifacts = emptyArtifacts();
+}
+
 function updateArchiveState(source) {
 	if (!source || typeof source !== 'object') {
 		return;
@@ -1238,7 +1254,9 @@ async function api(path, options = {}) {
 			state.user = null;
 			renderShell();
 		}
-		throw new Error(detail || `请求失败，状态码 ${response.status}`);
+		const error = new Error(detail || `请求失败，状态码 ${response.status}`);
+		error.status = response.status;
+		throw error;
 	}
 	const contentType = response.headers.get('content-type') || '';
 	if (!contentType.includes('application/json')) {

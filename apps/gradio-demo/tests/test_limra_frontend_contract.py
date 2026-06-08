@@ -533,6 +533,166 @@ def test_limra_standalone_frontend_respects_archive_and_pdf_readiness():
     assert checks["stalePdfDisabled"] is True
 
 
+def test_limra_standalone_frontend_clears_report_downloads_after_failed_restore():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    app = LIMRA_STANDALONE_ROOT / "public" / "app.js"
+    script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const source = fs.readFileSync({str(app)!r}, 'utf8');
+        const storage = new Map();
+        function element() {{
+            return {{
+                textContent: '',
+                disabled: false,
+                innerHTML: '',
+                scrollTop: 0,
+                scrollHeight: 0,
+                classList: {{ toggle() {{}}, add() {{}}, remove() {{}} }},
+                parentElement: {{ classList: {{ toggle() {{}} }} }},
+                addEventListener() {{}},
+                querySelectorAll: () => []
+            }};
+        }}
+        const context = {{
+            console,
+            URL,
+            element,
+            FormData: class FormData {{}},
+            Headers: class Headers {{
+                set() {{}}
+            }},
+            EventSource: class EventSource {{}},
+            fetch: async (path) => {{
+                if (String(path).startsWith('/api/limra/tasks/deleted-task')) {{
+                    return {{
+                        ok: false,
+                        status: 404,
+                        statusText: 'Not Found',
+                        headers: {{ get: () => 'application/json' }},
+                        text: async () => JSON.stringify({{ detail: 'task_not_found' }})
+                    }};
+                }}
+                return {{
+                    ok: true,
+                    status: 200,
+                    headers: {{ get: () => 'application/json' }},
+                    text: async () => JSON.stringify({{ documents: [] }})
+                }};
+            }},
+            localStorage: {{
+                getItem: (key) => storage.get(key) || '',
+                setItem: (key, value) => storage.set(key, String(value)),
+                removeItem: (key) => storage.delete(key)
+            }},
+            window: {{
+                location: {{ href: 'http://127.0.0.1/' }},
+                setTimeout: () => 0
+            }},
+            document: {{
+                addEventListener: () => {{}},
+                querySelectorAll: () => []
+            }}
+        }};
+        (async () => {{
+            vm.createContext(context);
+            vm.runInContext(source, context);
+            await vm.runInContext(`(async () => {{
+                Object.assign(dom, {{
+                    statusLabel: element(),
+                    taskLabel: element(),
+                    submitResearchButton: element(),
+                    downloadArchiveButton: element(),
+                    reportMessage: element(),
+                    exportPdfButton: element(),
+                    downloadPdfButton: element(),
+                    messageList: element(),
+                    eventLog: element(),
+                    artifactTabs: element(),
+                    artifactContent: element(),
+                    uploadList: element(),
+                    uploadMessage: element()
+                }});
+
+                localStorage.setItem(
+                    STORAGE_KEY,
+                    JSON.stringify({{
+                        taskId: 'deleted-task',
+                        status: 'completed',
+                        archiveStatus: 'ready',
+                        archiveDownloadUrl: '/api/limra/tasks/deleted-task/archive.zip',
+                        latestReport: {{
+                            task_id: 'deleted-task',
+                            report_id: 'old-report',
+                            pdf_url: '/api/limra/tasks/deleted-task/reports/old-report/pdf'
+                        }},
+                        finalReportText: 'stale report body',
+                        artifacts: {{
+                            report_sections: [{{ title: 'stale', markdown: 'stale markdown' }}]
+                        }}
+                    }})
+                );
+                restoreWorkspace();
+                renderReportControls();
+                const beforeDisabled = dom.downloadPdfButton.disabled;
+                const beforePdfUrl = reportPdfUrl(state.latestReport);
+                const beforeHref = window.location.href;
+
+                await resumeWorkspace();
+                renderReportControls();
+                downloadPdf();
+                const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+
+                this.__limraFailedRestoreChecks = {{
+                    beforeDisabled,
+                    beforePdfUrl,
+                    afterTaskId: state.taskId,
+                    afterStatus: state.status,
+                    afterLatestReport: state.latestReport,
+                    afterFinalReportText: state.finalReportText,
+                    afterReportSections: state.artifacts.report_sections.length,
+                    afterDisabled: dom.downloadPdfButton.disabled,
+                    afterHrefUnchanged: window.location.href === beforeHref,
+                    savedTaskId: saved.taskId,
+                    savedLatestReport: saved.latestReport,
+                    savedFinalReportText: saved.finalReportText,
+                    errorMessage: state.messages[state.messages.length - 1].content
+                }};
+            }})()`, context);
+            process.stdout.write(JSON.stringify(context.__limraFailedRestoreChecks));
+        }})().catch((error) => {{
+            console.error(error);
+            process.exit(1);
+        }});
+    """
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    checks = json.loads(result.stdout)
+
+    assert checks["beforeDisabled"] is False
+    assert checks["beforePdfUrl"] == "/api/limra/tasks/deleted-task/reports/old-report/pdf"
+    assert checks["afterTaskId"] == ""
+    assert checks["afterStatus"] == "ready"
+    assert checks["afterLatestReport"] is None
+    assert checks["afterFinalReportText"] == ""
+    assert checks["afterReportSections"] == 0
+    assert checks["afterDisabled"] is True
+    assert checks["afterHrefUnchanged"] is True
+    assert checks["savedTaskId"] == ""
+    assert checks["savedLatestReport"] is None
+    assert checks["savedFinalReportText"] == ""
+    assert "无法从后端恢复上次任务" in checks["errorMessage"]
+
+
 def test_limra_research_page_has_demo_scenario_selector():
     page = _read(LIMRA_PAGE)
 
