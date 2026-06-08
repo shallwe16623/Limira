@@ -335,7 +335,7 @@ class LimraTask:
             "archive_status": self.archive_status,
             "scenario": self.scenario,
             "error": _public_error_text(self.error, fallback="limra_task_failed"),
-            "model_summary": scrub_limra_secrets(self.model_summary or {}),
+            "model_summary": _public_model_summary(self.model_summary or {}),
             "download_url": f"/api/limra/tasks/{self.task_id}/archive.zip"
             if self.archive_status == "ready"
             else None,
@@ -5042,6 +5042,63 @@ def _public_error_text(value: Any, *, fallback: str) -> str | None:
 
 def _public_reason_text(value: Any) -> str | None:
     return _public_error_text(value, fallback="runner_stream_conflict")
+
+
+def _public_model_summary(value: Any) -> Any:
+    scrubbed = scrub_limra_secrets(value)
+    return _public_metadata_value(scrubbed)
+
+
+def _public_metadata_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        public: dict[Any, Any] = {}
+        for key, item in value.items():
+            public_key = _public_metadata_key(key)
+            if public_key is None:
+                continue
+            public[public_key] = _public_metadata_value(item)
+        return public
+    if isinstance(value, list):
+        return [_public_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_metadata_value(item) for item in value]
+    if isinstance(value, set):
+        return [_public_metadata_value(item) for item in sorted(value, key=str)]
+    if isinstance(value, bytes):
+        try:
+            return _public_metadata_value(value.decode("utf-8"))
+        except UnicodeDecodeError:
+            return LIMRA_SECRET_REDACTION
+    if isinstance(value, str):
+        return _public_error_text(
+            value,
+            fallback="limra_internal_value_redacted",
+        )
+    return value
+
+
+def _public_metadata_key(key: Any) -> str | None:
+    key_text = str(key)
+    if _is_internal_metadata_field_name(key_text):
+        return None
+    public_key = _public_error_text(
+        key_text,
+        fallback="limra_internal_field_redacted",
+    )
+    if not public_key or public_key == "limra_internal_field_redacted":
+        return None
+    return public_key
+
+
+def _is_internal_metadata_field_name(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_")
+    return bool(
+        re.search(
+            r"(?:^|_)(?:object_key|minio_object_key|pdf_object_key|"
+            r"archive_object_key|runner_task_id|runner_url|service_token)(?:$|_)",
+            normalized,
+        )
+    )
 
 
 def _scrub_mapping_key(key: Any) -> Any:

@@ -799,6 +799,61 @@ async def test_admin_access_requires_explicit_admin_route():
 
 
 @pytest.mark.asyncio
+async def test_task_payload_hides_internal_model_summary_identifiers():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    admin = limra.LimraUser("admin-user", role="admin")
+    task = repo.create_task(
+        task_id="task-summary",
+        owner_user_id=user.id,
+        query="summarize internal state",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    repo.update_task(
+        task.task_id,
+        model_summary={
+            "provider": "deepseek",
+            "runner_task_id": "runner-task-secret",
+            "object_key": "limra/users/hash/tasks/task-summary/uploads/doc.txt",
+            "endpoint": (
+                "http://10.20.30.40:8091/mirothinker/tasks/runner-task-secret"
+            ),
+            "nested": {
+                "archive_object_key": (
+                    "limra/users/hash/tasks/task-summary/archives/archive.zip"
+                ),
+                "safe": "kept",
+                "warning": "limra/users/hash/tasks/task-summary/uploads/doc.txt",
+            },
+        },
+    )
+
+    user_payload = await limra.get_task(task.task_id, user=user, repo=repo)
+    admin_payload = await limra.admin_get_task(task.task_id, user=admin, repo=repo)
+
+    for payload in (user_payload, admin_payload):
+        assert payload["model_summary"]["provider"] == "deepseek"
+        assert payload["model_summary"]["nested"]["safe"] == "kept"
+        assert payload["model_summary"]["endpoint"] == "limra_internal_value_redacted"
+        assert payload["model_summary"]["nested"]["warning"] == (
+            "limra_internal_value_redacted"
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for leaked in (
+            "runner_task_id",
+            "runner-task-secret",
+            "object_key",
+            "archive_object_key",
+            "limra/users/hash",
+            "http://10.20.30.40:8091",
+            "/mirothinker/",
+        ):
+            assert leaked not in serialized
+        _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
