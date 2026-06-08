@@ -3291,12 +3291,28 @@ async def _load_or_create_persisted_archive(
 ) -> bytes:
     if task.archive_object_key:
         try:
-            return await object_storage.get_object(object_key=task.archive_object_key)
+            archive_bytes = await object_storage.get_object(object_key=task.archive_object_key)
+            reuse_failure = _persisted_archive_reuse_failure_reason(
+                archive_bytes,
+                task=task,
+            )
+            if reuse_failure is None:
+                return archive_bytes
+            log.warning(
+                "Persisted limra archive object failed validation; regenerating",
+                extra={
+                    "task_id": task.task_id,
+                    "user_id": user.id,
+                    "reason": reuse_failure,
+                },
+            )
+            _clear_persisted_archive_metadata(task, repo=repo)
         except FileNotFoundError:
             log.warning(
                 "Persisted limra archive object missing; regenerating",
                 extra={"task_id": task.task_id, "user_id": user.id},
             )
+            _clear_persisted_archive_metadata(task, repo=repo)
 
     archive_bytes = _build_persisted_archive_zip(task, repo)
     validate_archive_zip(archive_bytes)
@@ -3331,6 +3347,37 @@ async def _load_or_create_persisted_archive(
     task.archive_object_key = stored.object_key
     task.archive_zip_sha256 = stored.sha256
     return archive_bytes
+
+
+def _persisted_archive_reuse_failure_reason(
+    archive_bytes: bytes,
+    *,
+    task: LimraTask,
+) -> str | None:
+    try:
+        validate_archive_zip(archive_bytes)
+    except HTTPException:
+        return "invalid_archive_zip"
+    if not task.archive_zip_sha256:
+        return "archive_sha_missing"
+    actual_sha = hashlib.sha256(archive_bytes).hexdigest()
+    if actual_sha != task.archive_zip_sha256:
+        return "archive_sha_mismatch"
+    return None
+
+
+def _clear_persisted_archive_metadata(
+    task: LimraTask,
+    *,
+    repo: LimraTaskRepository,
+) -> None:
+    repo.update_task(
+        task.task_id,
+        archive_object_key=None,
+        archive_zip_sha256=None,
+    )
+    task.archive_object_key = None
+    task.archive_zip_sha256 = None
 
 
 def _build_persisted_archive_zip(

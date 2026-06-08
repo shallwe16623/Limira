@@ -3,6 +3,7 @@ import json
 import sys
 import zipfile
 import asyncio
+import hashlib
 import types
 from pathlib import Path
 
@@ -281,6 +282,100 @@ async def test_user_isolation_for_task_status_and_archive_download():
     assert second_response.body == response.body
     assert len(storage.objects) == 1
     _assert_no_browser_leak(response.body.decode("latin1"))
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_mismatched_persisted_archive_object():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-archive-mismatch",
+        owner_user_id=user.id,
+        query="archive mismatch",
+        scenario=None,
+        runner_task_id="runner-archive-mismatch",
+    )
+    task.archive_status = "ready"
+
+    first_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_key = task.archive_object_key
+    assert archive_key in storage.objects
+    first_sha = task.archive_zip_sha256
+    assert first_sha == hashlib.sha256(first_response.body).hexdigest()
+
+    tampered_archive = _archive_zip()
+    tampered_sha = hashlib.sha256(tampered_archive).hexdigest()
+    assert tampered_sha != first_sha
+    storage.objects[archive_key]["data"] = tampered_archive
+    storage.objects[archive_key]["sha256"] = tampered_sha
+
+    second_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert second_response.body != tampered_archive
+    assert task.archive_object_key == archive_key
+    assert task.archive_zip_sha256 == hashlib.sha256(second_response.body).hexdigest()
+    assert storage.objects[archive_key]["sha256"] == task.archive_zip_sha256
+    members = _archive_member_texts(second_response.body)
+    metadata = json.loads(members["metadata.json"])
+    assert metadata["task"]["task_id"] == task.task_id
+    assert "archive mismatch" in members["report.md"]
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_invalid_persisted_archive_object():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-archive-invalid-object",
+        owner_user_id=user.id,
+        query="archive invalid object",
+        scenario=None,
+        runner_task_id="runner-archive-invalid-object",
+    )
+    task.archive_status = "ready"
+
+    first_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_key = task.archive_object_key
+    assert archive_key in storage.objects
+    corrupt_archive = b"not a zip archive"
+    corrupt_sha = hashlib.sha256(corrupt_archive).hexdigest()
+    assert corrupt_sha != hashlib.sha256(first_response.body).hexdigest()
+    storage.objects[archive_key]["data"] = corrupt_archive
+    storage.objects[archive_key]["sha256"] = corrupt_sha
+
+    second_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert second_response.body != corrupt_archive
+    assert task.archive_object_key == archive_key
+    assert task.archive_zip_sha256 == hashlib.sha256(second_response.body).hexdigest()
+    assert zipfile.ZipFile(io.BytesIO(second_response.body)).namelist() == [
+        "metadata.json",
+        "report.html",
+        "report.md",
+        "trace.json",
+    ]
 
 
 @pytest.mark.asyncio
