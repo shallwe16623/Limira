@@ -762,7 +762,7 @@ function renderEvidence() {
 function evidenceCard(item, index) {
 	const id = item.evidence_id || item.ref_id || item.id || `EVID-${String(index + 1).padStart(3, '0')}`;
 	const title = item.title || item.source || id;
-	const url = item.url || item.source_url || '';
+	const url = safeExternalUrl(item.url || item.source_url || '');
 	const summary = item.summary || item.text || item.description || '';
 	return `<article id="evidence-${safeDomId(id)}" class="artifact-card">
 		<div class="artifact-title">${escapeHtml(title)}</div>
@@ -772,7 +772,7 @@ function evidenceCard(item, index) {
 			${item.published_at ? `<span>${escapeHtml(item.published_at)}</span>` : ''}
 		</div>
 		<div class="artifact-body">${escapeHtml(summary)}</div>
-		${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">打开来源</a>` : ''}
+		${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
 	</article>`;
 }
 
@@ -1064,7 +1064,7 @@ function renderInlineMarkdown(value) {
 	htmlText = htmlText.replace(/\*([^*]+)\*/g, '<em>$1</em>');
 	htmlText = htmlText.replace(
 		/(https?:\/\/[^\s<]+[^<.,;:!?)\]\s])/g,
-		'<a href="$1" target="_blank" rel="noreferrer">$1</a>'
+		'<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
 	);
 	return htmlText;
 }
@@ -1402,6 +1402,19 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
 	return escapeHtml(value).replaceAll('`', '&#096;');
+}
+
+function safeExternalUrl(value) {
+	const text = String(value || '').trim();
+	if (!/^https?:\/\//i.test(text)) {
+		return '';
+	}
+	try {
+		const url = new URL(text);
+		return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+	} catch {
+		return '';
+	}
 }
 
 function escapeSvg(value) {

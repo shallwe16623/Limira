@@ -266,6 +266,84 @@ def test_limra_standalone_proxy_only_forwards_limra_api_namespace():
         backend.server_close()
 
 
+def test_limra_standalone_frontend_sanitizes_external_links():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    app = LIMRA_STANDALONE_ROOT / "public" / "app.js"
+    script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const source = fs.readFileSync({str(app)!r}, 'utf8');
+        const storage = new Map();
+        const context = {{
+            console,
+            URL,
+            FormData: class FormData {{}},
+            Headers: class Headers {{
+                set() {{}}
+            }},
+            EventSource: class EventSource {{}},
+            fetch: async () => ({{ ok: true, headers: new Map(), text: async () => '{{}}' }}),
+            localStorage: {{
+                getItem: (key) => storage.get(key) || '',
+                setItem: (key, value) => storage.set(key, String(value)),
+                removeItem: (key) => storage.delete(key)
+            }},
+            window: {{
+                location: {{ href: 'http://127.0.0.1/' }},
+                setTimeout: () => 0
+            }},
+            document: {{
+                addEventListener: () => {{}},
+                querySelectorAll: () => []
+            }}
+        }};
+        vm.createContext(context);
+        vm.runInContext(source, context);
+        vm.runInContext(`
+            this.__limraLinkChecks = {{
+                javascriptEvidence: evidenceCard({{
+                    evidence_id: 'EVID-JS',
+                    title: 'Bad',
+                    url: 'javascript:alert(1)'
+                }}, 0),
+                dataEvidence: evidenceCard({{
+                    evidence_id: 'EVID-DATA',
+                    title: 'Bad',
+                    source_url: 'data:text/html,<script>alert(1)</script>'
+                }}, 1),
+                httpsEvidence: evidenceCard({{
+                    evidence_id: 'EVID-HTTPS',
+                    title: 'Good',
+                    source_url: 'https://example.test/source?q=1'
+                }}, 2),
+                markdownLink: renderInlineMarkdown('See https://example.test/report?q=1')
+            }};
+        `, context);
+        process.stdout.write(JSON.stringify(context.__limraLinkChecks));
+    """
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    checks = json.loads(result.stdout)
+
+    assert "href=" not in checks["javascriptEvidence"]
+    assert "javascript:" not in checks["javascriptEvidence"].lower()
+    assert "href=" not in checks["dataEvidence"]
+    assert "data:" not in checks["dataEvidence"].lower()
+    assert 'href="https://example.test/source?q=1"' in checks["httpsEvidence"]
+    assert 'rel="noopener noreferrer"' in checks["httpsEvidence"]
+    assert 'href="https://example.test/report?q=1"' in checks["markdownLink"]
+    assert 'rel="noopener noreferrer"' in checks["markdownLink"]
+
+
 def test_limra_research_page_has_demo_scenario_selector():
     page = _read(LIMRA_PAGE)
 
