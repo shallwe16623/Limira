@@ -43,6 +43,17 @@
 		pdf_sha256?: string;
 	};
 
+	type UploadedDocument = {
+		document_id: string;
+		task_id?: string | null;
+		filename: string;
+		content_type?: string | null;
+		byte_size: number;
+		language?: string | null;
+		extracted_text_chars: number;
+		download_url?: string;
+	};
+
 	const artifactTabs: ArtifactTab[] = ['Evidence', 'Entities', 'Graph', 'Timeline', 'Map', 'Report'];
 	const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 
@@ -72,6 +83,11 @@
 	let latestGeneratedReport: GeneratedReport | null = null;
 	let isExportingReport = false;
 	let reportMessage = '';
+	let uploadedDocuments: UploadedDocument[] = [];
+	let selectedUploadFile: File | null = null;
+	let uploadInput: HTMLInputElement;
+	let isUploadingDocument = false;
+	let uploadMessage = '';
 
 	let messages: ChatMessage[] = [
 		{
@@ -132,6 +148,65 @@
 		}
 	};
 
+	const loadUploadedDocuments = async (id = taskId) => {
+		try {
+			const data = await apiJson(
+				id ? `/api/limra/uploads?task_id=${encodeURIComponent(id)}` : '/api/limra/uploads'
+			);
+			uploadedDocuments = Array.isArray(data.documents) ? data.documents : [];
+		} catch (error) {
+			uploadMessage = error instanceof Error ? error.message : 'Unable to load uploaded documents.';
+		}
+	};
+
+	const selectUploadFile = (event: Event) => {
+		const input = event.currentTarget as HTMLInputElement;
+		selectedUploadFile = input.files?.[0] ?? null;
+		uploadMessage = selectedUploadFile ? selectedUploadFile.name : '';
+	};
+
+	const uploadDocument = async () => {
+		if (!selectedUploadFile || isUploadingDocument) {
+			return;
+		}
+
+		isUploadingDocument = true;
+		uploadMessage = '';
+
+		const formData = new FormData();
+		formData.append('file', selectedUploadFile);
+		if (taskId) {
+			formData.append('task_id', taskId);
+		}
+
+		try {
+			const response = await fetch('/api/limra/uploads', {
+				method: 'POST',
+				body: formData
+			});
+			if (!response.ok) {
+				const text = await response.text();
+				throw new Error(text || `Upload failed with ${response.status}`);
+			}
+
+			selectedUploadFile = null;
+			if (uploadInput) {
+				uploadInput.value = '';
+			}
+			uploadMessage = 'Upload ready.';
+			await loadUploadedDocuments(taskId);
+		} catch (error) {
+			uploadMessage = error instanceof Error ? error.message : 'Unable to upload document.';
+		} finally {
+			isUploadingDocument = false;
+		}
+	};
+
+	const uploadedDocumentDownloadUrl = (uploadedDocument: UploadedDocument) =>
+		uploadedDocument.download_url?.startsWith('/api/limra/uploads/')
+			? uploadedDocument.download_url
+			: `/api/limra/uploads/${uploadedDocument.document_id}/download`;
+
 	const useScenarioQuery = () => {
 		if (selectedScenarioDetail?.default_query) {
 			query = selectedScenarioDetail.default_query;
@@ -168,6 +243,7 @@
 			if (taskId) {
 				connectTaskStream(taskId);
 				await loadArtifacts(taskId);
+				await loadUploadedDocuments(taskId);
 			}
 		} catch (error) {
 			errorMessage = error instanceof Error ? error.message : 'Unable to start research.';
@@ -546,6 +622,7 @@
 
 	onMount(() => {
 		void loadScenarios();
+		void loadUploadedDocuments();
 	});
 
 	onDestroy(() => {
@@ -635,6 +712,51 @@
 				</button>
 			</div>
 		</form>
+
+		<section class="upload-tools" aria-label="Uploaded documents">
+			<div class="upload-heading">
+				<div>
+					<label for="limra-upload">Upload document</label>
+					<p>Attach PDF or text sources to this workspace.</p>
+				</div>
+				<button type="button" class="secondary-button" on:click={() => loadUploadedDocuments()}>
+					Refresh uploads
+				</button>
+			</div>
+			<div class="upload-row">
+				<input
+					id="limra-upload"
+					bind:this={uploadInput}
+					type="file"
+					accept=".pdf,.txt,application/pdf,text/plain"
+					on:change={selectUploadFile}
+				/>
+				<button
+					type="button"
+					class="secondary-button"
+					disabled={!selectedUploadFile || isUploadingDocument}
+					on:click={uploadDocument}
+				>
+					{isUploadingDocument ? 'Uploading...' : 'Upload'}
+				</button>
+			</div>
+			{#if uploadMessage}
+				<p class="upload-message">{uploadMessage}</p>
+			{/if}
+			{#if uploadedDocuments.length > 0}
+				<ul class="upload-list">
+					{#each uploadedDocuments as uploadedDocument}
+						<li>
+							<div>
+								<strong>{uploadedDocument.filename}</strong>
+								<span>{uploadedDocument.extracted_text_chars} extracted chars</span>
+							</div>
+							<a href={uploadedDocumentDownloadUrl(uploadedDocument)}>Download</a>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
 	</section>
 
 	<aside class="artifact-drawer" aria-label="Research artifacts">
@@ -1007,6 +1129,76 @@
 		justify-content: flex-end;
 		flex-wrap: wrap;
 		gap: 0.5rem;
+	}
+
+	.upload-tools {
+		border-top: 1px solid #e2e8f0;
+		padding: 0.85rem 1rem 1rem;
+		display: grid;
+		gap: 0.65rem;
+	}
+
+	:global(.dark) .upload-tools {
+		border-color: #293241;
+	}
+
+	.upload-heading,
+	.upload-row,
+	.upload-list li {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+	}
+
+	.upload-heading p,
+	.upload-message,
+	.upload-list span {
+		color: #64748b;
+		font-size: 0.78rem;
+		line-height: 1.35;
+	}
+
+	.upload-row {
+		flex-wrap: wrap;
+		justify-content: flex-start;
+	}
+
+	input[type='file'] {
+		min-width: 16rem;
+		max-width: 100%;
+		font: inherit;
+		font-size: 0.82rem;
+	}
+
+	.upload-list {
+		display: grid;
+		gap: 0.4rem;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+
+	.upload-list li {
+		border: 1px solid #e2e8f0;
+		padding: 0.55rem 0.65rem;
+		background: #f8fafc;
+	}
+
+	:global(.dark) .upload-list li {
+		border-color: #2f3642;
+		background: #111827;
+	}
+
+	.upload-list div {
+		min-width: 0;
+		display: grid;
+		gap: 0.15rem;
+	}
+
+	.upload-list strong {
+		overflow-wrap: anywhere;
+		font-size: 0.84rem;
 	}
 
 	button {

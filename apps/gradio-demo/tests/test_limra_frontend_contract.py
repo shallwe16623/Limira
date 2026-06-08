@@ -134,6 +134,9 @@ def test_limra_research_page_uses_only_browser_facing_limra_api_paths():
         "`/api/limra/tasks/${taskId}/archive.zip`",
         "`/api/limra/tasks/${taskId}/reports/pdf`",
         "`/api/limra/tasks/${taskId}/reports/${latestGeneratedReport.report_id}/pdf`",
+        "'/api/limra/uploads'",
+        "`/api/limra/uploads?task_id=${encodeURIComponent(id)}`",
+        "`/api/limra/uploads/${uploadedDocument.document_id}/download`",
     ]
     for path in required_paths:
         assert path in page
@@ -182,6 +185,34 @@ def test_limra_research_page_has_report_pdf_export_controls():
     assert "Download PDF" in page
     assert "disabled={!taskId || isExportingReport || artifacts.report_sections.length === 0}" in page
     assert "disabled={!latestGeneratedReport?.report_id}" in page
+
+
+def test_limra_research_page_has_uploaded_document_controls():
+    page = _read(LIMRA_PAGE)
+
+    assert "type UploadedDocument" in page
+    assert "let uploadedDocuments: UploadedDocument[] = [];" in page
+    assert "let selectedUploadFile: File | null = null;" in page
+    assert "const loadUploadedDocuments = async (id = taskId) =>" in page
+    assert "`/api/limra/uploads?task_id=${encodeURIComponent(id)}`" in page
+    assert "const selectUploadFile = (event: Event) =>" in page
+    assert "const uploadDocument = async () =>" in page
+    assert "const formData = new FormData();" in page
+    assert "formData.append('file', selectedUploadFile);" in page
+    assert "formData.append('task_id', taskId);" in page
+    assert "fetch('/api/limra/uploads'" in page
+    assert "headers: {" not in page.split("const uploadDocument = async () =>", 1)[1].split(
+        "const uploadedDocumentDownloadUrl", 1
+    )[0]
+    assert "const uploadedDocumentDownloadUrl = (uploadedDocument: UploadedDocument) =>" in page
+    assert "`/api/limra/uploads/${uploadedDocument.document_id}/download`" in page
+    assert 'id="limra-upload"' in page
+    assert "Upload document" in page
+    assert "Refresh uploads" in page
+    assert "selectedUploadFile || isUploadingDocument" in page
+    assert "uploadedDocument.download_url?.startsWith('/api/limra/uploads/')" in page
+    assert "user_id" not in page
+    assert "owner_user_id" not in page
 
 
 def test_limra_artifact_drawer_tabs_and_reference_controls_are_present():
