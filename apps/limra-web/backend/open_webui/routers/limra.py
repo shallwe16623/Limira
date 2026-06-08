@@ -474,6 +474,16 @@ class LimraTaskRepository(Protocol):
         task_id: str | None = None,
     ) -> list[LimraUploadedDocument]: ...
 
+    def search_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+        task_id: str | None = None,
+        query_embedding: list[float] | None = None,
+    ) -> list[LimraUploadedDocumentSearchResult]: ...
+
     def record_generated_report(
         self,
         *,
@@ -740,6 +750,30 @@ class InMemoryLimraTaskRepository:
             and (task_id is None or document.task_id == task_id)
         ]
         return sorted(documents, key=lambda document: document.document_id)
+
+    def search_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+        task_id: str | None = None,
+        query_embedding: list[float] | None = None,
+    ) -> list[LimraUploadedDocumentSearchResult]:
+        documents = self.list_user_documents(
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+        )
+        if query_embedding is not None:
+            vector_results = _rank_uploaded_documents_by_embedding(
+                documents,
+                query,
+                query_embedding,
+                limit,
+            )
+            if vector_results:
+                return vector_results
+        return _rank_uploaded_documents(documents, query, limit)
 
     def record_generated_report(
         self,
@@ -1577,6 +1611,19 @@ class PostgresLimraTaskRepository:
           AND (:task_id IS NULL OR task_id = :task_id)
         ORDER BY created_at DESC, document_id ASC
     """
+    SEARCH_USER_UPLOADED_DOCUMENTS_BY_VECTOR_SQL = f"""
+        SELECT
+            {DOCUMENT_COLUMNS},
+            1 - (embedding <=> CAST(:query_embedding AS vector)) AS limra_search_score
+        FROM limra_uploaded_documents
+        WHERE owner_user_id = :owner_user_id
+          AND (:task_id IS NULL OR task_id = :task_id)
+          AND embedding IS NOT NULL
+        ORDER BY embedding <=> CAST(:query_embedding AS vector) ASC,
+                 created_at DESC,
+                 document_id ASC
+        LIMIT :limit
+    """
 
     def __init__(self, database_url: str, *, engine_factory: Any | None = None) -> None:
         if not _is_postgres_database_url(database_url):
@@ -1846,6 +1893,41 @@ class PostgresLimraTaskRepository:
             {"owner_user_id": owner_user_id, "task_id": task_id},
         )
         return [_uploaded_document_from_row(row) for row in rows]
+
+    def search_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+        task_id: str | None = None,
+        query_embedding: list[float] | None = None,
+    ) -> list[LimraUploadedDocumentSearchResult]:
+        if query_embedding is not None:
+            rows = self._fetch_all(
+                self.SEARCH_USER_UPLOADED_DOCUMENTS_BY_VECTOR_SQL,
+                {
+                    "owner_user_id": owner_user_id,
+                    "task_id": task_id,
+                    "query_embedding": _vector_param(query_embedding),
+                    "limit": limit,
+                },
+            )
+            results = [
+                _uploaded_document_vector_search_result(
+                    _uploaded_document_from_row(row),
+                    query,
+                    float(row.get("limra_search_score") or 0.0),
+                )
+                for row in rows
+            ]
+            if results:
+                return results
+        documents = self.list_user_documents(
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+        )
+        return _rank_uploaded_documents(documents, query, limit)
 
     def record_generated_report(
         self,
@@ -2680,6 +2762,12 @@ async def search_uploaded_documents(
     limit: int = 10,
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
+    embedding_config: LimraUploadEmbeddingConfig = Depends(
+        get_upload_embedding_config
+    ),
+    embedding_provider: LimraUploadEmbeddingProvider = Depends(
+        get_upload_embedding_provider
+    ),
 ) -> dict[str, Any]:
     trimmed_query = query.strip()
     if not trimmed_query:
@@ -2687,8 +2775,18 @@ async def search_uploaded_documents(
     if task_id:
         _get_owned_task(repo, task_id, user)
     bounded_limit = max(1, min(int(limit), 25))
-    documents = repo.list_user_documents(owner_user_id=user.id, task_id=task_id)
-    results = _rank_uploaded_documents(documents, trimmed_query, bounded_limit)
+    query_embedding = await _uploaded_document_search_embedding(
+        trimmed_query,
+        config=embedding_config,
+        provider=embedding_provider,
+    )
+    results = repo.search_user_documents(
+        owner_user_id=user.id,
+        task_id=task_id,
+        query=trimmed_query,
+        limit=bounded_limit,
+        query_embedding=query_embedding,
+    )
     return _assert_browser_safe(
         {
             "query": trimmed_query,
@@ -3851,6 +3949,32 @@ async def _uploaded_document_embedding(
     return embedding, metadata
 
 
+async def _uploaded_document_search_embedding(
+    query: str,
+    *,
+    config: LimraUploadEmbeddingConfig,
+    provider: LimraUploadEmbeddingProvider,
+) -> list[float] | None:
+    if not config.enabled:
+        return None
+    try:
+        raw_embedding = await provider.embed_upload_text(query, config=config)
+        embedding = [float(value) for value in raw_embedding]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="upload_search_embedding_failed",
+        ) from exc
+    if len(embedding) != config.dimensions:
+        raise HTTPException(
+            status_code=500,
+            detail="upload_search_embedding_dimension_mismatch",
+        )
+    return embedding
+
+
 def _embedding_from_value(value: Any) -> list[float] | None:
     if value is None:
         return None
@@ -3909,6 +4033,78 @@ def _rank_uploaded_documents(
         )
     )
     return results[:limit]
+
+
+def _rank_uploaded_documents_by_embedding(
+    documents: list[LimraUploadedDocument],
+    query: str,
+    query_embedding: list[float],
+    limit: int,
+) -> list[LimraUploadedDocumentSearchResult]:
+    results = [
+        result
+        for result in (
+            _uploaded_document_vector_search_result(
+                document,
+                query,
+                _cosine_similarity(query_embedding, document.embedding),
+            )
+            for document in documents
+            if document.embedding is not None
+        )
+        if result is not None
+    ]
+    results.sort(
+        key=lambda result: (
+            -result.score,
+            result.document.original_filename.lower(),
+            result.document.document_id,
+        )
+    )
+    return results[:limit]
+
+
+def _cosine_similarity(
+    left: list[float],
+    right: list[float] | None,
+) -> float | None:
+    if right is None or len(left) != len(right):
+        return None
+    dot = sum(
+        float(left_value) * float(right_value)
+        for left_value, right_value in zip(left, right)
+    )
+    left_norm = sum(float(value) * float(value) for value in left) ** 0.5
+    right_norm = sum(float(value) * float(value) for value in right) ** 0.5
+    if left_norm == 0.0 or right_norm == 0.0:
+        return None
+    return dot / (left_norm * right_norm)
+
+
+def _uploaded_document_vector_search_result(
+    document: LimraUploadedDocument,
+    query: str,
+    score: float | None,
+) -> LimraUploadedDocumentSearchResult | None:
+    if score is None:
+        return None
+    terms = _search_terms(query)
+    matched_terms = [
+        term
+        for term in terms
+        if term in (document.extracted_text or "").lower()
+        or term in (document.original_filename or "").lower()
+    ]
+    return LimraUploadedDocumentSearchResult(
+        document=document,
+        score=score,
+        snippet=_uploaded_document_search_snippet(
+            document.extracted_text or "",
+            document.original_filename or "",
+            matched_terms or terms,
+        ),
+        matched_terms=matched_terms,
+    )
 
 
 def _uploaded_document_search_result(

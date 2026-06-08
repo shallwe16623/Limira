@@ -1314,6 +1314,139 @@ async def test_upload_search_is_owner_scoped_task_filterable_and_browser_safe():
 
 
 @pytest.mark.asyncio
+async def test_upload_search_uses_configured_embedding_ranking_when_enabled():
+    app, repo, storage = _limra_asgi_app()
+    provider = FakeUploadEmbeddingProvider([1.0, 0.0])
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=2,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+    repo.record_uploaded_document(
+        document_id="doc-vector",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="near-vector.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-a/uploads/doc-vector.txt",
+        extracted_text="Nickel supply memorandum.",
+        language=None,
+        metadata={},
+        embedding=[1.0, 0.0],
+    )
+    repo.record_uploaded_document(
+        document_id="doc-lexical",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="lexical-lithium.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-a/uploads/doc-lexical.txt",
+        extracted_text="Lithium lithium lithium.",
+        language=None,
+        metadata={},
+        embedding=[0.0, 1.0],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "lithium", "limit": 2},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [document["document_id"] for document in payload["documents"]] == [
+        "doc-vector",
+        "doc-lexical",
+    ]
+    assert payload["documents"][0]["score"] > payload["documents"][1]["score"]
+    assert "embedding" not in json.dumps(payload)
+    assert "object_key" not in json.dumps(payload)
+    assert provider.calls == [
+        {
+            "text": "lithium",
+            "config": limra.LimraUploadEmbeddingConfig(
+                enabled=True,
+                provider="fake",
+                model="fake-model",
+                dimensions=2,
+            ),
+        }
+    ]
+    _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
+async def test_upload_search_rejects_embedding_dimension_mismatch():
+    app, repo, storage = _limra_asgi_app()
+    provider = FakeUploadEmbeddingProvider([1.0])
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=2,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+    repo.record_uploaded_document(
+        document_id="doc-vector",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="near-vector.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-a/uploads/doc-vector.txt",
+        extracted_text="Nickel supply memorandum.",
+        language=None,
+        metadata={},
+        embedding=[1.0, 0.0],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "nickel"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "upload_search_embedding_dimension_mismatch"
+
+
+@pytest.mark.asyncio
 async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
     app, repo, _storage = _limra_asgi_app()
     repo.create_task(
@@ -1738,6 +1871,8 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     assert "extracted_text" in sql
     assert "embedding" in sql
     assert "cast(:embedding as vector)" in sql
+    assert "embedding <=> cast(:query_embedding as vector)" in sql
+    assert "embedding is not null" in sql
     assert "archive_object_key" in sql
     assert "archive_zip_sha256" in sql
 
@@ -1975,6 +2110,77 @@ def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
     ] == ["doc-001"]
     assert repo.list_user_documents(owner_user_id="user-a", task_id="task-other") == []
     assert repo.list_user_documents(owner_user_id="user-b") == []
+
+
+def test_postgres_repository_searches_uploaded_documents_by_vector():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-doc",
+        owner_user_id="user-a",
+        query="document query",
+        scenario=None,
+        runner_task_id="runner-doc",
+    )
+    for document_id, owner, task_id, filename, text, embedding in (
+        (
+            "doc-far",
+            "user-a",
+            "task-doc",
+            "lexical-lithium.txt",
+            "Lithium lithium.",
+            [0.0, 1.0],
+        ),
+        ("doc-near", "user-a", "task-doc", "nickel.txt", "Nickel memo.", [1.0, 0.0]),
+        ("doc-other-task", "user-a", None, "other.txt", "Nickel other.", [1.0, 0.0]),
+        (
+            "doc-foreign",
+            "user-b",
+            "task-doc",
+            "foreign.txt",
+            "Nickel foreign.",
+            [1.0, 0.0],
+        ),
+    ):
+        repo.record_uploaded_document(
+            document_id=document_id,
+            owner_user_id=owner,
+            task_id=task_id,
+            original_filename=filename,
+            content_type="text/plain",
+            byte_size=len(text),
+            minio_bucket="limra-artifacts",
+            object_key=f"limra/users/hash/uploads/{document_id}.txt",
+            extracted_text=text,
+            language=None,
+            metadata={},
+            embedding=embedding,
+        )
+
+    results = repo.search_user_documents(
+        owner_user_id="user-a",
+        task_id="task-doc",
+        query="lithium",
+        limit=2,
+        query_embedding=[1.0, 0.0],
+    )
+
+    assert [result.document.document_id for result in results] == [
+        "doc-near",
+        "doc-far",
+    ]
+    assert results[0].score > results[1].score
+    assert engine.vector_search_calls == [
+        {
+            "owner_user_id": "user-a",
+            "task_id": "task-doc",
+            "query_embedding": "[1,0]",
+            "limit": 2,
+        }
+    ]
 
 
 def test_postgres_repository_records_generated_report_pdf_metadata():
@@ -3207,6 +3413,7 @@ class FakeLimraPostgresEngine:
         self.artifact_events = {}
         self.artifact_trace_events = []
         self.uploaded_documents = {}
+        self.vector_search_calls = []
         self.generated_reports = {}
         self.typed_inserts = {
             "limra_evidence_items": [],
@@ -3333,6 +3540,37 @@ class FakeLimraPostgresEngine:
             return FakeLimraPostgresResult([row])
 
         if "from limra_uploaded_documents" in sql:
+            if "embedding <=>" in sql:
+                self.vector_search_calls.append(dict(params))
+                query_embedding = limra._embedding_from_value(params["query_embedding"])
+                rows = []
+                for row in self.uploaded_documents.values():
+                    if row["owner_user_id"] != params["owner_user_id"]:
+                        continue
+                    if (
+                        params.get("task_id") is not None
+                        and row["task_id"] != params["task_id"]
+                    ):
+                        continue
+                    row_embedding = limra._embedding_from_value(row.get("embedding"))
+                    score = limra._cosine_similarity(
+                        query_embedding or [],
+                        row_embedding,
+                    )
+                    if score is None:
+                        continue
+                    result_row = dict(row)
+                    result_row["limra_search_score"] = score
+                    rows.append(result_row)
+                rows.sort(
+                    key=lambda row: (
+                        -row["limra_search_score"],
+                        row["original_filename"].lower(),
+                        row["document_id"],
+                    )
+                )
+                return FakeLimraPostgresResult(rows[: params["limit"]])
+
             if "document_id = :document_id" in sql:
                 row = self.uploaded_documents.get(params["document_id"])
                 if row and row["owner_user_id"] != params["owner_user_id"]:
