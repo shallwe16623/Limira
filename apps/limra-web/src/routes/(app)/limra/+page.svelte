@@ -54,6 +54,12 @@
 		download_url?: string;
 	};
 
+	type UploadedDocumentSearchResult = UploadedDocument & {
+		score: number;
+		snippet: string;
+		matched_terms: string[];
+	};
+
 	const artifactTabs: ArtifactTab[] = ['Evidence', 'Entities', 'Graph', 'Timeline', 'Map', 'Report'];
 	const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 
@@ -88,6 +94,10 @@
 	let uploadInput: HTMLInputElement;
 	let isUploadingDocument = false;
 	let uploadMessage = '';
+	let uploadSearchQuery = '';
+	let uploadSearchResults: UploadedDocumentSearchResult[] = [];
+	let isSearchingUploads = false;
+	let uploadSearchMessage = '';
 
 	let messages: ChatMessage[] = [
 		{
@@ -199,6 +209,31 @@
 			uploadMessage = error instanceof Error ? error.message : 'Unable to upload document.';
 		} finally {
 			isUploadingDocument = false;
+		}
+	};
+
+	const searchUploadedDocuments = async () => {
+		const trimmed = uploadSearchQuery.trim();
+		if (!trimmed || isSearchingUploads) {
+			return;
+		}
+
+		isSearchingUploads = true;
+		uploadSearchMessage = '';
+
+		try {
+			const taskFilter = taskId ? `&task_id=${encodeURIComponent(taskId)}` : '';
+			const data = await apiJson(
+				`/api/limra/uploads/search?query=${encodeURIComponent(trimmed)}${taskFilter}`
+			);
+			uploadSearchResults = Array.isArray(data.documents) ? data.documents : [];
+			uploadSearchMessage = uploadSearchResults.length
+				? `${uploadSearchResults.length} matching uploads`
+				: 'No matching uploads.';
+		} catch (error) {
+			uploadSearchMessage = error instanceof Error ? error.message : 'Unable to search uploads.';
+		} finally {
+			isSearchingUploads = false;
 		}
 	};
 
@@ -743,6 +778,45 @@
 			{#if uploadMessage}
 				<p class="upload-message">{uploadMessage}</p>
 			{/if}
+			<div class="upload-search-row">
+				<label for="limra-upload-search">Search uploads</label>
+				<input
+					id="limra-upload-search"
+					type="search"
+					bind:value={uploadSearchQuery}
+					placeholder="Search extracted text"
+					on:keydown={(event) => {
+						if (event.key === 'Enter') {
+							event.preventDefault();
+							void searchUploadedDocuments();
+						}
+					}}
+				/>
+				<button
+					type="button"
+					class="secondary-button"
+					disabled={!uploadSearchQuery.trim() || isSearchingUploads}
+					on:click={searchUploadedDocuments}
+				>
+					{isSearchingUploads ? 'Searching...' : 'Search'}
+				</button>
+			</div>
+			{#if uploadSearchMessage}
+				<p class="upload-message">{uploadSearchMessage}</p>
+			{/if}
+			{#if uploadSearchResults.length > 0}
+				<ul class="upload-search-list">
+					{#each uploadSearchResults as result}
+						<li>
+							<div>
+								<strong>{result.filename}</strong>
+								<span>{result.snippet}</span>
+							</div>
+							<small>{result.matched_terms.join(', ')} · {result.score}</small>
+						</li>
+					{/each}
+				</ul>
+			{/if}
 			{#if uploadedDocuments.length > 0}
 				<ul class="upload-list">
 					{#each uploadedDocuments as uploadedDocument}
@@ -1144,7 +1218,9 @@
 
 	.upload-heading,
 	.upload-row,
-	.upload-list li {
+	.upload-search-row,
+	.upload-list li,
+	.upload-search-list li {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
@@ -1153,25 +1229,43 @@
 
 	.upload-heading p,
 	.upload-message,
-	.upload-list span {
+	.upload-list span,
+	.upload-search-list span,
+	.upload-search-list small {
 		color: #64748b;
 		font-size: 0.78rem;
 		line-height: 1.35;
 	}
 
-	.upload-row {
+	.upload-row,
+	.upload-search-row {
 		flex-wrap: wrap;
 		justify-content: flex-start;
 	}
 
-	input[type='file'] {
+	input[type='file'],
+	input[type='search'] {
 		min-width: 16rem;
 		max-width: 100%;
 		font: inherit;
 		font-size: 0.82rem;
 	}
 
-	.upload-list {
+	input[type='search'] {
+		min-height: 2.25rem;
+		border: 1px solid #cbd5e1;
+		padding: 0 0.65rem;
+		background: #ffffff;
+		color: inherit;
+	}
+
+	:global(.dark) input[type='search'] {
+		border-color: #334155;
+		background: #0f172a;
+	}
+
+	.upload-list,
+	.upload-search-list {
 		display: grid;
 		gap: 0.4rem;
 		margin: 0;
@@ -1179,24 +1273,28 @@
 		list-style: none;
 	}
 
-	.upload-list li {
+	.upload-list li,
+	.upload-search-list li {
 		border: 1px solid #e2e8f0;
 		padding: 0.55rem 0.65rem;
 		background: #f8fafc;
 	}
 
-	:global(.dark) .upload-list li {
+	:global(.dark) .upload-list li,
+	:global(.dark) .upload-search-list li {
 		border-color: #2f3642;
 		background: #111827;
 	}
 
-	.upload-list div {
+	.upload-list div,
+	.upload-search-list div {
 		min-width: 0;
 		display: grid;
 		gap: 0.15rem;
 	}
 
-	.upload-list strong {
+	.upload-list strong,
+	.upload-search-list strong {
 		overflow-wrap: anywhere;
 		font-size: 0.84rem;
 	}

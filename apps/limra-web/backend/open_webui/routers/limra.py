@@ -76,6 +76,11 @@ LIMRA_OBJECT_STORAGE_ENDPOINT_ENV = "S3_ENDPOINT_URL"
 LIMRA_OBJECT_ACCESS_KEY_ENV = "AWS_ACCESS_KEY_ID"
 LIMRA_OBJECT_SECRET_KEY_ENV = "AWS_SECRET_ACCESS_KEY"
 LIMRA_OBJECT_REGION_ENV = "AWS_REGION"
+LIMRA_UPLOAD_EMBEDDINGS_ENABLED_ENV = "LIMRA_UPLOAD_EMBEDDINGS_ENABLED"
+LIMRA_EMBEDDING_PROVIDER_ENV = "LIMRA_EMBEDDING_PROVIDER"
+LIMRA_EMBEDDING_MODEL_ENV = "LIMRA_EMBEDDING_MODEL"
+LIMRA_EMBEDDING_DIMENSIONS_ENV = "LIMRA_EMBEDDING_DIMENSIONS"
+LIMRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 OBJECT_KEY_FORBIDDEN_FIELDS = {
     "object_key",
@@ -130,6 +135,7 @@ REPORT_CSP = (
     "base-uri 'none'; "
     "form-action 'none'"
 )
+SEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SECRET_FIELD_PATTERN = re.compile(
     r"(?i)(authorization|cookie|set-cookie|api[_-]?key|secret|token|password|"
     r"runner_service_token|serper|jina|e2b|openai|deepseek)"
@@ -327,6 +333,7 @@ class LimraUploadedDocument:
     extracted_text: str | None = None
     language: str | None = None
     metadata: dict[str, Any] | None = None
+    embedding: list[float] | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -339,6 +346,33 @@ class LimraUploadedDocument:
             "extracted_text_chars": len(self.extracted_text or ""),
             "download_url": f"/api/limra/uploads/{self.document_id}/download",
         }
+
+
+@dataclass(frozen=True)
+class LimraUploadedDocumentSearchResult:
+    document: LimraUploadedDocument
+    score: float
+    snippet: str
+    matched_terms: list[str]
+
+    def public_dict(self) -> dict[str, Any]:
+        payload = self.document.public_dict()
+        payload.update(
+            {
+                "score": round(self.score, 3),
+                "snippet": self.snippet,
+                "matched_terms": list(self.matched_terms),
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class LimraUploadEmbeddingConfig:
+    enabled: bool
+    provider: str
+    model: str
+    dimensions: int
 
 
 @dataclass
@@ -424,6 +458,7 @@ class LimraTaskRepository(Protocol):
         extracted_text: str | None,
         language: str | None,
         metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
     ) -> LimraUploadedDocument: ...
 
     def get_user_document(
@@ -549,6 +584,15 @@ class LimraObjectStorage(Protocol):
     ) -> bytes: ...
 
 
+class LimraUploadEmbeddingProvider(Protocol):
+    async def embed_upload_text(
+        self,
+        text: str,
+        *,
+        config: LimraUploadEmbeddingConfig,
+    ) -> list[float]: ...
+
+
 class LimraPdfExporter(Protocol):
     async def render_pdf(self, html_content: str) -> bytes: ...
 
@@ -653,6 +697,7 @@ class InMemoryLimraTaskRepository:
         extracted_text: str | None,
         language: str | None,
         metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
     ) -> LimraUploadedDocument:
         document = LimraUploadedDocument(
             document_id=document_id,
@@ -666,6 +711,7 @@ class InMemoryLimraTaskRepository:
             extracted_text=extracted_text,
             language=language,
             metadata=dict(metadata or {}),
+            embedding=list(embedding) if embedding is not None else None,
         )
         self.uploaded_documents[document_id] = document
         self._invalidate_archive_metadata(task_id)
@@ -1037,6 +1083,16 @@ class S3LimraObjectStorage:
             raise FileNotFoundError(object_key) from exc
 
 
+class DisabledLimraUploadEmbeddingProvider:
+    async def embed_upload_text(
+        self,
+        text: str,
+        *,
+        config: LimraUploadEmbeddingConfig,
+    ) -> list[float]:
+        raise RuntimeError("limra_upload_embedding_provider_unconfigured")
+
+
 async def _abort_playwright_route(route: Any) -> None:
     await route.abort()
 
@@ -1097,6 +1153,7 @@ class PostgresLimraTaskRepository:
         object_key,
         extracted_text,
         language,
+        embedding,
         metadata
     """
     REPORT_COLUMNS = """
@@ -1477,6 +1534,7 @@ class PostgresLimraTaskRepository:
             object_key,
             extracted_text,
             language,
+            embedding,
             metadata
         )
         VALUES (
@@ -1490,6 +1548,7 @@ class PostgresLimraTaskRepository:
             :object_key,
             :extracted_text,
             :language,
+            CAST(:embedding AS vector),
             CAST(:metadata AS jsonb)
         )
         ON CONFLICT (document_id) DO UPDATE SET
@@ -1501,6 +1560,7 @@ class PostgresLimraTaskRepository:
             object_key = EXCLUDED.object_key,
             extracted_text = EXCLUDED.extracted_text,
             language = EXCLUDED.language,
+            embedding = EXCLUDED.embedding,
             metadata = EXCLUDED.metadata
         RETURNING {DOCUMENT_COLUMNS}
     """
@@ -1740,6 +1800,7 @@ class PostgresLimraTaskRepository:
         extracted_text: str | None,
         language: str | None,
         metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
     ) -> LimraUploadedDocument:
         row = self._fetch_one(
             self.INSERT_UPLOADED_DOCUMENT_SQL,
@@ -1754,6 +1815,7 @@ class PostgresLimraTaskRepository:
                 "object_key": object_key,
                 "extracted_text": extracted_text,
                 "language": language,
+                "embedding": _vector_param(embedding),
                 "metadata": _json_dumps(metadata or {}),
             },
         )
@@ -2098,6 +2160,37 @@ def create_limra_object_storage_from_env(
     raise RuntimeError(f"unsupported_limra_object_storage_backend:{backend}")
 
 
+def create_limra_upload_embedding_config_from_env(
+    env: Any = os.environ,
+) -> LimraUploadEmbeddingConfig:
+    enabled = (
+        str(env.get(LIMRA_UPLOAD_EMBEDDINGS_ENABLED_ENV, ""))
+        .strip()
+        .lower()
+        in TRUTHY_ENV_VALUES
+    )
+    provider = str(env.get(LIMRA_EMBEDDING_PROVIDER_ENV, "disabled")).strip()
+    provider = provider or "disabled"
+    model = str(env.get(LIMRA_EMBEDDING_MODEL_ENV, "")).strip()
+    dimensions = _embedding_dimensions_from_env(
+        env.get(LIMRA_EMBEDDING_DIMENSIONS_ENV, LIMRA_DEFAULT_EMBEDDING_DIMENSIONS)
+    )
+
+    if enabled and provider.lower() in {"disabled", "none", "off"}:
+        raise RuntimeError("limra_upload_embedding_provider_required")
+    if enabled and not model:
+        raise RuntimeError("limra_upload_embedding_model_required")
+    if enabled and dimensions != LIMRA_DEFAULT_EMBEDDING_DIMENSIONS:
+        raise RuntimeError("limra_upload_embedding_dimensions_schema_mismatch")
+
+    return LimraUploadEmbeddingConfig(
+        enabled=enabled,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+    )
+
+
 class RunnerResearchClient:
     def __init__(
         self,
@@ -2307,6 +2400,22 @@ def get_object_storage(request: Request) -> LimraObjectStorage:
     return object_storage
 
 
+def get_upload_embedding_config(request: Request) -> LimraUploadEmbeddingConfig:
+    config = getattr(request.app.state, "limra_upload_embedding_config", None)
+    if config is None:
+        config = create_limra_upload_embedding_config_from_env()
+        request.app.state.limra_upload_embedding_config = config
+    return config
+
+
+def get_upload_embedding_provider(request: Request) -> LimraUploadEmbeddingProvider:
+    provider = getattr(request.app.state, "limra_upload_embedding_provider", None)
+    if provider is None:
+        provider = DisabledLimraUploadEmbeddingProvider()
+        request.app.state.limra_upload_embedding_provider = provider
+    return provider
+
+
 def get_pdf_exporter(request: Request) -> LimraPdfExporter:
     pdf_exporter = getattr(request.app.state, "limra_pdf_exporter", None)
     if pdf_exporter is None:
@@ -2491,6 +2600,12 @@ async def upload_document(
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
     object_storage: LimraObjectStorage = Depends(get_object_storage),
+    embedding_config: LimraUploadEmbeddingConfig = Depends(
+        get_upload_embedding_config
+    ),
+    embedding_provider: LimraUploadEmbeddingProvider = Depends(
+        get_upload_embedding_provider
+    ),
 ) -> dict[str, Any]:
     await _reject_browser_supplied_object_key_request(request)
     query_task_id = request.query_params.get("task_id")
@@ -2511,6 +2626,11 @@ async def upload_document(
         data,
         filename=filename,
         content_type=content_type,
+    )
+    embedding, embedding_metadata = await _uploaded_document_embedding(
+        extracted_text,
+        config=embedding_config,
+        provider=embedding_provider,
     )
     document_id = str(uuid.uuid4())
     object_key = build_limra_object_key(
@@ -2546,9 +2666,36 @@ async def upload_document(
         metadata={
             "sha256": stored.sha256,
             "upload_source": "api",
+            **embedding_metadata,
         },
+        embedding=embedding,
     )
     return _assert_browser_safe(document.public_dict())
+
+
+@router.get("/uploads/search")
+async def search_uploaded_documents(
+    query: str,
+    task_id: str | None = None,
+    limit: int = 10,
+    user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    trimmed_query = query.strip()
+    if not trimmed_query:
+        raise HTTPException(status_code=400, detail="search_query_required")
+    if task_id:
+        _get_owned_task(repo, task_id, user)
+    bounded_limit = max(1, min(int(limit), 25))
+    documents = repo.list_user_documents(owner_user_id=user.id, task_id=task_id)
+    results = _rank_uploaded_documents(documents, trimmed_query, bounded_limit)
+    return _assert_browser_safe(
+        {
+            "query": trimmed_query,
+            "task_id": task_id,
+            "documents": [result.public_dict() for result in results],
+        }
+    )
 
 
 @router.get("/uploads/{document_id}")
@@ -3605,6 +3752,7 @@ def _uploaded_document_from_row(row: dict[str, Any]) -> LimraUploadedDocument:
         extracted_text=_optional_string(row.get("extracted_text")),
         language=_optional_string(row.get("language")),
         metadata=_json_loads(row.get("metadata")) or {},
+        embedding=_embedding_from_value(row.get("embedding")),
     )
 
 
@@ -3654,6 +3802,169 @@ def _json_loads(value: Any) -> Any:
         except json.JSONDecodeError:
             return value
     return value
+
+
+def _embedding_dimensions_from_env(value: Any) -> int:
+    try:
+        dimensions = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("limra_upload_embedding_dimensions_invalid") from exc
+    if dimensions <= 0:
+        raise RuntimeError("limra_upload_embedding_dimensions_invalid")
+    return dimensions
+
+
+async def _uploaded_document_embedding(
+    extracted_text: str | None,
+    *,
+    config: LimraUploadEmbeddingConfig,
+    provider: LimraUploadEmbeddingProvider,
+) -> tuple[list[float] | None, dict[str, Any]]:
+    metadata: dict[str, Any] = {
+        "embedding": {
+            "enabled": config.enabled,
+            "provider": config.provider,
+            "model": config.model,
+            "dimensions": config.dimensions,
+        }
+    }
+    if not config.enabled:
+        metadata["embedding"]["status"] = "disabled"
+        return None, metadata
+
+    text = (extracted_text or "").strip()
+    if not text:
+        metadata["embedding"]["status"] = "skipped_empty_text"
+        return None, metadata
+
+    try:
+        raw_embedding = await provider.embed_upload_text(text, config=config)
+        embedding = [float(value) for value in raw_embedding]
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="upload_embedding_failed") from exc
+
+    if len(embedding) != config.dimensions:
+        raise HTTPException(status_code=500, detail="upload_embedding_dimension_mismatch")
+    metadata["embedding"]["status"] = "stored"
+    return embedding, metadata
+
+
+def _embedding_from_value(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("[") and stripped.endswith("]"):
+            stripped = stripped[1:-1]
+        parts = [part.strip() for part in stripped.split(",") if part.strip()]
+        return [float(part) for part in parts] if parts else None
+    if isinstance(value, (list, tuple)):
+        return [float(part) for part in value]
+    return None
+
+
+def _vector_param(value: list[float] | None) -> str | None:
+    if value is None:
+        return None
+    return "[" + ",".join(f"{float(part):.12g}" for part in value) + "]"
+
+
+def _search_terms(query: str) -> list[str]:
+    seen: set[str] = set()
+    terms: list[str] = []
+    for match in SEARCH_TOKEN_PATTERN.findall(query.lower()):
+        term = match.strip("._-")
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+    return terms
+
+
+def _rank_uploaded_documents(
+    documents: list[LimraUploadedDocument],
+    query: str,
+    limit: int,
+) -> list[LimraUploadedDocumentSearchResult]:
+    terms = _search_terms(query)
+    if not terms:
+        return []
+    results = [
+        result
+        for result in (
+            _uploaded_document_search_result(document, terms)
+            for document in documents
+        )
+        if result is not None
+    ]
+    results.sort(
+        key=lambda result: (
+            -result.score,
+            result.document.original_filename.lower(),
+            result.document.document_id,
+        )
+    )
+    return results[:limit]
+
+
+def _uploaded_document_search_result(
+    document: LimraUploadedDocument,
+    terms: list[str],
+) -> LimraUploadedDocumentSearchResult | None:
+    haystack_text = document.extracted_text or ""
+    filename = document.original_filename or ""
+    text_lower = haystack_text.lower()
+    filename_lower = filename.lower()
+    matched_terms = [
+        term for term in terms if term in text_lower or term in filename_lower
+    ]
+    if not matched_terms:
+        return None
+
+    score = 0.0
+    for term in matched_terms:
+        score += text_lower.count(term)
+        score += filename_lower.count(term) * 2
+    return LimraUploadedDocumentSearchResult(
+        document=document,
+        score=score,
+        snippet=_uploaded_document_search_snippet(haystack_text, filename, matched_terms),
+        matched_terms=matched_terms,
+    )
+
+
+def _uploaded_document_search_snippet(
+    text: str,
+    filename: str,
+    terms: list[str],
+) -> str:
+    source = text.strip() or filename
+    if not source:
+        return ""
+    source_lower = source.lower()
+    first_index = min(
+        (source_lower.find(term) for term in terms if source_lower.find(term) >= 0),
+        default=0,
+    )
+    start = max(first_index - 60, 0)
+    end = min(start + 180, len(source))
+    snippet = source[start:end].strip()
+    if start > 0:
+        snippet = f"...{snippet}"
+    if end < len(source):
+        snippet = f"{snippet}..."
+    return _browser_safe_text(snippet)
+
+
+def _browser_safe_text(value: str) -> str:
+    scrubbed = str(scrub_limra_secrets(value))
+    for needle in FORBIDDEN_BROWSER_SUBSTRINGS:
+        scrubbed = scrubbed.replace(needle, LIMRA_SECRET_REDACTION)
+    return scrubbed
 
 
 def _runtime_mapping(fields: dict[str, Any]) -> dict[str, str]:

@@ -136,6 +136,7 @@ def test_limra_research_page_uses_only_browser_facing_limra_api_paths():
         "`/api/limra/tasks/${taskId}/reports/${latestGeneratedReport.report_id}/pdf`",
         "'/api/limra/uploads'",
         "`/api/limra/uploads?task_id=${encodeURIComponent(id)}`",
+        "`/api/limra/uploads/search?query=${encodeURIComponent(trimmed)}${taskFilter}`",
         "`/api/limra/uploads/${uploadedDocument.document_id}/download`",
     ]
     for path in required_paths:
@@ -191,10 +192,15 @@ def test_limra_research_page_has_uploaded_document_controls():
     page = _read(LIMRA_PAGE)
 
     assert "type UploadedDocument" in page
+    assert "type UploadedDocumentSearchResult" in page
     assert "let uploadedDocuments: UploadedDocument[] = [];" in page
+    assert "let uploadSearchResults: UploadedDocumentSearchResult[] = [];" in page
+    assert "let uploadSearchQuery = '';" in page
     assert "let selectedUploadFile: File | null = null;" in page
     assert "const loadUploadedDocuments = async (id = taskId) =>" in page
     assert "`/api/limra/uploads?task_id=${encodeURIComponent(id)}`" in page
+    assert "const searchUploadedDocuments = async () =>" in page
+    assert "`/api/limra/uploads/search?query=${encodeURIComponent(trimmed)}${taskFilter}`" in page
     assert "const selectUploadFile = (event: Event) =>" in page
     assert "const uploadDocument = async () =>" in page
     assert "const formData = new FormData();" in page
@@ -211,6 +217,9 @@ def test_limra_research_page_has_uploaded_document_controls():
     assert "Refresh uploads" in page
     assert "selectedUploadFile || isUploadingDocument" in page
     assert "uploadedDocument.download_url?.startsWith('/api/limra/uploads/')" in page
+    assert 'id="limra-upload-search"' in page
+    assert "Search uploads" in page
+    assert "uploadSearchResults.length > 0" in page
     assert "user_id" not in page
     assert "owner_user_id" not in page
 

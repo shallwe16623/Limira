@@ -671,6 +671,56 @@ def test_limra_object_storage_factory_requires_s3_or_explicit_memory(monkeypatch
     assert isinstance(storage, limra.InMemoryLimraObjectStorage)
 
 
+def test_limra_upload_embedding_config_defaults_disabled_and_validates_enabled():
+    config = limra.create_limra_upload_embedding_config_from_env({})
+    assert config == limra.LimraUploadEmbeddingConfig(
+        enabled=False,
+        provider="disabled",
+        model="",
+        dimensions=1536,
+    )
+
+    enabled_env = {
+        "LIMRA_UPLOAD_EMBEDDINGS_ENABLED": "true",
+        "LIMRA_EMBEDDING_PROVIDER": "fake",
+        "LIMRA_EMBEDDING_MODEL": "fake-model",
+        "LIMRA_EMBEDDING_DIMENSIONS": "1536",
+    }
+    enabled = limra.create_limra_upload_embedding_config_from_env(enabled_env)
+    assert enabled.enabled is True
+    assert enabled.provider == "fake"
+    assert enabled.model == "fake-model"
+    assert enabled.dimensions == 1536
+
+    with pytest.raises(RuntimeError, match="limra_upload_embedding_provider_required"):
+        limra.create_limra_upload_embedding_config_from_env(
+            {"LIMRA_UPLOAD_EMBEDDINGS_ENABLED": "true"}
+        )
+    with pytest.raises(RuntimeError, match="limra_upload_embedding_model_required"):
+        limra.create_limra_upload_embedding_config_from_env(
+            {
+                "LIMRA_UPLOAD_EMBEDDINGS_ENABLED": "true",
+                "LIMRA_EMBEDDING_PROVIDER": "fake",
+            }
+        )
+    with pytest.raises(RuntimeError, match="limra_upload_embedding_dimensions_invalid"):
+        limra.create_limra_upload_embedding_config_from_env(
+            {"LIMRA_EMBEDDING_DIMENSIONS": "0"}
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="limra_upload_embedding_dimensions_schema_mismatch",
+    ):
+        limra.create_limra_upload_embedding_config_from_env(
+            {
+                "LIMRA_UPLOAD_EMBEDDINGS_ENABLED": "true",
+                "LIMRA_EMBEDDING_PROVIDER": "fake",
+                "LIMRA_EMBEDDING_MODEL": "fake-model",
+                "LIMRA_EMBEDDING_DIMENSIONS": "3",
+            }
+        )
+
+
 def test_limra_object_keys_are_server_generated_owner_scoped_and_safe():
     key = limra.build_limra_object_key(
         owner_user_id="analyst@example.com",
@@ -822,6 +872,14 @@ async def test_upload_route_stores_text_original_and_document_record():
     assert document.owner_user_id == "user-a"
     assert document.task_id is None
     assert document.extracted_text == "hello limra"
+    assert document.embedding is None
+    assert document.metadata["embedding"] == {
+        "enabled": False,
+        "provider": "disabled",
+        "model": "",
+        "dimensions": 1536,
+        "status": "disabled",
+    }
     assert document.minio_bucket == storage.bucket
     assert document.object_key in storage.objects
     stored = storage.objects[document.object_key]
@@ -830,6 +888,103 @@ async def test_upload_route_stores_text_original_and_document_record():
     assert stored["metadata"]["document_id"] == document.document_id
     assert stored["metadata"]["owner_user_id"] == "user-a"
     _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
+async def test_upload_route_records_configured_embedding_with_fake_provider():
+    app, repo, _storage = _limra_asgi_app()
+    provider = FakeUploadEmbeddingProvider([0.25, 0.5, 0.75])
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=3,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/uploads",
+            files={"file": ("embedding.txt", b"lithium graphite source", "text/plain")},
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert "embedding" not in payload
+    document = repo.get_user_document(payload["document_id"], "user-a")
+    assert document is not None
+    assert document.embedding == [0.25, 0.5, 0.75]
+    assert provider.calls == [
+        {
+            "text": "lithium graphite source",
+            "config": limra.LimraUploadEmbeddingConfig(
+                enabled=True,
+                provider="fake",
+                model="fake-model",
+                dimensions=3,
+            ),
+        }
+    ]
+    assert document.metadata["embedding"] == {
+        "enabled": True,
+        "provider": "fake",
+        "model": "fake-model",
+        "dimensions": 3,
+        "status": "stored",
+    }
+    _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
+async def test_upload_route_rejects_embedding_dimension_mismatch_without_writes():
+    app, repo, storage = _limra_asgi_app()
+    provider = FakeUploadEmbeddingProvider([0.25, 0.5])
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=3,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/uploads",
+            files={"file": ("bad-vector.txt", b"dimension mismatch", "text/plain")},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "upload_embedding_dimension_mismatch"
+    assert storage.objects == {}
+    assert repo.list_user_documents(owner_user_id="user-a") == []
 
 
 @pytest.mark.asyncio
@@ -1048,6 +1203,109 @@ async def test_upload_document_list_read_and_download_are_owner_scoped():
     assert 'filename="linked.txt"' in download_response.headers["content-disposition"]
     assert foreign_detail_response.status_code == 404
     assert foreign_download_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_search_is_owner_scoped_task_filterable_and_browser_safe():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="owned lithium task",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.create_task(
+        task_id="task-b",
+        owner_user_id="user-b",
+        query="foreign lithium task",
+        scenario=None,
+        runner_task_id="runner-task-b",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-lithium",
+        owner_user_id="user-a",
+        task_id="task-a",
+        original_filename="lithium-brief.txt",
+        content_type="text/plain",
+        byte_size=41,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-a/tasks/task-a/uploads/doc-lithium.txt",
+        extracted_text=(
+            "Critical minerals update: lithium export controls and graphite risks."
+        ),
+        language=None,
+        metadata={},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-copper",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="copper.txt",
+        content_type="text/plain",
+        byte_size=20,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-a/uploads/doc-copper.txt",
+        extracted_text="Copper inventory report.",
+        language=None,
+        metadata={},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-foreign",
+        owner_user_id="user-b",
+        task_id="task-b",
+        original_filename="foreign-lithium.txt",
+        content_type="text/plain",
+        byte_size=18,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-b/tasks/task-b/uploads/doc-foreign.txt",
+        extracted_text="Lithium sanctions.",
+        language=None,
+        metadata={},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        search_response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "lithium graphite"},
+        )
+        task_search_response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "lithium", "task_id": "task-a"},
+        )
+        foreign_task_response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "lithium", "task_id": "task-b"},
+        )
+        blank_response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "   "},
+        )
+
+    assert search_response.status_code == 200
+    payload = search_response.json()
+    assert [document["document_id"] for document in payload["documents"]] == [
+        "doc-lithium"
+    ]
+    result = payload["documents"][0]
+    assert result["score"] > 0
+    assert result["matched_terms"] == ["lithium", "graphite"]
+    assert "graphite risks" in result["snippet"]
+    assert "object_key" not in json.dumps(payload)
+    assert "minio_object_key" not in json.dumps(payload)
+    _assert_no_browser_leak(payload)
+
+    assert task_search_response.status_code == 200
+    assert [
+        document["document_id"]
+        for document in task_search_response.json()["documents"]
+    ] == ["doc-lithium"]
+    assert foreign_task_response.status_code == 404
+    assert blank_response.status_code == 400
+    assert blank_response.json()["detail"] == "search_query_required"
 
 
 @pytest.mark.asyncio
@@ -1473,6 +1731,8 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     assert "insert into limra_uploaded_documents" in sql
     assert "object_key" in sql
     assert "extracted_text" in sql
+    assert "embedding" in sql
+    assert "cast(:embedding as vector)" in sql
     assert "archive_object_key" in sql
     assert "archive_zip_sha256" in sql
 
@@ -1683,6 +1943,7 @@ def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
         extracted_text="brief text",
         language=None,
         metadata={"sha256": "abc123"},
+        embedding=[0.1, 0.2, 0.3],
     )
 
     assert document.document_id == "doc-001"
@@ -1690,12 +1951,15 @@ def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
     assert document.owner_user_id == "user-a"
     assert document.object_key.endswith("/uploads/doc-001.txt")
     assert document.extracted_text == "brief text"
+    assert document.embedding == [0.1, 0.2, 0.3]
     assert document.metadata == {"sha256": "abc123"}
     assert engine.uploaded_documents["doc-001"]["minio_bucket"] == "limra-artifacts"
+    assert engine.uploaded_documents["doc-001"]["embedding"] == "[0.1,0.2,0.3]"
 
     owned = repo.get_user_document("doc-001", "user-a")
     assert owned is not None
     assert owned.original_filename == "brief.txt"
+    assert owned.embedding == [0.1, 0.2, 0.3]
     assert repo.get_user_document("doc-001", "user-b") is None
     assert [document.document_id for document in repo.list_user_documents(owner_user_id="user-a")] == [
         "doc-001"
@@ -2703,6 +2967,7 @@ def test_limra_router_defines_required_browser_facing_paths():
         ("/tasks/{task_id}/archive.zip", "GET"),
         ("/uploads", "GET"),
         ("/uploads", "POST"),
+        ("/uploads/search", "GET"),
         ("/uploads/{document_id}", "GET"),
         ("/uploads/{document_id}/download", "GET"),
         ("/tasks/{task_id}/reports/pdf", "POST"),
@@ -2916,6 +3181,16 @@ class FakePdfExporter:
         return self.pdf_bytes
 
 
+class FakeUploadEmbeddingProvider:
+    def __init__(self, embedding):
+        self.embedding = list(embedding)
+        self.calls = []
+
+    async def embed_upload_text(self, text, *, config):
+        self.calls.append({"text": text, "config": config})
+        return list(self.embedding)
+
+
 def _pairs_to_mapping(values):
     assert len(values) % 2 == 0
     return {values[index]: values[index + 1] for index in range(0, len(values), 2)}
@@ -3046,6 +3321,7 @@ class FakeLimraPostgresEngine:
                 "object_key": params["object_key"],
                 "extracted_text": params["extracted_text"],
                 "language": params["language"],
+                "embedding": params["embedding"],
                 "metadata": params["metadata"],
             }
             self.uploaded_documents[params["document_id"]] = row
