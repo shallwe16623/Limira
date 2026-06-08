@@ -5827,6 +5827,120 @@ async def test_event_proxy_generic_exception_hides_internal_error_from_task_payl
 
 
 @pytest.mark.asyncio
+async def test_postgres_event_proxy_preserves_recorded_report_section_after_late_stream_failure():
+    class LateFailingResearchClient(FakeResearchClient):
+        async def stream_events(self, *, task, user):
+            self.stream_calls.append({"task": task, "user": user})
+            for event in self.events:
+                yield event
+            raise RuntimeError(
+                "late stream failure at http://10.20.30.40:8091/internal/tasks/"
+                "runner-task-a/events for limra/users/hash/tasks/task-a/uploads/doc.txt "
+                "OPENAI_API_KEY=sk-latefailureinternal123456"
+            )
+
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = LateFailingResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "title": "Late failure report",
+                        "markdown": "# Late answer\n\nRecorded before failure. [EVID-001]",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.72,
+                    "notes": "artifact emitted before runner failure",
+                },
+            }
+        ]
+    )
+    created = await limra.create_research_task(
+        {"query": "late failure artifact persistence"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    task_payload = await limra.get_task(task_id, user=user, repo=repo)
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    reports = repo.list_task_reports(task_id=task_id)
+    trace_events = repo.get_artifact_trace_events(task_id)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert [event["type"] for event in events] == [
+        "record_research_artifact",
+        "error",
+    ]
+    assert events[-1]["payload"]["error"] == "limra_event_proxy_failed"
+    assert task_payload["status"] == "failed"
+    assert task_payload["archive_status"] == "failed"
+    assert task_payload["error"] == "limra_event_proxy_failed"
+    assert json.loads(runtime_hash["status"]) == "failed"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "limra_event_proxy_failed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == (
+        "limra_event_proxy_failed"
+    )
+
+    assert len(artifacts["report_sections"]) == 1
+    report_section = artifacts["report_sections"][0]
+    assert report_section["section_id"] == "REPORT-001"
+    assert report_section["title"] == "Late failure report"
+    assert report_section["markdown"].startswith("# Late answer")
+    assert report_section["source_event_type"] == "record_research_artifact"
+    assert report_section["evidence_refs"] == ["EVID-001"]
+    assert report_section["confidence"] == 0.72
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].markdown == report_section["markdown"]
+    assert trace_events[0]["type"] == "report_section_generated"
+    assert trace_events[0]["source_event_type"] == "record_research_artifact"
+    assert trace_events[0]["local_artifact_id"] == "REPORT-001"
+
+    serialized = json.dumps(
+        {
+            "events": events,
+            "task": task_payload,
+            "artifacts": artifacts,
+            "reports": [report.public_dict() for report in reports],
+            "trace_events": trace_events,
+            "runtime": runtime_hash,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limra/users/hash",
+        "sk-latefailureinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
 async def test_completed_task_event_reattach_is_terminal_and_does_not_call_runner():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")
