@@ -3,7 +3,12 @@ import { expect, test } from '@playwright/test';
 const limraBaseUrl = process.env.LIMRA_WEB_BASE_URL ?? 'http://127.0.0.1:5173';
 const smokeAuthToken = 'limra-smoke-token';
 const privateRunnerUrlFragments = ['RUNNER_SERVICE_TOKEN', '/mirothinker/', 'limra-runner:8091', 'localhost:8091'];
-const streamedArtifactEvents = ['relation_extracted', 'map_feature_added', 'verification_result'] as const;
+const streamedArtifactEvents = [
+	'relation_extracted',
+	'map_feature_added',
+	'verification_result',
+	'record_research_artifact'
+] as const;
 
 const smokeBackendConfig = {
 	name: 'limra',

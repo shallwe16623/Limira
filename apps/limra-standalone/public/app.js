@@ -7,7 +7,8 @@ const artifactEvents = new Set([
 	'timeline_event_added',
 	'map_feature_added',
 	'verification_result',
-	'report_section_generated'
+	'report_section_generated',
+	'record_research_artifact'
 ]);
 
 const STORAGE_KEY = 'limraStandaloneWorkspace:v2';

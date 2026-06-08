@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
 LIMRA_STANDALONE_ROOT = REPO_ROOT / "apps" / "limra-standalone"
 LIMRA_STANDALONE_SERVER = LIMRA_STANDALONE_ROOT / "server.mjs"
+LIMRA_STANDALONE_APP = LIMRA_STANDALONE_ROOT / "public" / "app.js"
 BACKEND_ROOT = LIMRA_WEB_ROOT / "backend" / "open_webui"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
 SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
@@ -1374,6 +1375,7 @@ def test_limra_playwright_smoke_harness_covers_streamed_artifact_refresh_and_map
         "'relation_extracted'",
         "'map_feature_added'",
         "'verification_result'",
+        "'record_research_artifact'",
     ]:
         assert event_type in spec
 
@@ -1565,6 +1567,7 @@ def test_limra_stream_handler_refreshes_all_first_class_artifact_events():
         "'map_feature_added'",
         "'verification_result'",
         "'report_section_generated'",
+        "'record_research_artifact'",
     ]:
         assert event_type in page
 
@@ -1575,6 +1578,26 @@ def test_limra_stream_handler_refreshes_all_first_class_artifact_events():
     assert "eventType.includes('entity')" not in page
     assert "eventType.includes('timeline')" not in page
     assert "eventType.includes('report')" not in page
+
+
+def test_limra_standalone_stream_handler_refreshes_tool_recorded_artifacts():
+    app = _read(LIMRA_STANDALONE_APP)
+
+    assert "const artifactEvents = new Set([" in app
+    for event_type in [
+        "'evidence_collected'",
+        "'entity_extracted'",
+        "'relation_extracted'",
+        "'timeline_event_added'",
+        "'map_feature_added'",
+        "'verification_result'",
+        "'report_section_generated'",
+        "'record_research_artifact'",
+    ]:
+        assert event_type in app
+
+    assert "} else if (artifactEvents.has(eventType)) {" in app
+    assert "void loadArtifacts();" in app
 
 
 def test_limra_graph_and_map_use_required_frontend_libraries_with_empty_states():
