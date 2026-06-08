@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -2487,14 +2487,18 @@ async def list_uploaded_documents(
 async def upload_document(
     request: Request,
     file: UploadFile,
-    task_id: str | None = None,
+    form_task_id: str | None = Form(default=None, alias="task_id"),
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
     object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> dict[str, Any]:
     await _reject_browser_supplied_object_key_request(request)
-    if task_id:
-        _get_owned_task(repo, task_id, user)
+    query_task_id = request.query_params.get("task_id")
+    if form_task_id and query_task_id and form_task_id != query_task_id:
+        raise HTTPException(status_code=400, detail="conflicting_task_id")
+    effective_task_id = form_task_id or query_task_id
+    if effective_task_id:
+        _get_owned_task(repo, effective_task_id, user)
 
     filename = _safe_original_filename(file.filename)
     content_type = _uploaded_content_type(file.content_type, filename)
@@ -2512,7 +2516,7 @@ async def upload_document(
     object_key = build_limra_object_key(
         owner_user_id=user.id,
         category="uploads",
-        task_id=task_id,
+        task_id=effective_task_id,
         filename=filename,
         object_id=document_id,
     )
@@ -2523,7 +2527,7 @@ async def upload_document(
         metadata={
             "document_id": document_id,
             "owner_user_id": user.id,
-            "task_id": task_id or "",
+            "task_id": effective_task_id or "",
             "original_filename": filename,
             "content_type": content_type,
         },
@@ -2531,7 +2535,7 @@ async def upload_document(
     document = repo.record_uploaded_document(
         document_id=document_id,
         owner_user_id=user.id,
-        task_id=task_id,
+        task_id=effective_task_id,
         original_filename=filename,
         content_type=content_type,
         byte_size=stored.size_bytes,

@@ -856,13 +856,21 @@ async def test_upload_route_links_only_owned_tasks():
     ) as client:
         owned_response = await client.post(
             "/api/limra/uploads",
-            params={"task_id": "task-a"},
+            data={"task_id": "task-a"},
             files={"file": ("owned.md", b"# owned", "text/markdown")},
         )
         forbidden_response = await client.post(
             "/api/limra/uploads",
-            params={"task_id": "task-b"},
+            data={"task_id": "task-b"},
             files={"file": ("foreign.md", b"# foreign", "text/markdown")},
+        )
+        owned_list_response = await client.get(
+            "/api/limra/uploads",
+            params={"task_id": "task-a"},
+        )
+        foreign_list_response = await client.get(
+            "/api/limra/uploads",
+            params={"task_id": "task-b"},
         )
 
     assert owned_response.status_code == 201
@@ -872,8 +880,42 @@ async def test_upload_route_links_only_owned_tasks():
     assert document is not None
     assert document.task_id == "task-a"
     assert "/tasks/task-a/uploads/" in document.object_key
+    assert storage.objects[document.object_key]["metadata"]["task_id"] == "task-a"
+    assert owned_list_response.status_code == 200
+    assert [doc["document_id"] for doc in owned_list_response.json()["documents"]] == [
+        document.document_id
+    ]
+    assert foreign_list_response.status_code == 404
     assert forbidden_response.status_code == 404
     assert len(storage.objects) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_route_rejects_conflicting_form_and_query_task_ids():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="owned task",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/uploads",
+            params={"task_id": "task-a"},
+            data={"task_id": "task-other"},
+            files={"file": ("conflict.txt", b"conflict", "text/plain")},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "conflicting_task_id"
+    assert storage.objects == {}
+    assert repo.list_user_documents(owner_user_id="user-a") == []
 
 
 @pytest.mark.asyncio
