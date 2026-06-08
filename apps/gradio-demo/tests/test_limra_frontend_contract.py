@@ -33,6 +33,7 @@ BACKEND_WEB_RETRIEVAL_FILES = [
 ]
 PACKAGE_JSON = LIMRA_WEB_ROOT / "package.json"
 PACKAGE_LOCK = LIMRA_WEB_ROOT / "package-lock.json"
+LIMRA_SMOKE_SPEC = LIMRA_WEB_ROOT / "tests" / "limra-research-smoke.spec.ts"
 USER_VISIBLE_BRAND_SCAN_PATHS = [
     LIMRA_WEB_ROOT / "src" / "routes",
     LIB_ROOT,
@@ -222,6 +223,54 @@ def test_limra_research_page_has_uploaded_document_controls():
     assert "uploadSearchResults.length > 0" in page
     assert "user_id" not in page
     assert "owner_user_id" not in page
+
+
+def test_limra_playwright_smoke_harness_covers_streamed_artifact_refresh_and_map_geometry():
+    package = json.loads(_read(PACKAGE_JSON))
+    spec = _read(LIMRA_SMOKE_SPEC)
+
+    assert (
+        package["scripts"]["test:limra-smoke"]
+        == "npx -y @playwright/test@1.58.0 test tests/limra-research-smoke.spec.ts"
+    )
+    assert "import { expect, test } from '@playwright/test';" in spec
+    assert "process.env.LIMRA_WEB_BASE_URL ?? 'http://127.0.0.1:5173'" in spec
+    assert "class FakeEventSource" in spec
+    assert "window.__limraFakeEventSource" in spec
+
+    required_limra_routes = [
+        "'**/api/limra/scenarios'",
+        "'**/api/limra/uploads**'",
+        "'**/api/limra/research'",
+        "'**/api/limra/tasks/task-smoke'",
+        "'**/api/limra/tasks/task-smoke/artifacts'",
+        "'/api/limra/research'",
+        "'/api/limra/tasks/task-smoke/events'",
+        "'/api/limra/tasks/task-smoke/artifacts'",
+    ]
+    for route in required_limra_routes:
+        assert route in spec
+
+    for event_type in [
+        "'relation_extracted'",
+        "'map_feature_added'",
+        "'verification_result'",
+    ]:
+        assert event_type in spec
+
+    for geometry_type in ["type: 'Point'", "type: 'LineString'", "type: 'Polygon'"]:
+        assert geometry_type in spec
+
+    assert "artifactLoadCount" in spec
+    assert "toBeGreaterThanOrEqual(1 + streamedArtifactEvents.length)" in spec
+    assert "privateRunnerUrlFragments" in spec
+    assert "requestedUrls.some((url) => url.includes(forbidden))" in spec
+    assert "limra-runner:8091" in spec
+    assert "localhost:8091" in spec
+    assert "RUNNER_SERVICE_TOKEN" in spec
+    assert "/mirothinker/" in spec
+    assert "'**/mirothinker/" not in spec
+    assert "'**/api/runner" not in spec
 
 
 def test_limra_artifact_drawer_tabs_and_reference_controls_are_present():
