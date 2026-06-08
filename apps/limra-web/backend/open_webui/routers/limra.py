@@ -3612,6 +3612,7 @@ def _build_persisted_archive_zip(
         markdown=report_markdown,
         evidence_refs=evidence_refs,
     )
+    public_model_summary = _public_model_summary(task.model_summary or {})
     metadata = {
         "task": {
             "task_id": task.task_id,
@@ -3621,7 +3622,7 @@ def _build_persisted_archive_zip(
             "archive_status": task.archive_status,
             "scenario": task.scenario,
             "error": task.error,
-            "model_summary": task.model_summary or {},
+            "model_summary": public_model_summary,
         },
         "artifact_counts": {
             bucket: len(items)

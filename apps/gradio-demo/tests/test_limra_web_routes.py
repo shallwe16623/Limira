@@ -615,6 +615,80 @@ async def test_archive_proxy_scrubs_allowed_text_members_before_download():
 
 
 @pytest.mark.asyncio
+async def test_archive_download_hides_internal_model_summary_identifiers():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-summary-archive",
+        owner_user_id=user.id,
+        query="archive internal state",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        model_summary={
+            "provider": "deepseek",
+            "runner_task_id": "runner-task-secret",
+            "object_key": (
+                "limra/users/hash/tasks/task-summary-archive/uploads/doc.txt"
+            ),
+            "endpoint": (
+                "http://10.20.30.40:8091/mirothinker/tasks/runner-task-secret"
+            ),
+            "nested": {
+                "archive_object_key": (
+                    "limra/users/hash/tasks/task-summary-archive/archives/archive.zip"
+                ),
+                "safe": "kept",
+                "warning": (
+                    "limra/users/hash/tasks/task-summary-archive/uploads/doc.txt"
+                ),
+            },
+        },
+    )
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(response.body)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+
+    for task_payload in (metadata["task"], trace["task"]):
+        model_summary = task_payload["model_summary"]
+        assert model_summary["provider"] == "deepseek"
+        assert model_summary["nested"]["safe"] == "kept"
+        assert model_summary["endpoint"] == "limra_internal_value_redacted"
+        assert model_summary["nested"]["warning"] == "limra_internal_value_redacted"
+
+    serialized = json.dumps(
+        {
+            "metadata": metadata,
+            "trace": trace,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "runner_task_id",
+        "runner-task-secret",
+        "object_key",
+        "archive_object_key",
+        "limra/users/hash",
+        "http://10.20.30.40:8091",
+        "/mirothinker/",
+    ):
+        assert leaked not in serialized
+    assert task.archive_object_key in storage.objects
+    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
 async def test_archive_download_regenerates_after_task_scoped_writes():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
