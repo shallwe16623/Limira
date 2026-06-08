@@ -2797,6 +2797,175 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browser_runtime_and_task_state():
+    repo = limra.InMemoryLimraTaskRepository()
+    runtime_state = limra.InMemoryLimraRuntimeState()
+    user = limra.LimraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-statussecret123456",
+        "Authorization: Bearer status-secret-123456",
+        "RUNNER_SERVICE_TOKEN=status-runner-token-123456",
+    ]
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {
+                    "status": "running",
+                    "error": f"{raw_secret_values[0]} {raw_secret_values[1]}",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "error",
+                "payload": {
+                    "error": f"runner failed {raw_secret_values[2]}",
+                },
+            },
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "status secret scrub"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    task_payload = await limra.get_task(task_id, user=user, repo=repo)
+
+    assert [event["type"] for event in events] == ["status", "error"]
+    serialized = json.dumps(
+        {
+            "events": events,
+            "runtime": runtime_snapshot,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+        },
+        ensure_ascii=False,
+    )
+    for secret in raw_secret_values:
+        assert secret not in serialized
+    assert limra.LIMRA_SECRET_REDACTION in serialized
+    assert task_payload["status"] == "failed"
+    assert task_payload["error"].startswith("runner failed")
+    assert runtime_snapshot["error"].startswith("runner failed")
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_runner_status_scrubs_persisted_terminal_task_error_and_archive_metadata():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    runtime_state = limra.InMemoryLimraRuntimeState()
+    user = limra.LimraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-authoritativestatus123456",
+        "Authorization: Bearer authoritative-secret-123456",
+        "RUNNER_SERVICE_TOKEN=authoritative-runner-token-123456",
+    ]
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "failed",
+            "archive_status": "failed",
+            "error": " ".join(raw_secret_values),
+        },
+    )
+
+    created = await limra.create_research_task(
+        {"query": "authoritative secret scrub"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    first_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    first_events = _parse_sse_chunks(
+        [chunk async for chunk in first_response.body_iterator]
+    )
+    task = repo.get_task(task_id)
+    assert task.status == "failed"
+    assert task.error
+    assert limra.LIMRA_SECRET_REDACTION in task.error
+
+    terminal_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    terminal_events = _parse_sse_chunks(
+        [chunk async for chunk in terminal_response.body_iterator]
+    )
+    task_payload = await limra.get_task(task_id, user=user, repo=repo)
+
+    repo.update_task(task_id, archive_status="ready")
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_members = _archive_member_texts(archive_response.body)
+
+    serialized = json.dumps(
+        {
+            "first_events": first_events,
+            "terminal_events": terminal_events,
+            "task": task_payload,
+            "archive": archive_members,
+            "repo_error": task.error,
+        },
+        ensure_ascii=False,
+    )
+    for secret in raw_secret_values:
+        assert secret not in serialized
+    assert limra.LIMRA_SECRET_REDACTION in serialized
+    assert terminal_events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "failed",
+                "archive_status": "failed",
+                "terminal": True,
+                "error": task.error,
+            },
+        }
+    ]
+    assert task_payload["error"] == task.error
+    assert limra.LIMRA_SECRET_REDACTION in archive_members["metadata.json"]
+    assert limra.LIMRA_SECRET_REDACTION in archive_members["trace.json"]
+    _assert_no_browser_leak(first_events)
+    _assert_no_browser_leak(terminal_events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_persists_final_summary_show_text_as_report_section():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()

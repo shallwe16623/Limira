@@ -325,8 +325,8 @@ class LimraTask:
             "status": self.status,
             "archive_status": self.archive_status,
             "scenario": self.scenario,
-            "error": self.error,
-            "model_summary": self.model_summary or {},
+            "error": _scrub_optional_text(self.error),
+            "model_summary": scrub_limra_secrets(self.model_summary or {}),
             "download_url": f"/api/limra/tasks/{self.task_id}/archive.zip"
             if self.archive_status == "ready"
             else None,
@@ -3586,6 +3586,7 @@ async def _limra_event_stream(
                 current_agent_name=current_agent_name,
             )
             event = _scrub_runner_artifact_event(event)
+            event = _scrub_runner_event_payload(event)
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
@@ -3672,12 +3673,12 @@ async def _limra_event_stream(
             task.task_id,
             status="failed",
             archive_status="failed",
-            error=str(exc.detail),
+            error=_scrub_optional_text(exc.detail),
         )
         error_event = {
             "task_id": task.task_id,
             "type": "error",
-            "payload": {"error": exc.detail},
+            "payload": {"error": _scrub_optional_text(exc.detail)},
         }
         await _record_runtime_event(runtime_state, task.task_id, error_event)
         yield _sse_bytes(_assert_browser_safe(error_event))
@@ -3693,7 +3694,7 @@ async def _limra_event_stream(
             task.task_id,
             status="failed",
             archive_status="failed",
-            error=str(exc),
+            error=_scrub_optional_text(str(exc)),
         )
         error_event = {
             "task_id": task.task_id,
@@ -3725,6 +3726,7 @@ async def _authoritative_runner_status_event(
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
             return _terminal_status_event(current, reason=reason)
+        warning = _scrub_optional_text(exc.detail)
         return {
             "task_id": task.task_id,
             "type": "status",
@@ -3732,12 +3734,16 @@ async def _authoritative_runner_status_event(
                 "status": current.status if current else task.status,
                 "archive_status": current.archive_status if current else task.archive_status,
                 "status_source": "limra",
-                "warning": exc.detail,
+                "warning": warning,
                 **({"reason": reason} if reason else {}),
             },
         }
 
-    current = _apply_authoritative_runner_status(repo, task.task_id, runner_status)
+    current = _apply_authoritative_runner_status(
+        repo,
+        task.task_id,
+        scrub_limra_secrets(runner_status),
+    )
     payload: dict[str, Any] = {
         "status": current.status,
         "archive_status": current.archive_status,
@@ -3775,7 +3781,7 @@ def _apply_authoritative_runner_status(
     elif status in {"failed", "cancelled"}:
         updates["archive_status"] = "failed"
     if runner_status.get("error"):
-        updates["error"] = str(runner_status["error"])
+        updates["error"] = _scrub_optional_text(runner_status["error"])
     return repo.update_task(task_id, **updates)
 
 
@@ -3786,7 +3792,7 @@ def _terminal_status_event(task: LimraTask, *, reason: str | None = None) -> dic
         "terminal": True,
     }
     if task.error:
-        payload["error"] = task.error
+        payload["error"] = _scrub_optional_text(task.error)
     if reason:
         payload["reason"] = reason
     return {
@@ -3949,6 +3955,8 @@ def _apply_task_status_from_event(
             updates["archive_status"] = "ready"
         elif status in {"failed", "cancelled"}:
             updates["archive_status"] = "failed"
+        if isinstance(payload, dict) and payload.get("error"):
+            updates["error"] = _scrub_optional_text(payload["error"])
         repo.update_task(task_id, **updates)
         return str(status)
     return None
@@ -4067,6 +4075,16 @@ def _scrub_runner_artifact_event(event: dict[str, Any]) -> dict[str, Any]:
         return event
     scrubbed_event = dict(event)
     scrubbed_event["payload"] = scrub_limra_secrets(event.get("payload"))
+    return scrubbed_event
+
+
+def _scrub_runner_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    scrubbed_payload = scrub_limra_secrets(payload)
+    if scrubbed_payload == payload:
+        return event
+    scrubbed_event = dict(event)
+    scrubbed_event["payload"] = scrubbed_payload
     return scrubbed_event
 
 
@@ -4691,6 +4709,12 @@ def scrub_limra_secrets(value: Any) -> Any:
     if isinstance(value, str):
         return _scrub_secret_text(value)
     return value
+
+
+def _scrub_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(scrub_limra_secrets(str(value)))
 
 
 def _is_secret_field_name(value: Any) -> bool:
