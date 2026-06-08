@@ -760,6 +760,103 @@ async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
         assert empty_json_response.json()["detail"] == "object_key_server_generated"
 
 
+@pytest.mark.asyncio
+async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
+    app, repo, storage = _limra_asgi_app()
+    pdf_exporter = app.state.test_pdf_exporter
+    repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="report",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.create_task(
+        task_id="task-b",
+        owner_user_id="user-b",
+        query="foreign report",
+        scenario=None,
+        runner_task_id="runner-task-b",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/tasks/task-a/reports/pdf",
+            json={
+                "report_id": "report-a",
+                "report_type": "final",
+                "markdown": "Finding references [EVID-001]",
+                "html": '<h1 onclick="evil()">Finding [EVID-001]</h1><script>bad()</script><a href="javascript:bad">bad</a>',
+                "evidence_refs": ["EVID-001"],
+            },
+        )
+        foreign_response = await client.post(
+            "/api/limra/tasks/task-b/reports/pdf",
+            json={
+                "report_id": "report-b",
+                "markdown": "foreign",
+                "evidence_refs": [],
+            },
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["report_id"] == "report-a"
+    assert payload["task_id"] == "task-a"
+    assert payload["report_type"] == "final"
+    assert payload["evidence_refs"] == ["EVID-001"]
+    assert payload["pdf_size_bytes"] == len(pdf_exporter.pdf_bytes)
+    assert payload["pdf_sha256"]
+    assert payload["pdf_url"] == "/api/limra/tasks/task-a/reports/report-a/pdf"
+    assert "object_key" not in payload
+    assert "pdf_object_key" not in payload
+    _assert_no_browser_leak(payload)
+
+    assert len(pdf_exporter.html_inputs) == 1
+    rendered_html = pdf_exporter.html_inputs[0]
+    assert 'data-evidence-ref="EVID-001"' in rendered_html
+    assert "<script" not in rendered_html.lower()
+    assert "javascript:" not in rendered_html.lower()
+    assert "onclick" not in rendered_html.lower()
+
+    report = repo.get_user_report(
+        task_id="task-a",
+        report_id="report-a",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.markdown == "Finding references [EVID-001]"
+    assert report.html == rendered_html
+    assert report.evidence_refs == ["EVID-001"]
+    assert report.pdf_object_key in storage.objects
+    stored = storage.objects[report.pdf_object_key]
+    assert stored["data"] == pdf_exporter.pdf_bytes
+    assert stored["content_type"] == "application/pdf"
+    assert stored["metadata"]["report_id"] == "report-a"
+    assert stored["metadata"]["task_id"] == "task-a"
+    assert stored["metadata"]["owner_user_id"] == "user-a"
+    assert "/tasks/task-a/reports/" in report.pdf_object_key
+    assert foreign_response.status_code == 404
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        download_response = await client.get(payload["pdf_url"])
+        foreign_download_response = await client.get(
+            "/api/limra/tasks/task-b/reports/report-a/pdf"
+        )
+
+    assert download_response.status_code == 200
+    assert download_response.content == pdf_exporter.pdf_bytes
+    assert download_response.headers["content-type"].startswith("application/pdf")
+    assert 'filename="report-a.pdf"' in download_response.headers["content-disposition"]
+    assert foreign_download_response.status_code == 404
+
+
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     sql = limra.PostgresLimraTaskRepository.sql_contract().lower()
 
@@ -801,8 +898,9 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     assert "cast(:event_time_end as timestamptz)" in sql
     assert "st_geomfromgeojson(:geometry_geojson)" in sql
     assert "st_geomfromtext(:geometry_wkt)" in sql
-    assert "insert into limra_uploaded_documents" in sql
+    assert "pdf_object_key" in sql
     assert "returning" in sql
+    assert "insert into limra_uploaded_documents" in sql
     assert "object_key" in sql
     assert "extracted_text" in sql
     assert "archive_object_key" in sql
@@ -985,6 +1083,55 @@ def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
     ] == ["doc-001"]
     assert repo.list_user_documents(owner_user_id="user-a", task_id="task-other") == []
     assert repo.list_user_documents(owner_user_id="user-b") == []
+
+
+def test_postgres_repository_records_generated_report_pdf_metadata():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-report",
+        owner_user_id="user-a",
+        query="report query",
+        scenario=None,
+        runner_task_id="runner-report",
+    )
+
+    report = repo.record_generated_report(
+        report_id="report-001",
+        task_id="task-report",
+        report_type="final",
+        markdown="Final report [EVID-001]",
+        html="<p>Final report [EVID-001]</p>",
+        pdf_object_key="limra/users/hash/tasks/task-report/reports/report-001.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={"pdf_sha256": "abc123", "pdf_size_bytes": 123},
+    )
+
+    assert report.report_id == "report-001"
+    assert report.task_id == "task-report"
+    assert report.pdf_object_key.endswith("/reports/report-001.pdf")
+    assert report.evidence_refs == ["EVID-001"]
+    assert report.metadata == {"pdf_sha256": "abc123", "pdf_size_bytes": 123}
+    assert engine.generated_reports[("task-report", "report-001")]["pdf_object_key"].endswith(
+        "/reports/report-001.pdf"
+    )
+
+    owned = repo.get_user_report(
+        task_id="task-report",
+        report_id="report-001",
+        owner_user_id="user-a",
+    )
+    assert owned is not None
+    assert owned.markdown == "Final report [EVID-001]"
+    assert repo.get_user_report(
+        task_id="task-report",
+        report_id="report-001",
+        owner_user_id="user-b",
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -1729,6 +1876,7 @@ def test_limra_router_defines_required_browser_facing_paths():
         ("/uploads/{document_id}", "GET"),
         ("/uploads/{document_id}/download", "GET"),
         ("/tasks/{task_id}/reports/pdf", "POST"),
+        ("/tasks/{task_id}/reports/{report_id}/pdf", "GET"),
         ("/admin/tasks/{task_id}", "GET"),
         ("/admin/tasks/{task_id}/archive.zip", "GET"),
     }
@@ -1777,8 +1925,10 @@ def _assert_no_browser_leak(payload):
 def _limra_asgi_app():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
+    pdf_exporter = FakePdfExporter()
     app = FastAPI()
     app.include_router(limra.router, prefix="/api/limra")
+    app.state.test_pdf_exporter = pdf_exporter
 
     async def current_user_override():
         return limra.LimraUser("user-a")
@@ -1789,9 +1939,13 @@ def _limra_asgi_app():
     async def object_storage_override():
         return storage
 
+    async def pdf_exporter_override():
+        return pdf_exporter
+
     app.dependency_overrides[limra.get_current_limra_user] = current_user_override
     app.dependency_overrides[limra.get_task_repository] = task_repository_override
     app.dependency_overrides[limra.get_object_storage] = object_storage_override
+    app.dependency_overrides[limra.get_pdf_exporter] = pdf_exporter_override
     return app, repo, storage
 
 
@@ -1855,6 +2009,16 @@ class FakeS3Client:
         return {"ETag": '"fake"'}
 
 
+class FakePdfExporter:
+    def __init__(self):
+        self.pdf_bytes = b"%PDF-1.7\nfake limra report\n%%EOF"
+        self.html_inputs = []
+
+    async def render_pdf(self, html_content):
+        self.html_inputs.append(html_content)
+        return self.pdf_bytes
+
+
 def _pairs_to_mapping(values):
     assert len(values) % 2 == 0
     return {values[index]: values[index + 1] for index in range(0, len(values), 2)}
@@ -1865,6 +2029,7 @@ class FakeLimraPostgresEngine:
         self.tasks = {}
         self.artifact_events = {}
         self.uploaded_documents = {}
+        self.generated_reports = {}
         self.typed_inserts = {
             "limra_evidence_items": [],
             "limra_entities": [],
@@ -1964,6 +2129,28 @@ class FakeLimraPostgresEngine:
                 and (params.get("task_id") is None or row["task_id"] == params["task_id"])
             ]
             return FakeLimraPostgresResult(rows)
+
+        if "insert into limra_generated_reports" in sql and "returning" in sql:
+            row = {
+                "report_id": params["report_id"],
+                "task_id": params["task_id"],
+                "report_type": params["report_type"],
+                "markdown": params["markdown"],
+                "html": params["html"],
+                "pdf_object_key": params["pdf_object_key"],
+                "evidence_refs": params["evidence_refs"],
+                "creator_user_id": params["creator_user_id"],
+                "metadata": params["metadata"],
+            }
+            self.generated_reports[(params["task_id"], params["report_id"])] = row
+            return FakeLimraPostgresResult([row])
+
+        if "from limra_generated_reports" in sql:
+            task = self.tasks.get(params["task_id"])
+            row = self.generated_reports.get((params["task_id"], params["report_id"]))
+            if not task or task["owner_user_id"] != params["owner_user_id"]:
+                row = None
+            return FakeLimraPostgresResult([row] if row else [])
 
         for table in self.typed_inserts:
             if f"insert into {table}" in sql:

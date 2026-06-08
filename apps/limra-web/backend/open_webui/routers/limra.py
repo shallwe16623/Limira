@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import io
 import json
 import logging
@@ -16,7 +17,7 @@ from typing import Any, Protocol
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 try:
     from open_webui.utils.auth import (
@@ -99,6 +100,14 @@ class ResearchRequest(BaseModel):
     scenario: str | None = None
 
 
+class ReportPdfRequest(BaseModel):
+    report_id: str | None = Field(default=None, max_length=120)
+    report_type: str = Field(default="final", max_length=80)
+    markdown: str = Field(min_length=1, max_length=2_000_000)
+    html: str | None = Field(default=None, max_length=2_000_000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=2_000)
+
+
 @dataclass(frozen=True)
 class LimraUser:
     id: str
@@ -167,6 +176,35 @@ class LimraUploadedDocument:
         }
 
 
+@dataclass
+class LimraGeneratedReport:
+    report_id: str
+    task_id: str
+    report_type: str
+    markdown: str
+    html: str | None
+    pdf_object_key: str | None
+    evidence_refs: list[str]
+    creator_user_id: str
+    metadata: dict[str, Any] | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        metadata = self.metadata or {}
+        return {
+            "report_id": self.report_id,
+            "task_id": self.task_id,
+            "report_type": self.report_type,
+            "evidence_refs": list(self.evidence_refs),
+            "markdown_chars": len(self.markdown or ""),
+            "html_chars": len(self.html or ""),
+            "pdf_size_bytes": metadata.get("pdf_size_bytes"),
+            "pdf_sha256": metadata.get("pdf_sha256"),
+            "pdf_url": f"/api/limra/tasks/{self.task_id}/reports/{self.report_id}/pdf"
+            if self.pdf_object_key
+            else None,
+        }
+
+
 class RunnerStreamConflict(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -227,6 +265,28 @@ class LimraTaskRepository(Protocol):
         owner_user_id: str,
         task_id: str | None = None,
     ) -> list[LimraUploadedDocument]: ...
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraGeneratedReport: ...
+
+    def get_user_report(
+        self,
+        *,
+        task_id: str,
+        report_id: str,
+        owner_user_id: str,
+    ) -> LimraGeneratedReport | None: ...
 
 
 class RunnerResearchClientProtocol(Protocol):
@@ -310,11 +370,16 @@ class LimraObjectStorage(Protocol):
     ) -> bytes: ...
 
 
+class LimraPdfExporter(Protocol):
+    async def render_pdf(self, html_content: str) -> bytes: ...
+
+
 class InMemoryLimraTaskRepository:
     def __init__(self) -> None:
         self.tasks: dict[str, LimraTask] = {}
         self.artifacts: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self.uploaded_documents: dict[str, LimraUploadedDocument] = {}
+        self.generated_reports: dict[tuple[str, str], LimraGeneratedReport] = {}
 
     def create_task(
         self,
@@ -422,6 +487,45 @@ class InMemoryLimraTaskRepository:
             and (task_id is None or document.task_id == task_id)
         ]
         return sorted(documents, key=lambda document: document.document_id)
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraGeneratedReport:
+        report = LimraGeneratedReport(
+            report_id=report_id,
+            task_id=task_id,
+            report_type=report_type,
+            markdown=markdown,
+            html=html,
+            pdf_object_key=pdf_object_key,
+            evidence_refs=list(evidence_refs),
+            creator_user_id=creator_user_id,
+            metadata=dict(metadata or {}),
+        )
+        self.generated_reports[(task_id, report_id)] = report
+        return report
+
+    def get_user_report(
+        self,
+        *,
+        task_id: str,
+        report_id: str,
+        owner_user_id: str,
+    ) -> LimraGeneratedReport | None:
+        task = self.get_user_task(task_id, owner_user_id)
+        if not task:
+            return None
+        return self.generated_reports.get((task_id, report_id))
 
 
 class InMemoryLimraRuntimeState:
@@ -710,6 +814,24 @@ class S3LimraObjectStorage:
             raise FileNotFoundError(object_key) from exc
 
 
+class PlaywrightLimraPdfExporter:
+    async def render_pdf(self, html_content: str) -> bytes:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:  # pragma: no cover - depends on runtime image
+            raise RuntimeError("limra_playwright_dependency_missing") from exc
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(args=["--no-sandbox"])
+            try:
+                page = await browser.new_page()
+                await page.set_content(html_content, wait_until="networkidle")
+                pdf_bytes = await page.pdf(format="A4", print_background=True)
+            finally:
+                await browser.close()
+        return bytes(pdf_bytes)
+
+
 class PostgresLimraTaskRepository:
     POSTGRES_ARTIFACT_TABLES = {
         "limra_research_tasks",
@@ -746,6 +868,17 @@ class PostgresLimraTaskRepository:
         object_key,
         extracted_text,
         language,
+        metadata
+    """
+    REPORT_COLUMNS = """
+        report_id,
+        task_id,
+        report_type,
+        markdown,
+        html,
+        pdf_object_key,
+        evidence_refs,
+        creator_user_id,
         metadata
     """
     INSERT_TASK_SQL = f"""
@@ -1022,6 +1155,49 @@ class PostgresLimraTaskRepository:
             metadata = EXCLUDED.metadata,
             updated_at = now()
     """
+    UPSERT_GENERATED_REPORT_SQL = f"""
+        INSERT INTO limra_generated_reports (
+            report_id,
+            task_id,
+            report_type,
+            markdown,
+            html,
+            pdf_object_key,
+            evidence_refs,
+            creator_user_id,
+            metadata
+        )
+        VALUES (
+            :report_id,
+            :task_id,
+            :report_type,
+            :markdown,
+            :html,
+            :pdf_object_key,
+            :evidence_refs,
+            :creator_user_id,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, report_id) DO UPDATE SET
+            report_type = EXCLUDED.report_type,
+            markdown = EXCLUDED.markdown,
+            html = EXCLUDED.html,
+            pdf_object_key = EXCLUDED.pdf_object_key,
+            evidence_refs = EXCLUDED.evidence_refs,
+            creator_user_id = EXCLUDED.creator_user_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = now()
+        RETURNING {REPORT_COLUMNS}
+    """
+    SELECT_USER_GENERATED_REPORT_SQL = f"""
+        SELECT {REPORT_COLUMNS}
+        FROM limra_generated_reports reports
+        JOIN limra_research_tasks tasks
+          ON tasks.task_id = reports.task_id
+        WHERE reports.task_id = :task_id
+          AND reports.report_id = :report_id
+          AND tasks.owner_user_id = :owner_user_id
+    """
     INSERT_UPLOADED_DOCUMENT_SQL = f"""
         INSERT INTO limra_uploaded_documents (
             document_id,
@@ -1276,6 +1452,54 @@ class PostgresLimraTaskRepository:
             {"owner_user_id": owner_user_id, "task_id": task_id},
         )
         return [_uploaded_document_from_row(row) for row in rows]
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraGeneratedReport:
+        row = self._fetch_one(
+            self.UPSERT_GENERATED_REPORT_SQL,
+            {
+                "report_id": report_id,
+                "task_id": task_id,
+                "report_type": report_type,
+                "markdown": markdown,
+                "html": html,
+                "pdf_object_key": pdf_object_key,
+                "evidence_refs": _list_of_strings(evidence_refs),
+                "creator_user_id": creator_user_id,
+                "metadata": _json_dumps(metadata or {}),
+            },
+        )
+        if not row:
+            raise RuntimeError("limra_generated_report_insert_failed")
+        return _generated_report_from_row(row)
+
+    def get_user_report(
+        self,
+        *,
+        task_id: str,
+        report_id: str,
+        owner_user_id: str,
+    ) -> LimraGeneratedReport | None:
+        row = self._fetch_one(
+            self.SELECT_USER_GENERATED_REPORT_SQL,
+            {
+                "task_id": task_id,
+                "report_id": report_id,
+                "owner_user_id": owner_user_id,
+            },
+        )
+        return _generated_report_from_row(row) if row else None
 
     def _record_typed_artifact(
         self,
@@ -1724,6 +1948,14 @@ def get_object_storage(request: Request) -> LimraObjectStorage:
     return object_storage
 
 
+def get_pdf_exporter(request: Request) -> LimraPdfExporter:
+    pdf_exporter = getattr(request.app.state, "limra_pdf_exporter", None)
+    if pdf_exporter is None:
+        pdf_exporter = PlaywrightLimraPdfExporter()
+        request.app.state.limra_pdf_exporter = pdf_exporter
+    return pdf_exporter
+
+
 @router.post("/research", status_code=202)
 async def create_research_task(
     form_data: dict[str, Any],
@@ -1972,7 +2204,7 @@ async def download_uploaded_document(
     )
 
 
-@router.post("/tasks/{task_id}/reports/pdf", status_code=501)
+@router.post("/tasks/{task_id}/reports/pdf", status_code=201)
 async def export_task_pdf(
     task_id: str,
     request: Request,
@@ -1980,14 +2212,90 @@ async def export_task_pdf(
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
     object_storage: LimraObjectStorage = Depends(get_object_storage),
-) -> dict[str, str]:
-    _ = object_storage
+    pdf_exporter: LimraPdfExporter = Depends(get_pdf_exporter),
+) -> dict[str, Any]:
     await _reject_browser_supplied_object_key_request(
         request,
         extra_fields=form_data or {},
     )
-    _get_owned_task(repo, task_id, user)
-    return {"error": "pdf_export_not_implemented"}
+    task = _get_owned_task(repo, task_id, user)
+    try:
+        request_data = ReportPdfRequest.model_validate(form_data or {})
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="invalid_report_payload") from exc
+
+    report_id = _safe_report_id(request_data.report_id)
+    report_html = _render_report_html(
+        markdown=request_data.markdown,
+        provided_html=request_data.html,
+        evidence_refs=request_data.evidence_refs,
+    )
+    try:
+        pdf_bytes = await pdf_exporter.render_pdf(report_html)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="pdf_export_failed") from exc
+
+    object_key = build_limra_object_key(
+        owner_user_id=user.id,
+        category="reports",
+        task_id=task.task_id,
+        filename=f"{report_id}.pdf",
+        object_id=report_id,
+    )
+    stored = await object_storage.put_object(
+        object_key=object_key,
+        data=pdf_bytes,
+        content_type="application/pdf",
+        metadata={
+            "task_id": task.task_id,
+            "report_id": report_id,
+            "owner_user_id": user.id,
+            "report_type": request_data.report_type,
+        },
+    )
+    report = repo.record_generated_report(
+        report_id=report_id,
+        task_id=task.task_id,
+        report_type=_safe_report_type(request_data.report_type),
+        markdown=request_data.markdown,
+        html=report_html,
+        pdf_object_key=stored.object_key,
+        evidence_refs=_list_of_strings(request_data.evidence_refs),
+        creator_user_id=user.id,
+        metadata={
+            "pdf_bucket": stored.bucket,
+            "pdf_sha256": stored.sha256,
+            "pdf_size_bytes": stored.size_bytes,
+            "exporter": "playwright",
+        },
+    )
+    return _assert_browser_safe(report.public_dict())
+
+
+@router.get("/tasks/{task_id}/reports/{report_id}/pdf")
+async def download_task_report_pdf(
+    task_id: str,
+    report_id: str,
+    user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+    object_storage: LimraObjectStorage = Depends(get_object_storage),
+) -> Response:
+    report = _get_owned_report(repo, task_id, report_id, user)
+    if not report.pdf_object_key:
+        raise HTTPException(status_code=404, detail="report_pdf_not_found")
+    try:
+        data = await object_storage.get_object(object_key=report.pdf_object_key)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="report_pdf_not_found") from exc
+    return Response(
+        data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": _content_disposition_attachment(
+                f"{report.report_id}.pdf"
+            )
+        },
+    )
 
 
 async def _download_archive(
@@ -2038,6 +2346,22 @@ def _get_owned_document(
     if not document:
         raise HTTPException(status_code=404, detail="document_not_found")
     return document
+
+
+def _get_owned_report(
+    repo: LimraTaskRepository,
+    task_id: str,
+    report_id: str,
+    user: LimraUser,
+) -> LimraGeneratedReport:
+    report = repo.get_user_report(
+        task_id=task_id,
+        report_id=report_id,
+        owner_user_id=user.id,
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="report_not_found")
+    return report
 
 
 async def _limra_event_stream(
@@ -2636,6 +2960,20 @@ def _uploaded_document_from_row(row: dict[str, Any]) -> LimraUploadedDocument:
     )
 
 
+def _generated_report_from_row(row: dict[str, Any]) -> LimraGeneratedReport:
+    return LimraGeneratedReport(
+        report_id=str(row["report_id"]),
+        task_id=str(row["task_id"]),
+        report_type=str(row.get("report_type") or "final"),
+        markdown=str(row.get("markdown") or ""),
+        html=_optional_string(row.get("html")),
+        pdf_object_key=_optional_string(row.get("pdf_object_key")),
+        evidence_refs=_list_of_strings(row.get("evidence_refs")),
+        creator_user_id=str(row.get("creator_user_id") or "limra"),
+        metadata=_json_loads(row.get("metadata")) or {},
+    )
+
+
 def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
     key_by_type = {
         "evidence": "evidence_id",
@@ -2961,6 +3299,60 @@ def _safe_original_filename(filename: str | None) -> str:
 def _content_disposition_attachment(filename: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _safe_original_filename(filename))[:120]
     return f'attachment; filename="{safe or "upload.bin"}"'
+
+
+def _safe_report_id(report_id: str | None) -> str:
+    return _safe_object_segment(report_id or f"report-{uuid.uuid4().hex[:12]}", fallback="report")
+
+
+def _safe_report_type(report_type: str | None) -> str:
+    return _safe_object_segment(report_type or "final", fallback="final")
+
+
+def _render_report_html(
+    *,
+    markdown: str,
+    provided_html: str | None,
+    evidence_refs: list[str],
+) -> str:
+    body = _sanitize_report_html(provided_html) if provided_html else _markdown_to_html(markdown)
+    body = _link_evidence_refs(body, evidence_refs)
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<title>limra report</title></head><body>"
+        f"{body}</body></html>"
+    )
+
+
+def _markdown_to_html(markdown: str) -> str:
+    blocks = []
+    for paragraph in re.split(r"\n{2,}", markdown.strip()):
+        if not paragraph:
+            continue
+        escaped = html.escape(paragraph).replace("\n", "<br>")
+        blocks.append(f"<p>{escaped}</p>")
+    return "\n".join(blocks) or "<p></p>"
+
+
+def _sanitize_report_html(value: str) -> str:
+    clean = re.sub(r"(?is)<script[^>]*>.*?</script>", "", value)
+    clean = re.sub(r"\son[a-zA-Z]+\s*=\s*(['\"]).*?\1", "", clean)
+    clean = re.sub(r"(?i)javascript:", "", clean)
+    return clean
+
+
+def _link_evidence_refs(body: str, evidence_refs: list[str]) -> str:
+    linked = body
+    for ref in _list_of_strings(evidence_refs):
+        safe_ref = html.escape(ref, quote=True)
+        label = f"[{safe_ref}]"
+        target = f"evidence-{safe_ref}"
+        anchor = (
+            f'<a href="#{target}" data-evidence-ref="{safe_ref}">'
+            f"{label}</a>"
+        )
+        linked = linked.replace(label, anchor)
+    return linked
 
 
 def _uploaded_content_type(content_type: str | None, filename: str) -> str:
