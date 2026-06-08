@@ -90,6 +90,40 @@ OBJECT_KEY_ALLOWED_EXTENSIONS = {
     ".txt",
     ".zip",
 }
+REPORT_BLOCKED_HTML_TAGS = (
+    "base",
+    "button",
+    "canvas",
+    "embed",
+    "form",
+    "iframe",
+    "img",
+    "input",
+    "link",
+    "math",
+    "meta",
+    "object",
+    "script",
+    "select",
+    "source",
+    "style",
+    "svg",
+    "textarea",
+    "track",
+    "video",
+)
+REPORT_CSP = (
+    "default-src 'none'; "
+    "script-src 'none'; "
+    "connect-src 'none'; "
+    "img-src 'none'; "
+    "font-src 'none'; "
+    "media-src 'none'; "
+    "object-src 'none'; "
+    "frame-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'"
+)
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -814,6 +848,10 @@ class S3LimraObjectStorage:
             raise FileNotFoundError(object_key) from exc
 
 
+async def _abort_playwright_route(route: Any) -> None:
+    await route.abort()
+
+
 class PlaywrightLimraPdfExporter:
     async def render_pdf(self, html_content: str) -> bytes:
         try:
@@ -825,7 +863,8 @@ class PlaywrightLimraPdfExporter:
             browser = await playwright.chromium.launch(args=["--no-sandbox"])
             try:
                 page = await browser.new_page()
-                await page.set_content(html_content, wait_until="networkidle")
+                await page.route("**/*", _abort_playwright_route)
+                await page.set_content(html_content, wait_until="load")
                 pdf_bytes = await page.pdf(format="A4", print_background=True)
             finally:
                 await browser.close()
@@ -2223,11 +2262,12 @@ async def export_task_pdf(
         request_data = ReportPdfRequest.model_validate(form_data or {})
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail="invalid_report_payload") from exc
+    if (request_data.html or "").strip():
+        raise HTTPException(status_code=400, detail="browser_report_html_not_allowed")
 
     report_id = _safe_report_id(request_data.report_id)
     report_html = _render_report_html(
         markdown=request_data.markdown,
-        provided_html=request_data.html,
         evidence_refs=request_data.evidence_refs,
     )
     try:
@@ -3312,13 +3352,12 @@ def _safe_report_type(report_type: str | None) -> str:
 def _render_report_html(
     *,
     markdown: str,
-    provided_html: str | None,
     evidence_refs: list[str],
 ) -> str:
-    body = _sanitize_report_html(provided_html) if provided_html else _markdown_to_html(markdown)
-    body = _link_evidence_refs(body, evidence_refs)
+    body = _link_evidence_refs(_markdown_to_html(markdown), evidence_refs)
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<meta http-equiv=\"Content-Security-Policy\" content=\"{REPORT_CSP}\">"
         "<title>limra report</title></head><body>"
         f"{body}</body></html>"
     )
@@ -3326,7 +3365,8 @@ def _render_report_html(
 
 def _markdown_to_html(markdown: str) -> str:
     blocks = []
-    for paragraph in re.split(r"\n{2,}", markdown.strip()):
+    safe_markdown = _strip_active_report_markup(markdown)
+    for paragraph in re.split(r"\n{2,}", safe_markdown.strip()):
         if not paragraph:
             continue
         escaped = html.escape(paragraph).replace("\n", "<br>")
@@ -3335,9 +3375,30 @@ def _markdown_to_html(markdown: str) -> str:
 
 
 def _sanitize_report_html(value: str) -> str:
-    clean = re.sub(r"(?is)<script[^>]*>.*?</script>", "", value)
-    clean = re.sub(r"\son[a-zA-Z]+\s*=\s*(['\"]).*?\1", "", clean)
-    clean = re.sub(r"(?i)javascript:", "", clean)
+    return _markdown_to_html(_strip_active_report_markup(value))
+
+
+def _strip_active_report_markup(value: str) -> str:
+    clean = value or ""
+    blocked = "|".join(re.escape(tag) for tag in REPORT_BLOCKED_HTML_TAGS)
+    clean = re.sub(
+        rf"(?is)<\s*({blocked})\b.*?<\s*/\s*\1\s*>",
+        "",
+        clean,
+    )
+    clean = re.sub(rf"(?is)<\s*(?:{blocked})\b[^>]*(?:/?>)", "", clean)
+    clean = re.sub(r"(?is)<[^>]+>", "", clean)
+    clean = re.sub(
+        r"(?is)\b(?:srcdoc|src|href|xlink:href)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        "",
+        clean,
+    )
+    clean = re.sub(
+        r"(?is)\bon[a-z0-9_-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        "",
+        clean,
+    )
+    clean = re.sub(r"(?i)\b(?:javascript|data|blob|file)\s*:", "", clean)
     return clean
 
 

