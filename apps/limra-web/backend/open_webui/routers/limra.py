@@ -172,6 +172,15 @@ SECRET_TEXT_PATTERNS = (
         r"[^&#\s<>'\"]+"
     ),
 )
+INTERNAL_ERROR_TEXT_PATTERNS = (
+    re.compile(r"(?i)\bhttps?://"),
+    re.compile(r"/mirothinker/"),
+    re.compile(r"\blimra/users/"),
+    re.compile(
+        r"(?i)\b(?:object_key|minio_object_key|pdf_object_key|archive_object_key)\b"
+    ),
+    re.compile(r"(?i)\btraceback\b|File \"[^\"]+\", line \d+"),
+)
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -325,7 +334,7 @@ class LimraTask:
             "status": self.status,
             "archive_status": self.archive_status,
             "scenario": self.scenario,
-            "error": _scrub_optional_text(self.error),
+            "error": _public_error_text(self.error, fallback="limra_task_failed"),
             "model_summary": scrub_limra_secrets(self.model_summary or {}),
             "download_url": f"/api/limra/tasks/{self.task_id}/archive.zip"
             if self.archive_status == "ready"
@@ -3936,7 +3945,7 @@ async def _limra_event_stream(
             task.task_id,
             status="failed",
             archive_status="failed",
-            error=_scrub_optional_text(str(exc)),
+            error="limra_event_proxy_failed",
         )
         error_event = {
             "task_id": task.task_id,
@@ -4023,7 +4032,10 @@ def _apply_authoritative_runner_status(
     elif status in {"failed", "cancelled"}:
         updates["archive_status"] = "failed"
     if runner_status.get("error"):
-        updates["error"] = _scrub_optional_text(runner_status["error"])
+        updates["error"] = _public_error_text(
+            runner_status["error"],
+            fallback="runner_task_failed",
+        )
     return repo.update_task(task_id, **updates)
 
 
@@ -4034,7 +4046,10 @@ def _terminal_status_event(task: LimraTask, *, reason: str | None = None) -> dic
         "terminal": True,
     }
     if task.error:
-        payload["error"] = _scrub_optional_text(task.error)
+        payload["error"] = _public_error_text(
+            task.error,
+            fallback="limra_task_failed",
+        )
     if reason:
         payload["reason"] = reason
     return {
@@ -4957,6 +4972,15 @@ def _scrub_optional_text(value: Any) -> str | None:
     if value is None:
         return None
     return str(scrub_limra_secrets(str(value)))
+
+
+def _public_error_text(value: Any, *, fallback: str) -> str | None:
+    scrubbed = _scrub_optional_text(value)
+    if scrubbed is None:
+        return None
+    if any(pattern.search(scrubbed) for pattern in INTERNAL_ERROR_TEXT_PATTERNS):
+        return fallback
+    return scrubbed
 
 
 def _scrub_mapping_key(key: Any) -> Any:

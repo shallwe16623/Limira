@@ -4067,6 +4067,84 @@ async def test_authoritative_runner_status_scrubs_persisted_terminal_task_error_
 
 
 @pytest.mark.asyncio
+async def test_authoritative_runner_status_hides_internal_error_details_from_browser_state():
+    repo = limra.InMemoryLimraTaskRepository()
+    runtime_state = limra.InMemoryLimraRuntimeState()
+    user = limra.LimraUser("user-a")
+    internal_error = (
+        "runner failed GET http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limra/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-authoritativeinternal123456"
+    )
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "failed",
+            "archive_status": "failed",
+            "error": internal_error,
+        },
+    )
+
+    created = await limra.create_research_task(
+        {"query": "authoritative internal error"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    first_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    first_events = _parse_sse_chunks(
+        [chunk async for chunk in first_response.body_iterator]
+    )
+    task = repo.get_task(task_id)
+    task_payload = await limra.get_task(task_id, user=user, repo=repo)
+
+    terminal_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    terminal_events = _parse_sse_chunks(
+        [chunk async for chunk in terminal_response.body_iterator]
+    )
+
+    assert task is not None
+    assert task.error == "runner_task_failed"
+    assert task_payload["error"] == "runner_task_failed"
+    assert terminal_events[-1]["payload"]["error"] == "runner_task_failed"
+    serialized = json.dumps(
+        {
+            "events": first_events,
+            "terminal_events": terminal_events,
+            "task": task_payload,
+            "repo_error": task.error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limra/users/hash",
+        "sk-authoritativeinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(first_events)
+    _assert_no_browser_leak(terminal_events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_persists_final_summary_show_text_as_report_section():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
@@ -4638,6 +4716,62 @@ async def test_event_proxy_generic_exception_records_failed_terminal_runtime_sta
     assert json.loads(runtime_hash["error"]) == "limra_event_proxy_failed"
     assert json.loads(runtime_hash["stream_state"]) == "closed"
     assert json.loads(runtime_hash["stream_close_reason"]) == "limra_event_proxy_failed"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_generic_exception_hides_internal_error_from_task_payload():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    internal_error = (
+        "stream failed at http://10.20.30.40:8091/internal/tasks/runner-task-a/events "
+        "for limra/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-genericinternal123456"
+    )
+    research = FakeResearchClient(stream_exception=RuntimeError(internal_error))
+    created = await limra.create_research_task(
+        {"query": "generic exception internal error"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    task_payload = await limra.get_task(task_id, user=user, repo=repo)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert events[-1]["payload"]["error"] == "limra_event_proxy_failed"
+    assert repo.get_task(task_id).error == "limra_event_proxy_failed"
+    assert task_payload["error"] == "limra_event_proxy_failed"
+    assert json.loads(runtime_hash["error"]) == "limra_event_proxy_failed"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+            "runtime": runtime_hash,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limra/users/hash",
+        "sk-genericinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
 
 
 @pytest.mark.asyncio
