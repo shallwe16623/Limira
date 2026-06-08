@@ -25,8 +25,12 @@ const mimeTypes = new Map([
 const server = createServer(async (req, res) => {
 	try {
 		const requestUrl = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`);
-		if (requestUrl.pathname.startsWith('/api/')) {
+		if (isLimraApiPath(requestUrl.pathname)) {
 			await proxyApi(req, res, requestUrl);
+			return;
+		}
+		if (requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/mirothinker/')) {
+			rejectPrivateApi(res);
 			return;
 		}
 		serveStatic(requestUrl.pathname, res);
@@ -41,8 +45,20 @@ const server = createServer(async (req, res) => {
 
 server.listen(port, host, () => {
 	console.log(`limra standalone frontend listening on http://${host}:${port}`);
-	console.log(`proxying /api/* to ${backendUrl}`);
+	console.log(`proxying /api/limra/* to ${backendUrl}`);
 });
+
+function isLimraApiPath(pathname) {
+	return pathname === '/api/limra' || pathname.startsWith('/api/limra/');
+}
+
+function rejectPrivateApi(res) {
+	res.writeHead(404, {
+		'content-type': 'application/json; charset=utf-8',
+		'cache-control': 'no-store'
+	});
+	res.end(JSON.stringify({ detail: 'not_found' }));
+}
 
 async function proxyApi(req, res, requestUrl) {
 	const target = `${backendUrl}${requestUrl.pathname}${requestUrl.search}`;

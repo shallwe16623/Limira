@@ -790,6 +790,68 @@ async def test_filesystem_object_storage_rejects_unsafe_object_keys(tmp_path):
     assert [path.name for path in tmp_path.iterdir()] == []
 
 
+@pytest.mark.asyncio
+async def test_object_storage_backends_validate_and_normalize_object_keys(tmp_path):
+    unsafe_keys = [
+        "",
+        "/absolute/object.txt",
+        "../outside.txt",
+        "limra/users/u/../secret.txt",
+        "limra/users/u/a/../../secret.txt",
+        "limra/users/u/./object.txt",
+        "limra/users/u//object.txt",
+        "limra\\users\\u\\object.txt",
+        "limra/users/u/object.metadata.json",
+        "limra/users/u/object.metadata.json/nested.txt",
+    ]
+    safe_key = "limra/users/u/uploads/document.txt"
+    whitespace_key = f"  {safe_key}  "
+
+    memory_storage = limra.InMemoryLimraObjectStorage(bucket="memory")
+    filesystem_storage = limra.FileSystemLimraObjectStorage(
+        root_path=str(tmp_path / "objects"),
+        bucket="local",
+    )
+    s3_client = FakeS3Client()
+    s3_storage = limra.S3LimraObjectStorage(
+        bucket="limra-artifacts",
+        endpoint_url="http://minio:9000",
+        access_key_id="limra_minio",
+        secret_access_key="replace-with-local-minio-password",
+        s3_client=s3_client,
+    )
+
+    for storage in [memory_storage, filesystem_storage, s3_storage]:
+        stored = await storage.put_object(
+            object_key=whitespace_key,
+            data=b"safe-bytes",
+            content_type="text/plain",
+            metadata={"document_id": "doc-a"},
+        )
+        assert stored.object_key == safe_key
+        assert await storage.get_object(object_key=whitespace_key) == b"safe-bytes"
+
+    assert list(memory_storage.objects) == [safe_key]
+    assert s3_client.put_calls[-1]["Key"] == safe_key
+    assert s3_client.get_calls[-1]["Key"] == safe_key
+
+    for storage in [memory_storage, filesystem_storage, s3_storage]:
+        for object_key in unsafe_keys:
+            with pytest.raises(ValueError, match="invalid_limra_object_key"):
+                await storage.put_object(
+                    object_key=object_key,
+                    data=b"unsafe",
+                    content_type="text/plain",
+                    metadata={"document_id": "doc-a"},
+                )
+            with pytest.raises(ValueError, match="invalid_limra_object_key"):
+                await storage.get_object(object_key=object_key)
+
+    assert list(memory_storage.objects) == [safe_key]
+    assert [call["Key"] for call in s3_client.put_calls] == [safe_key]
+    assert [call["Key"] for call in s3_client.get_calls] == [safe_key]
+
+
 def test_limra_upload_embedding_config_defaults_disabled_and_validates_enabled():
     config = limra.create_limra_upload_embedding_config_from_env({})
     assert config == limra.LimraUploadEmbeddingConfig(
@@ -2588,6 +2650,11 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
     user = limra.LimraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-runnersecret123456",
+        "Authorization: Bearer runner-secret-123456",
+        "RUNNER_SERVICE_TOKEN=runner-service-secret-123456",
+    ]
     research = FakeResearchClient(
         events=[
             {
@@ -2600,8 +2667,10 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
                 "type": "evidence_collected",
                 "payload": {
                     "title": "Export control notice",
-                    "summary": "Policy update",
-                    "source_url": "https://example.test/source",
+                    "summary": f"Policy update {raw_secret_values[0]}",
+                    "source_url": (
+                        "https://example.test/source?token=runner-query-secret-123456"
+                    ),
                 },
             },
             {
@@ -2620,11 +2689,14 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
                     "artifact_type": "report_section",
                     "payload": {
                         "title": "Assessment",
-                        "markdown": "Finding references [EVID-001]",
+                        "markdown": (
+                            "Finding references [EVID-001]\n\n"
+                            f"{raw_secret_values[1]}\n{raw_secret_values[2]}"
+                        ),
                     },
                     "evidence_refs": ["EVID-001"],
                     "confidence": 0.8,
-                    "notes": "draft",
+                    "notes": raw_secret_values[2],
                 },
             },
             {
@@ -2666,6 +2738,11 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     assert events[-1]["payload"]["status"] == "completed"
     assert events[-1]["payload"]["status_source"] == "runner"
     _assert_no_browser_leak(events)
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_events
+    assert "runner-query-secret-123456" not in serialized_events
+    assert limra.LIMRA_SECRET_REDACTION in serialized_events
 
     task = repo.get_task(task_id)
     assert task.status == "completed"
@@ -2675,11 +2752,17 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
     assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
     assert artifacts["evidence"][0]["title"] == "Export control notice"
+    assert limra.LIMRA_SECRET_REDACTION in artifacts["evidence"][0]["summary"]
+    assert limra.LIMRA_SECRET_REDACTION in artifacts["evidence"][0]["source_url"]
     assert artifacts["entities"][0]["entity_id"] == "ENT-001"
     assert artifacts["report_sections"][0]["evidence_refs"] == ["EVID-001"]
     assert artifacts["report_sections"][0]["confidence"] == 0.8
     assert artifacts["relations"] == []
     _assert_no_browser_leak(artifacts)
+    serialized_artifacts = json.dumps(artifacts, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_artifacts
+    assert "runner-query-secret-123456" not in serialized_artifacts
 
     archive_response = await limra.download_task_archive(
         task_id,
@@ -2687,7 +2770,14 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
         repo=repo,
         object_storage=storage,
     )
-    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    members = _archive_member_texts(archive_response.body)
+    serialized_members = json.dumps(members, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_members
+    assert "runner-query-secret-123456" not in serialized_members
+    assert limra.LIMRA_SECRET_REDACTION in members["report.md"]
+    assert limra.LIMRA_SECRET_REDACTION in members["trace.json"]
+    trace = json.loads(members["trace.json"])
     assert [event["type"] for event in trace["artifact_events"]] == [
         "evidence_collected",
         "entity_extracted",
@@ -3730,10 +3820,26 @@ class FakeRedisClient:
 class FakeS3Client:
     def __init__(self):
         self.put_calls = []
+        self.get_calls = []
+        self.objects = {}
 
     def put_object(self, **kwargs):
         self.put_calls.append(dict(kwargs))
+        self.objects[(kwargs["Bucket"], kwargs["Key"])] = bytes(kwargs["Body"])
         return {"ETag": '"fake"'}
+
+    def get_object(self, **kwargs):
+        self.get_calls.append(dict(kwargs))
+        data = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        return {"Body": FakeS3Body(data)}
+
+
+class FakeS3Body:
+    def __init__(self, data):
+        self.data = bytes(data)
+
+    def read(self):
+        return self.data
 
 
 class FakePdfExporter:

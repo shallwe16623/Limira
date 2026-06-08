@@ -1223,6 +1223,7 @@ class InMemoryLimraObjectStorage:
         content_type: str,
         metadata: Mapping[str, Any] | None = None,
     ) -> LimraStoredObject:
+        object_key = validate_limra_object_key(object_key)
         stored = _stored_object(
             object_key=object_key,
             bucket=self.bucket,
@@ -1230,7 +1231,7 @@ class InMemoryLimraObjectStorage:
             content_type=content_type,
             metadata=metadata,
         )
-        self.objects[object_key] = {
+        self.objects[stored.object_key] = {
             "data": bytes(data),
             "content_type": content_type,
             "metadata": stored.metadata,
@@ -1243,6 +1244,7 @@ class InMemoryLimraObjectStorage:
         *,
         object_key: str,
     ) -> bytes:
+        object_key = validate_limra_object_key(object_key)
         try:
             return bytes(self.objects[object_key]["data"])
         except KeyError as exc:
@@ -1272,7 +1274,7 @@ class FileSystemLimraObjectStorage:
             content_type=content_type,
             metadata=metadata,
         )
-        object_path = self._object_path(object_key)
+        object_path = self._object_path(stored.object_key)
         os.makedirs(os.path.dirname(object_path), exist_ok=True)
         with open(object_path, "wb") as file:
             file.write(bytes(data))
@@ -1367,7 +1369,7 @@ class S3LimraObjectStorage:
         await _maybe_await(
             self.s3_client.put_object(
                 Bucket=self.bucket,
-                Key=object_key,
+                Key=stored.object_key,
                 Body=bytes(data),
                 ContentType=stored.content_type,
                 Metadata=stored.metadata,
@@ -1380,6 +1382,7 @@ class S3LimraObjectStorage:
         *,
         object_key: str,
     ) -> bytes:
+        object_key = validate_limra_object_key(object_key)
         try:
             response = await _maybe_await(
                 self.s3_client.get_object(Bucket=self.bucket, Key=object_key)
@@ -2930,7 +2933,7 @@ async def get_task_artifacts(
     repo: LimraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, list[Any]]:
     _get_owned_task(repo, task_id, user)
-    artifacts = repo.get_artifacts(task_id)
+    artifacts = scrub_limra_secrets(repo.get_artifacts(task_id))
     artifacts["timeline"] = artifacts["timeline_events"]
     return _assert_browser_safe(artifacts)
 
@@ -3582,6 +3585,7 @@ async def _limra_event_stream(
                 event,
                 current_agent_name=current_agent_name,
             )
+            event = _scrub_runner_artifact_event(event)
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
@@ -4048,6 +4052,21 @@ def _scrub_final_show_text_event(
     scrubbed_payload = dict(payload)
     scrubbed_payload["tool_input"] = scrub_limra_secrets(payload.get("tool_input"))
     scrubbed_event["payload"] = scrubbed_payload
+    return scrubbed_event
+
+
+def _scrub_runner_artifact_event(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or "")
+    if event_type not in {
+        *ARTIFACT_EVENT_TYPES.keys(),
+        "artifact",
+        "artifact_recorded",
+        "record_research_artifact",
+        "artifact_warning",
+    }:
+        return event
+    scrubbed_event = dict(event)
+    scrubbed_event["payload"] = scrub_limra_secrets(event.get("payload"))
     return scrubbed_event
 
 

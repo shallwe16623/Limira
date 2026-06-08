@@ -1,11 +1,23 @@
 import json
+import os
 import re
+import shutil
+import socket
 import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
+LIMRA_STANDALONE_ROOT = REPO_ROOT / "apps" / "limra-standalone"
+LIMRA_STANDALONE_SERVER = LIMRA_STANDALONE_ROOT / "server.mjs"
 BACKEND_ROOT = LIMRA_WEB_ROOT / "backend" / "open_webui"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
 SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
@@ -112,6 +124,44 @@ def _resolve_lib_import(import_path: str) -> Path | None:
     return None
 
 
+def _node_executable() -> str | None:
+    path_node = shutil.which("node")
+    if path_node:
+        return path_node
+    bundled_node = Path("/tmp/codex-node/node/bin/node")
+    if bundled_node.exists():
+        return str(bundled_node)
+    return None
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _read_url(url: str) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8")
+
+
+class _RecordingBackendHandler(BaseHTTPRequestHandler):
+    requests: list[str] = []
+
+    def do_GET(self):
+        self.requests.append(self.path)
+        self.send_response(200)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps({"proxied_path": self.path}).encode("utf-8"))
+
+    def log_message(self, *_args):
+        return
+
+
 def test_limra_research_page_exists_inside_authenticated_app_shell():
     assert LIMRA_PAGE.exists()
     page = _read(LIMRA_PAGE)
@@ -151,6 +201,69 @@ def test_limra_research_page_uses_only_browser_facing_limra_api_paths():
     ]
     for forbidden in forbidden_browser_strings:
         assert forbidden not in page
+
+
+def test_limra_standalone_proxy_only_forwards_limra_api_namespace():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    backend_port = _free_local_port()
+    proxy_port = _free_local_port()
+    _RecordingBackendHandler.requests = []
+    backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _RecordingBackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+    process = subprocess.Popen(
+        [node, str(LIMRA_STANDALONE_SERVER)],
+        cwd=LIMRA_STANDALONE_ROOT,
+        env={
+            **os.environ,
+            "LIMRA_STANDALONE_HOST": "127.0.0.1",
+            "LIMRA_STANDALONE_PORT": str(proxy_port),
+            "LIMRA_BACKEND_URL": f"http://127.0.0.1:{backend_port}",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{proxy_port}"
+        for _ in range(50):
+            try:
+                status, body = _read_url(f"{base_url}/api/limra/scenarios")
+                if status == 200:
+                    break
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.1)
+        else:
+            stdout, stderr = process.communicate(timeout=2)
+            raise AssertionError(
+                f"standalone proxy did not start; stdout={stdout!r}; stderr={stderr!r}"
+            )
+
+        assert status == 200
+        assert json.loads(body)["proxied_path"] == "/api/limra/scenarios"
+
+        for blocked_path in [
+            "/api/v1/auths",
+            "/api/config",
+            "/mirothinker/tasks/task-a/events",
+        ]:
+            blocked_status, blocked_body = _read_url(f"{base_url}{blocked_path}")
+            assert blocked_status == 404
+            assert json.loads(blocked_body)["detail"] == "not_found"
+
+        assert _RecordingBackendHandler.requests == ["/api/limra/scenarios"]
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        backend.shutdown()
+        backend.server_close()
 
 
 def test_limra_research_page_has_demo_scenario_selector():
