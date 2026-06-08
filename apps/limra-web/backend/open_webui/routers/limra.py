@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Mapping
@@ -63,6 +64,7 @@ ARTIFACT_TYPE_EVENTS = {
 }
 LIMRA_REPOSITORY_BACKEND_ENV = "LIMRA_REPOSITORY_BACKEND"
 LIMRA_DATABASE_URL_ENV = "LIMRA_DATABASE_URL"
+LIMRA_SQLITE_DATABASE_PATH_ENV = "LIMRA_SQLITE_DATABASE_PATH"
 LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV = "LIMRA_ALLOW_IN_MEMORY_REPOSITORY"
 LIMRA_RUNTIME_STATE_BACKEND_ENV = "LIMRA_RUNTIME_STATE_BACKEND"
 LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE_ENV = "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE"
@@ -70,6 +72,7 @@ LIMRA_RUNTIME_STATE_KEY_PREFIX_ENV = "LIMRA_RUNTIME_STATE_KEY_PREFIX"
 LIMRA_RUNTIME_STATE_TTL_SECONDS_ENV = "LIMRA_RUNTIME_STATE_TTL_SECONDS"
 LIMRA_OBJECT_STORAGE_BACKEND_ENV = "LIMRA_OBJECT_STORAGE_BACKEND"
 LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE_ENV = "LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE"
+LIMRA_OBJECT_STORAGE_PATH_ENV = "LIMRA_OBJECT_STORAGE_PATH"
 LIMRA_OBJECT_BUCKET_ENV = "LIMRA_OBJECT_BUCKET"
 LIMRA_OBJECT_KEY_PREFIX_ENV = "LIMRA_OBJECT_KEY_PREFIX"
 LIMRA_OBJECT_STORAGE_ENDPOINT_ENV = "S3_ENDPOINT_URL"
@@ -831,6 +834,203 @@ class InMemoryLimraTaskRepository:
         )
 
 
+class SQLiteLimraTaskRepository(InMemoryLimraTaskRepository):
+    def __init__(self, database_path: str) -> None:
+        super().__init__()
+        self.database_path = os.path.abspath(os.path.expanduser(database_path))
+        os.makedirs(os.path.dirname(self.database_path), exist_ok=True)
+        self._init_db()
+        self._load_state()
+
+    def _init_db(self) -> None:
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS limra_repository_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.database_path, timeout=30)
+
+    def _load_state(self) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM limra_repository_state WHERE state_key = ?",
+                ("state",),
+            ).fetchone()
+        if not row:
+            return
+        try:
+            state = json.loads(row[0])
+        except json.JSONDecodeError:
+            log.warning("Ignoring invalid limra SQLite repository state")
+            return
+
+        self.tasks = {
+            str(task_id): LimraTask(**payload)
+            for task_id, payload in (state.get("tasks") or {}).items()
+            if isinstance(payload, dict)
+        }
+        self.artifacts = {
+            str(task_id): _normalize_artifact_buckets(payload)
+            for task_id, payload in (state.get("artifacts") or {}).items()
+            if isinstance(payload, dict)
+        }
+        self.artifact_trace_events = {
+            str(task_id): [dict(event) for event in events if isinstance(event, dict)]
+            for task_id, events in (state.get("artifact_trace_events") or {}).items()
+            if isinstance(events, list)
+        }
+        self.uploaded_documents = {
+            str(document_id): LimraUploadedDocument(**payload)
+            for document_id, payload in (state.get("uploaded_documents") or {}).items()
+            if isinstance(payload, dict)
+        }
+        self.generated_reports = {}
+        for payload in state.get("generated_reports") or []:
+            if not isinstance(payload, dict):
+                continue
+            report = LimraGeneratedReport(**payload)
+            self.generated_reports[(report.task_id, report.report_id)] = report
+
+    def _persist_state(self) -> None:
+        state = {
+            "tasks": {
+                task_id: asdict(task)
+                for task_id, task in self.tasks.items()
+            },
+            "artifacts": self.artifacts,
+            "artifact_trace_events": self.artifact_trace_events,
+            "uploaded_documents": {
+                document_id: asdict(document)
+                for document_id, document in self.uploaded_documents.items()
+            },
+            "generated_reports": [
+                asdict(report)
+                for report in self.generated_reports.values()
+            ],
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO limra_repository_state (state_key, state_json, updated_at)
+                VALUES (?, ?, CAST(strftime('%s', 'now') AS REAL))
+                ON CONFLICT(state_key) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                ("state", json.dumps(state, ensure_ascii=False)),
+            )
+
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        owner_user_id: str,
+        query: str,
+        scenario: str | None,
+        runner_task_id: str | None,
+    ) -> LimraTask:
+        task = super().create_task(
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            query=query,
+            scenario=scenario,
+            runner_task_id=runner_task_id,
+        )
+        self._persist_state()
+        return task
+
+    def update_task(self, task_id: str, **updates: Any) -> LimraTask:
+        task = super().update_task(task_id, **updates)
+        self._persist_state()
+        return task
+
+    def record_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+    ) -> None:
+        super().record_artifact(task_id, artifact_type, artifact)
+        self._persist_state()
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        super().record_artifact_trace_event(task_id, event)
+        self._persist_state()
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
+    ) -> LimraUploadedDocument:
+        document = super().record_uploaded_document(
+            document_id=document_id,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            original_filename=original_filename,
+            content_type=content_type,
+            byte_size=byte_size,
+            minio_bucket=minio_bucket,
+            object_key=object_key,
+            extracted_text=extracted_text,
+            language=language,
+            metadata=metadata,
+            embedding=embedding,
+        )
+        self._persist_state()
+        return document
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimraGeneratedReport:
+        report = super().record_generated_report(
+            report_id=report_id,
+            task_id=task_id,
+            report_type=report_type,
+            markdown=markdown,
+            html=html,
+            pdf_object_key=pdf_object_key,
+            evidence_refs=evidence_refs,
+            creator_user_id=creator_user_id,
+            metadata=metadata,
+        )
+        self._persist_state()
+        return report
+
+
 class InMemoryLimraRuntimeState:
     def __init__(self) -> None:
         self.task_runtime: dict[str, dict[str, Any]] = {}
@@ -1035,6 +1235,69 @@ class InMemoryLimraObjectStorage:
             return bytes(self.objects[object_key]["data"])
         except KeyError as exc:
             raise FileNotFoundError(object_key) from exc
+
+
+class FileSystemLimraObjectStorage:
+    def __init__(self, *, root_path: str, bucket: str = "limra-local") -> None:
+        if not root_path:
+            raise RuntimeError("limra_filesystem_object_storage_path_missing")
+        self.root_path = os.path.abspath(os.path.expanduser(root_path))
+        self.bucket = bucket or "limra-local"
+        os.makedirs(self.root_path, exist_ok=True)
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimraStoredObject:
+        stored = _stored_object(
+            object_key=object_key,
+            bucket=self.bucket,
+            data=data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        object_path = self._object_path(object_key)
+        os.makedirs(os.path.dirname(object_path), exist_ok=True)
+        with open(object_path, "wb") as file:
+            file.write(bytes(data))
+        with open(f"{object_path}.metadata.json", "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "object_key": stored.object_key,
+                    "bucket": stored.bucket,
+                    "content_type": stored.content_type,
+                    "size_bytes": stored.size_bytes,
+                    "sha256": stored.sha256,
+                    "metadata": stored.metadata,
+                },
+                file,
+                ensure_ascii=False,
+            )
+        return stored
+
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes:
+        object_path = self._object_path(object_key)
+        try:
+            with open(object_path, "rb") as file:
+                return file.read()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(object_key) from exc
+
+    def _object_path(self, object_key: str) -> str:
+        if not object_key or object_key.startswith("/") or "/../" in f"/{object_key}/":
+            raise ValueError("invalid_limra_object_key")
+        object_path = os.path.abspath(os.path.join(self.root_path, *object_key.split("/")))
+        if object_path != self.root_path and not object_path.startswith(f"{self.root_path}{os.sep}"):
+            raise ValueError("invalid_limra_object_key")
+        return object_path
 
 
 class S3LimraObjectStorage:
@@ -2155,6 +2418,32 @@ class PostgresLimraTaskRepository:
             connection.execute(_sql_text(sql), params)
 
 
+def _limra_data_dir(env: Any = os.environ) -> str:
+    return os.path.abspath(
+        os.path.expanduser(
+            str(
+                env.get("DATA_DIR")
+                or os.path.join(os.path.dirname(__file__), "..", "..", "data")
+            )
+        )
+    )
+
+
+def _limra_sqlite_database_path(env: Any = os.environ) -> str:
+    raw_path = str(
+        env.get(LIMRA_SQLITE_DATABASE_PATH_ENV)
+        or env.get(LIMRA_DATABASE_URL_ENV)
+        or ""
+    ).strip()
+    if raw_path.startswith("sqlite:///"):
+        raw_path = raw_path.removeprefix("sqlite:///")
+    elif raw_path.startswith("sqlite://"):
+        raw_path = raw_path.removeprefix("sqlite://")
+    if raw_path:
+        return os.path.abspath(os.path.expanduser(raw_path))
+    return os.path.join(_limra_data_dir(env), "limra_repository.sqlite3")
+
+
 def create_limra_task_repository_from_env(env: Any = os.environ) -> LimraTaskRepository:
     backend = str(env.get(LIMRA_REPOSITORY_BACKEND_ENV, "postgres")).strip().lower()
     if backend in {"postgres", "postgresql"}:
@@ -2164,6 +2453,9 @@ def create_limra_task_repository_from_env(env: Any = os.environ) -> LimraTaskRep
         if not database_url:
             raise RuntimeError("limra_postgres_database_url_missing")
         return PostgresLimraTaskRepository(database_url)
+
+    if backend in {"sqlite", "sqlite3"}:
+        return SQLiteLimraTaskRepository(_limra_sqlite_database_path(env))
 
     if backend in {"memory", "in-memory", "in_memory"}:
         allow_memory = str(env.get(LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV, ""))
@@ -2238,6 +2530,17 @@ def create_limra_object_storage_from_env(
             )
         bucket = str(env.get(LIMRA_OBJECT_BUCKET_ENV) or "limra-memory").strip()
         return InMemoryLimraObjectStorage(bucket=bucket or "limra-memory")
+
+    if backend in {"filesystem", "file", "local"}:
+        bucket = str(env.get(LIMRA_OBJECT_BUCKET_ENV) or "limra-local").strip()
+        root_path = str(
+            env.get(LIMRA_OBJECT_STORAGE_PATH_ENV)
+            or os.path.join(_limra_data_dir(env), "limra_objects")
+        )
+        return FileSystemLimraObjectStorage(
+            root_path=root_path,
+            bucket=bucket or "limra-local",
+        )
 
     raise RuntimeError(f"unsupported_limra_object_storage_backend:{backend}")
 
@@ -3249,13 +3552,25 @@ async def _limra_event_stream(
     )
     saw_terminal_status = False
     stream_close_reason = "stream_exhausted"
+    current_agent_name: str | None = None
 
     try:
         async for runner_event in research_client.stream_events(task=task, user=user):
             event = _normalize_runner_event(task, runner_event)
+            event_payload = event.get("payload")
+            if event.get("type") == "start_of_agent" and isinstance(event_payload, dict):
+                current_agent_name = str(event_payload.get("agent_name") or "")
+            elif event.get("type") == "end_of_agent":
+                current_agent_name = None
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
+            final_report_event = _record_final_show_text_report_from_event(
+                repo,
+                task,
+                event,
+                current_agent_name=current_agent_name,
+            )
             await _record_runtime_event(runtime_state, task.task_id, event)
             if applied_status in FINAL_TASK_STATUSES:
                 await runtime_state.update_task_runtime(
@@ -3267,6 +3582,9 @@ async def _limra_event_stream(
             if warning:
                 await _record_runtime_event(runtime_state, task.task_id, warning)
                 yield _sse_bytes(_assert_browser_safe(warning))
+            if final_report_event:
+                await _record_runtime_event(runtime_state, task.task_id, final_report_event)
+                yield _sse_bytes(_assert_browser_safe(final_report_event))
             if applied_status in FINAL_TASK_STATUSES:
                 stream_close_reason = f"terminal_{applied_status}"
 
@@ -3655,6 +3973,67 @@ def _record_artifact_from_event(
     return None
 
 
+def _record_final_show_text_report_from_event(
+    repo: LimraTaskRepository,
+    task: LimraTask,
+    event: dict[str, Any],
+    *,
+    current_agent_name: str | None,
+) -> dict[str, Any] | None:
+    if current_agent_name != "Final Summary" or event.get("type") != "tool_call":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("tool_name") != "show_text":
+        return None
+    markdown = _show_text_markdown(payload.get("tool_input"))
+    if not markdown:
+        return None
+    artifacts = repo.get_artifacts(task.task_id)
+    for section in artifacts.get("report_sections", []):
+        if (
+            section.get("source_event_type") == "final_summary_show_text"
+            and str(section.get("markdown") or "").strip() == markdown
+        ):
+            return None
+    artifact = {
+        "artifact_type": "report_section",
+        "title": "最终回答",
+        "markdown": markdown,
+        "source_event_type": "final_summary_show_text",
+        "evidence_refs": _evidence_refs_from_markdown(markdown),
+    }
+    _ensure_artifact_id(repo, task.task_id, "report_section", artifact)
+    repo.record_artifact(task.task_id, "report_section", artifact)
+    return {
+        "task_id": task.task_id,
+        "type": "report_section_generated",
+        "payload": artifact,
+    }
+
+
+def _show_text_markdown(tool_input: Any) -> str:
+    text = ""
+    if isinstance(tool_input, dict):
+        text = str(tool_input.get("text") or "")
+        result = tool_input.get("result")
+        if not text and isinstance(result, dict):
+            text = str(result.get("text") or "")
+    elif isinstance(tool_input, str):
+        text = tool_input
+    return text.strip()
+
+
+def _evidence_refs_from_markdown(markdown: str) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\[(EVID-\d{3,})\]", markdown):
+        ref = match.group(1)
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+    return refs
+
+
 def _record_and_return_artifact_warning(
     repo: LimraTaskRepository,
     task: LimraTask,
@@ -3819,6 +4198,15 @@ def _empty_artifact_buckets() -> dict[str, list[dict[str, Any]]]:
         "verifications": [],
         "report_sections": [],
     }
+
+
+def _normalize_artifact_buckets(value: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    buckets = _empty_artifact_buckets()
+    for bucket in buckets:
+        items = value.get(bucket)
+        if isinstance(items, list):
+            buckets[bucket] = [dict(item) for item in items if isinstance(item, dict)]
+    return buckets
 
 
 def _task_from_row(row: dict[str, Any]) -> LimraTask:
@@ -4520,14 +4908,128 @@ def _render_report_html(
 
 
 def _markdown_to_html(markdown: str) -> str:
-    blocks = []
     safe_markdown = _strip_active_report_markup(markdown)
-    for paragraph in re.split(r"\n{2,}", safe_markdown.strip()):
-        if not paragraph:
+    lines = safe_markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
             continue
-        escaped = html.escape(paragraph).replace("\n", "<br>")
-        blocks.append(f"<p>{escaped}</p>")
+        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading:
+            level = len(heading.group(1))
+            blocks.append(
+                f"<h{level}>{_markdown_inline_to_html(heading.group(2).strip())}</h{level}>"
+            )
+            index += 1
+            continue
+        if re.match(r"^\s*---+\s*$", line):
+            blocks.append("<hr>")
+            index += 1
+            continue
+        if _is_markdown_table(lines, index):
+            table_html, index = _markdown_table_to_html(lines, index)
+            blocks.append(table_html)
+            continue
+        if re.match(r"^\s*[-*]\s+", line):
+            items = []
+            while index < len(lines) and re.match(r"^\s*[-*]\s+", lines[index]):
+                items.append(re.sub(r"^\s*[-*]\s+", "", lines[index]))
+                index += 1
+            blocks.append(
+                "<ul>"
+                + "".join(
+                    f"<li>{_markdown_inline_to_html(item)}</li>" for item in items
+                )
+                + "</ul>"
+            )
+            continue
+        if re.match(r"^\s*\d+\.\s+", line):
+            items = []
+            while index < len(lines) and re.match(r"^\s*\d+\.\s+", lines[index]):
+                items.append(re.sub(r"^\s*\d+\.\s+", "", lines[index]))
+                index += 1
+            blocks.append(
+                "<ol>"
+                + "".join(
+                    f"<li>{_markdown_inline_to_html(item)}</li>" for item in items
+                )
+                + "</ol>"
+            )
+            continue
+        paragraph = []
+        while (
+            index < len(lines)
+            and lines[index].strip()
+            and not re.match(r"^(#{1,6})\s+(.+)$", lines[index])
+            and not _is_markdown_table(lines, index)
+            and not re.match(r"^\s*[-*]\s+", lines[index])
+            and not re.match(r"^\s*\d+\.\s+", lines[index])
+            and not re.match(r"^\s*---+\s*$", lines[index])
+        ):
+            paragraph.append(lines[index])
+            index += 1
+        blocks.append(
+            "<p>"
+            + "<br>".join(_markdown_inline_to_html(item) for item in paragraph)
+            + "</p>"
+        )
     return "\n".join(blocks) or "<p></p>"
+
+
+def _is_markdown_table(lines: list[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and "|" in lines[index]
+        and re.match(
+            r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$",
+            lines[index + 1],
+        )
+        is not None
+    )
+
+
+def _markdown_table_to_html(lines: list[str], index: int) -> tuple[str, int]:
+    header = _split_markdown_table_row(lines[index])
+    index += 2
+    rows: list[list[str]] = []
+    while index < len(lines) and "|" in lines[index] and lines[index].strip():
+        rows.append(_split_markdown_table_row(lines[index]))
+        index += 1
+    header_html = "".join(
+        f"<th>{_markdown_inline_to_html(cell)}</th>" for cell in header
+    )
+    row_html = "".join(
+        "<tr>"
+        + "".join(
+            f"<td>{_markdown_inline_to_html(row[cell_index] if cell_index < len(row) else '')}</td>"
+            for cell_index, _ in enumerate(header)
+        )
+        + "</tr>"
+        for row in rows
+    )
+    return (
+        f"<table><thead><tr>{header_html}</tr></thead><tbody>{row_html}</tbody></table>",
+        index,
+    )
+
+
+def _split_markdown_table_row(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def _markdown_inline_to_html(value: str) -> str:
+    escaped = html.escape(value, quote=True)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
+    return re.sub(
+        r"(https?://[^\s<]+[^<.,;:!?)\]\s])",
+        r'<a href="\1" rel="noreferrer">\1</a>',
+        escaped,
+    )
 
 
 def _sanitize_report_html(value: str) -> str:

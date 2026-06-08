@@ -605,6 +605,79 @@ def test_limra_repository_factory_requires_explicit_memory_fallback(monkeypatch)
     assert isinstance(repo, limra.InMemoryLimraTaskRepository)
 
 
+def test_sqlite_limra_repository_persists_task_artifacts_reports_and_uploads(tmp_path):
+    database_path = tmp_path / "limra.sqlite3"
+    repo = limra.SQLiteLimraTaskRepository(str(database_path))
+    task = repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="query",
+        scenario="scenario-a",
+        runner_task_id="runner-a",
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "Source",
+            "summary": "Persistent evidence",
+        },
+    )
+    repo.record_artifact_trace_event(
+        task.task_id,
+        {
+            "type": "artifact_warning",
+            "payload": {"warning": "nonfatal"},
+        },
+    )
+    repo.record_uploaded_document(
+        document_id="doc-a",
+        owner_user_id="user-a",
+        task_id=task.task_id,
+        original_filename="memo.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket="bucket",
+        object_key="limra/users/u/tasks/task-a/uploads/doc-a.txt",
+        extracted_text="Persistent memo text",
+        language="en",
+        metadata={"sha256": "abc"},
+        embedding=[1.0, 0.0],
+    )
+    repo.record_generated_report(
+        report_id="report-a",
+        task_id=task.task_id,
+        report_type="final",
+        markdown="## Final\n\nPersistent report",
+        html=None,
+        pdf_object_key="limra/users/u/tasks/task-a/reports/report-a.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={"pdf_size_bytes": 123},
+    )
+
+    restored = limra.SQLiteLimraTaskRepository(str(database_path))
+    restored_task = restored.get_user_task("task-a", "user-a")
+    assert restored_task is not None
+    assert restored_task.status == "completed"
+    assert restored.get_artifacts("task-a")["evidence"][0]["evidence_id"] == "EVID-001"
+    assert restored.get_artifact_trace_events("task-a")[-1]["type"] == "artifact_warning"
+    assert restored.list_user_documents(owner_user_id="user-a", task_id="task-a")[0].document_id == "doc-a"
+    assert restored.search_user_documents(
+        owner_user_id="user-a",
+        task_id="task-a",
+        query="memo",
+        limit=5,
+    )[0].document.document_id == "doc-a"
+    assert restored.get_user_report(
+        task_id="task-a",
+        report_id="report-a",
+        owner_user_id="user-a",
+    ).pdf_object_key.endswith("report-a.pdf")
+
+
 def test_limra_runtime_state_factory_requires_redis_or_explicit_memory(monkeypatch):
     monkeypatch.setenv("LIMRA_RUNTIME_STATE_BACKEND", "redis")
     with pytest.raises(RuntimeError, match="limra_redis_runtime_state_missing"):
@@ -669,6 +742,21 @@ def test_limra_object_storage_factory_requires_s3_or_explicit_memory(monkeypatch
     monkeypatch.setenv("LIMRA_ALLOW_IN_MEMORY_OBJECT_STORAGE", "true")
     storage = limra.create_limra_object_storage_from_env()
     assert isinstance(storage, limra.InMemoryLimraObjectStorage)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_object_storage_persists_objects_across_instances(tmp_path):
+    storage = limra.FileSystemLimraObjectStorage(root_path=str(tmp_path), bucket="local")
+    stored = await storage.put_object(
+        object_key="limra/users/u/tasks/task-a/reports/report-a.pdf",
+        data=b"%PDF-test",
+        content_type="application/pdf",
+        metadata={"report_id": "report-a"},
+    )
+
+    restored = limra.FileSystemLimraObjectStorage(root_path=str(tmp_path), bucket="local")
+    assert stored.bucket == "local"
+    assert await restored.get_object(object_key=stored.object_key) == b"%PDF-test"
 
 
 def test_limra_upload_embedding_config_defaults_disabled_and_validates_enabled():
@@ -1685,7 +1773,13 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
 def test_report_html_renderer_strips_active_markup_from_markdown():
     rendered_html = limra._render_report_html(
         markdown=(
-            "Finding [EVID-001]\n\n"
+            "# Final Report\n\n"
+            "Finding **important** [EVID-001]\n\n"
+            "| Item | Status |\n"
+            "| --- | --- |\n"
+            "| BYD | not listed |\n\n"
+            "- Verify official list\n"
+            "- Monitor updates\n\n"
             '<img src="https://example.test/leak?token=RUNNER_SERVICE_TOKEN" onerror=alert(1)>\n'
             "<svg onload=alert(2)><text>bad</text></svg>\n"
             '<iframe srcdoc="<script>bad()</script>"></iframe>\n'
@@ -1699,6 +1793,13 @@ def test_report_html_renderer_strips_active_markup_from_markdown():
     )
 
     lower_html = rendered_html.lower()
+    assert "<h1>Final Report</h1>" in rendered_html
+    assert "<strong>important</strong>" in rendered_html
+    assert "<table>" in rendered_html
+    assert "<th>Item</th>" in rendered_html
+    assert "<td>BYD</td>" in rendered_html
+    assert "<ul>" in rendered_html
+    assert "<li>Verify official list</li>" in rendered_html
     assert 'data-evidence-ref="EVID-001"' in rendered_html
     assert "content-security-policy" in lower_html
     for forbidden in [
@@ -2522,6 +2623,83 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     assert trace["artifact_warnings"][0]["payload"]["source_event_type"] == (
         "relation_extracted"
     )
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_persists_final_summary_show_text_as_report_section():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {
+                        "text": "# Final answer\n\nBYD is not on the active list. [EVID-001]"
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "start_of_agent",
+        "tool_call",
+        "report_section_generated",
+        "end_of_agent",
+        "status",
+    ]
+    report_event = events[2]
+    assert report_event["payload"]["title"] == "最终回答"
+    assert report_event["payload"]["evidence_refs"] == ["EVID-001"]
+
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    assert len(artifacts["report_sections"]) == 1
+    assert artifacts["report_sections"][0]["markdown"].startswith("# Final answer")
+    assert artifacts["report_sections"][0]["source_event_type"] == "final_summary_show_text"
+
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert "# Final answer" in members["report.md"]
+    trace = json.loads(members["trace.json"])
+    assert trace["artifact_events"][0]["type"] == "report_section_generated"
+    assert trace["artifact_events"][0]["source_event_type"] == "final_summary_show_text"
 
 
 @pytest.mark.asyncio
