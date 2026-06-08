@@ -693,6 +693,170 @@ def test_limra_standalone_frontend_clears_report_downloads_after_failed_restore(
     assert "无法从后端恢复上次任务" in checks["errorMessage"]
 
 
+def test_limra_standalone_frontend_preserves_cache_after_transient_restore_failure():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    app = LIMRA_STANDALONE_ROOT / "public" / "app.js"
+    script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const source = fs.readFileSync({str(app)!r}, 'utf8');
+        const storage = new Map();
+        function element() {{
+            return {{
+                textContent: '',
+                disabled: false,
+                innerHTML: '',
+                scrollTop: 0,
+                scrollHeight: 0,
+                classList: {{ toggle() {{}}, add() {{}}, remove() {{}} }},
+                parentElement: {{ classList: {{ toggle() {{}} }} }},
+                addEventListener() {{}},
+                querySelectorAll: () => []
+            }};
+        }}
+        const context = {{
+            console,
+            URL,
+            element,
+            FormData: class FormData {{}},
+            Headers: class Headers {{
+                set() {{}}
+            }},
+            EventSource: class EventSource {{}},
+            fetch: async (path) => {{
+                if (String(path).startsWith('/api/limra/tasks/transient-task')) {{
+                    return {{
+                        ok: false,
+                        status: 500,
+                        statusText: 'Server Error',
+                        headers: {{ get: () => 'application/json' }},
+                        text: async () => JSON.stringify({{ detail: 'temporary' }})
+                    }};
+                }}
+                return {{
+                    ok: true,
+                    status: 200,
+                    headers: {{ get: () => 'application/json' }},
+                    text: async () => JSON.stringify({{ documents: [] }})
+                }};
+            }},
+            localStorage: {{
+                getItem: (key) => storage.get(key) || '',
+                setItem: (key, value) => storage.set(key, String(value)),
+                removeItem: (key) => storage.delete(key)
+            }},
+            window: {{
+                location: {{ href: 'http://127.0.0.1/' }},
+                setTimeout: () => 0
+            }},
+            document: {{
+                addEventListener: () => {{}},
+                querySelectorAll: () => []
+            }}
+        }};
+        (async () => {{
+            vm.createContext(context);
+            vm.runInContext(source, context);
+            await vm.runInContext(`(async () => {{
+                Object.assign(dom, {{
+                    statusLabel: element(),
+                    taskLabel: element(),
+                    submitResearchButton: element(),
+                    downloadArchiveButton: element(),
+                    reportMessage: element(),
+                    exportPdfButton: element(),
+                    downloadPdfButton: element(),
+                    messageList: element(),
+                    eventLog: element(),
+                    artifactTabs: element(),
+                    artifactContent: element(),
+                    uploadList: element(),
+                    uploadMessage: element()
+                }});
+
+                localStorage.setItem(
+                    STORAGE_KEY,
+                    JSON.stringify({{
+                        taskId: 'transient-task',
+                        status: 'completed',
+                        archiveStatus: 'ready',
+                        archiveDownloadUrl: '/api/limra/tasks/transient-task/archive.zip',
+                        latestReport: {{
+                            task_id: 'transient-task',
+                            report_id: 'cached-report',
+                            pdf_url: '/api/limra/tasks/transient-task/reports/cached-report/pdf'
+                        }},
+                        finalReportText: 'recoverable report body',
+                        artifacts: {{
+                            report_sections: [{{ title: 'cached', markdown: 'cached markdown' }}]
+                        }}
+                    }})
+                );
+                restoreWorkspace();
+                const beforeHref = window.location.href;
+
+                await resumeWorkspace();
+                renderStatus();
+                renderReportControls();
+                downloadPdf();
+                downloadArchive();
+                await exportPdf();
+                const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+
+                this.__limraTransientRestoreChecks = {{
+                    restoreBlocked: state.restoreBlocked,
+                    taskId: state.taskId,
+                    status: state.status,
+                    latestReportId: state.latestReport && state.latestReport.report_id,
+                    finalReportText: state.finalReportText,
+                    reportSections: state.artifacts.report_sections.length,
+                    pdfDisabled: dom.downloadPdfButton.disabled,
+                    archiveDisabled: dom.downloadArchiveButton.disabled,
+                    exportDisabled: dom.exportPdfButton.disabled,
+                    hrefUnchanged: window.location.href === beforeHref,
+                    savedTaskId: saved.taskId,
+                    savedLatestReportId: saved.latestReport && saved.latestReport.report_id,
+                    savedFinalReportText: saved.finalReportText,
+                    savedReportSections: saved.artifacts.report_sections.length,
+                    reportMessage: dom.reportMessage.textContent
+                }};
+            }})()`, context);
+            process.stdout.write(JSON.stringify(context.__limraTransientRestoreChecks));
+        }})().catch((error) => {{
+            console.error(error);
+            process.exit(1);
+        }});
+    """
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    checks = json.loads(result.stdout)
+
+    assert checks["restoreBlocked"] is True
+    assert checks["taskId"] == "transient-task"
+    assert checks["status"] == "completed"
+    assert checks["latestReportId"] == "cached-report"
+    assert checks["finalReportText"] == "recoverable report body"
+    assert checks["reportSections"] == 1
+    assert checks["pdfDisabled"] is True
+    assert checks["archiveDisabled"] is True
+    assert checks["exportDisabled"] is True
+    assert checks["hrefUnchanged"] is True
+    assert checks["savedTaskId"] == "transient-task"
+    assert checks["savedLatestReportId"] == "cached-report"
+    assert checks["savedFinalReportText"] == "recoverable report body"
+    assert checks["savedReportSections"] == 1
+    assert "暂未从后端确认" in checks["reportMessage"]
+
+
 def test_limra_research_page_has_demo_scenario_selector():
     page = _read(LIMRA_PAGE)
 

@@ -91,6 +91,7 @@ const state = {
 	isUploading: false,
 	isSearching: false,
 	isExporting: false,
+	restoreBlocked: false,
 	latestReport: null,
 	finalReportText: '',
 	messages: initialMessages(),
@@ -272,8 +273,12 @@ async function resumeWorkspace() {
 			'error',
 			`无法从后端恢复上次任务：${errorMessage(error)}`
 		);
-		clearRestoredTaskState(error);
-		saveWorkspace();
+		if (isAuthoritativeRestoreRejection(error)) {
+			clearRestoredTaskState();
+			saveWorkspace();
+		} else {
+			state.restoreBlocked = true;
+		}
 		renderStatus();
 		renderTabs();
 		renderReportControls();
@@ -286,6 +291,7 @@ async function refreshTask() {
 		return;
 	}
 	const task = await api(`/api/limra/tasks/${encodeURIComponent(state.taskId)}`);
+	state.restoreBlocked = false;
 	state.status = task.status || state.status;
 	updateArchiveState(task);
 	saveWorkspace();
@@ -372,6 +378,7 @@ function resetWorkspaceState() {
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
+	state.restoreBlocked = false;
 	state.activeTab = '证据';
 	state.latestReport = null;
 	state.finalReportText = '';
@@ -389,6 +396,7 @@ async function signOut() {
 	}
 	state.eventSource?.close();
 	state.eventSource = null;
+	state.restoreBlocked = false;
 	state.user = null;
 	state.token = '';
 	clearWorkspaceStorage();
@@ -450,6 +458,7 @@ async function submitResearch() {
 	state.taskId = '';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
+	state.restoreBlocked = false;
 	state.latestReport = null;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
@@ -675,6 +684,10 @@ async function searchUploads() {
 
 async function exportPdf() {
 	const markdown = reportMarkdown();
+	if (state.restoreBlocked) {
+		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再导出 PDF。';
+		return;
+	}
 	if (!state.taskId || !markdown.trim() || state.isExporting) {
 		return;
 	}
@@ -703,6 +716,10 @@ async function exportPdf() {
 }
 
 function downloadPdf() {
+	if (state.restoreBlocked) {
+		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再下载 PDF。';
+		return;
+	}
 	if (!state.taskId || !state.latestReport?.report_id) {
 		return;
 	}
@@ -715,6 +732,10 @@ function downloadPdf() {
 }
 
 function downloadArchive() {
+	if (state.restoreBlocked) {
+		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再下载归档。';
+		return;
+	}
 	if (state.archiveStatus === 'ready' && state.archiveDownloadUrl) {
 		window.location.href = state.archiveDownloadUrl;
 		return;
@@ -726,10 +747,13 @@ function downloadArchive() {
 function renderStatus() {
 	dom.statusLabel.textContent = statusLabel(state.status);
 	dom.taskLabel.textContent = state.taskId
-		? `任务 ${state.taskId} · 归档${archiveStatusLabel(state.archiveStatus)}`
+		? `任务 ${state.taskId} · 归档${archiveStatusLabel(state.archiveStatus)}${
+				state.restoreBlocked ? ' · 待恢复确认' : ''
+			}`
 		: '暂无任务';
 	dom.submitResearchButton.disabled = state.isSubmitting;
-	dom.downloadArchiveButton.disabled = !(state.archiveStatus === 'ready' && state.archiveDownloadUrl);
+	dom.downloadArchiveButton.disabled =
+		state.restoreBlocked || !(state.archiveStatus === 'ready' && state.archiveDownloadUrl);
 }
 
 function renderMessages() {
@@ -1128,21 +1152,23 @@ function renderUploads() {
 
 function renderReportControls() {
 	const hasMarkdown = Boolean(reportMarkdown().trim());
-	dom.exportPdfButton.disabled = !state.taskId || !hasMarkdown || state.isExporting;
-	dom.downloadPdfButton.disabled = !reportPdfUrl(state.latestReport);
+	dom.exportPdfButton.disabled = state.restoreBlocked || !state.taskId || !hasMarkdown || state.isExporting;
+	dom.downloadPdfButton.disabled = state.restoreBlocked || !reportPdfUrl(state.latestReport);
 }
 
-function clearRestoredTaskState(error) {
-	const rejectedTask = error?.status === 403 || error?.status === 404;
-	if (rejectedTask) {
-		state.taskId = '';
-		state.status = 'ready';
-	}
+function clearRestoredTaskState() {
+	state.restoreBlocked = false;
+	state.taskId = '';
+	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
 	state.latestReport = null;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
+}
+
+function isAuthoritativeRestoreRejection(error) {
+	return error?.status === 403 || error?.status === 404;
 }
 
 function updateArchiveState(source) {
