@@ -199,6 +199,44 @@ async def test_user_isolation_for_task_status_and_archive_download():
 
 
 @pytest.mark.asyncio
+async def test_archive_proxy_scrubs_allowed_text_members_before_download():
+    repo = limra.InMemoryLimraTaskRepository()
+    archive = FakeArchiveClient(_archive_zip(secret_members=True))
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-secret-archive",
+        owner_user_id=user.id,
+        query="archive secrets",
+        scenario=None,
+        runner_task_id="runner-secret-archive",
+    )
+    task.archive_status = "ready"
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        archive_client=archive,
+    )
+
+    assert response.media_type == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(response.body)) as scrubbed_archive:
+        assert scrubbed_archive.namelist() == [
+            "metadata.json",
+            "report.html",
+            "report.md",
+            "trace.json",
+        ]
+        combined = "\n".join(
+            scrubbed_archive.read(member).decode("utf-8")
+            for member in scrubbed_archive.namelist()
+        )
+
+    assert limra.LIMRA_SECRET_REDACTION in combined
+    _assert_no_raw_secret(combined)
+
+
+@pytest.mark.asyncio
 async def test_admin_access_requires_explicit_admin_route():
     repo = limra.InMemoryLimraTaskRepository()
     archive = FakeArchiveClient()
@@ -910,6 +948,89 @@ def test_report_html_renderer_strips_active_markup_from_markdown():
         "runner_service_token",
     ]:
         assert forbidden not in lower_html
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_scrubs_report_secrets_before_persistence_and_export():
+    app, repo, storage = _limra_asgi_app()
+    pdf_exporter = app.state.test_pdf_exporter
+    repo.create_task(
+        task_id="task-secret-report",
+        owner_user_id="user-a",
+        query="report secrets",
+        scenario=None,
+        runner_task_id="runner-secret-report",
+    )
+
+    markdown = (
+        "Finding [EVID-001]\n\n"
+        "Authorization: Bearer report-bearer-secret-123456\n"
+        "OPENAI_API_KEY=sk-reportopenai123456\n"
+        "SERPER_API_KEY=serper-secret-123456\n"
+        "Cookie: session=report-cookie-secret-123456\n"
+        "https://example.test/path?token=report-url-token-123456"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/tasks/task-secret-report/reports/pdf",
+            json={
+                "report_id": "report-secret",
+                "report_type": "OPENAI_API_KEY=sk-reportopenai123456",
+                "markdown": markdown,
+                "evidence_refs": ["EVID-001", "JINA_API_KEY=nested-jina-secret-123456"],
+            },
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    _assert_no_raw_secret(payload)
+    report = repo.get_user_report(
+        task_id="task-secret-report",
+        report_id="report-secret",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert limra.LIMRA_SECRET_REDACTION in report.markdown
+    assert limra.LIMRA_SECRET_REDACTION in report.html
+    assert "REDACTED" in report.report_type
+    assert limra.LIMRA_SECRET_REDACTION in report.evidence_refs
+    assert report.pdf_object_key in storage.objects
+    stored = storage.objects[report.pdf_object_key]
+    _assert_no_raw_secret(report.markdown)
+    _assert_no_raw_secret(report.html)
+    _assert_no_raw_secret(report.metadata)
+    _assert_no_raw_secret(report.evidence_refs)
+    _assert_no_raw_secret(stored["metadata"])
+    assert len(pdf_exporter.html_inputs) == 1
+    _assert_no_raw_secret(pdf_exporter.html_inputs[0])
+
+
+def test_limra_secret_scrubber_redacts_nested_payloads_and_urls():
+    payload = {
+        "headers": {
+            "Authorization": "Bearer report-bearer-secret-123456",
+            "Cookie": "session=report-cookie-secret-123456",
+        },
+        "nested": [
+            "OPENAI_API_KEY=sk-reportopenai123456",
+            {
+                "safe": "https://example.test/path?token=report-url-token-123456",
+                "jina_api_key": "nested-jina-secret-123456",
+            },
+        ],
+        "jwt": "eyJtrace.secret.payload",
+    }
+
+    scrubbed = limra.scrub_limra_secrets(payload)
+
+    _assert_no_raw_secret(scrubbed)
+    text = json.dumps(scrubbed, ensure_ascii=False)
+    assert text.count(limra.LIMRA_SECRET_REDACTION) >= 5
+    assert "Authorization" in scrubbed["headers"]
+    assert scrubbed["headers"]["Authorization"] == limra.LIMRA_SECRET_REDACTION
 
 
 @pytest.mark.asyncio
@@ -2031,13 +2152,44 @@ def test_limra_router_defines_required_browser_facing_paths():
         assert "/mirothinker/" not in path
 
 
-def _archive_zip(*, extra_member: bool = False) -> bytes:
+def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("metadata.json", "{}")
-        archive.writestr("report.html", "<!doctype html><main></main>")
-        archive.writestr("report.md", "# report")
-        archive.writestr("trace.json", "{}")
+        if secret_members:
+            archive.writestr(
+                "metadata.json",
+                json.dumps(
+                    {
+                        "Authorization": "Bearer runner-token-123456",
+                        "cookie": "open_webui_session=session-secret-123456",
+                        "url": "https://search.test?q=x&token=archive-token-123456",
+                    }
+                ),
+            )
+            archive.writestr(
+                "report.html",
+                "<!doctype html><main>OPENAI_API_KEY=sk-archiveopenai123456</main>",
+            )
+            archive.writestr(
+                "report.md",
+                "# report\nRUNNER_SERVICE_TOKEN=archive-runner-token-123456\n"
+                "https://api.test/resource?api_key=archive-query-secret-123456",
+            )
+            archive.writestr(
+                "trace.json",
+                json.dumps(
+                    {
+                        "headers": {"Cookie": "trace-cookie-secret-123456"},
+                        "deepseek": "DEEPSEEK_API_KEY=sk-tracedeepseek123456",
+                        "jwt": "eyJtrace.secret.payload",
+                    }
+                ),
+            )
+        else:
+            archive.writestr("metadata.json", "{}")
+            archive.writestr("report.html", "<!doctype html><main></main>")
+            archive.writestr("report.md", "# report")
+            archive.writestr("trace.json", "{}")
         if extra_member:
             archive.writestr(".env", "RUNNER_SERVICE_TOKEN=secret")
     return buffer.getvalue()
@@ -2058,6 +2210,34 @@ def _parse_sse_chunks(chunks):
 def _assert_no_browser_leak(payload):
     text = str(payload)
     for forbidden in limra.FORBIDDEN_BROWSER_SUBSTRINGS:
+        assert forbidden not in text
+
+
+def _assert_no_raw_secret(payload):
+    text = (
+        payload.decode("utf-8", errors="ignore")
+        if isinstance(payload, bytes)
+        else json.dumps(payload, ensure_ascii=False)
+        if isinstance(payload, (dict, list))
+        else str(payload)
+    )
+    for forbidden in [
+        "runner-token-123456",
+        "session-secret-123456",
+        "archive-token-123456",
+        "sk-archiveopenai123456",
+        "archive-runner-token-123456",
+        "archive-query-secret-123456",
+        "trace-cookie-secret-123456",
+        "sk-tracedeepseek123456",
+        "eyJtrace.secret.payload",
+        "report-bearer-secret-123456",
+        "sk-reportopenai123456",
+        "serper-secret-123456",
+        "report-cookie-secret-123456",
+        "report-url-token-123456",
+        "nested-jina-secret-123456",
+    ]:
         assert forbidden not in text
 
 

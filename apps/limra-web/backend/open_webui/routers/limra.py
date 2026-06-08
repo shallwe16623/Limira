@@ -29,7 +29,9 @@ except Exception:  # pragma: no cover - exercised only when imported without dep
     _open_webui_verified_user = None
 
 
-ARCHIVE_MEMBERS = {"trace.json", "report.md", "metadata.json", "report.html"}
+ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
+ARCHIVE_MEMBERS = set(ARCHIVE_MEMBER_ORDER)
+LIMRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
     "/mirothinker/",
     "limra-runner:8091",
@@ -123,6 +125,27 @@ REPORT_CSP = (
     "frame-src 'none'; "
     "base-uri 'none'; "
     "form-action 'none'"
+)
+SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)(authorization|cookie|set-cookie|api[_-]?key|secret|token|password|"
+    r"runner_service_token|serper|jina|e2b|openai|deepseek)"
+)
+SECRET_TEXT_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/\-=]+"),
+    re.compile(r"(?i)\b(?:Authorization|Cookie|Set-Cookie)\s*[:=]\s*[^\n\r<>{}\[\]]+"),
+    re.compile(
+        r"(?i)\b(?:RUNNER_SERVICE_TOKEN|SERPER_API_KEY|JINA_API_KEY|E2B_API_KEY|"
+        r"OPENAI_API_KEY|DEEPSEEK_API_KEY|[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))"
+        r"\s*[:=]\s*['\"]?[^'\"\s,;&<>]+"
+    ),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{6,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){1,2}\b"),
+    re.compile(
+        r"(?i)([?&](?:api[_-]?key|apikey|key|token|access_token|id_token|"
+        r"refresh_token|auth|authorization|cookie|secret|password|runner_service_token|"
+        r"serper_api_key|jina_api_key|e2b_api_key|openai_api_key|deepseek_api_key)=)"
+        r"[^&#\s<>'\"]+"
+    ),
 )
 
 router = APIRouter()
@@ -2265,10 +2288,21 @@ async def export_task_pdf(
     if (request_data.html or "").strip():
         raise HTTPException(status_code=400, detail="browser_report_html_not_allowed")
 
-    report_id = _safe_report_id(request_data.report_id)
+    scrubbed_report_id = scrub_limra_secrets(request_data.report_id)
+    scrubbed_report_type = _safe_report_type(
+        str(scrub_limra_secrets(request_data.report_type))
+    )
+    scrubbed_markdown = str(scrub_limra_secrets(request_data.markdown))
+    scrubbed_evidence_refs = _list_of_strings(
+        scrub_limra_secrets(request_data.evidence_refs)
+    )
+
+    report_id = _safe_report_id(
+        str(scrubbed_report_id) if scrubbed_report_id is not None else None
+    )
     report_html = _render_report_html(
-        markdown=request_data.markdown,
-        evidence_refs=request_data.evidence_refs,
+        markdown=scrubbed_markdown,
+        evidence_refs=scrubbed_evidence_refs,
     )
     try:
         pdf_bytes = await pdf_exporter.render_pdf(report_html)
@@ -2286,28 +2320,28 @@ async def export_task_pdf(
         object_key=object_key,
         data=pdf_bytes,
         content_type="application/pdf",
-        metadata={
+        metadata=scrub_limra_secrets({
             "task_id": task.task_id,
             "report_id": report_id,
             "owner_user_id": user.id,
-            "report_type": request_data.report_type,
-        },
+            "report_type": scrubbed_report_type,
+        }),
     )
     report = repo.record_generated_report(
         report_id=report_id,
         task_id=task.task_id,
-        report_type=_safe_report_type(request_data.report_type),
-        markdown=request_data.markdown,
+        report_type=scrubbed_report_type,
+        markdown=scrubbed_markdown,
         html=report_html,
         pdf_object_key=stored.object_key,
-        evidence_refs=_list_of_strings(request_data.evidence_refs),
+        evidence_refs=scrubbed_evidence_refs,
         creator_user_id=user.id,
-        metadata={
+        metadata=scrub_limra_secrets({
             "pdf_bucket": stored.bucket,
             "pdf_sha256": stored.sha256,
             "pdf_size_bytes": stored.size_bytes,
             "exporter": "playwright",
-        },
+        }),
     )
     return _assert_browser_safe(report.public_dict())
 
@@ -2347,6 +2381,8 @@ async def _download_archive(
         raise HTTPException(status_code=409, detail="archive_not_ready")
     archive_bytes = await archive_client.download_archive(task, user)
     validate_archive_zip(archive_bytes)
+    archive_bytes = _scrub_archive_zip(archive_bytes)
+    validate_archive_zip(archive_bytes)
     return Response(
         archive_bytes,
         media_type="application/zip",
@@ -2364,6 +2400,32 @@ def validate_archive_zip(archive_bytes: bytes) -> None:
         raise HTTPException(status_code=502, detail="invalid_archive_members")
     if any(name.startswith("/") or ".." in name.split("/") for name in names):
         raise HTTPException(status_code=502, detail="unsafe_archive_member")
+
+
+def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
+    output = io.BytesIO()
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as source:
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as target:
+                for member_name in ARCHIVE_MEMBER_ORDER:
+                    raw_member = source.read(member_name)
+                    try:
+                        scrubbed = _scrub_archive_member_text(raw_member)
+                        target.writestr(member_name, scrubbed.encode("utf-8"))
+                    except UnicodeDecodeError:
+                        target.writestr(member_name, raw_member)
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
+    return output.getvalue()
+
+
+def _scrub_archive_member_text(raw_member: bytes) -> str:
+    text = raw_member.decode("utf-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return _scrub_secret_text(text)
+    return json.dumps(scrub_limra_secrets(payload), ensure_ascii=False)
 
 
 def _get_owned_task(
@@ -3105,6 +3167,48 @@ def _list_of_strings(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item) for item in value if item is not None]
     return [str(value)]
+
+
+def scrub_limra_secrets(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        scrubbed: dict[Any, Any] = {}
+        for key, item in value.items():
+            if _is_secret_field_name(key):
+                scrubbed[key] = LIMRA_SECRET_REDACTION
+            else:
+                scrubbed[key] = scrub_limra_secrets(item)
+        return scrubbed
+    if isinstance(value, list):
+        return [scrub_limra_secrets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(scrub_limra_secrets(item) for item in value)
+    if isinstance(value, set):
+        return {scrub_limra_secrets(item) for item in value}
+    if isinstance(value, bytes):
+        try:
+            return _scrub_secret_text(value.decode("utf-8")).encode("utf-8")
+        except UnicodeDecodeError:
+            return value
+    if isinstance(value, str):
+        return _scrub_secret_text(value)
+    return value
+
+
+def _is_secret_field_name(value: Any) -> bool:
+    return bool(SECRET_FIELD_PATTERN.search(str(value)))
+
+
+def _scrub_secret_text(value: str) -> str:
+    redacted = value
+    for pattern in SECRET_TEXT_PATTERNS:
+        if pattern.groups:
+            redacted = pattern.sub(
+                lambda match: f"{match.group(1)}{LIMRA_SECRET_REDACTION}",
+                redacted,
+            )
+        else:
+            redacted = pattern.sub(LIMRA_SECRET_REDACTION, redacted)
+    return redacted
 
 
 def _optional_float(value: Any) -> float | None:
