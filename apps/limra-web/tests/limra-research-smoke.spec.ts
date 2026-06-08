@@ -1,8 +1,29 @@
 import { expect, test } from '@playwright/test';
 
 const limraBaseUrl = process.env.LIMRA_WEB_BASE_URL ?? 'http://127.0.0.1:5173';
+const smokeAuthToken = 'limra-smoke-token';
 const privateRunnerUrlFragments = ['RUNNER_SERVICE_TOKEN', '/mirothinker/', 'limra-runner:8091', 'localhost:8091'];
 const streamedArtifactEvents = ['relation_extracted', 'map_feature_added', 'verification_result'] as const;
+
+const smokeBackendConfig = {
+	name: 'limra',
+	version: 'smoke',
+	default_locale: 'en-US',
+	features: {
+		enable_websocket: false,
+		enable_direct_connections: false
+	}
+};
+
+const smokeSessionUser = {
+	id: 'user-smoke',
+	name: 'Smoke User',
+	email: 'smoke@example.test',
+	role: 'user',
+	profile_image_url: '',
+	token: smokeAuthToken,
+	permissions: {}
+};
 
 const emptyArtifacts = {
 	artifacts: {
@@ -139,8 +160,49 @@ test('limra research stream refreshes artifact tabs and map geometry without pri
 
 		Object.defineProperty(window, 'EventSource', { value: FakeEventSource });
 		Object.defineProperty(window, '__limraFakeEventSource', { value: FakeEventSource });
+		localStorage.setItem('token', 'limra-smoke-token');
+		localStorage.setItem('locale', 'en-US');
+		localStorage.setItem(
+			'settings',
+			JSON.stringify({
+				ui: {},
+				toolServers: [],
+				terminalServers: []
+			})
+		);
+		(localStorage as Storage & { token: string }).token = 'limra-smoke-token';
 	});
 
+	await page.route('**/api/config', async (route) => {
+		await route.fulfill({ json: smokeBackendConfig });
+	});
+	await page.route('**/api/v1/auths/', async (route) => {
+		await route.fulfill({ json: smokeSessionUser });
+	});
+	await page.route('**/api/v1/auths/update/timezone', async (route) => {
+		await route.fulfill({ json: { ok: true } });
+	});
+	await page.route('**/api/v1/users/user/settings', async (route) => {
+		await route.fulfill({
+			json: {
+				ui: {},
+				toolServers: [],
+				terminalServers: []
+			}
+		});
+	});
+	await page.route('**/api/models**', async (route) => {
+		await route.fulfill({ json: { data: [] } });
+	});
+	await page.route('**/api/v1/configs/banners', async (route) => {
+		await route.fulfill({ json: [] });
+	});
+	await page.route('**/api/v1/tools/', async (route) => {
+		await route.fulfill({ json: [] });
+	});
+	await page.route('**/api/v1/terminals/', async (route) => {
+		await route.fulfill({ json: [] });
+	});
 	await page.route('**/api/limra/scenarios', async (route) => {
 		await route.fulfill({
 			json: {

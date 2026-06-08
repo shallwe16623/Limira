@@ -235,8 +235,30 @@ def test_limra_playwright_smoke_harness_covers_streamed_artifact_refresh_and_map
     )
     assert "import { expect, test } from '@playwright/test';" in spec
     assert "process.env.LIMRA_WEB_BASE_URL ?? 'http://127.0.0.1:5173'" in spec
+    assert "const smokeAuthToken = 'limra-smoke-token';" in spec
+    assert "const smokeBackendConfig = {" in spec
+    assert "const smokeSessionUser = {" in spec
+    assert "localStorage.setItem('token', 'limra-smoke-token');" in spec
+    assert "(localStorage as Storage & { token: string }).token = 'limra-smoke-token';" in spec
     assert "class FakeEventSource" in spec
     assert "window.__limraFakeEventSource" in spec
+
+    required_open_webui_bootstrap_routes = [
+        "'**/api/config'",
+        "'**/api/v1/auths/'",
+        "'**/api/v1/auths/update/timezone'",
+        "'**/api/v1/users/user/settings'",
+        "'**/api/models**'",
+        "'**/api/v1/configs/banners'",
+        "'**/api/v1/tools/'",
+        "'**/api/v1/terminals/'",
+    ]
+    for route in required_open_webui_bootstrap_routes:
+        assert route in spec
+
+    assert "enable_websocket: false" in spec
+    assert "enable_direct_connections: false" in spec
+    assert "role: 'user'" in spec
 
     required_limra_routes = [
         "'**/api/limra/scenarios'",
