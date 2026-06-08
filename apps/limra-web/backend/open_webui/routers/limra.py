@@ -57,6 +57,10 @@ ARTIFACT_EVENT_TYPES = {
     "verification_result": "verification",
     "report_section_generated": "report_section",
 }
+ARTIFACT_TYPE_EVENTS = {
+    artifact_type: event_type
+    for event_type, artifact_type in ARTIFACT_EVENT_TYPES.items()
+}
 LIMRA_REPOSITORY_BACKEND_ENV = "LIMRA_REPOSITORY_BACKEND"
 LIMRA_DATABASE_URL_ENV = "LIMRA_DATABASE_URL"
 LIMRA_ALLOW_IN_MEMORY_REPOSITORY_ENV = "LIMRA_ALLOW_IN_MEMORY_REPOSITORY"
@@ -294,6 +298,14 @@ class LimraTaskRepository(Protocol):
 
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]: ...
 
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None: ...
+
+    def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]: ...
+
     def record_uploaded_document(
         self,
         *,
@@ -441,6 +453,7 @@ class InMemoryLimraTaskRepository:
     def __init__(self) -> None:
         self.tasks: dict[str, LimraTask] = {}
         self.artifacts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self.artifact_trace_events: dict[str, list[dict[str, Any]]] = {}
         self.uploaded_documents: dict[str, LimraUploadedDocument] = {}
         self.generated_reports: dict[tuple[str, str], LimraGeneratedReport] = {}
 
@@ -462,6 +475,7 @@ class InMemoryLimraTaskRepository:
         )
         self.tasks[task_id] = task
         self.artifacts[task_id] = _empty_artifact_buckets()
+        self.artifact_trace_events[task_id] = []
         return task
 
     def get_task(self, task_id: str) -> LimraTask | None:
@@ -500,11 +514,26 @@ class InMemoryLimraTaskRepository:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
         bucket = ARTIFACT_BUCKETS[artifact_type]
         task_artifacts[bucket].append(artifact)
+        self.record_artifact_trace_event(
+            task_id,
+            _artifact_trace_event_from_artifact(artifact_type, bucket, artifact),
+        )
         self._invalidate_archive_metadata(task_id)
 
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
         return {bucket: list(items) for bucket, items in task_artifacts.items()}
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        self.artifact_trace_events.setdefault(task_id, []).append(dict(event))
+        self._invalidate_archive_metadata(task_id)
+
+    def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]:
+        return [dict(event) for event in self.artifact_trace_events.get(task_id, [])]
 
     def record_uploaded_document(
         self,
@@ -931,6 +960,7 @@ class PostgresLimraTaskRepository:
     POSTGRES_ARTIFACT_TABLES = {
         "limra_research_tasks",
         "limra_artifact_events",
+        "limra_artifact_trace_events",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
@@ -1047,6 +1077,38 @@ class PostgresLimraTaskRepository:
         FROM limra_artifact_events
         WHERE task_id = :task_id
         ORDER BY created_at ASC, local_artifact_id ASC
+    """
+    INSERT_ARTIFACT_TRACE_EVENT_SQL = """
+        INSERT INTO limra_artifact_trace_events (
+            task_id,
+            event_type,
+            artifact_type,
+            bucket,
+            local_artifact_id,
+            payload,
+            source_event_type
+        )
+        VALUES (
+            :task_id,
+            :event_type,
+            :artifact_type,
+            :bucket,
+            :local_artifact_id,
+            CAST(:payload AS jsonb),
+            :source_event_type
+        )
+    """
+    SELECT_ARTIFACT_TRACE_EVENTS_SQL = """
+        SELECT
+            event_type,
+            artifact_type,
+            bucket,
+            local_artifact_id,
+            payload,
+            source_event_type
+        FROM limra_artifact_trace_events
+        WHERE task_id = :task_id
+        ORDER BY created_at ASC, trace_event_id ASC
     """
     INSERT_EVIDENCE_SQL = """
         INSERT INTO limra_evidence_items (
@@ -1494,6 +1556,10 @@ class PostgresLimraTaskRepository:
             "source_event_type": _optional_string(artifact.get("source_event_type")),
         }
         self._execute(self.INSERT_ARTIFACT_EVENT_SQL, event_params)
+        self.record_artifact_trace_event(
+            task_id,
+            _artifact_trace_event_from_artifact(artifact_type, bucket, artifact),
+        )
         try:
             self._record_typed_artifact(task_id, artifact_type, artifact, artifact_id)
         except Exception:
@@ -1511,6 +1577,50 @@ class PostgresLimraTaskRepository:
             if isinstance(payload, dict):
                 artifacts[ARTIFACT_BUCKETS[artifact_type]].append(payload)
         return artifacts
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        self._execute(
+            self.INSERT_ARTIFACT_TRACE_EVENT_SQL,
+            {
+                "task_id": task_id,
+                "event_type": str(event.get("type") or "artifact_event"),
+                "artifact_type": _optional_string(event.get("artifact_type")),
+                "bucket": _optional_string(event.get("bucket")),
+                "local_artifact_id": _optional_string(event.get("local_artifact_id")),
+                "payload": _json_dumps(payload),
+                "source_event_type": _optional_string(event.get("source_event_type")),
+            },
+        )
+        self._invalidate_archive_metadata(task_id)
+
+    def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._fetch_all(
+            self.SELECT_ARTIFACT_TRACE_EVENTS_SQL,
+            {"task_id": task_id},
+        )
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            event: dict[str, Any] = {
+                "type": row.get("event_type"),
+                "payload": _json_loads(row.get("payload")),
+            }
+            if row.get("artifact_type"):
+                event["artifact_type"] = row["artifact_type"]
+            if row.get("bucket"):
+                event["bucket"] = row["bucket"]
+            if row.get("local_artifact_id"):
+                event["local_artifact_id"] = row["local_artifact_id"]
+            if row.get("source_event_type"):
+                event["source_event_type"] = row["source_event_type"]
+            events.append(event)
+        return events
 
     def record_uploaded_document(
         self,
@@ -2521,6 +2631,10 @@ def _build_persisted_archive_zip(
     repo: LimraTaskRepository,
 ) -> bytes:
     artifacts = repo.get_artifacts(task.task_id)
+    artifact_events = repo.get_artifact_trace_events(task.task_id)
+    artifact_warnings = [
+        event for event in artifact_events if event.get("type") == "artifact_warning"
+    ]
     reports = repo.list_task_reports(task_id=task.task_id)
     documents = repo.list_user_documents(
         owner_user_id=task.owner_user_id,
@@ -2548,12 +2662,16 @@ def _build_persisted_archive_zip(
             bucket: len(items)
             for bucket, items in artifacts.items()
         },
+        "artifact_event_count": len(artifact_events),
+        "artifact_warning_count": len(artifact_warnings),
         "reports": [report.public_dict() for report in reports],
         "uploaded_documents": [document.public_dict() for document in documents],
     }
     trace = {
         "task": metadata["task"],
         "artifacts": artifacts,
+        "artifact_events": artifact_events,
+        "artifact_warnings": artifact_warnings,
         "reports": [report.public_dict() for report in reports],
         "uploaded_documents": [document.public_dict() for document in documents],
     }
@@ -3114,14 +3232,29 @@ def _record_artifact_from_event(
     task: LimraTask,
     event: dict[str, Any],
 ) -> dict[str, Any] | None:
+    if event.get("type") == "artifact_warning":
+        repo.record_artifact_trace_event(
+            task.task_id,
+            _artifact_trace_event_from_warning(event),
+        )
+        return None
+
     artifact_type, artifact_payload, metadata = _artifact_parts_from_event(event)
     if not artifact_type:
         return None
 
     if artifact_type not in ARTIFACT_BUCKETS:
-        return _artifact_warning(task.task_id, event, "unsupported_artifact_type")
+        return _record_and_return_artifact_warning(
+            repo,
+            task,
+            _artifact_warning(task.task_id, event, "unsupported_artifact_type"),
+        )
     if not isinstance(artifact_payload, dict):
-        return _artifact_warning(task.task_id, event, "invalid_artifact_payload")
+        return _record_and_return_artifact_warning(
+            repo,
+            task,
+            _artifact_warning(task.task_id, event, "invalid_artifact_payload"),
+        )
 
     artifact = dict(artifact_payload)
     artifact.setdefault("artifact_type", artifact_type)
@@ -3135,6 +3268,18 @@ def _record_artifact_from_event(
     _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
     repo.record_artifact(task.task_id, artifact_type, artifact)
     return None
+
+
+def _record_and_return_artifact_warning(
+    repo: LimraTaskRepository,
+    task: LimraTask,
+    warning: dict[str, Any],
+) -> dict[str, Any]:
+    repo.record_artifact_trace_event(
+        task.task_id,
+        _artifact_trace_event_from_warning(warning),
+    )
+    return warning
 
 
 def _artifact_parts_from_event(
@@ -3199,6 +3344,37 @@ def _artifact_warning(
             "warning": warning,
             "source_event_type": event.get("type"),
         },
+    }
+
+
+def _artifact_trace_event_from_artifact(
+    artifact_type: str,
+    bucket: str,
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    local_artifact_id = _artifact_primary_id(artifact_type, artifact)
+    source_event_type = artifact.get("source_event_type")
+    return {
+        "type": ARTIFACT_TYPE_EVENTS.get(artifact_type, "artifact_recorded"),
+        "artifact_type": artifact_type,
+        "bucket": bucket,
+        "local_artifact_id": local_artifact_id,
+        "source_event_type": str(source_event_type) if source_event_type else None,
+        "payload": dict(artifact),
+    }
+
+
+def _artifact_trace_event_from_warning(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {"warning": "invalid_artifact_warning", "payload": payload}
+    return {
+        "type": "artifact_warning",
+        "artifact_type": payload.get("artifact_type"),
+        "bucket": None,
+        "local_artifact_id": None,
+        "source_event_type": payload.get("source_event_type"),
+        "payload": dict(payload),
     }
 
 

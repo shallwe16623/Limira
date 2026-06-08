@@ -188,6 +188,7 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
     required_tables = {
         "limra_research_tasks",
         "limra_artifact_events",
+        "limra_artifact_trace_events",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
@@ -213,6 +214,14 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
         "constraint uq_limra_artifact_events_task_local unique "
         "(task_id, artifact_type, local_artifact_id)"
         in tables["limra_artifact_events"]["body"]
+    )
+    assert (
+        "trace_event_id text primary key"
+        in tables["limra_artifact_trace_events"]["body"]
+    )
+    assert (
+        "payload jsonb not null default '{}'::jsonb"
+        in tables["limra_artifact_trace_events"]["body"]
     )
     assert "evidence_storage_id text primary key" in tables["limra_evidence_items"]["body"]
     assert (

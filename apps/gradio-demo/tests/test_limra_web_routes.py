@@ -1319,6 +1319,7 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     for table in (
         "limra_research_tasks",
         "limra_artifact_events",
+        "limra_artifact_trace_events",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
@@ -1340,6 +1341,8 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
         assert artifact_type in limra.ARTIFACT_BUCKETS
 
     assert "select artifact_type, payload" in sql
+    assert "insert into limra_artifact_trace_events" in sql
+    assert "from limra_artifact_trace_events" in sql
     assert "on conflict" in sql
     assert "on conflict (task_id, artifact_type, local_artifact_id)" in sql
     assert "on conflict (task_id, evidence_id)" in sql
@@ -1417,6 +1420,59 @@ def test_postgres_repository_preserves_task_local_artifact_refs_by_task():
     assert task_b_artifacts["report_sections"][0]["markdown"] == "Report B"
     assert ("task-a", "evidence", "EVID-001") in engine.artifact_events
     assert ("task-b", "evidence", "EVID-001") in engine.artifact_events
+
+
+def test_postgres_repository_records_artifact_trace_events_and_warnings():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-trace",
+        owner_user_id="user-a",
+        query="trace artifact events",
+        scenario=None,
+        runner_task_id="runner-trace",
+    )
+
+    repo.record_artifact(
+        "task-trace",
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "Evidence A",
+            "source_event_type": "record_research_artifact",
+        },
+    )
+    repo.record_artifact_trace_event(
+        "task-trace",
+        {
+            "type": "artifact_warning",
+            "artifact_type": "relation",
+            "payload": {
+                "warning": "invalid_artifact_payload",
+                "artifact_type": "relation",
+                "source_event_type": "record_research_artifact",
+            },
+            "source_event_type": "record_research_artifact",
+        },
+    )
+
+    trace_events = repo.get_artifact_trace_events("task-trace")
+
+    assert [event["type"] for event in trace_events] == [
+        "evidence_collected",
+        "artifact_warning",
+    ]
+    assert trace_events[0]["artifact_type"] == "evidence"
+    assert trace_events[0]["bucket"] == "evidence"
+    assert trace_events[0]["local_artifact_id"] == "EVID-001"
+    assert trace_events[0]["source_event_type"] == "record_research_artifact"
+    assert trace_events[0]["payload"]["title"] == "Evidence A"
+    assert trace_events[1]["artifact_type"] == "relation"
+    assert trace_events[1]["payload"]["warning"] == "invalid_artifact_payload"
+    assert engine.artifact_trace_events[0]["task_id"] == "task-trace"
 
 
 def test_postgres_repository_artifact_params_include_temporal_and_geometry_fields():
@@ -1695,6 +1751,7 @@ def test_postgres_repository_invalidates_archive_metadata_on_task_scoped_writes(
 @pytest.mark.asyncio
 async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
     user = limra.LimraUser("user-a")
     research = FakeResearchClient(
         events=[
@@ -1789,6 +1846,30 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     assert artifacts["relations"] == []
     _assert_no_browser_leak(artifacts)
 
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    assert [event["type"] for event in trace["artifact_events"]] == [
+        "evidence_collected",
+        "entity_extracted",
+        "report_section_generated",
+        "artifact_warning",
+    ]
+    assert trace["artifact_events"][2]["source_event_type"] == (
+        "record_research_artifact"
+    )
+    assert trace["artifact_events"][2]["local_artifact_id"] == "REPORT-001"
+    assert trace["artifact_warnings"][0]["payload"]["warning"] == (
+        "invalid_artifact_payload"
+    )
+    assert trace["artifact_warnings"][0]["payload"]["source_event_type"] == (
+        "relation_extracted"
+    )
+
 
 @pytest.mark.asyncio
 async def test_record_research_artifact_tool_call_reaches_artifacts_and_archive_trace():
@@ -1856,6 +1937,17 @@ async def test_record_research_artifact_tool_call_reaches_artifacts_and_archive_
     assert trace["artifacts"]["evidence"][0]["source_event_type"] == (
         "record_research_artifact"
     )
+    assert trace["artifact_events"][0]["type"] == "evidence_collected"
+    assert trace["artifact_events"][0]["artifact_type"] == "evidence"
+    assert trace["artifact_events"][0]["bucket"] == "evidence"
+    assert trace["artifact_events"][0]["local_artifact_id"] == "EVID-001"
+    assert trace["artifact_events"][0]["source_event_type"] == (
+        "record_research_artifact"
+    )
+    assert trace["artifact_events"][0]["payload"]["title"] == (
+        "Port authority bulletin"
+    )
+    assert trace["artifact_warnings"] == []
     assert repo.get_task(task_id).archive_object_key in storage.objects
     _assert_no_browser_leak(trace)
 
@@ -2723,6 +2815,7 @@ class FakeLimraPostgresEngine:
     def __init__(self):
         self.tasks = {}
         self.artifact_events = {}
+        self.artifact_trace_events = []
         self.uploaded_documents = {}
         self.generated_reports = {}
         self.typed_inserts = {
@@ -2793,6 +2886,35 @@ class FakeLimraPostgresEngine:
                 "payload": params["payload"],
             }
             return FakeLimraPostgresResult([])
+
+        if "insert into limra_artifact_trace_events" in sql:
+            self.artifact_trace_events.append(
+                {
+                    "task_id": params["task_id"],
+                    "event_type": params["event_type"],
+                    "artifact_type": params["artifact_type"],
+                    "bucket": params["bucket"],
+                    "local_artifact_id": params["local_artifact_id"],
+                    "payload": params["payload"],
+                    "source_event_type": params["source_event_type"],
+                }
+            )
+            return FakeLimraPostgresResult([])
+
+        if "from limra_artifact_trace_events" in sql:
+            rows = [
+                {
+                    "event_type": row["event_type"],
+                    "artifact_type": row["artifact_type"],
+                    "bucket": row["bucket"],
+                    "local_artifact_id": row["local_artifact_id"],
+                    "payload": row["payload"],
+                    "source_event_type": row["source_event_type"],
+                }
+                for row in self.artifact_trace_events
+                if row["task_id"] == params["task_id"]
+            ]
+            return FakeLimraPostgresResult(rows)
 
         if "from limra_artifact_events" in sql:
             rows = [
