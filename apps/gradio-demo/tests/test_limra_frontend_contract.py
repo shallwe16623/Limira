@@ -127,6 +127,7 @@ def test_limra_research_page_uses_only_browser_facing_limra_api_paths():
     page = _read(LIMRA_PAGE)
 
     required_paths = [
+        "'/api/limra/scenarios'",
         "'/api/limra/research'",
         "`/api/limra/tasks/${id}/events`",
         "`/api/limra/tasks/${id}/artifacts`",
@@ -143,6 +144,20 @@ def test_limra_research_page_uses_only_browser_facing_limra_api_paths():
     ]
     for forbidden in forbidden_browser_strings:
         assert forbidden not in page
+
+
+def test_limra_research_page_has_demo_scenario_selector():
+    page = _read(LIMRA_PAGE)
+
+    assert "type LimraScenario" in page
+    assert "const loadScenarios = async () =>" in page
+    assert "'/api/limra/scenarios'" in page
+    assert 'id="limra-scenario"' in page
+    assert "bind:value={selectedScenario}" in page
+    assert "selectedScenarioDetail" in page
+    assert "Use scenario query" in page
+    assert "scenario: selectedScenario || undefined" in page
+    assert "osint-mvp" not in page
 
 
 def test_limra_artifact_drawer_tabs_and_reference_controls_are_present():

@@ -156,9 +156,113 @@ router = APIRouter()
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class LimraDemoScenario:
+    scenario_id: str
+    title: str
+    description: str
+    default_query: str
+    focus_areas: tuple[str, ...]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.scenario_id,
+            "title": self.title,
+            "description": self.description,
+            "default_query": self.default_query,
+            "focus_areas": list(self.focus_areas),
+        }
+
+    def runner_query(self, query: str) -> str:
+        focus = "\n".join(f"- {item}" for item in self.focus_areas)
+        return (
+            f"limra built-in demo scenario: {self.title} ({self.scenario_id}).\n"
+            f"Scenario objective: {self.description}\n\n"
+            f"Focus areas:\n{focus}\n\n"
+            "Artifact requirements:\n"
+            "- Use record_research_artifact for source-backed evidence records, "
+            "entities, relations, timeline events, map features, verification "
+            "notes, and report sections.\n"
+            "- Use task-local references such as EVID-001, ENT-001, TL-001, "
+            "MAP-001, and REPORT-001 when creating artifacts.\n"
+            "- Each evidence artifact should include a title, URL, source, "
+            "summary, confidence, and published_at when available.\n"
+            "- If a trustworthy location exists, create map_feature artifacts "
+            "with GeoJSON Point, LineString, or Polygon geometry; otherwise add "
+            "a report_section that states why the map remains empty.\n"
+            "- Report sections must cite evidence_refs such as [EVID-001] so "
+            "the limra report and archive can link back to evidence.\n"
+            "- Treat unsupported or low-confidence claims as verification "
+            "artifacts instead of silently omitting them.\n\n"
+            f"User research question:\n{query}"
+        )
+
+
+LIMRA_DEMO_SCENARIOS: dict[str, LimraDemoScenario] = {
+    scenario.scenario_id: scenario
+    for scenario in (
+        LimraDemoScenario(
+            scenario_id="sanctions_export_controls",
+            title="Sanctions and export controls",
+            description=(
+                "Track sanctions, export-control, entity-list, and licensing "
+                "changes affecting a company, sector, or supply chain."
+            ),
+            default_query=(
+                "Track recent export control changes affecting semiconductor "
+                "supply chains and identify entities, jurisdictions, and dates."
+            ),
+            focus_areas=(
+                "Official sanctions, export-control, entity-list, and licensing notices",
+                "Affected companies, intermediaries, jurisdictions, and supply-chain links",
+                "Effective dates, enforcement milestones, and compliance deadlines",
+                "Source-backed confidence grading for conflicting or unclear claims",
+            ),
+        ),
+        LimraDemoScenario(
+            scenario_id="geopolitical_risk_assessment",
+            title="Geopolitical risk assessment",
+            description=(
+                "Assess current political, security, regulatory, and trade risks "
+                "for a target country, corridor, investment, or operation."
+            ),
+            default_query=(
+                "Assess geopolitical risk for a logistics route crossing the Red "
+                "Sea and identify current incidents, actors, and risk indicators."
+            ),
+            focus_areas=(
+                "Recent official advisories, incidents, sanctions, and regulatory actions",
+                "State and non-state actors, alliances, chokepoints, and exposed assets",
+                "Timeline of risk escalation, de-escalation, and announced mitigations",
+                "Geographic hotspots or a clear map-empty rationale when coordinates are unreliable",
+            ),
+        ),
+        LimraDemoScenario(
+            scenario_id="critical_minerals_competition",
+            title="Critical minerals competition",
+            description=(
+                "Map international competition over critical minerals, including "
+                "projects, offtake deals, processing capacity, policy moves, and "
+                "strategic chokepoints."
+            ),
+            default_query=(
+                "Analyze recent international competition over lithium and nickel "
+                "supply chains, including projects, policy moves, and chokepoints."
+            ),
+            focus_areas=(
+                "Mine, refinery, processing, and transport assets with verifiable locations",
+                "Government policy moves, investment screening, subsidies, and trade restrictions",
+                "Companies, state-backed investors, offtake agreements, and supply-chain dependencies",
+                "Evidence-backed timeline and map artifacts for projects and chokepoints",
+            ),
+        ),
+    )
+}
+
+
 class ResearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
-    scenario: str | None = None
+    scenario: str | None = Field(default=None, max_length=120)
 
 
 class ReportPdfRequest(BaseModel):
@@ -2120,6 +2224,21 @@ def runner_service_headers(user: LimraUser, service_token: str | None) -> dict[s
     return headers
 
 
+def _normalize_scenario_id(scenario: str | None) -> str | None:
+    if scenario is None:
+        return None
+    normalized = str(scenario).strip()
+    return normalized or None
+
+
+def _runner_query_for_scenario(query: str, scenario: str | None) -> str:
+    scenario_id = _normalize_scenario_id(scenario)
+    demo_scenario = LIMRA_DEMO_SCENARIOS.get(scenario_id or "")
+    if demo_scenario is None:
+        return query
+    return demo_scenario.runner_query(query)
+
+
 def _open_webui_verified_dependency():
     if _open_webui_verified_user is None:
         async def _missing_verified_user():
@@ -2196,6 +2315,21 @@ def get_pdf_exporter(request: Request) -> LimraPdfExporter:
     return pdf_exporter
 
 
+@router.get("/scenarios")
+async def list_demo_scenarios(
+    user: LimraUser = Depends(get_current_limra_user),
+) -> dict[str, Any]:
+    return _assert_browser_safe(
+        {
+            "scenarios": [
+                scenario.public_dict()
+                for scenario in LIMRA_DEMO_SCENARIOS.values()
+            ],
+            "count": len(LIMRA_DEMO_SCENARIOS),
+        }
+    )
+
+
 @router.post("/research", status_code=202)
 async def create_research_task(
     form_data: dict[str, Any],
@@ -2208,18 +2342,20 @@ async def create_research_task(
         raise HTTPException(status_code=400, detail="user_id_not_allowed")
     request_data = ResearchRequest.model_validate(form_data)
     query = request_data.query.strip()
+    scenario = _normalize_scenario_id(request_data.scenario)
+    runner_query = _runner_query_for_scenario(query, scenario)
     task_id = str(uuid.uuid4())
     task = repo.create_task(
         task_id=task_id,
         owner_user_id=user.id,
         query=query,
-        scenario=request_data.scenario,
+        scenario=scenario,
         runner_task_id=None,
     )
     try:
         runner_payload = await research_client.create_research_task(
-            query=query,
-            scenario=request_data.scenario,
+            query=runner_query,
+            scenario=scenario,
             user=user,
         )
         runner_task_id = _runner_task_id_from_payload(runner_payload)

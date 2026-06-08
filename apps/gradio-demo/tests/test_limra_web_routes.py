@@ -118,6 +118,73 @@ async def test_create_research_uses_limra_namespace_and_rejects_body_user_id():
 
 
 @pytest.mark.asyncio
+async def test_demo_scenarios_are_browser_safe_and_artifact_oriented():
+    payload = await limra.list_demo_scenarios(user=limra.LimraUser("user-a"))
+
+    scenario_ids = {scenario["id"] for scenario in payload["scenarios"]}
+    assert scenario_ids == {
+        "sanctions_export_controls",
+        "geopolitical_risk_assessment",
+        "critical_minerals_competition",
+    }
+    assert payload["count"] == 3
+    _assert_no_browser_leak(payload)
+
+    payload_text = json.dumps(payload)
+    assert "Artifact requirements" not in payload_text
+    assert "record_research_artifact" not in payload_text
+    assert "runner" not in payload_text.lower()
+
+    for scenario_id in scenario_ids:
+        runner_query = limra._runner_query_for_scenario("base query", scenario_id)
+        assert "base query" in runner_query
+        assert "record_research_artifact" in runner_query
+        assert "EVID-001" in runner_query
+        assert "map_feature" in runner_query
+        assert "[EVID-001]" in runner_query
+        assert "report_section" in runner_query
+
+    assert limra._runner_query_for_scenario("base query", "legacy-scenario") == "base query"
+
+
+@pytest.mark.asyncio
+async def test_create_research_with_known_demo_scenario_enriches_runner_query_only():
+    repo = limra.InMemoryLimraTaskRepository()
+    research = FakeResearchClient()
+    user = limra.LimraUser("user-a")
+    scenario_id = "critical_minerals_competition"
+
+    payload = await limra.create_research_task(
+        {"query": "Analyze nickel supply chain risk", "scenario": scenario_id},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+
+    assert payload["scenario"] == scenario_id
+    assert payload["query"] == "Analyze nickel supply chain risk"
+    _assert_no_browser_leak(payload)
+    assert "record_research_artifact" not in json.dumps(payload)
+
+    assert len(research.create_calls) == 1
+    runner_call = research.create_calls[0]
+    assert runner_call["scenario"] == scenario_id
+    assert runner_call["user"] == user
+    assert runner_call["query"] != payload["query"]
+    assert "Critical minerals competition" in runner_call["query"]
+    assert "Analyze nickel supply chain risk" in runner_call["query"]
+    assert "record_research_artifact" in runner_call["query"]
+    assert "EVID-001" in runner_call["query"]
+    assert "map_feature" in runner_call["query"]
+    assert "[EVID-001]" in runner_call["query"]
+
+    task = repo.get_task(payload["task_id"])
+    assert task.query == "Analyze nickel supply chain risk"
+    assert task.scenario == scenario_id
+
+
+@pytest.mark.asyncio
 async def test_create_research_records_failed_web_task_when_runner_start_fails():
     repo = limra.InMemoryLimraTaskRepository()
     research = FakeResearchClient()
@@ -2586,6 +2653,7 @@ def test_runner_research_client_uses_server_side_headers(monkeypatch):
 
 def test_limra_router_defines_required_browser_facing_paths():
     route_contract = {
+        ("/scenarios", "GET"),
         ("/research", "POST"),
         ("/tasks/{task_id}", "GET"),
         ("/tasks/{task_id}/events", "GET"),

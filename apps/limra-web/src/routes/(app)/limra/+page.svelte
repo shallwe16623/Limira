@@ -1,8 +1,16 @@
 <script lang="ts">
-	import { onDestroy, tick } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import 'maplibre-gl/dist/maplibre-gl.css';
 
 	type ArtifactTab = 'Evidence' | 'Entities' | 'Graph' | 'Timeline' | 'Map' | 'Report';
+
+	type LimraScenario = {
+		id: string;
+		title: string;
+		description: string;
+		default_query: string;
+		focus_areas: string[];
+	};
 
 	type ChatMessage = {
 		role: 'user' | 'assistant' | 'system';
@@ -49,6 +57,8 @@
 	let mapContainer: HTMLDivElement;
 	let graphInstance: any = null;
 	let mapInstance: any = null;
+	let scenarios: LimraScenario[] = [];
+	let selectedScenario = '';
 
 	let messages: ChatMessage[] = [
 		{
@@ -66,6 +76,8 @@
 	$: graphHasData = entityCount > 0 || relationCount > 0;
 	$: mapFeatureCollection = buildMapFeatureCollection(artifacts);
 	$: mapHasData = mapFeatureCollection.features.length > 0;
+	$: selectedScenarioDetail =
+		scenarios.find((scenario) => scenario.id === selectedScenario) ?? scenarios[0];
 
 	const appendMessage = (role: ChatMessage['role'], content: string) => {
 		messages = [
@@ -95,6 +107,24 @@
 		return response.json();
 	};
 
+	const loadScenarios = async () => {
+		try {
+			const data = await apiJson('/api/limra/scenarios');
+			scenarios = Array.isArray(data.scenarios) ? data.scenarios : [];
+			if (!selectedScenario && scenarios[0]) {
+				selectedScenario = scenarios[0].id;
+			}
+		} catch (error) {
+			errorMessage = error instanceof Error ? error.message : 'Unable to load scenarios.';
+		}
+	};
+
+	const useScenarioQuery = () => {
+		if (selectedScenarioDetail?.default_query) {
+			query = selectedScenarioDetail.default_query;
+		}
+	};
+
 	const submitResearch = async () => {
 		const trimmed = query.trim();
 		if (!trimmed || isSubmitting) {
@@ -112,7 +142,7 @@
 				method: 'POST',
 				body: JSON.stringify({
 					query: trimmed,
-					scenario: 'osint-mvp'
+					scenario: selectedScenario || undefined
 				})
 			});
 
@@ -431,6 +461,10 @@
 		mapInstance.addControl(new maplibre.NavigationControl({ showCompass: false }), 'top-right');
 	};
 
+	onMount(() => {
+		void loadScenarios();
+	});
+
 	onDestroy(() => {
 		eventSource?.close();
 		graphInstance?.destroy();
@@ -474,12 +508,32 @@
 		{/if}
 
 		<form class="query-form" on:submit|preventDefault={submitResearch}>
+			<div class="scenario-field">
+				<label for="limra-scenario">Scenario</label>
+				<div class="scenario-select-row">
+					<select id="limra-scenario" bind:value={selectedScenario}>
+						{#if scenarios.length === 0}
+							<option value="">General OSINT</option>
+						{/if}
+						{#each scenarios as scenario}
+							<option value={scenario.id}>{scenario.title}</option>
+						{/each}
+					</select>
+					<button type="button" class="secondary-button" disabled={!selectedScenarioDetail} on:click={useScenarioQuery}>
+						Use scenario query
+					</button>
+				</div>
+				{#if selectedScenarioDetail}
+					<p class="scenario-summary">{selectedScenarioDetail.description}</p>
+				{/if}
+			</div>
 			<label for="limra-query">Research query</label>
 			<textarea
 				id="limra-query"
 				bind:value={query}
 				rows="4"
-				placeholder="Track recent export control changes affecting semiconductor supply chains"
+				placeholder={selectedScenarioDetail?.default_query ??
+					'Track recent export control changes affecting semiconductor supply chains'}
 				on:keydown={(event) => {
 					if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
 						void submitResearch();
@@ -800,6 +854,40 @@
 		background: #0f172a;
 	}
 
+	.scenario-field {
+		display: grid;
+		gap: 0.45rem;
+	}
+
+	.scenario-select-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	select {
+		flex: 1;
+		min-width: 14rem;
+		min-height: 2.25rem;
+		border: 1px solid #cbd5e1;
+		padding: 0 0.65rem;
+		background: #ffffff;
+		color: inherit;
+		font: inherit;
+		font-size: 0.85rem;
+	}
+
+	:global(.dark) select {
+		border-color: #334155;
+		background: #0f172a;
+	}
+
+	.scenario-summary {
+		color: #64748b;
+		font-size: 0.82rem;
+		line-height: 1.4;
+	}
+
 	.form-actions {
 		display: flex;
 		justify-content: flex-end;
@@ -1013,6 +1101,7 @@
 	@media (max-width: 560px) {
 		.workspace-header,
 		.drawer-header,
+		.scenario-select-row,
 		.form-actions {
 			align-items: stretch;
 			flex-direction: column;
