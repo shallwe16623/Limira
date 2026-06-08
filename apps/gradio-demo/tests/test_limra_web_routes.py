@@ -2087,6 +2087,62 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
     assert foreign_download_response.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_pdf_download_clears_invalid_persisted_pdf_object_key():
+    app, repo, _storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-invalid-pdf-key",
+        owner_user_id="user-a",
+        query="invalid pdf key",
+        scenario=None,
+        runner_task_id="runner-invalid-pdf-key",
+    )
+    report = repo.record_generated_report(
+        report_id="report-invalid-key",
+        task_id="task-invalid-pdf-key",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key="../bad.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": "bad-sha",
+            "pdf_size_bytes": 123,
+            "source": "cache",
+        },
+    )
+
+    public_report = report.public_dict()
+    assert public_report["pdf_url"] is None
+    assert public_report["pdf_sha256"] is None
+    assert public_report["pdf_size_bytes"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/tasks/task-invalid-pdf-key/reports/report-invalid-key/pdf"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-invalid-pdf-key",
+        report_id="report-invalid-key",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    public_refreshed = refreshed.public_dict()
+    assert public_refreshed["pdf_url"] is None
+    assert public_refreshed["pdf_sha256"] is None
+    assert public_refreshed["pdf_size_bytes"] is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
 def test_report_html_renderer_strips_active_markup_from_markdown():
     rendered_html = limra._render_report_html(
         markdown=(
@@ -2732,6 +2788,67 @@ def test_postgres_repository_records_generated_report_pdf_metadata():
     reports = repo.list_task_reports(task_id="task-report")
     assert [item.report_id for item in reports] == ["report-001"]
     assert reports[0].markdown == "Final report [EVID-001]"
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_invalid_persisted_pdf_object_key():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-invalid-pdf-key",
+        owner_user_id="user-a",
+        query="postgres invalid pdf key",
+        scenario=None,
+        runner_task_id="runner-postgres-invalid-pdf-key",
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-invalid-key",
+        task_id="task-postgres-invalid-pdf-key",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key="../bad.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": "bad-sha",
+            "pdf_size_bytes": 456,
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_task_report_pdf(
+            "task-postgres-invalid-pdf-key",
+            "report-postgres-invalid-key",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-invalid-pdf-key",
+        report_id="report-postgres-invalid-key",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    public_refreshed = refreshed.public_dict()
+    assert public_refreshed["pdf_url"] is None
+    assert public_refreshed["pdf_sha256"] is None
+    assert public_refreshed["pdf_size_bytes"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-invalid-pdf-key", "report-postgres-invalid-key")
+    ]
+    assert persisted["pdf_object_key"] is None
 
 
 def test_postgres_repository_invalidates_archive_metadata_on_task_scoped_writes():

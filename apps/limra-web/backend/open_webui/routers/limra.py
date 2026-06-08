@@ -404,6 +404,7 @@ class LimraGeneratedReport:
 
     def public_dict(self) -> dict[str, Any]:
         metadata = self.metadata or {}
+        has_valid_pdf_object = _is_valid_limra_object_key(self.pdf_object_key)
         return {
             "report_id": self.report_id,
             "task_id": self.task_id,
@@ -411,10 +412,12 @@ class LimraGeneratedReport:
             "evidence_refs": list(self.evidence_refs),
             "markdown_chars": len(self.markdown or ""),
             "html_chars": len(self.html or ""),
-            "pdf_size_bytes": metadata.get("pdf_size_bytes"),
-            "pdf_sha256": metadata.get("pdf_sha256"),
+            "pdf_size_bytes": metadata.get("pdf_size_bytes")
+            if has_valid_pdf_object
+            else None,
+            "pdf_sha256": metadata.get("pdf_sha256") if has_valid_pdf_object else None,
             "pdf_url": f"/api/limra/tasks/{self.task_id}/reports/{self.report_id}/pdf"
-            if self.pdf_object_key
+            if has_valid_pdf_object
             else None,
         }
 
@@ -3242,6 +3245,9 @@ async def download_task_report_pdf(
         data = await object_storage.get_object(object_key=report.pdf_object_key)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="report_pdf_not_found") from exc
+    except ValueError as exc:
+        _clear_report_pdf_metadata(report, repo=repo)
+        raise HTTPException(status_code=404, detail="report_pdf_not_found") from exc
     return Response(
         data,
         media_type="application/pdf",
@@ -3388,6 +3394,35 @@ def _clear_persisted_archive_metadata(
     )
     task.archive_object_key = None
     task.archive_zip_sha256 = None
+
+
+def _clear_report_pdf_metadata(
+    report: LimraGeneratedReport,
+    *,
+    repo: LimraTaskRepository,
+) -> None:
+    metadata = scrub_limra_secrets(_drop_report_pdf_metadata(report.metadata or {}))
+    repo.record_generated_report(
+        report_id=report.report_id,
+        task_id=report.task_id,
+        report_type=report.report_type,
+        markdown=report.markdown,
+        html=report.html,
+        pdf_object_key=None,
+        evidence_refs=report.evidence_refs,
+        creator_user_id=report.creator_user_id,
+        metadata=metadata,
+    )
+    report.pdf_object_key = None
+    report.metadata = metadata
+
+
+def _drop_report_pdf_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in metadata.items()
+        if str(key) != "pdf_bucket" and not str(key).startswith("pdf_")
+    }
 
 
 def _build_persisted_archive_zip(
@@ -5000,6 +5035,16 @@ def validate_limra_object_key(object_key: str) -> str:
     if any(segment.endswith(OBJECT_METADATA_SIDECAR_SUFFIX) for segment in segments):
         raise ValueError("invalid_limra_object_key")
     return object_key
+
+
+def _is_valid_limra_object_key(object_key: str | None) -> bool:
+    if not object_key:
+        return False
+    try:
+        validate_limra_object_key(object_key)
+    except ValueError:
+        return False
+    return True
 
 
 def _object_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
