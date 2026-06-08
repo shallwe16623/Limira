@@ -629,25 +629,7 @@ async def test_archive_download_hides_internal_model_summary_identifiers():
     repo.update_task(
         task.task_id,
         archive_status="ready",
-        model_summary={
-            "provider": "deepseek",
-            "runner_task_id": "runner-task-secret",
-            "object_key": (
-                "limra/users/hash/tasks/task-summary-archive/uploads/doc.txt"
-            ),
-            "endpoint": (
-                "http://10.20.30.40:8091/mirothinker/tasks/runner-task-secret"
-            ),
-            "nested": {
-                "archive_object_key": (
-                    "limra/users/hash/tasks/task-summary-archive/archives/archive.zip"
-                ),
-                "safe": "kept",
-                "warning": (
-                    "limra/users/hash/tasks/task-summary-archive/uploads/doc.txt"
-                ),
-            },
-        },
+        model_summary=_internal_model_summary(task.task_id),
     )
 
     response = await limra.download_task_archive(
@@ -656,36 +638,133 @@ async def test_archive_download_hides_internal_model_summary_identifiers():
         repo=repo,
         object_storage=storage,
     )
-    members = _archive_member_texts(response.body)
-    metadata = json.loads(members["metadata.json"])
-    trace = json.loads(members["trace.json"])
-
-    for task_payload in (metadata["task"], trace["task"]):
-        model_summary = task_payload["model_summary"]
-        assert model_summary["provider"] == "deepseek"
-        assert model_summary["nested"]["safe"] == "kept"
-        assert model_summary["endpoint"] == "limra_internal_value_redacted"
-        assert model_summary["nested"]["warning"] == "limra_internal_value_redacted"
-
-    serialized = json.dumps(
-        {
-            "metadata": metadata,
-            "trace": trace,
-        },
-        ensure_ascii=False,
-    )
-    for leaked in (
-        "runner_task_id",
-        "runner-task-secret",
-        "object_key",
-        "archive_object_key",
-        "limra/users/hash",
-        "http://10.20.30.40:8091",
-        "/mirothinker/",
-    ):
-        assert leaked not in serialized
+    _assert_archive_hides_internal_model_summary_identifiers(response.body)
     assert task.archive_object_key in storage.objects
-    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
+async def test_archive_download_repairs_reused_persisted_model_summary_identifiers():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-summary-archive-reuse",
+        owner_user_id=user.id,
+        query="archive internal state reuse",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    raw_archive = _archive_zip_with_raw_model_summary(
+        task_id=task.task_id,
+        owner_user_id=user.id,
+    )
+    raw_members = _archive_member_texts(raw_archive)
+    assert "runner_task_id" in raw_members["metadata.json"]
+    assert "limra/users/hash" in raw_members["trace.json"]
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    _assert_archive_hides_internal_model_summary_identifiers(response.body)
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+    _assert_archive_hides_internal_model_summary_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_repairs_reused_persisted_model_summary_identifiers():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task_id = "task-postgres-summary-archive-reuse"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres archive internal state reuse",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    raw_archive = _archive_zip_with_raw_model_summary(
+        task_id=task_id,
+        owner_user_id=user.id,
+    )
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task_id,
+        filename="archive.zip",
+        object_id=task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    _assert_archive_hides_internal_model_summary_identifiers(response.body)
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] == stored.object_key
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == persisted["archive_zip_sha256"]
+    assert repaired["metadata"]["archive_sha256"] == persisted["archive_zip_sha256"]
+    _assert_archive_hides_internal_model_summary_identifiers(repaired["data"])
 
 
 @pytest.mark.asyncio
@@ -5667,12 +5746,115 @@ def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) ->
     return buffer.getvalue()
 
 
+def _archive_zip_with_raw_model_summary(
+    *,
+    task_id: str,
+    owner_user_id: str,
+    runner_task_id: str = "runner-task-secret",
+) -> bytes:
+    task_payload = {
+        "task_id": task_id,
+        "owner_user_id": owner_user_id,
+        "query": "archive internal state reuse",
+        "status": "completed",
+        "archive_status": "ready",
+        "scenario": None,
+        "error": None,
+        "model_summary": _internal_model_summary(
+            task_id,
+            runner_task_id=runner_task_id,
+        ),
+    }
+    metadata = {
+        "task": task_payload,
+        "artifact_counts": {},
+        "artifact_event_count": 0,
+        "artifact_warning_count": 0,
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    trace = {
+        "task": dict(task_payload),
+        "artifacts": {},
+        "artifact_events": [],
+        "artifact_warnings": [],
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    members = {
+        "metadata.json": json.dumps(metadata, ensure_ascii=False),
+        "report.html": "<!doctype html><main>safe report</main>",
+        "report.md": "# safe report",
+        "trace.json": json.dumps(trace, ensure_ascii=False),
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for member_name in ("metadata.json", "report.html", "report.md", "trace.json"):
+            archive.writestr(member_name, members[member_name])
+    return buffer.getvalue()
+
+
 def _archive_member_texts(archive_bytes: bytes) -> dict[str, str]:
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
         return {
             member_name: archive.read(member_name).decode("utf-8")
             for member_name in archive.namelist()
         }
+
+
+def _internal_model_summary(
+    task_id: str,
+    *,
+    runner_task_id: str = "runner-task-secret",
+) -> dict[str, object]:
+    return {
+        "provider": "deepseek",
+        "runner_task_id": runner_task_id,
+        "object_key": f"limra/users/hash/tasks/{task_id}/uploads/doc.txt",
+        "endpoint": f"http://10.20.30.40:8091/mirothinker/tasks/{runner_task_id}",
+        "nested": {
+            "archive_object_key": (
+                f"limra/users/hash/tasks/{task_id}/archives/archive.zip"
+            ),
+            "safe": "kept",
+            "warning": f"limra/users/hash/tasks/{task_id}/uploads/doc.txt",
+        },
+    }
+
+
+def _assert_archive_hides_internal_model_summary_identifiers(
+    archive_bytes: bytes,
+) -> tuple[dict[str, object], dict[str, object]]:
+    members = _archive_member_texts(archive_bytes)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+
+    for task_payload in (metadata["task"], trace["task"]):
+        model_summary = task_payload["model_summary"]
+        assert model_summary["provider"] == "deepseek"
+        assert model_summary["nested"]["safe"] == "kept"
+        assert model_summary["endpoint"] == "limra_internal_value_redacted"
+        assert model_summary["nested"]["warning"] == "limra_internal_value_redacted"
+
+    serialized = json.dumps(
+        {
+            "metadata": metadata,
+            "trace": trace,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "runner_task_id",
+        "runner-task-secret",
+        "object_key",
+        "archive_object_key",
+        "limra/users/hash",
+        "http://10.20.30.40:8091",
+        "/mirothinker/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(serialized)
+    return metadata, trace
 
 
 def _parse_sse_chunks(chunks):

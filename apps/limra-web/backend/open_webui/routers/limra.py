@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover - exercised only when imported without dep
 
 ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
 ARCHIVE_MEMBERS = set(ARCHIVE_MEMBER_ORDER)
+ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 LIMRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
     "/mirothinker/",
@@ -3380,7 +3381,18 @@ async def _load_or_create_persisted_archive(
                 task=task,
             )
             if reuse_failure is None:
-                return archive_bytes
+                public_archive_bytes = _scrub_archive_zip(archive_bytes)
+                validate_archive_zip(public_archive_bytes)
+                if public_archive_bytes != archive_bytes:
+                    await _store_persisted_archive_bytes(
+                        task,
+                        user=user,
+                        repo=repo,
+                        object_storage=object_storage,
+                        object_key=task.archive_object_key,
+                        archive_bytes=public_archive_bytes,
+                    )
+                return public_archive_bytes
             log.warning(
                 "Persisted limra archive object failed validation; regenerating",
                 extra={
@@ -3418,6 +3430,26 @@ async def _load_or_create_persisted_archive(
         filename="archive.zip",
         object_id=task.task_id,
     )
+    await _store_persisted_archive_bytes(
+        task,
+        user=user,
+        repo=repo,
+        object_storage=object_storage,
+        object_key=object_key,
+        archive_bytes=archive_bytes,
+    )
+    return archive_bytes
+
+
+async def _store_persisted_archive_bytes(
+    task: LimraTask,
+    *,
+    user: LimraUser,
+    repo: LimraTaskRepository,
+    object_storage: LimraObjectStorage,
+    object_key: str,
+    archive_bytes: bytes,
+) -> LimraStoredObject:
     stored = await object_storage.put_object(
         object_key=object_key,
         data=archive_bytes,
@@ -3437,9 +3469,10 @@ async def _load_or_create_persisted_archive(
         archive_object_key=stored.object_key,
         archive_zip_sha256=stored.sha256,
     )
+    task.archive_status = "ready"
     task.archive_object_key = stored.object_key
     task.archive_zip_sha256 = stored.sha256
-    return archive_bytes
+    return stored
 
 
 def _persisted_archive_reuse_failure_reason(
@@ -3642,15 +3675,15 @@ def _build_persisted_archive_zip(
         "uploaded_documents": [document.public_dict() for document in documents],
     }
     members = {
-        "metadata.json": _archive_json_text(metadata),
+        "metadata.json": _archive_json_text(metadata, member_name="metadata.json"),
         "report.html": str(scrub_limra_secrets(report_html)),
         "report.md": str(scrub_limra_secrets(report_markdown)),
-        "trace.json": _archive_json_text(trace),
+        "trace.json": _archive_json_text(trace, member_name="trace.json"),
     }
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for member_name in ARCHIVE_MEMBER_ORDER:
-            archive.writestr(member_name, members[member_name])
+            _write_archive_member(archive, member_name, members[member_name])
     return output.getvalue()
 
 
@@ -3698,10 +3731,29 @@ def _archive_report_markdown(
     )
 
 
-def _archive_json_text(value: Any) -> str:
+def _archive_json_text(value: Any, *, member_name: str | None = None) -> str:
     scrubbed = scrub_limra_secrets(value)
+    if member_name is not None:
+        scrubbed = _public_archive_member_payload(member_name, scrubbed)
     scrubbed = json.loads(json.dumps(scrubbed, ensure_ascii=False, default=str))
     return json.dumps(scrubbed, ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def _public_archive_member_payload(member_name: str, payload: Any) -> Any:
+    if member_name not in {"metadata.json", "trace.json"}:
+        return payload
+    if not isinstance(payload, Mapping):
+        return payload
+    public_payload = dict(payload)
+    task_payload = public_payload.get("task")
+    if isinstance(task_payload, Mapping):
+        public_task = dict(task_payload)
+        if "model_summary" in public_task:
+            public_task["model_summary"] = _public_model_summary(
+                public_task.get("model_summary") or {}
+            )
+        public_payload["task"] = public_task
+    return public_payload
 
 
 def validate_archive_zip(archive_bytes: bytes) -> None:
@@ -3724,22 +3776,36 @@ def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
                 for member_name in ARCHIVE_MEMBER_ORDER:
                     raw_member = source.read(member_name)
                     try:
-                        scrubbed = _scrub_archive_member_text(raw_member)
-                        target.writestr(member_name, scrubbed.encode("utf-8"))
+                        scrubbed = _scrub_archive_member_text(member_name, raw_member)
+                        _write_archive_member(
+                            target,
+                            member_name,
+                            scrubbed.encode("utf-8"),
+                        )
                     except UnicodeDecodeError:
-                        target.writestr(member_name, raw_member)
+                        _write_archive_member(target, member_name, raw_member)
     except (KeyError, zipfile.BadZipFile) as exc:
         raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
     return output.getvalue()
 
 
-def _scrub_archive_member_text(raw_member: bytes) -> str:
+def _write_archive_member(
+    archive: zipfile.ZipFile,
+    member_name: str,
+    data: str | bytes,
+) -> None:
+    member = zipfile.ZipInfo(member_name, date_time=ARCHIVE_MEMBER_TIMESTAMP)
+    member.compress_type = zipfile.ZIP_DEFLATED
+    archive.writestr(member, data)
+
+
+def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
     text = raw_member.decode("utf-8")
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
         return _scrub_secret_text(text)
-    return json.dumps(scrub_limra_secrets(payload), ensure_ascii=False)
+    return _archive_json_text(payload, member_name=member_name)
 
 
 def _get_owned_task(
