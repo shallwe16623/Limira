@@ -84,6 +84,8 @@ const state = {
 	query: '',
 	taskId: '',
 	status: 'ready',
+	archiveStatus: 'pending',
+	archiveDownloadUrl: '',
 	activeTab: '证据',
 	isSubmitting: false,
 	isUploading: false,
@@ -270,6 +272,8 @@ async function resumeWorkspace() {
 			'error',
 			`无法从后端恢复上次任务：${errorMessage(error)}`
 		);
+		state.archiveStatus = 'pending';
+		state.archiveDownloadUrl = '';
 		await loadUploads();
 	}
 }
@@ -280,6 +284,7 @@ async function refreshTask() {
 	}
 	const task = await api(`/api/limra/tasks/${encodeURIComponent(state.taskId)}`);
 	state.status = task.status || state.status;
+	updateArchiveState(task);
 	saveWorkspace();
 	renderStatus();
 }
@@ -306,10 +311,12 @@ function restoreWorkspace() {
 	state.savedUserId = typeof saved.userId === 'string' ? saved.userId : '';
 	state.taskId = typeof saved.taskId === 'string' ? saved.taskId : '';
 	state.status = typeof saved.status === 'string' ? saved.status : 'ready';
+	state.archiveStatus = typeof saved.archiveStatus === 'string' ? saved.archiveStatus : 'pending';
+	state.archiveDownloadUrl = safeArchiveDownloadUrl(saved.archiveDownloadUrl, state.taskId);
 	state.activeTab = tabs.includes(saved.activeTab)
 		? saved.activeTab
 		: LEGACY_TAB_LABELS[saved.activeTab] || '证据';
-	state.latestReport = saved.latestReport && typeof saved.latestReport === 'object' ? saved.latestReport : null;
+	state.latestReport = normalizeGeneratedReport(saved.latestReport);
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
 	state.events = Array.isArray(saved.events) ? saved.events : [];
@@ -324,6 +331,8 @@ function saveWorkspace() {
 		selectedScenario: state.selectedScenario,
 		taskId: state.taskId,
 		status: state.status,
+		archiveStatus: state.archiveStatus,
+		archiveDownloadUrl: state.archiveDownloadUrl,
 		activeTab: state.activeTab,
 		latestReport: state.latestReport,
 		finalReportText: state.finalReportText,
@@ -358,6 +367,8 @@ function resetWorkspaceState() {
 	state.savedUserId = state.user?.id || '';
 	state.taskId = '';
 	state.status = 'ready';
+	state.archiveStatus = 'pending';
+	state.archiveDownloadUrl = '';
 	state.activeTab = '证据';
 	state.latestReport = null;
 	state.finalReportText = '';
@@ -434,6 +445,8 @@ async function submitResearch() {
 	state.isSubmitting = true;
 	state.status = 'starting';
 	state.taskId = '';
+	state.archiveStatus = 'pending';
+	state.archiveDownloadUrl = '';
 	state.latestReport = null;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
@@ -453,6 +466,7 @@ async function submitResearch() {
 		});
 		state.taskId = task.task_id || '';
 		state.status = task.status || 'queued';
+		updateArchiveState(task);
 		state.savedUserId = state.user?.id || state.savedUserId;
 		dom.queryInput.value = '';
 		addMessage('assistant', `研究任务 ${state.taskId || '已创建'}：${statusLabel(state.status)}。`);
@@ -496,6 +510,9 @@ function handleStreamEvent(payload) {
 				: {};
 	const nested = data.data && typeof data.data === 'object' ? data.data : {};
 	const status = payload.status || data.status || nested.status;
+	updateArchiveState(payload);
+	updateArchiveState(data);
+	updateArchiveState(nested);
 
 	recordEvent(eventType, payload);
 
@@ -670,7 +687,7 @@ async function exportPdf() {
 				evidence_refs: reportEvidenceRefs()
 			}
 		});
-		state.latestReport = report;
+		state.latestReport = normalizeGeneratedReport(report);
 		dom.reportMessage.textContent = 'PDF 已生成。';
 		saveWorkspace();
 		renderReportControls();
@@ -678,6 +695,7 @@ async function exportPdf() {
 		dom.reportMessage.textContent = `PDF 导出失败：${errorMessage(error)}`;
 	} finally {
 		state.isExporting = false;
+		renderReportControls();
 	}
 }
 
@@ -685,24 +703,30 @@ function downloadPdf() {
 	if (!state.taskId || !state.latestReport?.report_id) {
 		return;
 	}
-	window.location.href =
-		state.latestReport.pdf_url ||
-		`/api/limra/tasks/${encodeURIComponent(state.taskId)}/reports/${encodeURIComponent(
-			state.latestReport.report_id
-		)}/pdf`;
+	const url = reportPdfUrl(state.latestReport);
+	if (!url) {
+		dom.reportMessage.textContent = '当前任务没有可下载的 PDF。';
+		return;
+	}
+	window.location.href = url;
 }
 
 function downloadArchive() {
-	if (state.taskId) {
-		window.location.href = `/api/limra/tasks/${encodeURIComponent(state.taskId)}/archive.zip`;
+	if (state.archiveStatus === 'ready' && state.archiveDownloadUrl) {
+		window.location.href = state.archiveDownloadUrl;
+		return;
 	}
+	dom.reportMessage.textContent =
+		state.archiveStatus === 'failed' ? '归档生成失败，暂时无法下载。' : '归档尚未生成完成。';
 }
 
 function renderStatus() {
 	dom.statusLabel.textContent = statusLabel(state.status);
-	dom.taskLabel.textContent = state.taskId ? `任务 ${state.taskId}` : '暂无任务';
+	dom.taskLabel.textContent = state.taskId
+		? `任务 ${state.taskId} · 归档${archiveStatusLabel(state.archiveStatus)}`
+		: '暂无任务';
 	dom.submitResearchButton.disabled = state.isSubmitting;
-	dom.downloadArchiveButton.disabled = !state.taskId;
+	dom.downloadArchiveButton.disabled = !(state.archiveStatus === 'ready' && state.archiveDownloadUrl);
 }
 
 function renderMessages() {
@@ -1102,7 +1126,69 @@ function renderUploads() {
 function renderReportControls() {
 	const hasMarkdown = Boolean(reportMarkdown().trim());
 	dom.exportPdfButton.disabled = !state.taskId || !hasMarkdown || state.isExporting;
-	dom.downloadPdfButton.disabled = !state.latestReport?.report_id;
+	dom.downloadPdfButton.disabled = !reportPdfUrl(state.latestReport);
+}
+
+function updateArchiveState(source) {
+	if (!source || typeof source !== 'object') {
+		return;
+	}
+	const archiveStatus = source.archive_status || source.archiveStatus;
+	if (archiveStatus) {
+		state.archiveStatus = String(archiveStatus);
+	}
+	const safeUrl = safeArchiveDownloadUrl(source.download_url || source.archive_download_url, state.taskId);
+	if (safeUrl) {
+		state.archiveDownloadUrl = safeUrl;
+	} else if (state.archiveStatus === 'ready' && state.taskId) {
+		state.archiveDownloadUrl = defaultArchiveDownloadUrl(state.taskId);
+	} else if (archiveStatus && state.archiveStatus !== 'ready') {
+		state.archiveDownloadUrl = '';
+	}
+}
+
+function defaultArchiveDownloadUrl(taskId) {
+	return taskId ? `/api/limra/tasks/${encodeURIComponent(taskId)}/archive.zip` : '';
+}
+
+function safeArchiveDownloadUrl(value, taskId) {
+	const expected = defaultArchiveDownloadUrl(taskId);
+	return String(value || '').trim() === expected ? expected : '';
+}
+
+function normalizeGeneratedReport(report) {
+	if (!report || typeof report !== 'object' || !state.taskId) {
+		return null;
+	}
+	const reportId = String(report.report_id || '').trim();
+	const taskId = String(report.task_id || '').trim();
+	if (!reportId || taskId !== state.taskId) {
+		return null;
+	}
+	return {
+		...report,
+		task_id: taskId,
+		report_id: reportId,
+		pdf_url: safeReportPdfUrl(report.pdf_url, taskId, reportId)
+	};
+}
+
+function reportPdfUrl(report) {
+	const normalized = normalizeGeneratedReport(report);
+	if (!normalized) {
+		return '';
+	}
+	return (
+		normalized.pdf_url ||
+		`/api/limra/tasks/${encodeURIComponent(normalized.task_id)}/reports/${encodeURIComponent(
+			normalized.report_id
+		)}/pdf`
+	);
+}
+
+function safeReportPdfUrl(value, taskId, reportId) {
+	const expected = `/api/limra/tasks/${encodeURIComponent(taskId)}/reports/${encodeURIComponent(reportId)}/pdf`;
+	return String(value || '').trim() === expected ? expected : '';
 }
 
 function renderEvents() {
@@ -1327,6 +1413,16 @@ function formatBytes(value) {
 
 function statusLabel(status) {
 	return STATUS_LABELS[String(status || '').toLowerCase()] || String(status || '未知');
+}
+
+function archiveStatusLabel(status) {
+	const labels = {
+		pending: '未就绪',
+		running: '生成中',
+		ready: '已就绪',
+		failed: '失败'
+	};
+	return labels[String(status || '').toLowerCase()] || statusLabel(status);
 }
 
 function roleLabel(role) {

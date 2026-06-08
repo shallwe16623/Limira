@@ -344,6 +344,195 @@ def test_limra_standalone_frontend_sanitizes_external_links():
     assert 'rel="noopener noreferrer"' in checks["markdownLink"]
 
 
+def test_limra_standalone_frontend_respects_archive_and_pdf_readiness():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    app = LIMRA_STANDALONE_ROOT / "public" / "app.js"
+    script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const source = fs.readFileSync({str(app)!r}, 'utf8');
+        const storage = new Map();
+        function element() {{
+            return {{
+                textContent: '',
+                disabled: false,
+                innerHTML: '',
+                scrollTop: 0,
+                scrollHeight: 0,
+                classList: {{ toggle() {{}}, add() {{}}, remove() {{}} }},
+                parentElement: {{ classList: {{ toggle() {{}} }} }},
+                addEventListener() {{}},
+                querySelectorAll: () => []
+            }};
+        }}
+        const context = {{
+            console,
+            URL,
+            element,
+            FormData: class FormData {{}},
+            Headers: class Headers {{
+                set() {{}}
+            }},
+            EventSource: class EventSource {{}},
+            fetch: async () => ({{ ok: true, headers: new Map(), text: async () => '{{}}' }}),
+            localStorage: {{
+                getItem: (key) => storage.get(key) || '',
+                setItem: (key, value) => storage.set(key, String(value)),
+                removeItem: (key) => storage.delete(key)
+            }},
+            window: {{
+                location: {{ href: 'http://127.0.0.1/' }},
+                setTimeout: () => 0
+            }},
+            document: {{
+                addEventListener: () => {{}},
+                querySelectorAll: () => []
+            }}
+        }};
+        vm.createContext(context);
+        vm.runInContext(source, context);
+        vm.runInContext(`
+            Object.assign(dom, {{
+                statusLabel: element(),
+                taskLabel: element(),
+                submitResearchButton: element(),
+                downloadArchiveButton: element(),
+                reportMessage: element(),
+                exportPdfButton: element(),
+                downloadPdfButton: element(),
+                messageList: element(),
+                eventLog: element(),
+                artifactContent: element()
+            }});
+
+            state.taskId = 'task-pending';
+            state.status = 'running';
+            state.archiveStatus = 'pending';
+            state.archiveDownloadUrl = '';
+            renderStatus();
+            const pendingDisabled = dom.downloadArchiveButton.disabled;
+            const beforePendingHref = window.location.href;
+            downloadArchive();
+            const pendingHrefUnchanged = window.location.href === beforePendingHref;
+            const pendingMessage = dom.reportMessage.textContent;
+
+            state.archiveStatus = 'failed';
+            state.archiveDownloadUrl = '';
+            renderStatus();
+            const failedDisabled = dom.downloadArchiveButton.disabled;
+            const beforeFailedHref = window.location.href;
+            downloadArchive();
+            const failedHrefUnchanged = window.location.href === beforeFailedHref;
+            const failedMessage = dom.reportMessage.textContent;
+
+            handleStreamEvent({{
+                event: 'status',
+                data: {{
+                    status: 'completed',
+                    archive_status: 'ready',
+                    download_url: '/api/limra/tasks/task-pending/archive.zip'
+                }}
+            }});
+            const readyDisabled = dom.downloadArchiveButton.disabled;
+            downloadArchive();
+            const readyHref = window.location.href;
+
+            state.taskId = 'task-unsafe';
+            state.archiveStatus = 'pending';
+            state.archiveDownloadUrl = '';
+            handleStreamEvent({{
+                event: 'status',
+                data: {{
+                    archive_status: 'ready',
+                    download_url: 'https://evil.test/archive.zip'
+                }}
+            }});
+            const unsafeArchiveUrl = state.archiveDownloadUrl;
+
+            localStorage.setItem(
+                STORAGE_KEY,
+                JSON.stringify({{
+                    taskId: 'task-restore',
+                    status: 'completed',
+                    archiveStatus: 'ready',
+                    archiveDownloadUrl: '/api/limra/tasks/task-restore/archive.zip',
+                    latestReport: {{
+                        task_id: 'task-other',
+                        report_id: 'report-old',
+                        pdf_url: '/api/limra/tasks/task-other/reports/report-old/pdf'
+                    }}
+                }})
+            );
+            restoreWorkspace();
+            const restoredArchiveUrl = state.archiveDownloadUrl;
+            const restoredLatestReport = state.latestReport;
+
+            state.taskId = 'task-pdf';
+            state.latestReport = normalizeGeneratedReport({{
+                task_id: 'task-pdf',
+                report_id: 'report-1',
+                pdf_url: 'https://evil.test/report.pdf'
+            }});
+            const pdfFallbackUrl = reportPdfUrl(state.latestReport);
+            downloadPdf();
+            const pdfHref = window.location.href;
+
+            state.latestReport = normalizeGeneratedReport({{
+                task_id: 'task-other',
+                report_id: 'report-stale',
+                pdf_url: '/api/limra/tasks/task-other/reports/report-stale/pdf'
+            }});
+            renderReportControls();
+            const stalePdfDisabled = dom.downloadPdfButton.disabled;
+
+            this.__limraReadinessChecks = {{
+                pendingDisabled,
+                pendingHrefUnchanged,
+                pendingMessage,
+                failedDisabled,
+                failedHrefUnchanged,
+                failedMessage,
+                readyDisabled,
+                readyHref,
+                unsafeArchiveUrl,
+                restoredArchiveUrl,
+                restoredLatestReport,
+                pdfFallbackUrl,
+                pdfHref,
+                stalePdfDisabled
+            }};
+        `, context);
+        process.stdout.write(JSON.stringify(context.__limraReadinessChecks));
+    """
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    checks = json.loads(result.stdout)
+
+    assert checks["pendingDisabled"] is True
+    assert checks["pendingHrefUnchanged"] is True
+    assert "尚未" in checks["pendingMessage"]
+    assert checks["failedDisabled"] is True
+    assert checks["failedHrefUnchanged"] is True
+    assert "失败" in checks["failedMessage"]
+    assert checks["readyDisabled"] is False
+    assert checks["readyHref"] == "/api/limra/tasks/task-pending/archive.zip"
+    assert checks["unsafeArchiveUrl"] == "/api/limra/tasks/task-unsafe/archive.zip"
+    assert checks["restoredArchiveUrl"] == "/api/limra/tasks/task-restore/archive.zip"
+    assert checks["restoredLatestReport"] is None
+    assert checks["pdfFallbackUrl"] == "/api/limra/tasks/task-pdf/reports/report-1/pdf"
+    assert checks["pdfHref"] == "/api/limra/tasks/task-pdf/reports/report-1/pdf"
+    assert checks["stalePdfDisabled"] is True
+
+
 def test_limra_research_page_has_demo_scenario_selector():
     page = _read(LIMRA_PAGE)
 
