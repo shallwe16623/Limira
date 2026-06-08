@@ -385,6 +385,30 @@ def test_limra_stream_handler_reads_nested_status_and_closes_terminal_events():
     assert "void refreshTask(id);" in page
 
 
+def test_limra_stream_handler_refreshes_all_first_class_artifact_events():
+    page = _read(LIMRA_PAGE)
+
+    assert "const artifactRefreshEventTypes = new Set([" in page
+    for event_type in [
+        "'evidence_collected'",
+        "'entity_extracted'",
+        "'relation_extracted'",
+        "'timeline_event_added'",
+        "'map_feature_added'",
+        "'verification_result'",
+        "'report_section_generated'",
+    ]:
+        assert event_type in page
+
+    assert "const isArtifactEvent = (eventType: string) => artifactRefreshEventTypes.has(eventType);" in page
+    assert "if (isArtifactEvent(eventType))" in page
+    assert page.count("void loadArtifacts(id);") >= 2
+    assert "eventType.includes('evidence')" not in page
+    assert "eventType.includes('entity')" not in page
+    assert "eventType.includes('timeline')" not in page
+    assert "eventType.includes('report')" not in page
+
+
 def test_limra_graph_and_map_use_required_frontend_libraries_with_empty_states():
     page = _read(LIMRA_PAGE)
 

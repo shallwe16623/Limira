@@ -62,6 +62,15 @@
 
 	const artifactTabs: ArtifactTab[] = ['Evidence', 'Entities', 'Graph', 'Timeline', 'Map', 'Report'];
 	const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
+	const artifactRefreshEventTypes = new Set([
+		'evidence_collected',
+		'entity_extracted',
+		'relation_extracted',
+		'timeline_event_added',
+		'map_feature_added',
+		'verification_result',
+		'report_section_generated'
+	]);
 	const supportedMapGeometryTypes = new Set([
 		'Point',
 		'MultiPoint',
@@ -334,11 +343,7 @@
 		};
 	};
 
-	const isArtifactEvent = (eventType: string) =>
-		eventType.includes('evidence') ||
-		eventType.includes('entity') ||
-		eventType.includes('timeline') ||
-		eventType.includes('report');
+	const isArtifactEvent = (eventType: string) => artifactRefreshEventTypes.has(eventType);
 
 	const isTerminalStatus = (value: unknown) => typeof value === 'string' && terminalStatuses.has(value);
 
