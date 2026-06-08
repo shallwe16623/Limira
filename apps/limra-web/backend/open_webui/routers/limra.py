@@ -94,6 +94,18 @@ OBJECT_KEY_FORBIDDEN_FIELDS = {
     "minioObjectKey",
 }
 OBJECT_KEY_CATEGORIES = {"uploads", "reports", "archives", "media"}
+OBJECT_METADATA_SIDECAR_SUFFIX = ".metadata.json"
+UPLOAD_ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+}
+UPLOAD_GENERIC_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "binary/octet-stream",
+}
 OBJECT_KEY_ALLOWED_EXTENSIONS = {
     ".bin",
     ".csv",
@@ -1292,9 +1304,8 @@ class FileSystemLimraObjectStorage:
             raise FileNotFoundError(object_key) from exc
 
     def _object_path(self, object_key: str) -> str:
-        if not object_key or object_key.startswith("/") or "/../" in f"/{object_key}/":
-            raise ValueError("invalid_limra_object_key")
-        object_path = os.path.abspath(os.path.join(self.root_path, *object_key.split("/")))
+        safe_object_key = validate_limra_object_key(object_key)
+        object_path = os.path.abspath(os.path.join(self.root_path, *safe_object_key.split("/")))
         if object_path != self.root_path and not object_path.startswith(f"{self.root_path}{os.sep}"):
             raise ValueError("invalid_limra_object_key")
         return object_path
@@ -3127,7 +3138,8 @@ async def download_uploaded_document(
         headers={
             "Content-Disposition": _content_disposition_attachment(
                 document.original_filename
-            )
+            ),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -3233,7 +3245,8 @@ async def download_task_report_pdf(
         headers={
             "Content-Disposition": _content_disposition_attachment(
                 f"{report.report_id}.pdf"
-            )
+            ),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -3259,7 +3272,10 @@ async def _download_archive(
     return Response(
         archive_bytes,
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="archive.zip"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -3562,6 +3578,10 @@ async def _limra_event_stream(
                 current_agent_name = str(event_payload.get("agent_name") or "")
             elif event.get("type") == "end_of_agent":
                 current_agent_name = None
+            event = _scrub_final_show_text_event(
+                event,
+                current_agent_name=current_agent_name,
+            )
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
@@ -3988,19 +4008,22 @@ def _record_final_show_text_report_from_event(
     markdown = _show_text_markdown(payload.get("tool_input"))
     if not markdown:
         return None
+    scrubbed_markdown = str(scrub_limra_secrets(markdown)).strip()
+    if not scrubbed_markdown:
+        return None
     artifacts = repo.get_artifacts(task.task_id)
     for section in artifacts.get("report_sections", []):
         if (
             section.get("source_event_type") == "final_summary_show_text"
-            and str(section.get("markdown") or "").strip() == markdown
+            and str(section.get("markdown") or "").strip() == scrubbed_markdown
         ):
             return None
     artifact = {
         "artifact_type": "report_section",
         "title": "最终回答",
-        "markdown": markdown,
+        "markdown": scrubbed_markdown,
         "source_event_type": "final_summary_show_text",
-        "evidence_refs": _evidence_refs_from_markdown(markdown),
+        "evidence_refs": _evidence_refs_from_markdown(scrubbed_markdown),
     }
     _ensure_artifact_id(repo, task.task_id, "report_section", artifact)
     repo.record_artifact(task.task_id, "report_section", artifact)
@@ -4009,6 +4032,23 @@ def _record_final_show_text_report_from_event(
         "type": "report_section_generated",
         "payload": artifact,
     }
+
+
+def _scrub_final_show_text_event(
+    event: dict[str, Any],
+    *,
+    current_agent_name: str | None,
+) -> dict[str, Any]:
+    if current_agent_name != "Final Summary" or event.get("type") != "tool_call":
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("tool_name") != "show_text":
+        return event
+    scrubbed_event = dict(event)
+    scrubbed_payload = dict(payload)
+    scrubbed_payload["tool_input"] = scrub_limra_secrets(payload.get("tool_input"))
+    scrubbed_event["payload"] = scrubbed_payload
+    return scrubbed_event
 
 
 def _show_text_markdown(tool_input: Any) -> str:
@@ -4827,8 +4867,7 @@ def _stored_object(
     content_type: str,
     metadata: Mapping[str, Any] | None,
 ) -> LimraStoredObject:
-    if not object_key or object_key.startswith("/") or "/../" in f"/{object_key}/":
-        raise ValueError("invalid_limra_object_key")
+    object_key = validate_limra_object_key(object_key)
     data_bytes = bytes(data)
     return LimraStoredObject(
         object_key=object_key,
@@ -4838,6 +4877,20 @@ def _stored_object(
         sha256=hashlib.sha256(data_bytes).hexdigest(),
         metadata=_object_metadata(metadata or {}),
     )
+
+
+def validate_limra_object_key(object_key: str) -> str:
+    if not isinstance(object_key, str):
+        raise ValueError("invalid_limra_object_key")
+    object_key = object_key.strip()
+    if not object_key or object_key.startswith("/") or "\\" in object_key:
+        raise ValueError("invalid_limra_object_key")
+    segments = object_key.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise ValueError("invalid_limra_object_key")
+    if any(segment.endswith(OBJECT_METADATA_SIDECAR_SUFFIX) for segment in segments):
+        raise ValueError("invalid_limra_object_key")
+    return object_key
 
 
 def _object_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
@@ -5076,8 +5129,10 @@ def _link_evidence_refs(body: str, evidence_refs: list[str]) -> str:
 
 def _uploaded_content_type(content_type: str | None, filename: str) -> str:
     normalized = (content_type or "").split(";", 1)[0].strip().lower()
-    if normalized:
+    if normalized in UPLOAD_ALLOWED_CONTENT_TYPES:
         return normalized
+    if normalized not in UPLOAD_GENERIC_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail="unsupported_upload_type")
     lower_name = filename.lower()
     if lower_name.endswith(".pdf"):
         return "application/pdf"
@@ -5087,7 +5142,7 @@ def _uploaded_content_type(content_type: str | None, filename: str) -> str:
         return "text/csv"
     if lower_name.endswith(".txt"):
         return "text/plain"
-    return "application/octet-stream"
+    raise HTTPException(status_code=415, detail="unsupported_upload_type")
 
 
 def _extract_uploaded_document_text(
@@ -5096,10 +5151,9 @@ def _extract_uploaded_document_text(
     filename: str,
     content_type: str,
 ) -> str:
-    lower_name = filename.lower()
-    if content_type == "application/pdf" or lower_name.endswith(".pdf"):
+    if content_type == "application/pdf":
         return _extract_pdf_text(data)
-    if content_type.startswith("text/") or lower_name.endswith((".txt", ".md", ".csv")):
+    if content_type in {"text/plain", "text/markdown", "text/csv"}:
         return _decode_text_upload(data)
     raise HTTPException(status_code=415, detail="unsupported_upload_type")
 

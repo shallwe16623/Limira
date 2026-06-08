@@ -254,6 +254,7 @@ async def test_user_isolation_for_task_status_and_archive_download():
     )
 
     assert response.media_type == "application/zip"
+    assert response.headers["x-content-type-options"] == "nosniff"
     assert zipfile.ZipFile(io.BytesIO(response.body)).namelist() == [
         "metadata.json",
         "report.html",
@@ -759,6 +760,36 @@ async def test_filesystem_object_storage_persists_objects_across_instances(tmp_p
     assert await restored.get_object(object_key=stored.object_key) == b"%PDF-test"
 
 
+@pytest.mark.asyncio
+async def test_filesystem_object_storage_rejects_unsafe_object_keys(tmp_path):
+    storage = limra.FileSystemLimraObjectStorage(root_path=str(tmp_path), bucket="local")
+    unsafe_keys = [
+        "",
+        "/absolute/object.txt",
+        "../outside.txt",
+        "limra/users/u/../secret.txt",
+        "limra/users/u/a/../../secret.txt",
+        "limra/users/u/./object.txt",
+        "limra/users/u//object.txt",
+        "limra\\users\\u\\object.txt",
+        "limra/users/u/object.metadata.json",
+        "limra/users/u/object.metadata.json/nested.txt",
+    ]
+
+    for object_key in unsafe_keys:
+        with pytest.raises(ValueError, match="invalid_limra_object_key"):
+            await storage.put_object(
+                object_key=object_key,
+                data=b"unsafe",
+                content_type="text/plain",
+                metadata={"document_id": "doc-a"},
+            )
+        with pytest.raises(ValueError, match="invalid_limra_object_key"):
+            await storage.get_object(object_key=object_key)
+
+    assert [path.name for path in tmp_path.iterdir()] == []
+
+
 def test_limra_upload_embedding_config_defaults_disabled_and_validates_enabled():
     config = limra.create_limra_upload_embedding_config_from_env({})
     assert config == limra.LimraUploadEmbeddingConfig(
@@ -981,6 +1012,54 @@ async def test_upload_route_stores_text_original_and_document_record():
     assert stored["metadata"]["document_id"] == document.document_id
     assert stored["metadata"]["owner_user_id"] == "user-a"
     _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
+async def test_upload_route_rejects_active_or_unsupported_content_types():
+    app, repo, storage = _limra_asgi_app()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        for filename, content_type in [
+            ("active.html", "text/html; charset=utf-8"),
+            ("active.svg", "image/svg+xml"),
+            ("active.xml", "application/xml"),
+            ("active.js", "application/javascript"),
+            ("unknown.bin", "application/octet-stream"),
+        ]:
+            response = await client.post(
+                "/api/limra/uploads",
+                files={
+                    "file": (
+                        filename,
+                        b"<script>alert(1)</script>",
+                        content_type,
+                    )
+                },
+            )
+            assert response.status_code == 415, (filename, content_type)
+            assert response.json()["detail"] == "unsupported_upload_type"
+
+        markdown_response = await client.post(
+            "/api/limra/uploads",
+            files={
+                "file": (
+                    "source.md",
+                    b"# inert markdown",
+                    "application/octet-stream",
+                )
+            },
+        )
+
+    assert markdown_response.status_code == 201
+    assert markdown_response.json()["content_type"] == "text/markdown"
+    assert len(repo.uploaded_documents) == 1
+    assert len(storage.objects) == 1
+    document = next(iter(repo.uploaded_documents.values()))
+    assert document.original_filename == "source.md"
+    assert document.content_type == "text/markdown"
 
 
 @pytest.mark.asyncio
@@ -1294,6 +1373,7 @@ async def test_upload_document_list_read_and_download_are_owner_scoped():
     assert download_response.content == b"linked"
     assert download_response.headers["content-type"].startswith("text/plain")
     assert 'filename="linked.txt"' in download_response.headers["content-disposition"]
+    assert download_response.headers["x-content-type-options"] == "nosniff"
     assert foreign_detail_response.status_code == 404
     assert foreign_download_response.status_code == 404
 
@@ -1767,6 +1847,7 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
     assert download_response.content == pdf_exporter.pdf_bytes
     assert download_response.headers["content-type"].startswith("application/pdf")
     assert 'filename="report-a.pdf"' in download_response.headers["content-disposition"]
+    assert download_response.headers["x-content-type-options"] == "nosniff"
     assert foreign_download_response.status_code == 404
 
 
@@ -2630,6 +2711,11 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
     user = limra.LimraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-finalopenai123456",
+        "Bearer final-bearer-token-123456",
+        "RUNNER_SERVICE_TOKEN=final-runner-token-123456",
+    ]
     research = FakeResearchClient(
         events=[
             {
@@ -2643,7 +2729,11 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
                 "payload": {
                     "tool_name": "show_text",
                     "tool_input": {
-                        "text": "# Final answer\n\nBYD is not on the active list. [EVID-001]"
+                        "text": (
+                            "# Final answer\n\n"
+                            "BYD is not on the active list. [EVID-001]\n\n"
+                            + "\n".join(raw_secret_values)
+                        )
                     },
                 },
             },
@@ -2680,14 +2770,27 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
         "end_of_agent",
         "status",
     ]
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_events
+    assert limra.LIMRA_SECRET_REDACTION in serialized_events
+    assert limra.LIMRA_SECRET_REDACTION in json.dumps(
+        events[1]["payload"]["tool_input"],
+        ensure_ascii=False,
+    )
     report_event = events[2]
     assert report_event["payload"]["title"] == "最终回答"
     assert report_event["payload"]["evidence_refs"] == ["EVID-001"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(report_event, ensure_ascii=False)
 
     artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
     assert len(artifacts["report_sections"]) == 1
     assert artifacts["report_sections"][0]["markdown"].startswith("# Final answer")
     assert artifacts["report_sections"][0]["source_event_type"] == "final_summary_show_text"
+    assert limra.LIMRA_SECRET_REDACTION in artifacts["report_sections"][0]["markdown"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(artifacts, ensure_ascii=False)
 
     archive_response = await limra.download_task_archive(
         task_id,
@@ -2697,6 +2800,10 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
     )
     members = _archive_member_texts(archive_response.body)
     assert "# Final answer" in members["report.md"]
+    assert limra.LIMRA_SECRET_REDACTION in members["report.md"]
+    assert limra.LIMRA_SECRET_REDACTION in members["trace.json"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(members, ensure_ascii=False)
     trace = json.loads(members["trace.json"])
     assert trace["artifact_events"][0]["type"] == "report_section_generated"
     assert trace["artifact_events"][0]["source_event_type"] == "final_summary_show_text"
