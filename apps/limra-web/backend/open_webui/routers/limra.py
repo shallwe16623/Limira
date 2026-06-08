@@ -3960,13 +3960,12 @@ async def _uploaded_document_search_embedding(
     try:
         raw_embedding = await provider.embed_upload_text(query, config=config)
         embedding = [float(value) for value in raw_embedding]
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="upload_search_embedding_failed",
-        ) from exc
+    except Exception:
+        log.warning(
+            "Limra upload search embedding unavailable; falling back to lexical search",
+            extra={"embedding_provider": config.provider},
+        )
+        return None
     if len(embedding) != config.dimensions:
         raise HTTPException(
             status_code=500,

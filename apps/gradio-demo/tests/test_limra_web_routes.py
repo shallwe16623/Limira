@@ -1397,6 +1397,75 @@ async def test_upload_search_uses_configured_embedding_ranking_when_enabled():
 
 
 @pytest.mark.asyncio
+async def test_upload_search_falls_back_to_lexical_when_embedding_provider_fails():
+    app, repo, storage = _limra_asgi_app()
+    provider = FakeFailingUploadEmbeddingProvider(RuntimeError("provider unavailable"))
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=2,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+    repo.record_uploaded_document(
+        document_id="doc-lexical",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="lithium-fallback.txt",
+        content_type="text/plain",
+        byte_size=20,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/user-a/uploads/doc-lexical.txt",
+        extracted_text="Lithium supply memo.",
+        language=None,
+        metadata={},
+        embedding=[0.0, 1.0],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "lithium"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [document["document_id"] for document in payload["documents"]] == [
+        "doc-lexical"
+    ]
+    assert payload["documents"][0]["matched_terms"] == ["lithium"]
+    assert "Lithium supply memo" in payload["documents"][0]["snippet"]
+    assert "embedding" not in json.dumps(payload)
+    assert "object_key" not in json.dumps(payload)
+    assert provider.calls == [
+        {
+            "text": "lithium",
+            "config": limra.LimraUploadEmbeddingConfig(
+                enabled=True,
+                provider="fake",
+                model="fake-model",
+                dimensions=2,
+            ),
+        }
+    ]
+    _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
 async def test_upload_search_rejects_embedding_dimension_mismatch():
     app, repo, storage = _limra_asgi_app()
     provider = FakeUploadEmbeddingProvider([1.0])
@@ -3400,6 +3469,16 @@ class FakeUploadEmbeddingProvider:
     async def embed_upload_text(self, text, *, config):
         self.calls.append({"text": text, "config": config})
         return list(self.embedding)
+
+
+class FakeFailingUploadEmbeddingProvider:
+    def __init__(self, error):
+        self.error = error
+        self.calls = []
+
+    async def embed_upload_text(self, text, *, config):
+        self.calls.append({"text": text, "config": config})
+        raise self.error
 
 
 def _pairs_to_mapping(values):
