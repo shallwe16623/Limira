@@ -4044,6 +4044,93 @@ async def test_event_proxy_shapes_runner_status_and_error_internal_details_befor
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_shapes_non_status_runner_event_internal_error_fields_before_browser_runtime_state():
+    repo = limra.InMemoryLimraTaskRepository()
+    runtime_state = limra.InMemoryLimraRuntimeState()
+    user = limra.LimraUser("user-a")
+    internal_detail = (
+        "progress failed at http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limra/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-progressinternal123456"
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "progress",
+                "payload": {
+                    "status": "failed",
+                    "archive_status": "failed",
+                    "error": internal_detail,
+                    "warning": internal_detail,
+                    "reason": internal_detail,
+                    "data": {
+                        "error": internal_detail,
+                        "warning": internal_detail,
+                        "reason": internal_detail,
+                    },
+                },
+            }
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "progress internal detail shaping"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    task_payload = await limra.get_task(task_id, user=user, repo=repo)
+
+    assert [event["type"] for event in events] == ["progress"]
+    payload = events[0]["payload"]
+    assert payload["error"] == "runner_task_failed"
+    assert payload["warning"] == "runner_status_warning"
+    assert payload["reason"] == "runner_stream_conflict"
+    assert payload["data"]["error"] == "runner_task_failed"
+    assert payload["data"]["warning"] == "runner_status_warning"
+    assert payload["data"]["reason"] == "runner_stream_conflict"
+    assert repo.get_task(task_id).error == "runner_task_failed"
+    assert runtime_snapshot["error"] == "runner_task_failed"
+    assert runtime_snapshot["last_warning"] == "runner_status_warning"
+    assert runtime_snapshot["last_event"]["payload"]["error"] == "runner_task_failed"
+    assert runtime_snapshot["last_event"]["payload"]["data"]["error"] == (
+        "runner_task_failed"
+    )
+    assert task_payload["error"] == "runner_task_failed"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "runtime": runtime_snapshot,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limra/users/hash",
+        "sk-progressinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
 async def test_authoritative_runner_status_scrubs_persisted_terminal_task_error_and_archive_metadata():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()

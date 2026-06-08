@@ -4357,9 +4357,6 @@ def _scrub_runner_event(event: dict[str, Any], *, task_id: str) -> dict[str, Any
 
 
 def _shape_runner_event_public_errors(event: dict[str, Any]) -> dict[str, Any]:
-    event_type = str(event.get("type") or "")
-    if event_type not in {"status", "error"}:
-        return event
     payload = event.get("payload")
     if not isinstance(payload, dict):
         return event
