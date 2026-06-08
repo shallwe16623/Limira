@@ -31,7 +31,6 @@ except Exception:  # pragma: no cover - exercised only when imported without dep
 
 
 ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
-ARCHIVE_MEMBERS = set(ARCHIVE_MEMBER_ORDER)
 ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 LIMRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
@@ -3759,13 +3758,21 @@ def _public_archive_member_payload(member_name: str, payload: Any) -> Any:
 def validate_archive_zip(archive_bytes: bytes) -> None:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-            names = set(archive.namelist())
+            names = archive.namelist()
+            if names != list(ARCHIVE_MEMBER_ORDER):
+                raise HTTPException(status_code=502, detail="invalid_archive_members")
+            if any(name.startswith("/") or ".." in name.split("/") for name in names):
+                raise HTTPException(status_code=502, detail="unsafe_archive_member")
+            for member_name in ARCHIVE_MEMBER_ORDER:
+                try:
+                    archive.read(member_name).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="invalid_archive_member_encoding",
+                    ) from exc
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
-    if names != ARCHIVE_MEMBERS:
-        raise HTTPException(status_code=502, detail="invalid_archive_members")
-    if any(name.startswith("/") or ".." in name.split("/") for name in names):
-        raise HTTPException(status_code=502, detail="unsafe_archive_member")
 
 
 def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
@@ -3783,7 +3790,12 @@ def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
                             scrubbed.encode("utf-8"),
                         )
                     except UnicodeDecodeError:
-                        _write_archive_member(target, member_name, raw_member)
+                        fallback = _archive_member_decode_failure_text(member_name)
+                        _write_archive_member(
+                            target,
+                            member_name,
+                            fallback.encode("utf-8"),
+                        )
     except (KeyError, zipfile.BadZipFile) as exc:
         raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
     return output.getvalue()
@@ -3806,6 +3818,17 @@ def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
     except json.JSONDecodeError:
         return _scrub_secret_text(text)
     return _archive_json_text(payload, member_name=member_name)
+
+
+def _archive_member_decode_failure_text(member_name: str) -> str:
+    if member_name in {"metadata.json", "trace.json"}:
+        return _archive_json_text(
+            {"archive_member_error": "invalid_text_encoding"},
+            member_name=member_name,
+        )
+    if member_name == "report.html":
+        return "<!doctype html><main>Archive member could not be decoded.</main>"
+    return "# limra report\n\nArchive member could not be decoded."
 
 
 def _get_owned_task(

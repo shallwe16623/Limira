@@ -798,6 +798,128 @@ async def test_postgres_archive_download_repairs_reused_persisted_model_summary_
 
 
 @pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_with_undecodable_text_member():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-binary-archive-reuse",
+        owner_user_id=user.id,
+        query="binary archive member",
+        scenario=None,
+        runner_task_id="runner-binary-archive",
+    )
+    raw_archive = _archive_zip_with_undecodable_report_member()
+    with zipfile.ZipFile(io.BytesIO(raw_archive)) as raw_zip:
+        assert b"sk-binarysecret123456" in raw_zip.read("report.html")
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    assert members["metadata.json"]
+    assert "binary archive member" in members["report.md"]
+    combined = "\n".join(members.values())
+    assert "sk-binarysecret123456" not in combined
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_regenerates_reused_archive_with_undecodable_text_member():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task_id = "task-postgres-binary-archive-reuse"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres binary archive member",
+        scenario=None,
+        runner_task_id="runner-postgres-binary-archive",
+    )
+    raw_archive = _archive_zip_with_undecodable_report_member()
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task_id,
+        filename="archive.zip",
+        object_id=task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    combined = "\n".join(_archive_member_texts(response.body).values())
+    assert "postgres binary archive member" in combined
+    assert "sk-binarysecret123456" not in combined
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] == stored.object_key
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == persisted["archive_zip_sha256"]
+    assert repaired["metadata"]["archive_sha256"] == persisted["archive_zip_sha256"]
+
+
+@pytest.mark.asyncio
 async def test_archive_download_regenerates_after_task_scoped_writes():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
@@ -5964,6 +6086,19 @@ def _archive_zip_with_raw_model_summary(
     with zipfile.ZipFile(buffer, "w") as archive:
         for member_name in ("metadata.json", "report.html", "report.md", "trace.json"):
             archive.writestr(member_name, members[member_name])
+    return buffer.getvalue()
+
+
+def _archive_zip_with_undecodable_report_member() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", "{}")
+        archive.writestr(
+            "report.html",
+            b"\xff\xfeOPENAI_API_KEY=sk-binarysecret123456",
+        )
+        archive.writestr("report.md", "# stale report")
+        archive.writestr("trace.json", "{}")
     return buffer.getvalue()
 
 
