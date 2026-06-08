@@ -2143,6 +2143,186 @@ async def test_pdf_download_clears_invalid_persisted_pdf_object_key():
     assert refreshed.metadata == {"source": "cache"}
 
 
+@pytest.mark.asyncio
+async def test_pdf_download_clears_missing_persisted_pdf_object():
+    app, repo, _storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-missing-pdf",
+        owner_user_id="user-a",
+        query="missing pdf",
+        scenario=None,
+        runner_task_id="runner-missing-pdf",
+    )
+    expected_sha = hashlib.sha256(b"expected pdf bytes").hexdigest()
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-missing-pdf",
+        filename="report-missing.pdf",
+        object_id="report-missing",
+    )
+    report = repo.record_generated_report(
+        report_id="report-missing",
+        task_id="task-missing-pdf",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": expected_sha,
+            "pdf_size_bytes": 18,
+            "source": "cache",
+        },
+    )
+
+    assert report.public_dict()["pdf_url"].endswith("/report-missing/pdf")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/tasks/task-missing-pdf/reports/report-missing/pdf"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-missing-pdf",
+        report_id="report-missing",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    public_refreshed = refreshed.public_dict()
+    assert public_refreshed["pdf_url"] is None
+    assert public_refreshed["pdf_sha256"] is None
+    assert public_refreshed["pdf_size_bytes"] is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
+@pytest.mark.asyncio
+async def test_pdf_download_clears_mismatched_persisted_pdf_object():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-mismatch-pdf",
+        owner_user_id="user-a",
+        query="mismatch pdf",
+        scenario=None,
+        runner_task_id="runner-mismatch-pdf",
+    )
+    expected_sha = hashlib.sha256(b"expected pdf bytes").hexdigest()
+    mismatched_bytes = b"not the expected pdf bytes"
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-mismatch-pdf",
+        filename="report-mismatch.pdf",
+        object_id="report-mismatch",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=mismatched_bytes,
+        content_type="application/pdf",
+        metadata={"report_id": "report-mismatch"},
+    )
+    repo.record_generated_report(
+        report_id="report-mismatch",
+        task_id="task-mismatch-pdf",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": expected_sha,
+            "pdf_size_bytes": len(b"expected pdf bytes"),
+            "source": "cache",
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/tasks/task-mismatch-pdf/reports/report-mismatch/pdf"
+        )
+
+    assert response.status_code == 404
+    assert response.content != mismatched_bytes
+    refreshed = repo.get_user_report(
+        task_id="task-mismatch-pdf",
+        report_id="report-mismatch",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
+@pytest.mark.asyncio
+async def test_pdf_download_clears_missing_persisted_pdf_checksum():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-missing-pdf-sha",
+        owner_user_id="user-a",
+        query="missing pdf sha",
+        scenario=None,
+        runner_task_id="runner-missing-pdf-sha",
+    )
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-missing-pdf-sha",
+        filename="report-missing-sha.pdf",
+        object_id="report-missing-sha",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=b"%PDF-1.7\nmissing sha\n%%EOF",
+        content_type="application/pdf",
+        metadata={"report_id": "report-missing-sha"},
+    )
+    report = repo.record_generated_report(
+        report_id="report-missing-sha",
+        task_id="task-missing-pdf-sha",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=[],
+        creator_user_id="user-a",
+        metadata={"source": "cache"},
+    )
+
+    assert report.public_dict()["pdf_url"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/tasks/task-missing-pdf-sha/reports/report-missing-sha/pdf"
+        )
+
+    assert response.status_code == 404
+    refreshed = repo.get_user_report(
+        task_id="task-missing-pdf-sha",
+        report_id="report-missing-sha",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
 def test_report_html_renderer_strips_active_markup_from_markdown():
     rendered_html = limra._render_report_html(
         markdown=(
@@ -2847,6 +3027,142 @@ async def test_postgres_pdf_download_clears_invalid_persisted_pdf_object_key():
     assert refreshed.metadata == {"source": "postgres-cache"}
     persisted = engine.generated_reports[
         ("task-postgres-invalid-pdf-key", "report-postgres-invalid-key")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_missing_persisted_pdf_object():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-missing-pdf",
+        owner_user_id="user-a",
+        query="postgres missing pdf",
+        scenario=None,
+        runner_task_id="runner-postgres-missing-pdf",
+    )
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-postgres-missing-pdf",
+        filename="report-postgres-missing.pdf",
+        object_id="report-postgres-missing",
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-missing",
+        task_id="task-postgres-missing-pdf",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": hashlib.sha256(b"expected pdf bytes").hexdigest(),
+            "pdf_size_bytes": 18,
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_task_report_pdf(
+            "task-postgres-missing-pdf",
+            "report-postgres-missing",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-missing-pdf",
+        report_id="report-postgres-missing",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-missing-pdf", "report-postgres-missing")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_mismatched_persisted_pdf_object():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-mismatch-pdf",
+        owner_user_id="user-a",
+        query="postgres mismatch pdf",
+        scenario=None,
+        runner_task_id="runner-postgres-mismatch-pdf",
+    )
+    expected_sha = hashlib.sha256(b"expected pdf bytes").hexdigest()
+    mismatched_bytes = b"not the expected pdf bytes"
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-postgres-mismatch-pdf",
+        filename="report-postgres-mismatch.pdf",
+        object_id="report-postgres-mismatch",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=mismatched_bytes,
+        content_type="application/pdf",
+        metadata={"report_id": "report-postgres-mismatch"},
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-mismatch",
+        task_id="task-postgres-mismatch-pdf",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": expected_sha,
+            "pdf_size_bytes": len(b"expected pdf bytes"),
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_task_report_pdf(
+            "task-postgres-mismatch-pdf",
+            "report-postgres-mismatch",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-mismatch-pdf",
+        report_id="report-postgres-mismatch",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-mismatch-pdf", "report-postgres-mismatch")
     ]
     assert persisted["pdf_object_key"] is None
 

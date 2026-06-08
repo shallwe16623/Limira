@@ -404,7 +404,10 @@ class LimraGeneratedReport:
 
     def public_dict(self) -> dict[str, Any]:
         metadata = self.metadata or {}
-        has_valid_pdf_object = _is_valid_limra_object_key(self.pdf_object_key)
+        has_valid_pdf_object = _is_valid_report_pdf_metadata(
+            self.pdf_object_key,
+            metadata.get("pdf_sha256"),
+        )
         return {
             "report_id": self.report_id,
             "task_id": self.task_id,
@@ -3244,10 +3247,23 @@ async def download_task_report_pdf(
     try:
         data = await object_storage.get_object(object_key=report.pdf_object_key)
     except FileNotFoundError as exc:
+        _clear_report_pdf_metadata(report, repo=repo)
         raise HTTPException(status_code=404, detail="report_pdf_not_found") from exc
     except ValueError as exc:
         _clear_report_pdf_metadata(report, repo=repo)
         raise HTTPException(status_code=404, detail="report_pdf_not_found") from exc
+    reuse_failure = _persisted_report_pdf_reuse_failure_reason(data, report=report)
+    if reuse_failure is not None:
+        log.warning(
+            "Persisted limra report PDF object failed validation; clearing metadata",
+            extra={
+                "task_id": report.task_id,
+                "report_id": report.report_id,
+                "reason": reuse_failure,
+            },
+        )
+        _clear_report_pdf_metadata(report, repo=repo)
+        raise HTTPException(status_code=404, detail="report_pdf_not_found")
     return Response(
         data,
         media_type="application/pdf",
@@ -3415,6 +3431,24 @@ def _clear_report_pdf_metadata(
     )
     report.pdf_object_key = None
     report.metadata = metadata
+
+
+def _persisted_report_pdf_reuse_failure_reason(
+    pdf_bytes: bytes,
+    *,
+    report: LimraGeneratedReport,
+) -> str | None:
+    metadata = report.metadata or {}
+    expected_sha = metadata.get("pdf_sha256")
+    if not isinstance(expected_sha, str) or not expected_sha.strip():
+        return "pdf_sha_missing"
+    expected_sha = expected_sha.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+        return "pdf_sha_malformed"
+    actual_sha = hashlib.sha256(pdf_bytes).hexdigest()
+    if actual_sha != expected_sha:
+        return "pdf_sha_mismatch"
+    return None
 
 
 def _drop_report_pdf_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -5045,6 +5079,17 @@ def _is_valid_limra_object_key(object_key: str | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_valid_report_pdf_metadata(
+    object_key: str | None,
+    pdf_sha256: Any,
+) -> bool:
+    return (
+        _is_valid_limra_object_key(object_key)
+        and isinstance(pdf_sha256, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", pdf_sha256.strip()) is not None
+    )
 
 
 def _object_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
