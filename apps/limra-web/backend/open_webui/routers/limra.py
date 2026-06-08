@@ -3914,6 +3914,10 @@ async def _limra_event_stream(
             event = _scrub_runner_event(event, task_id=task.task_id)
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
+            if applied_status in FINAL_TASK_STATUSES and isinstance(
+                event.get("payload"), dict
+            ):
+                event["payload"]["terminal"] = True
             warning = _record_artifact_from_event(repo, task, event)
             final_report_event = _record_final_show_text_report_from_event(
                 repo,
@@ -3937,6 +3941,7 @@ async def _limra_event_stream(
                 yield _sse_bytes(_assert_browser_safe(final_report_event))
             if applied_status in FINAL_TASK_STATUSES:
                 stream_close_reason = f"terminal_{applied_status}"
+                break
 
         if not saw_terminal_status:
             status_event = await _authoritative_runner_status_event(
