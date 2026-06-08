@@ -216,6 +216,70 @@ async def test_create_research_records_failed_web_task_when_runner_start_fails()
 
 
 @pytest.mark.asyncio
+async def test_create_research_hides_internal_runner_start_error_details_from_browser_and_task_state():
+    app, repo, _storage = _limra_asgi_app()
+    internal_detail = (
+        "runner create failed at http://10.20.30.40:8091/mirothinker/research "
+        "for limra/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-researchstartinternal123456"
+    )
+
+    class FailingResearchClient(FakeResearchClient):
+        async def create_research_task(self, *, query, scenario, user):
+            self.create_calls.append(
+                {
+                    "query": query,
+                    "scenario": scenario,
+                    "user": user,
+                }
+            )
+            raise HTTPException(status_code=503, detail=internal_detail)
+
+    research = FailingResearchClient()
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limra.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/research",
+            json={"query": "runner start internal detail"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "runner_research_start_failed"
+    assert len(repo.tasks) == 1
+    task = next(iter(repo.tasks.values()))
+    assert task.owner_user_id == "user-a"
+    assert task.status == "failed"
+    assert task.archive_status == "failed"
+    assert task.error == "runner_research_start_failed"
+    assert task.runner_task_id is None
+    serialized = json.dumps(
+        {
+            "response": response.json(),
+            "task": task.public_dict(),
+            "repo_error": task.error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limra/users/hash",
+        "sk-researchstartinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(response.json())
+    _assert_no_browser_leak(task.public_dict())
+
+
+@pytest.mark.asyncio
 async def test_user_isolation_for_task_status_and_archive_download():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()

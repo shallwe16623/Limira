@@ -2895,13 +2895,21 @@ async def create_research_task(
             status=str(runner_payload.get("status") or "queued"),
         )
     except HTTPException as exc:
+        public_detail = _public_error_text(
+            exc.detail,
+            fallback="runner_research_start_failed",
+        ) or "runner_research_start_failed"
         repo.update_task(
             task.task_id,
             status="failed",
             archive_status="failed",
-            error=str(exc.detail),
+            error=public_detail,
         )
-        raise
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=public_detail,
+            headers=getattr(exc, "headers", None),
+        ) from exc
     except Exception as exc:
         repo.update_task(
             task.task_id,
