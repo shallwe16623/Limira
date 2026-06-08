@@ -150,7 +150,7 @@ async def test_create_research_records_failed_web_task_when_runner_start_fails()
 @pytest.mark.asyncio
 async def test_user_isolation_for_task_status_and_archive_download():
     repo = limra.InMemoryLimraTaskRepository()
-    archive = FakeArchiveClient()
+    storage = limra.InMemoryLimraObjectStorage()
     research = FakeResearchClient()
     user_a = limra.LimraUser("user-a")
     user_b = limra.LimraUser("user-b")
@@ -175,7 +175,7 @@ async def test_user_isolation_for_task_status_and_archive_download():
             task_id,
             user=user_b,
             repo=repo,
-            archive_client=archive,
+            object_storage=storage,
         )
     assert forbidden_archive.value.status_code == 404
 
@@ -183,7 +183,7 @@ async def test_user_isolation_for_task_status_and_archive_download():
         task_id,
         user=user_a,
         repo=repo,
-        archive_client=archive,
+        object_storage=storage,
     )
 
     assert response.media_type == "application/zip"
@@ -193,15 +193,32 @@ async def test_user_isolation_for_task_status_and_archive_download():
         "report.md",
         "trace.json",
     ]
-    assert archive.calls[0]["task"].runner_task_id == "runner-task-a"
-    assert archive.calls[0]["user"].id == "user-a"
+    archive_key = repo.tasks[task_id].archive_object_key
+    assert archive_key in storage.objects
+    assert "/tasks/" in archive_key
+    assert "/archives/" in archive_key
+    assert (
+        repo.tasks[task_id].archive_zip_sha256
+        == storage.objects[archive_key]["sha256"]
+    )
+    assert storage.objects[archive_key]["content_type"] == "application/zip"
+    assert storage.objects[archive_key]["metadata"]["task_id"] == task_id
+    assert storage.objects[archive_key]["metadata"]["owner_user_id"] == "user-a"
+    second_response = await limra.download_task_archive(
+        task_id,
+        user=user_a,
+        repo=repo,
+        object_storage=storage,
+    )
+    assert second_response.body == response.body
+    assert len(storage.objects) == 1
     _assert_no_browser_leak(response.body.decode("latin1"))
 
 
 @pytest.mark.asyncio
 async def test_archive_proxy_scrubs_allowed_text_members_before_download():
     repo = limra.InMemoryLimraTaskRepository()
-    archive = FakeArchiveClient(_archive_zip(secret_members=True))
+    storage = limra.InMemoryLimraObjectStorage()
     user = limra.LimraUser("user-a")
     task = repo.create_task(
         task_id="task-secret-archive",
@@ -211,12 +228,40 @@ async def test_archive_proxy_scrubs_allowed_text_members_before_download():
         runner_task_id="runner-secret-archive",
     )
     task.archive_status = "ready"
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "summary": "Authorization: Bearer runner-token-123456",
+            "url": "https://search.test?q=x&token=archive-token-123456",
+        },
+    )
+    repo.record_generated_report(
+        report_id="report-secret",
+        task_id=task.task_id,
+        report_type="final",
+        markdown=(
+            "# report\n"
+            "OPENAI_API_KEY=sk-archiveopenai123456\n"
+            "RUNNER_SERVICE_TOKEN=archive-runner-token-123456\n"
+            "https://api.test/resource?api_key=archive-query-secret-123456"
+        ),
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=["EVID-001"],
+        creator_user_id=user.id,
+        metadata={
+            "cookie": "open_webui_session=session-secret-123456",
+            "deepseek": "DEEPSEEK_API_KEY=sk-tracedeepseek123456",
+        },
+    )
 
     response = await limra.download_task_archive(
         task.task_id,
         user=user,
         repo=repo,
-        archive_client=archive,
+        object_storage=storage,
     )
 
     assert response.media_type == "application/zip"
@@ -231,15 +276,21 @@ async def test_archive_proxy_scrubs_allowed_text_members_before_download():
             scrubbed_archive.read(member).decode("utf-8")
             for member in scrubbed_archive.namelist()
         )
+        metadata = json.loads(scrubbed_archive.read("metadata.json"))
+        trace = json.loads(scrubbed_archive.read("trace.json"))
 
     assert limra.LIMRA_SECRET_REDACTION in combined
     _assert_no_raw_secret(combined)
+    assert metadata["reports"][0]["report_id"] == "report-secret"
+    assert trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-001"
+    assert task.archive_object_key in storage.objects
+    _assert_no_raw_secret(storage.objects[task.archive_object_key]["metadata"])
 
 
 @pytest.mark.asyncio
 async def test_admin_access_requires_explicit_admin_route():
     repo = limra.InMemoryLimraTaskRepository()
-    archive = FakeArchiveClient()
+    storage = limra.InMemoryLimraObjectStorage()
     research = FakeResearchClient()
     user = limra.LimraUser("user-a")
     admin = limra.LimraUser("admin-user", role="admin")
@@ -266,14 +317,16 @@ async def test_admin_access_requires_explicit_admin_route():
         task_id,
         user=admin,
         repo=repo,
-        archive_client=archive,
+        object_storage=storage,
     )
     assert response.media_type == "application/zip"
+    assert repo.tasks[task_id].archive_object_key in storage.objects
 
 
 @pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
     research = FakeResearchClient()
     user = limra.LimraUser("user-a")
     created = await limra.create_research_task(
@@ -290,18 +343,13 @@ async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
             task_id,
             user=user,
             repo=repo,
-            archive_client=FakeArchiveClient(),
+            object_storage=storage,
         )
     assert not_ready.value.status_code == 409
 
     repo.tasks[task_id].archive_status = "ready"
     with pytest.raises(HTTPException) as invalid_zip:
-        await limra.download_task_archive(
-            task_id,
-            user=user,
-            repo=repo,
-            archive_client=FakeArchiveClient(_archive_zip(extra_member=True)),
-        )
+        limra.validate_archive_zip(_archive_zip(extra_member=True))
     assert invalid_zip.value.status_code == 502
 
 
@@ -1159,6 +1207,8 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     assert "st_geomfromgeojson(:geometry_geojson)" in sql
     assert "st_geomfromtext(:geometry_wkt)" in sql
     assert "pdf_object_key" in sql
+    assert "from limra_generated_reports" in sql
+    assert "order by created_at desc" in sql
     assert "returning" in sql
     assert "insert into limra_uploaded_documents" in sql
     assert "object_key" in sql
@@ -1392,6 +1442,9 @@ def test_postgres_repository_records_generated_report_pdf_metadata():
         report_id="report-001",
         owner_user_id="user-b",
     ) is None
+    reports = repo.list_task_reports(task_id="task-report")
+    assert [item.report_id for item in reports] == ["report-001"]
+    assert reports[0].markdown == "Final report [EVID-001]"
 
 
 @pytest.mark.asyncio
@@ -2391,6 +2444,15 @@ class FakeLimraPostgresEngine:
                 [{"owner_user_id": row["owner_user_id"]}] if row else []
             )
 
+        if "update limra_research_tasks" in sql:
+            row = self.tasks.get(params["task_id"])
+            if not row:
+                return FakeLimraPostgresResult([])
+            for key, value in params.items():
+                if key != "task_id":
+                    row[key] = value
+            return FakeLimraPostgresResult([row])
+
         if "from limra_research_tasks" in sql:
             row = self.tasks.get(params["task_id"])
             if row and params.get("owner_user_id") and row["owner_user_id"] != params["owner_user_id"]:
@@ -2464,12 +2526,20 @@ class FakeLimraPostgresEngine:
             self.generated_reports[(params["task_id"], params["report_id"])] = row
             return FakeLimraPostgresResult([row])
 
-        if "from limra_generated_reports" in sql:
+        if "from limra_generated_reports" in sql and "report_id = :report_id" in sql:
             task = self.tasks.get(params["task_id"])
             row = self.generated_reports.get((params["task_id"], params["report_id"]))
             if not task or task["owner_user_id"] != params["owner_user_id"]:
                 row = None
             return FakeLimraPostgresResult([row] if row else [])
+
+        if "from limra_generated_reports" in sql:
+            rows = [
+                row
+                for (task_id, _report_id), row in self.generated_reports.items()
+                if task_id == params["task_id"]
+            ]
+            return FakeLimraPostgresResult(rows)
 
         for table in self.typed_inserts:
             if f"insert into {table}" in sql:

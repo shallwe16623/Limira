@@ -345,6 +345,12 @@ class LimraTaskRepository(Protocol):
         owner_user_id: str,
     ) -> LimraGeneratedReport | None: ...
 
+    def list_task_reports(
+        self,
+        *,
+        task_id: str,
+    ) -> list[LimraGeneratedReport]: ...
+
 
 class RunnerResearchClientProtocol(Protocol):
     async def create_research_task(
@@ -583,6 +589,21 @@ class InMemoryLimraTaskRepository:
         if not task:
             return None
         return self.generated_reports.get((task_id, report_id))
+
+    def list_task_reports(
+        self,
+        *,
+        task_id: str,
+    ) -> list[LimraGeneratedReport]:
+        reports = [
+            report
+            for (report_task_id, _report_id), report in self.generated_reports.items()
+            if report_task_id == task_id
+        ]
+        return sorted(
+            reports,
+            key=lambda report: (report.report_type != "final", report.report_id),
+        )
 
 
 class InMemoryLimraRuntimeState:
@@ -1260,6 +1281,12 @@ class PostgresLimraTaskRepository:
           AND reports.report_id = :report_id
           AND tasks.owner_user_id = :owner_user_id
     """
+    SELECT_TASK_GENERATED_REPORTS_SQL = f"""
+        SELECT {REPORT_COLUMNS}
+        FROM limra_generated_reports
+        WHERE task_id = :task_id
+        ORDER BY created_at DESC, report_id ASC
+    """
     INSERT_UPLOADED_DOCUMENT_SQL = f"""
         INSERT INTO limra_uploaded_documents (
             document_id,
@@ -1562,6 +1589,17 @@ class PostgresLimraTaskRepository:
             },
         )
         return _generated_report_from_row(row) if row else None
+
+    def list_task_reports(
+        self,
+        *,
+        task_id: str,
+    ) -> list[LimraGeneratedReport]:
+        rows = self._fetch_all(
+            self.SELECT_TASK_GENERATED_REPORTS_SQL,
+            {"task_id": task_id},
+        )
+        return [_generated_report_from_row(row) for row in rows]
 
     def _record_typed_artifact(
         self,
@@ -2121,10 +2159,10 @@ async def download_task_archive(
     task_id: str,
     user: LimraUser = Depends(get_current_limra_user),
     repo: LimraTaskRepository = Depends(get_task_repository),
-    archive_client: RunnerArchiveClient = Depends(get_archive_client),
+    object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> Response:
     task = _get_owned_task(repo, task_id, user)
-    return await _download_archive(task, user, archive_client)
+    return await _download_archive(task, user, repo, object_storage)
 
 
 @router.get("/admin/tasks/{task_id}")
@@ -2147,12 +2185,12 @@ async def admin_download_task_archive(
     task_id: str,
     user: LimraUser = Depends(get_current_limra_admin),
     repo: LimraTaskRepository = Depends(get_task_repository),
-    archive_client: RunnerArchiveClient = Depends(get_archive_client),
+    object_storage: LimraObjectStorage = Depends(get_object_storage),
 ) -> Response:
     task = repo.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task_not_found")
-    return await _download_archive(task, user, archive_client)
+    return await _download_archive(task, user, repo, object_storage)
 
 
 @router.get("/uploads")
@@ -2375,11 +2413,18 @@ async def download_task_report_pdf(
 async def _download_archive(
     task: LimraTask,
     user: LimraUser,
-    archive_client: RunnerArchiveClient,
+    repo: LimraTaskRepository,
+    object_storage: LimraObjectStorage,
 ) -> Response:
     if task.archive_status != "ready":
         raise HTTPException(status_code=409, detail="archive_not_ready")
-    archive_bytes = await archive_client.download_archive(task, user)
+
+    archive_bytes = await _load_or_create_persisted_archive(
+        task,
+        user=user,
+        repo=repo,
+        object_storage=object_storage,
+    )
     validate_archive_zip(archive_bytes)
     archive_bytes = _scrub_archive_zip(archive_bytes)
     validate_archive_zip(archive_bytes)
@@ -2388,6 +2433,161 @@ async def _download_archive(
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
     )
+
+
+async def _load_or_create_persisted_archive(
+    task: LimraTask,
+    *,
+    user: LimraUser,
+    repo: LimraTaskRepository,
+    object_storage: LimraObjectStorage,
+) -> bytes:
+    if task.archive_object_key:
+        try:
+            return await object_storage.get_object(object_key=task.archive_object_key)
+        except FileNotFoundError:
+            log.warning(
+                "Persisted limra archive object missing; regenerating",
+                extra={"task_id": task.task_id, "user_id": user.id},
+            )
+
+    archive_bytes = _build_persisted_archive_zip(task, repo)
+    validate_archive_zip(archive_bytes)
+    archive_bytes = _scrub_archive_zip(archive_bytes)
+    validate_archive_zip(archive_bytes)
+    object_key = build_limra_object_key(
+        owner_user_id=task.owner_user_id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await object_storage.put_object(
+        object_key=object_key,
+        data=archive_bytes,
+        content_type="application/zip",
+        metadata=scrub_limra_secrets(
+            {
+                "task_id": task.task_id,
+                "owner_user_id": task.owner_user_id,
+                "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+                "generated_by": user.id,
+            }
+        ),
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+    task.archive_object_key = stored.object_key
+    task.archive_zip_sha256 = stored.sha256
+    return archive_bytes
+
+
+def _build_persisted_archive_zip(
+    task: LimraTask,
+    repo: LimraTaskRepository,
+) -> bytes:
+    artifacts = repo.get_artifacts(task.task_id)
+    reports = repo.list_task_reports(task_id=task.task_id)
+    documents = repo.list_user_documents(
+        owner_user_id=task.owner_user_id,
+        task_id=task.task_id,
+    )
+    report = _select_archive_report(reports)
+    evidence_refs = _archive_evidence_refs(report, artifacts)
+    report_markdown = _archive_report_markdown(task, report, artifacts)
+    report_html = _render_report_html(
+        markdown=report_markdown,
+        evidence_refs=evidence_refs,
+    )
+    metadata = {
+        "task": {
+            "task_id": task.task_id,
+            "owner_user_id": task.owner_user_id,
+            "query": task.query,
+            "status": task.status,
+            "archive_status": task.archive_status,
+            "scenario": task.scenario,
+            "error": task.error,
+            "model_summary": task.model_summary or {},
+        },
+        "artifact_counts": {
+            bucket: len(items)
+            for bucket, items in artifacts.items()
+        },
+        "reports": [report.public_dict() for report in reports],
+        "uploaded_documents": [document.public_dict() for document in documents],
+    }
+    trace = {
+        "task": metadata["task"],
+        "artifacts": artifacts,
+        "reports": [report.public_dict() for report in reports],
+        "uploaded_documents": [document.public_dict() for document in documents],
+    }
+    members = {
+        "metadata.json": _archive_json_text(metadata),
+        "report.html": str(scrub_limra_secrets(report_html)),
+        "report.md": str(scrub_limra_secrets(report_markdown)),
+        "trace.json": _archive_json_text(trace),
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member_name in ARCHIVE_MEMBER_ORDER:
+            archive.writestr(member_name, members[member_name])
+    return output.getvalue()
+
+
+def _select_archive_report(
+    reports: list[LimraGeneratedReport],
+) -> LimraGeneratedReport | None:
+    for report in reports:
+        if report.report_type == "final":
+            return report
+    return reports[0] if reports else None
+
+
+def _archive_evidence_refs(
+    report: LimraGeneratedReport | None,
+    artifacts: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    refs: list[str] = []
+    refs.extend(report.evidence_refs if report else [])
+    for evidence in artifacts.get("evidence", []):
+        evidence_id = evidence.get("evidence_id") or evidence.get("id")
+        if evidence_id:
+            refs.append(str(evidence_id))
+    return list(dict.fromkeys(refs))
+
+
+def _archive_report_markdown(
+    task: LimraTask,
+    report: LimraGeneratedReport | None,
+    artifacts: dict[str, list[dict[str, Any]]],
+) -> str:
+    if report and report.markdown.strip():
+        return report.markdown
+    report_sections = artifacts.get("report_sections", [])
+    if report_sections:
+        sections = []
+        for section in report_sections:
+            title = str(section.get("title") or section.get("section_id") or "Section")
+            body = str(section.get("markdown") or section.get("content") or "")
+            sections.append(f"## {title}\n\n{body}".strip())
+        return "# limra report\n\n" + "\n\n".join(sections)
+    return (
+        "# limra report\n\n"
+        f"Query: {task.query}\n\n"
+        "No generated report content has been recorded yet."
+    )
+
+
+def _archive_json_text(value: Any) -> str:
+    scrubbed = scrub_limra_secrets(value)
+    scrubbed = json.loads(json.dumps(scrubbed, ensure_ascii=False, default=str))
+    return json.dumps(scrubbed, ensure_ascii=False, sort_keys=True, indent=2)
 
 
 def validate_archive_zip(archive_bytes: bytes) -> None:
