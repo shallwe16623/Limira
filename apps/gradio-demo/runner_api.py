@@ -103,7 +103,12 @@ def create_app(
     app.router.add_post("/mirothinker/tasks/{task_id}/cancel", cancel_task)
     app.router.add_get("/mirothinker/tasks/{task_id}/events", stream_task_events)
     app.router.add_get("/mirothinker/tasks/{task_id}/archive.zip", download_archive)
+    app.router.add_get("/health", healthcheck)
     return app
+
+
+async def healthcheck(request: web.Request) -> web.Response:
+    return web.json_response({"status": True})
 
 
 async def start_research(request: web.Request) -> web.Response:

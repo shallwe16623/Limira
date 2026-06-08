@@ -9,6 +9,7 @@ COMPOSE_FILE = ROOT / "docker-compose.limra-aggressive.yml"
 ENV_EXAMPLE = ROOT / ".env.example"
 LIMRA_WEB_ENV = ROOT / "apps/limra-web/backend/open_webui/env.py"
 LIMRA_WEB_MAIN = ROOT / "apps/limra-web/backend/open_webui/main.py"
+RUNNER_API = ROOT / "apps/gradio-demo/runner_api.py"
 MIGRATION_FILE = (
     ROOT / "deploy/limra/postgres/migrations/001_limra_osint_schema.sql"
 )
@@ -34,11 +35,17 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert _published_port(services["postgres"]) == "5433"
     assert _published_port(services["redis"]) == "6380"
     assert _published_ports(services["minio"]) == {"9002", "9003"}
+    for service_name in ("limra-web", "limra-runner", "postgres", "redis", "minio"):
+        assert _published_bind_hosts(services[service_name]) == {"127.0.0.1"}
 
     assert "healthcheck" in services["postgres"]
     assert "healthcheck" in services["redis"]
     assert "healthcheck" in services["minio"]
+    assert "healthcheck" in services["limra-runner"]
     assert services["minio-init"]["depends_on"]["minio"]["condition"] == (
+        "service_healthy"
+    )
+    assert services["limra-web"]["depends_on"]["limra-runner"]["condition"] == (
         "service_healthy"
     )
 
@@ -55,6 +62,12 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert "${RUNNER_SERVICE_TOKEN" in runner["environment"]["RUNNER_SERVICE_TOKEN"]
     assert runner["environment"]["RUNNER_TASK_STORE_BACKEND"] == "postgres"
     assert runner["environment"]["RUNNER_DATABASE_URL"].startswith("postgresql://")
+    assert "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}" in runner["environment"][
+        "RUNNER_DATABASE_URL"
+    ]
+    assert runner["environment"]["AWS_SECRET_ACCESS_KEY"] == (
+        "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+    )
     assert "RUNNER_ALLOW_SQLITE_TASK_STORE" not in runner["environment"]
 
     web = services["limra-web"]
@@ -72,6 +85,9 @@ def test_limra_compose_defines_aggressive_stack_contract():
     ]
     assert web["environment"]["LIMRA_REPOSITORY_BACKEND"] == "postgres"
     assert web["environment"]["LIMRA_DATABASE_URL"].startswith("postgresql://")
+    assert "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}" in web["environment"][
+        "LIMRA_DATABASE_URL"
+    ]
     assert "LIMRA_ALLOW_IN_MEMORY_REPOSITORY" not in web["environment"]
     assert web["environment"]["LIMRA_RUNTIME_STATE_BACKEND"] == "redis"
     assert "LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE" not in web["environment"]
@@ -92,13 +108,27 @@ def test_limra_compose_defines_aggressive_stack_contract():
     )
     assert web["environment"]["S3_ENDPOINT_URL"] == "http://minio:9000"
     assert web["environment"]["AWS_ACCESS_KEY_ID"] == "${MINIO_ROOT_USER:-limra_minio}"
-    assert "${MINIO_ROOT_PASSWORD" in web["environment"]["AWS_SECRET_ACCESS_KEY"]
+    assert web["environment"]["AWS_SECRET_ACCESS_KEY"] == (
+        "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+    )
+
+    assert postgres["environment"]["POSTGRES_PASSWORD"] == (
+        "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+    )
+    assert services["minio"]["environment"]["MINIO_ROOT_PASSWORD"] == (
+        "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+    )
+    assert services["minio-init"]["environment"]["MINIO_ROOT_PASSWORD"] == (
+        "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
+    )
+    _assert_no_sensitive_compose_defaults(compose)
 
 
 def test_limra_env_example_has_required_placeholders_without_real_secrets():
     env = _read_env_example()
     required = {
         "COMPOSE_PROJECT_NAME",
+        "LIMRA_BIND_ADDRESS",
         "LIMRA_WEB_PORT",
         "LIMRA_RUNNER_PORT",
         "POSTGRES_PORT",
@@ -144,6 +174,7 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert required.issubset(env)
 
     assert env["COMPOSE_PROJECT_NAME"] == "limra_aggressive"
+    assert env["LIMRA_BIND_ADDRESS"] == "127.0.0.1"
     assert env["LIMRA_WEB_PORT"] == "3001"
     assert env["LIMRA_RUNNER_PORT"] == "8091"
     assert env["POSTGRES_PORT"] == "5433"
@@ -151,7 +182,7 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert env["MINIO_API_PORT"] == "9002"
     assert env["MINIO_CONSOLE_PORT"] == "9003"
     assert env["LIMRA_REPOSITORY_BACKEND"] == "postgres"
-    assert env["LIMRA_DATABASE_URL"].startswith("postgresql://")
+    assert env["LIMRA_DATABASE_URL"] == ""
     assert env["LIMRA_ALLOW_IN_MEMORY_REPOSITORY"] == "false"
     assert env["LIMRA_RUNTIME_STATE_BACKEND"] == "redis"
     assert env["LIMRA_ALLOW_IN_MEMORY_RUNTIME_STATE"] == "false"
@@ -164,7 +195,7 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
     assert env["LIMRA_EMBEDDING_MODEL"] == ""
     assert env["LIMRA_EMBEDDING_DIMENSIONS"] == "1536"
     assert env["RUNNER_TASK_STORE_BACKEND"] == "postgres"
-    assert env["RUNNER_DATABASE_URL"].startswith("postgresql://")
+    assert env["RUNNER_DATABASE_URL"] == ""
     assert env["RUNNER_ALLOW_SQLITE_TASK_STORE"] == "false"
 
     secret_keys = [
@@ -381,6 +412,10 @@ def test_limra_deploy_helper_files_exist_and_are_executable_where_needed():
     init_script = ROOT / "deploy/limra/minio/init-bucket.sh"
     assert init_script.stat().st_mode & 0o111
 
+    runner_api = RUNNER_API.read_text(encoding="utf-8")
+    assert 'app.router.add_get("/health", healthcheck)' in runner_api
+    assert 'return web.json_response({"status": True})' in runner_api
+
 
 def test_limra_web_is_real_open_webui_vendor_path_not_placeholder():
     limra_web = ROOT / "apps/limra-web"
@@ -414,13 +449,42 @@ def _published_ports(service: dict) -> set[str]:
     return {_extract_host_port(port) for port in service.get("ports", [])}
 
 
+def _published_bind_hosts(service: dict) -> set[str]:
+    return {_extract_host_ip(port) for port in service.get("ports", [])}
+
+
 def _extract_host_port(port: str | dict) -> str:
     if isinstance(port, dict):
-        return str(port["published"])
+        published = str(port["published"])
+        default_match = re.search(r"\$\{[^:}]+:-([0-9]+)\}", published)
+        return default_match.group(1) if default_match else published
     default_match = re.search(r"\$\{[^:}]+:-([0-9]+)\}", port)
     if default_match:
         return default_match.group(1)
     return port.split(":", 1)[0]
+
+
+def _extract_host_ip(port: str | dict) -> str:
+    if isinstance(port, dict):
+        host_ip = str(port.get("host_ip") or "")
+        default_match = re.search(r"\$\{[^:}]+:-([^}]+)\}", host_ip)
+        return default_match.group(1) if default_match else host_ip
+    parts = port.split(":")
+    return parts[0] if len(parts) == 3 else ""
+
+
+def _assert_no_sensitive_compose_defaults(compose: dict) -> None:
+    serialized = yaml.safe_dump(compose)
+    forbidden = (
+        "${POSTGRES_PASSWORD:-",
+        "${MINIO_ROOT_PASSWORD:-",
+        "${RUNNER_SERVICE_TOKEN:-",
+        "limra_dev_password",
+        "limra_minio_dev_password",
+        "replace-with-long-random-service-token",
+    )
+    for value in forbidden:
+        assert value not in serialized
 
 
 def _parse_create_tables(sql: str) -> dict[str, dict]:

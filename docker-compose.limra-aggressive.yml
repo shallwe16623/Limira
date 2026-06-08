@@ -15,9 +15,11 @@ services:
       minio:
         condition: service_healthy
       limra-runner:
-        condition: service_started
+        condition: service_healthy
     ports:
-      - "${LIMRA_WEB_PORT:-3001}:8080"
+      - target: 8080
+        published: "${LIMRA_WEB_PORT:-3001}"
+        host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
     environment:
       PORT: "8080"
       WEBUI_NAME: limra
@@ -25,7 +27,7 @@ services:
       LIMRA_RUNNER_INTERNAL_URL: http://limra-runner:8091
       LIMRA_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?set RUNNER_SERVICE_TOKEN}
       LIMRA_REPOSITORY_BACKEND: postgres
-      LIMRA_DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
+      LIMRA_DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-limra}
       LIMRA_RUNTIME_STATE_BACKEND: redis
       LIMRA_OBJECT_STORAGE_BACKEND: s3
       LIMRA_OBJECT_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
@@ -33,12 +35,12 @@ services:
       LIMRA_EMBEDDING_PROVIDER: ${LIMRA_EMBEDDING_PROVIDER:-disabled}
       LIMRA_EMBEDDING_MODEL: ${LIMRA_EMBEDDING_MODEL:-}
       LIMRA_EMBEDDING_DIMENSIONS: ${LIMRA_EMBEDDING_DIMENSIONS:-1536}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-limra}
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       S3_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-limra_minio}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-limra_minio_dev_password}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
     networks:
       - limra
 
@@ -54,18 +56,29 @@ services:
       minio:
         condition: service_healthy
     ports:
-      - "${LIMRA_RUNNER_PORT:-8091}:8091"
+      - target: 8091
+        published: "${LIMRA_RUNNER_PORT:-8091}"
+        host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8091/health', timeout=2).read()\"",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     environment:
       MIROTHINKER_RUNNER_PORT: "8091"
       RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?set RUNNER_SERVICE_TOKEN}
       RUNNER_TASK_STORE_BACKEND: postgres
-      RUNNER_DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:-limra_dev_password}@postgres:5432/${POSTGRES_DB:-limra}
+      RUNNER_DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-limra}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-limra}
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       S3_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-limra_minio}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-limra_minio_dev_password}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
       BASE_URL: ${BASE_URL:-}
       DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-}
       DEFAULT_LLM_PROVIDER: ${DEFAULT_LLM_PROVIDER:-}
@@ -87,11 +100,13 @@ services:
       context: .
       dockerfile: deploy/limra/postgres.Dockerfile
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - target: 5432
+        published: "${POSTGRES_PORT:-5433}"
+        host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-limra}
       POSTGRES_USER: ${POSTGRES_USER:-limra}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-limra_dev_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
@@ -107,7 +122,9 @@ services:
     image: redis:7.2-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "${REDIS_PORT:-6380}:6379"
+      - target: 6379
+        published: "${REDIS_PORT:-6380}"
+        host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -122,11 +139,15 @@ services:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
     ports:
-      - "${MINIO_API_PORT:-9002}:9000"
-      - "${MINIO_CONSOLE_PORT:-9003}:9001"
+      - target: 9000
+        published: "${MINIO_API_PORT:-9002}"
+        host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
+      - target: 9001
+        published: "${MINIO_CONSOLE_PORT:-9003}"
+        host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-limra_minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-limra_minio_dev_password}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
       interval: 5s
@@ -144,7 +165,7 @@ services:
         condition: service_healthy
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-limra_minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-limra_minio_dev_password}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
     entrypoint: ["/bin/sh", "/init-bucket.sh"]
     volumes:
