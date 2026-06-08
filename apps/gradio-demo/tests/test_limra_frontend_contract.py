@@ -1036,6 +1036,220 @@ def test_limra_standalone_frontend_clears_task_state_on_sign_out():
     assert checks["storageToken"] == ""
 
 
+def test_limra_standalone_frontend_ignores_inflight_upload_results_after_sign_out():
+    node = _node_executable()
+    if not node:
+        pytest.skip("node executable is unavailable")
+
+    app = LIMRA_STANDALONE_ROOT / "public" / "app.js"
+    script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const source = fs.readFileSync({str(app)!r}, 'utf8');
+        const storage = new Map();
+        let resolveOldSearch;
+        let resolveOldUploads;
+        const oldSearchPromise = new Promise((resolve) => {{
+            resolveOldSearch = resolve;
+        }});
+        const oldUploadsPromise = new Promise((resolve) => {{
+            resolveOldUploads = resolve;
+        }});
+        function jsonResponse(body) {{
+            return {{
+                ok: true,
+                status: 200,
+                headers: {{ get: () => 'application/json' }},
+                text: async () => JSON.stringify(body)
+            }};
+        }}
+        function element() {{
+            return {{
+                textContent: '',
+                disabled: false,
+                innerHTML: '',
+                value: '',
+                autocomplete: '',
+                scrollTop: 0,
+                scrollHeight: 0,
+                classList: {{ toggle() {{}}, add() {{}}, remove() {{}} }},
+                parentElement: {{ classList: {{ toggle() {{}} }} }},
+                addEventListener() {{}},
+                querySelectorAll: () => []
+            }};
+        }}
+        const context = {{
+            console,
+            URL,
+            element,
+            FormData: class FormData {{}},
+            Headers: class Headers {{
+                set() {{}}
+            }},
+            EventSource: class EventSource {{}},
+            fetch: async (path) => {{
+                const text = String(path);
+                if (text.startsWith('/api/limra/uploads/search')) {{
+                    return oldSearchPromise.then(jsonResponse);
+                }}
+                if (text.startsWith('/api/limra/uploads?task_id=old-task')) {{
+                    return oldUploadsPromise.then(jsonResponse);
+                }}
+                if (text.startsWith('/api/limra/uploads')) {{
+                    return jsonResponse({{
+                        documents: [
+                            {{
+                                document_id: 'new-doc',
+                                filename: 'new-user.txt',
+                                content_type: 'text/plain',
+                                byte_size: 7
+                            }}
+                        ]
+                    }});
+                }}
+                return jsonResponse({{ ok: true }});
+            }},
+            resolveOldSearch,
+            resolveOldUploads,
+            localStorage: {{
+                getItem: (key) => storage.get(key) || '',
+                setItem: (key, value) => storage.set(key, String(value)),
+                removeItem: (key) => storage.delete(key)
+            }},
+            window: {{
+                location: {{ href: 'http://127.0.0.1/' }},
+                setTimeout: () => 0
+            }},
+            document: {{
+                addEventListener: () => {{}},
+                querySelectorAll: () => []
+            }}
+        }};
+        (async () => {{
+            vm.createContext(context);
+            vm.runInContext(source, context);
+            await vm.runInContext(`(async () => {{
+                Object.assign(dom, {{
+                    authPanel: element(),
+                    workspace: element(),
+                    signOutButton: element(),
+                    sessionLabel: element(),
+                    signinModeButton: element(),
+                    signupModeButton: element(),
+                    nameInput: element(),
+                    authSubmitButton: element(),
+                    passwordInput: element(),
+                    scenarioSelect: element(),
+                    scenarioDetails: element(),
+                    statusLabel: element(),
+                    taskLabel: element(),
+                    submitResearchButton: element(),
+                    downloadArchiveButton: element(),
+                    reportMessage: element(),
+                    exportPdfButton: element(),
+                    downloadPdfButton: element(),
+                    messageList: element(),
+                    eventLog: element(),
+                    artifactTabs: element(),
+                    artifactContent: element(),
+                    uploadSearchInput: element(),
+                    uploadInput: element(),
+                    uploadList: element(),
+                    uploadMessage: element()
+                }});
+
+                setUser({{ id: 'old-user', email: 'old@example.test', role: 'user', token: 'old-token' }});
+                state.savedUserId = 'old-user';
+                state.taskId = 'old-task';
+                dom.uploadSearchInput.value = 'old';
+
+                const searchRun = searchUploads();
+                const uploadsRun = loadUploads();
+                await Promise.resolve();
+                await signOut();
+
+                const afterSignOutUser = state.user;
+                const afterSignOutResults = state.uploadResults.length;
+                const afterSignOutUploads = state.uploads.length;
+
+                resolveOldSearch({{
+                    documents: [
+                        {{
+                            document_id: 'old-search-doc',
+                            filename: 'old-user-search.txt',
+                            content_type: 'text/plain',
+                            byte_size: 5
+                        }}
+                    ]
+                }});
+                resolveOldUploads({{
+                    documents: [
+                        {{
+                            document_id: 'old-list-doc',
+                            filename: 'old-user-list.txt',
+                            content_type: 'text/plain',
+                            byte_size: 6
+                        }}
+                    ]
+                }});
+                await searchRun;
+                await uploadsRun;
+
+                const staleHtml = dom.uploadList.innerHTML;
+                const afterLateUser = state.user;
+                const afterLateResults = state.uploadResults.length;
+                const afterLateUploads = state.uploads.length;
+
+                setUser({{ id: 'new-user', email: 'new@example.test', role: 'user', token: 'new-token' }});
+                await loadUploads();
+                const newHtml = dom.uploadList.innerHTML;
+
+                this.__limraInflightUploadChecks = {{
+                    afterSignOutUser,
+                    afterSignOutResults,
+                    afterSignOutUploads,
+                    afterLateUser,
+                    afterLateResults,
+                    afterLateUploads,
+                    staleHtml,
+                    newUploadResults: state.uploadResults.length,
+                    newUploads: state.uploads.length,
+                    newHtml
+                }};
+            }})()`, context);
+            process.stdout.write(JSON.stringify(context.__limraInflightUploadChecks));
+        }})().catch((error) => {{
+            console.error(error);
+            process.exit(1);
+        }});
+    """
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=REPO_ROOT,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    checks = json.loads(result.stdout)
+
+    assert checks["afterSignOutUser"] is None
+    assert checks["afterSignOutResults"] == 0
+    assert checks["afterSignOutUploads"] == 0
+    assert checks["afterLateUser"] is None
+    assert checks["afterLateResults"] == 0
+    assert checks["afterLateUploads"] == 0
+    assert "old-user-search.txt" not in checks["staleHtml"]
+    assert "old-user-list.txt" not in checks["staleHtml"]
+    assert "/api/limra/uploads/old-search-doc/download" not in checks["staleHtml"]
+    assert "/api/limra/uploads/old-list-doc/download" not in checks["staleHtml"]
+    assert checks["newUploadResults"] == 0
+    assert checks["newUploads"] == 1
+    assert "new-user.txt" in checks["newHtml"]
+    assert "/api/limra/uploads/new-doc/download" in checks["newHtml"]
+    assert "old-user-search.txt" not in checks["newHtml"]
+
+
 def test_limra_research_page_has_demo_scenario_selector():
     page = _read(LIMRA_PAGE)
 

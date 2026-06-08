@@ -92,6 +92,7 @@ const state = {
 	isSearching: false,
 	isExporting: false,
 	restoreBlocked: false,
+	workspaceGeneration: 0,
 	latestReport: null,
 	finalReportText: '',
 	messages: initialMessages(),
@@ -241,7 +242,12 @@ async function loadSession() {
 }
 
 function setUser(user) {
+	const previousUserId = state.user?.id || '';
+	const nextUserId = user?.id || '';
 	state.user = user;
+	if (previousUserId !== nextUserId) {
+		bumpWorkspaceGeneration();
+	}
 	if (user?.token) {
 		state.token = user.token;
 		localStorage.setItem('limraToken', user.token);
@@ -290,7 +296,11 @@ async function refreshTask() {
 	if (!state.taskId) {
 		return;
 	}
+	const context = captureAsyncContext();
 	const task = await api(`/api/limra/tasks/${encodeURIComponent(state.taskId)}`);
+	if (!isCurrentAsyncContext(context)) {
+		return;
+	}
 	state.restoreBlocked = false;
 	state.status = task.status || state.status;
 	updateArchiveState(task);
@@ -373,12 +383,17 @@ function clearWorkspaceStorage() {
 }
 
 function resetWorkspaceState() {
+	bumpWorkspaceGeneration();
 	state.savedUserId = state.user?.id || '';
 	state.taskId = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
 	state.restoreBlocked = false;
+	state.isSubmitting = false;
+	state.isUploading = false;
+	state.isSearching = false;
+	state.isExporting = false;
 	state.activeTab = '证据';
 	state.latestReport = null;
 	state.finalReportText = '';
@@ -456,6 +471,8 @@ async function submitResearch() {
 	}
 
 	state.isSubmitting = true;
+	bumpWorkspaceGeneration();
+	const context = captureAsyncContext({ includeTask: false });
 	state.status = 'starting';
 	state.taskId = '';
 	state.archiveStatus = 'pending';
@@ -464,6 +481,8 @@ async function submitResearch() {
 	state.latestReport = null;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
+	state.uploadResults = [];
+	state.isSearching = false;
 	saveWorkspace();
 	addMessage('user', query);
 	renderStatus();
@@ -478,6 +497,9 @@ async function submitResearch() {
 				scenario: state.selectedScenario || undefined
 			}
 		});
+		if (!state.isSubmitting || !isCurrentAsyncContext(context)) {
+			return;
+		}
 		state.taskId = task.task_id || '';
 		state.status = task.status || 'queued';
 		updateArchiveState(task);
@@ -489,11 +511,16 @@ async function submitResearch() {
 		await loadArtifacts();
 		await loadUploads();
 	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		state.status = 'failed';
 		addMessage('error', errorMessage(error));
 	} finally {
-		state.isSubmitting = false;
-		renderStatus();
+		if (isCurrentAsyncContext(context)) {
+			state.isSubmitting = false;
+			renderStatus();
+		}
 	}
 }
 
@@ -501,10 +528,19 @@ function connectStream() {
 	if (!state.taskId) {
 		return;
 	}
+	const context = captureAsyncContext();
 	state.eventSource?.close();
 	state.eventSource = new EventSource(`/api/limra/tasks/${state.taskId}/events`);
-	state.eventSource.onmessage = (event) => handleStreamEvent(parseJson(event.data));
+	state.eventSource.onmessage = (event) => {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		handleStreamEvent(parseJson(event.data));
+	};
 	state.eventSource.onerror = () => {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		if (!terminalStatuses.has(state.status)) {
 			state.status = 'stream reconnecting';
 			saveWorkspace();
@@ -616,13 +652,20 @@ async function loadArtifacts() {
 	if (!state.taskId) {
 		return;
 	}
+	const context = captureAsyncContext();
 	try {
 		const data = await api(`/api/limra/tasks/${encodeURIComponent(state.taskId)}/artifacts`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		state.artifacts = normalizeArtifacts(data);
 		saveWorkspace();
 		renderTabs();
 		renderReportControls();
 	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
 	}
 }
@@ -631,12 +674,20 @@ async function loadUploads() {
 	if (!state.user) {
 		return;
 	}
+	const context = captureAsyncContext();
 	try {
 		const taskParam = state.taskId ? `?task_id=${encodeURIComponent(state.taskId)}` : '';
 		const data = await api(`/api/limra/uploads${taskParam}`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		state.uploads = Array.isArray(data.documents) ? data.documents : [];
+		state.uploadResults = [];
 		renderUploads();
 	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		dom.uploadMessage.textContent = errorMessage(error);
 	}
 }
@@ -649,6 +700,7 @@ async function uploadDocument() {
 	}
 	state.isUploading = true;
 	dom.uploadMessage.textContent = '正在上传...';
+	const context = captureAsyncContext();
 	const form = new FormData();
 	form.append('file', file);
 	if (state.taskId) {
@@ -656,13 +708,21 @@ async function uploadDocument() {
 	}
 	try {
 		await api('/api/limra/uploads', { method: 'POST', body: form });
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		dom.uploadInput.value = '';
 		dom.uploadMessage.textContent = '上传完成。';
 		await loadUploads();
 	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		dom.uploadMessage.textContent = errorMessage(error);
 	} finally {
-		state.isUploading = false;
+		if (isCurrentAsyncContext(context)) {
+			state.isUploading = false;
+		}
 	}
 }
 
@@ -672,15 +732,24 @@ async function searchUploads() {
 		return;
 	}
 	state.isSearching = true;
+	const context = captureAsyncContext();
 	try {
 		const taskParam = state.taskId ? `&task_id=${encodeURIComponent(state.taskId)}` : '';
 		const data = await api(`/api/limra/uploads/search?query=${encodeURIComponent(query)}${taskParam}`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		state.uploadResults = Array.isArray(data.documents) ? data.documents : [];
 		renderUploads();
 	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		dom.uploadMessage.textContent = errorMessage(error);
 	} finally {
-		state.isSearching = false;
+		if (isCurrentAsyncContext(context)) {
+			state.isSearching = false;
+		}
 	}
 }
 
@@ -695,6 +764,7 @@ async function exportPdf() {
 	}
 	state.isExporting = true;
 	dom.reportMessage.textContent = '正在导出...';
+	const context = captureAsyncContext();
 	try {
 		const report = await api(`/api/limra/tasks/${encodeURIComponent(state.taskId)}/reports/pdf`, {
 			method: 'POST',
@@ -705,15 +775,23 @@ async function exportPdf() {
 				evidence_refs: reportEvidenceRefs()
 			}
 		});
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		state.latestReport = normalizeGeneratedReport(report);
 		dom.reportMessage.textContent = 'PDF 已生成。';
 		saveWorkspace();
 		renderReportControls();
 	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
 		dom.reportMessage.textContent = `PDF 导出失败：${errorMessage(error)}`;
 	} finally {
-		state.isExporting = false;
-		renderReportControls();
+		if (isCurrentAsyncContext(context)) {
+			state.isExporting = false;
+			renderReportControls();
+		}
 	}
 }
 
@@ -1156,6 +1234,31 @@ function renderReportControls() {
 	const hasMarkdown = Boolean(reportMarkdown().trim());
 	dom.exportPdfButton.disabled = state.restoreBlocked || !state.taskId || !hasMarkdown || state.isExporting;
 	dom.downloadPdfButton.disabled = state.restoreBlocked || !reportPdfUrl(state.latestReport);
+}
+
+function bumpWorkspaceGeneration() {
+	state.workspaceGeneration += 1;
+	return state.workspaceGeneration;
+}
+
+function captureAsyncContext(options = {}) {
+	const context = {
+		generation: state.workspaceGeneration,
+		userId: state.user?.id || ''
+	};
+	if (options.includeTask !== false) {
+		context.taskId = state.taskId || '';
+	}
+	return context;
+}
+
+function isCurrentAsyncContext(context) {
+	return (
+		Boolean(context) &&
+		context.generation === state.workspaceGeneration &&
+		context.userId === (state.user?.id || '') &&
+		(!Object.hasOwn(context, 'taskId') || context.taskId === (state.taskId || ''))
+	);
 }
 
 function clearRestoredTaskState() {
