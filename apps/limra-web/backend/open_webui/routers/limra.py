@@ -3920,16 +3920,20 @@ async def _limra_event_stream(
             await _record_runtime_event(runtime_state, task.task_id, terminal_event)
             yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
+        public_error = _public_error_text(
+            exc.detail,
+            fallback="limra_event_proxy_failed",
+        )
         repo.update_task(
             task.task_id,
             status="failed",
             archive_status="failed",
-            error=_scrub_optional_text(exc.detail),
+            error=public_error,
         )
         error_event = {
             "task_id": task.task_id,
             "type": "error",
-            "payload": {"error": _scrub_optional_text(exc.detail)},
+            "payload": {"error": public_error},
         }
         await _record_runtime_event(runtime_state, task.task_id, error_event)
         yield _sse_bytes(_assert_browser_safe(error_event))
@@ -3977,7 +3981,11 @@ async def _authoritative_runner_status_event(
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
             return _terminal_status_event(current, reason=reason)
-        warning = _scrub_optional_text(exc.detail)
+        warning = _public_error_text(
+            exc.detail,
+            fallback="runner_status_warning",
+        )
+        public_reason = _public_reason_text(reason)
         return {
             "task_id": task.task_id,
             "type": "status",
@@ -3986,7 +3994,7 @@ async def _authoritative_runner_status_event(
                 "archive_status": current.archive_status if current else task.archive_status,
                 "status_source": "limra",
                 "warning": warning,
-                **({"reason": reason} if reason else {}),
+                **({"reason": public_reason} if public_reason else {}),
             },
         }
 
@@ -4002,7 +4010,7 @@ async def _authoritative_runner_status_event(
         "status_source": "runner",
     }
     if reason:
-        payload["reason"] = reason
+        payload["reason"] = _public_reason_text(reason)
     return {
         "task_id": task.task_id,
         "type": "status",
@@ -4051,7 +4059,7 @@ def _terminal_status_event(task: LimraTask, *, reason: str | None = None) -> dic
             fallback="limra_task_failed",
         )
     if reason:
-        payload["reason"] = reason
+        payload["reason"] = _public_reason_text(reason)
     return {
         "task_id": task.task_id,
         "type": "status",
@@ -4213,7 +4221,10 @@ def _apply_task_status_from_event(
         elif status in {"failed", "cancelled"}:
             updates["archive_status"] = "failed"
         if isinstance(payload, dict) and payload.get("error"):
-            updates["error"] = _scrub_optional_text(payload["error"])
+            updates["error"] = _public_error_text(
+                payload["error"],
+                fallback="runner_task_failed",
+            )
         repo.update_task(task_id, **updates)
         return str(status)
     return None
@@ -4341,7 +4352,49 @@ def _scrub_runner_event(event: dict[str, Any], *, task_id: str) -> dict[str, Any
     scrubbed_event = dict(scrubbed_value) if isinstance(scrubbed_value, dict) else {}
     scrubbed_event["task_id"] = task_id
     scrubbed_event["type"] = str(scrub_limra_secrets(event_type))
+    scrubbed_event = _shape_runner_event_public_errors(scrubbed_event)
     return scrubbed_event
+
+
+def _shape_runner_event_public_errors(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or "")
+    if event_type not in {"status", "error"}:
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return event
+    shaped_event = dict(event)
+    shaped_payload = dict(payload)
+    if shaped_payload.get("error"):
+        shaped_payload["error"] = _public_error_text(
+            shaped_payload["error"],
+            fallback="runner_task_failed",
+        )
+    if shaped_payload.get("warning"):
+        shaped_payload["warning"] = _public_error_text(
+            shaped_payload["warning"],
+            fallback="runner_status_warning",
+        )
+    if shaped_payload.get("reason"):
+        shaped_payload["reason"] = _public_reason_text(shaped_payload["reason"])
+    data = shaped_payload.get("data")
+    if isinstance(data, dict):
+        shaped_data = dict(data)
+        if shaped_data.get("error"):
+            shaped_data["error"] = _public_error_text(
+                shaped_data["error"],
+                fallback="runner_task_failed",
+            )
+        if shaped_data.get("warning"):
+            shaped_data["warning"] = _public_error_text(
+                shaped_data["warning"],
+                fallback="runner_status_warning",
+            )
+        if shaped_data.get("reason"):
+            shaped_data["reason"] = _public_reason_text(shaped_data["reason"])
+        shaped_payload["data"] = shaped_data
+    shaped_event["payload"] = shaped_payload
+    return shaped_event
 
 
 def _show_text_markdown(tool_input: Any) -> str:
@@ -4981,6 +5034,10 @@ def _public_error_text(value: Any, *, fallback: str) -> str | None:
     if any(pattern.search(scrubbed) for pattern in INTERNAL_ERROR_TEXT_PATTERNS):
         return fallback
     return scrubbed
+
+
+def _public_reason_text(value: Any) -> str | None:
+    return _public_error_text(value, fallback="runner_stream_conflict")
 
 
 def _scrub_mapping_key(key: Any) -> Any:
