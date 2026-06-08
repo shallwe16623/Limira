@@ -601,6 +601,112 @@ async def test_upload_route_stores_pdf_with_extracted_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_upload_document_list_read_and_download_are_owner_scoped():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="owned task",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.create_task(
+        task_id="task-b",
+        owner_user_id="user-b",
+        query="foreign task",
+        scenario=None,
+        runner_task_id="runner-task-b",
+    )
+    foreign = repo.record_uploaded_document(
+        document_id="foreign-doc",
+        owner_user_id="user-b",
+        task_id="task-b",
+        original_filename="foreign.txt",
+        content_type="text/plain",
+        byte_size=7,
+        minio_bucket=storage.bucket,
+        object_key="limra/users/foreign/tasks/task-b/uploads/foreign.txt",
+        extracted_text="foreign",
+        language=None,
+        metadata={},
+    )
+    storage.objects[foreign.object_key] = {
+        "data": b"foreign",
+        "content_type": "text/plain",
+        "metadata": {},
+        "sha256": "foreign",
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        unlinked_response = await client.post(
+            "/api/limra/uploads",
+            files={"file": ("unlinked.txt", b"unlinked", "text/plain")},
+        )
+        linked_response = await client.post(
+            "/api/limra/uploads",
+            params={"task_id": "task-a"},
+            files={"file": ("linked.txt", b"linked", "text/plain")},
+        )
+
+        list_response = await client.get("/api/limra/uploads")
+        task_list_response = await client.get(
+            "/api/limra/uploads",
+            params={"task_id": "task-a"},
+        )
+        foreign_task_list_response = await client.get(
+            "/api/limra/uploads",
+            params={"task_id": "task-b"},
+        )
+        detail_response = await client.get(
+            f"/api/limra/uploads/{linked_response.json()['document_id']}"
+        )
+        download_response = await client.get(
+            f"/api/limra/uploads/{linked_response.json()['document_id']}/download"
+        )
+        foreign_detail_response = await client.get("/api/limra/uploads/foreign-doc")
+        foreign_download_response = await client.get(
+            "/api/limra/uploads/foreign-doc/download"
+        )
+
+    assert unlinked_response.status_code == 201
+    assert linked_response.status_code == 201
+    assert list_response.status_code == 200
+    listed = list_response.json()["documents"]
+    assert {document["filename"] for document in listed} == {
+        "linked.txt",
+        "unlinked.txt",
+    }
+    assert all("object_key" not in document for document in listed)
+    assert all("minio_object_key" not in document for document in listed)
+    assert all(document["download_url"].startswith("/api/limra/uploads/") for document in listed)
+    _assert_no_browser_leak(listed)
+
+    assert task_list_response.status_code == 200
+    assert [document["filename"] for document in task_list_response.json()["documents"]] == [
+        "linked.txt"
+    ]
+    assert foreign_task_list_response.status_code == 404
+
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["filename"] == "linked.txt"
+    assert detail["task_id"] == "task-a"
+    assert "object_key" not in detail
+    assert "minio_object_key" not in detail
+    _assert_no_browser_leak(detail)
+
+    assert download_response.status_code == 200
+    assert download_response.content == b"linked"
+    assert download_response.headers["content-type"].startswith("text/plain")
+    assert 'filename="linked.txt"' in download_response.headers["content-disposition"]
+    assert foreign_detail_response.status_code == 404
+    assert foreign_download_response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
     app, repo, _storage = _limra_asgi_app()
     repo.create_task(
@@ -870,6 +976,15 @@ def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
     assert owned is not None
     assert owned.original_filename == "brief.txt"
     assert repo.get_user_document("doc-001", "user-b") is None
+    assert [document.document_id for document in repo.list_user_documents(owner_user_id="user-a")] == [
+        "doc-001"
+    ]
+    assert [
+        document.document_id
+        for document in repo.list_user_documents(owner_user_id="user-a", task_id="task-doc")
+    ] == ["doc-001"]
+    assert repo.list_user_documents(owner_user_id="user-a", task_id="task-other") == []
+    assert repo.list_user_documents(owner_user_id="user-b") == []
 
 
 @pytest.mark.asyncio
@@ -1609,7 +1724,10 @@ def test_limra_router_defines_required_browser_facing_paths():
         ("/tasks/{task_id}/events", "GET"),
         ("/tasks/{task_id}/artifacts", "GET"),
         ("/tasks/{task_id}/archive.zip", "GET"),
+        ("/uploads", "GET"),
         ("/uploads", "POST"),
+        ("/uploads/{document_id}", "GET"),
+        ("/uploads/{document_id}/download", "GET"),
         ("/tasks/{task_id}/reports/pdf", "POST"),
         ("/admin/tasks/{task_id}", "GET"),
         ("/admin/tasks/{task_id}/archive.zip", "GET"),
@@ -1833,10 +1951,19 @@ class FakeLimraPostgresEngine:
             return FakeLimraPostgresResult([row])
 
         if "from limra_uploaded_documents" in sql:
-            row = self.uploaded_documents.get(params["document_id"])
-            if row and row["owner_user_id"] != params["owner_user_id"]:
-                row = None
-            return FakeLimraPostgresResult([row] if row else [])
+            if "document_id = :document_id" in sql:
+                row = self.uploaded_documents.get(params["document_id"])
+                if row and row["owner_user_id"] != params["owner_user_id"]:
+                    row = None
+                return FakeLimraPostgresResult([row] if row else [])
+
+            rows = [
+                row
+                for row in self.uploaded_documents.values()
+                if row["owner_user_id"] == params["owner_user_id"]
+                and (params.get("task_id") is None or row["task_id"] == params["task_id"])
+            ]
+            return FakeLimraPostgresResult(rows)
 
         for table in self.typed_inserts:
             if f"insert into {table}" in sql:

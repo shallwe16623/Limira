@@ -163,6 +163,7 @@ class LimraUploadedDocument:
             "byte_size": self.byte_size,
             "language": self.language,
             "extracted_text_chars": len(self.extracted_text or ""),
+            "download_url": f"/api/limra/uploads/{self.document_id}/download",
         }
 
 
@@ -219,6 +220,13 @@ class LimraTaskRepository(Protocol):
         document_id: str,
         owner_user_id: str,
     ) -> LimraUploadedDocument | None: ...
+
+    def list_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        task_id: str | None = None,
+    ) -> list[LimraUploadedDocument]: ...
 
 
 class RunnerResearchClientProtocol(Protocol):
@@ -294,6 +302,12 @@ class LimraObjectStorage(Protocol):
         content_type: str,
         metadata: Mapping[str, Any] | None = None,
     ) -> LimraStoredObject: ...
+
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes: ...
 
 
 class InMemoryLimraTaskRepository:
@@ -394,6 +408,20 @@ class InMemoryLimraTaskRepository:
         if not document or document.owner_user_id != owner_user_id:
             return None
         return document
+
+    def list_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        task_id: str | None = None,
+    ) -> list[LimraUploadedDocument]:
+        documents = [
+            document
+            for document in self.uploaded_documents.values()
+            if document.owner_user_id == owner_user_id
+            and (task_id is None or document.task_id == task_id)
+        ]
+        return sorted(documents, key=lambda document: document.document_id)
 
 
 class InMemoryLimraRuntimeState:
@@ -591,6 +619,16 @@ class InMemoryLimraObjectStorage:
         }
         return stored
 
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes:
+        try:
+            return bytes(self.objects[object_key]["data"])
+        except KeyError as exc:
+            raise FileNotFoundError(object_key) from exc
+
 
 class S3LimraObjectStorage:
     def __init__(
@@ -655,6 +693,21 @@ class S3LimraObjectStorage:
             )
         )
         return stored
+
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes:
+        try:
+            response = await _maybe_await(
+                self.s3_client.get_object(Bucket=self.bucket, Key=object_key)
+            )
+            body = response["Body"]
+            data = await _maybe_await(body.read())
+            return bytes(data)
+        except Exception as exc:
+            raise FileNotFoundError(object_key) from exc
 
 
 class PostgresLimraTaskRepository:
@@ -1014,6 +1067,13 @@ class PostgresLimraTaskRepository:
         WHERE document_id = :document_id
           AND owner_user_id = :owner_user_id
     """
+    SELECT_USER_UPLOADED_DOCUMENTS_SQL = f"""
+        SELECT {DOCUMENT_COLUMNS}
+        FROM limra_uploaded_documents
+        WHERE owner_user_id = :owner_user_id
+          AND (:task_id IS NULL OR task_id = :task_id)
+        ORDER BY created_at DESC, document_id ASC
+    """
 
     def __init__(self, database_url: str, *, engine_factory: Any | None = None) -> None:
         if not _is_postgres_database_url(database_url):
@@ -1204,6 +1264,18 @@ class PostgresLimraTaskRepository:
             {"document_id": document_id, "owner_user_id": owner_user_id},
         )
         return _uploaded_document_from_row(row) if row else None
+
+    def list_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        task_id: str | None = None,
+    ) -> list[LimraUploadedDocument]:
+        rows = self._fetch_all(
+            self.SELECT_USER_UPLOADED_DOCUMENTS_SQL,
+            {"owner_user_id": owner_user_id, "task_id": task_id},
+        )
+        return [_uploaded_document_from_row(row) for row in rows]
 
     def _record_typed_artifact(
         self,
@@ -1789,6 +1861,20 @@ async def admin_download_task_archive(
     return await _download_archive(task, user, archive_client)
 
 
+@router.get("/uploads")
+async def list_uploaded_documents(
+    task_id: str | None = None,
+    user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    if task_id:
+        _get_owned_task(repo, task_id, user)
+    documents = repo.list_user_documents(owner_user_id=user.id, task_id=task_id)
+    return _assert_browser_safe(
+        {"documents": [document.public_dict() for document in documents]}
+    )
+
+
 @router.post("/uploads", status_code=201)
 async def upload_document(
     request: Request,
@@ -1853,6 +1939,39 @@ async def upload_document(
     return _assert_browser_safe(document.public_dict())
 
 
+@router.get("/uploads/{document_id}")
+async def get_uploaded_document(
+    document_id: str,
+    user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    document = _get_owned_document(repo, document_id, user)
+    return _assert_browser_safe(document.public_dict())
+
+
+@router.get("/uploads/{document_id}/download")
+async def download_uploaded_document(
+    document_id: str,
+    user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+    object_storage: LimraObjectStorage = Depends(get_object_storage),
+) -> Response:
+    document = _get_owned_document(repo, document_id, user)
+    try:
+        data = await object_storage.get_object(object_key=document.object_key)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="document_object_not_found") from exc
+    return Response(
+        data,
+        media_type=document.content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": _content_disposition_attachment(
+                document.original_filename
+            )
+        },
+    )
+
+
 @router.post("/tasks/{task_id}/reports/pdf", status_code=501)
 async def export_task_pdf(
     task_id: str,
@@ -1908,6 +2027,17 @@ def _get_owned_task(
     if not task:
         raise HTTPException(status_code=404, detail="task_not_found")
     return task
+
+
+def _get_owned_document(
+    repo: LimraTaskRepository,
+    document_id: str,
+    user: LimraUser,
+) -> LimraUploadedDocument:
+    document = repo.get_user_document(document_id, user.id)
+    if not document:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    return document
 
 
 async def _limra_event_stream(
@@ -2826,6 +2956,11 @@ def _safe_original_filename(filename: str | None) -> str:
     basename = (filename or "upload.bin").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     basename = basename.strip()[:255]
     return basename or "upload.bin"
+
+
+def _content_disposition_attachment(filename: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _safe_original_filename(filename))[:120]
+    return f'attachment; filename="{safe or "upload.bin"}"'
 
 
 def _uploaded_content_type(content_type: str | None, filename: str) -> str:
