@@ -62,6 +62,14 @@
 
 	const artifactTabs: ArtifactTab[] = ['Evidence', 'Entities', 'Graph', 'Timeline', 'Map', 'Report'];
 	const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
+	const supportedMapGeometryTypes = new Set([
+		'Point',
+		'MultiPoint',
+		'LineString',
+		'MultiLineString',
+		'Polygon',
+		'MultiPolygon'
+	]);
 
 	const emptyArtifacts = (): ArtifactState => ({
 		evidence: [],
@@ -582,14 +590,16 @@
 	const buildMapFeatureCollection = (state: ArtifactState) => {
 		const features = [...state.map_features, ...state.timeline_events]
 			.map((item, index) => {
-				const geometry = item.geometry ?? item.payload?.geometry;
+				const geometry = normalizeMapGeometry(
+					item.geometry ?? item.payload?.geometry ?? item.geojson ?? item.payload?.geojson
+				);
 				if (!geometry) {
 					return null;
 				}
 
 				return {
 					type: 'Feature',
-					geometry: typeof geometry === 'string' ? parsePayload(geometry) : geometry,
+					geometry,
 					properties: {
 						title: item.title ?? item.event_title ?? item.name ?? `Feature ${index + 1}`,
 						risk_level: item.risk_level ?? item.risk ?? 'unknown'
@@ -604,10 +614,50 @@
 		};
 	};
 
+	const normalizeMapGeometry = (rawGeometry: unknown) => {
+		const parsed = typeof rawGeometry === 'string' ? parsePayload(rawGeometry) : rawGeometry;
+		const candidate =
+			parsed && typeof parsed === 'object' && (parsed as Record<string, any>).type === 'Feature'
+				? (parsed as Record<string, any>).geometry
+				: parsed;
+		if (!candidate || typeof candidate !== 'object') {
+			return null;
+		}
+
+		const geometry = candidate as Record<string, any>;
+		if (!supportedMapGeometryTypes.has(String(geometry.type))) {
+			return null;
+		}
+		if (collectCoordinatePairs(geometry.coordinates).length === 0) {
+			return null;
+		}
+		return geometry;
+	};
+
+	const collectCoordinatePairs = (coordinates: unknown): [number, number][] => {
+		if (isLngLatPair(coordinates)) {
+			return [[Number(coordinates[0]), Number(coordinates[1])]];
+		}
+		if (!Array.isArray(coordinates)) {
+			return [];
+		}
+		return coordinates.flatMap((value) => collectCoordinatePairs(value));
+	};
+
+	const isLngLatPair = (value: unknown): value is [number | string, number | string] =>
+		Array.isArray(value) &&
+		value.length >= 2 &&
+		Number.isFinite(Number(value[0])) &&
+		Number.isFinite(Number(value[1]));
+
 	const featureCenter = (feature: GeoJSONFeature) => {
-		const coordinates = feature.geometry?.coordinates;
-		if (feature.geometry?.type === 'Point' && Array.isArray(coordinates)) {
-			return coordinates;
+		const coordinates = collectCoordinatePairs(feature.geometry?.coordinates);
+		if (coordinates.length > 0) {
+			const sums = coordinates.reduce(
+				([lng, lat], pair) => [lng + pair[0], lat + pair[1]],
+				[0, 0]
+			);
+			return [sums[0] / coordinates.length, sums[1] / coordinates.length];
 		}
 		return [0, 20];
 	};
@@ -638,9 +688,45 @@
 				},
 				layers: [
 					{
+						id: 'limra-polygons',
+						type: 'fill',
+						source: 'limra',
+						filter: [
+							'any',
+							['==', ['geometry-type'], 'Polygon'],
+							['==', ['geometry-type'], 'MultiPolygon']
+						],
+						paint: {
+							'fill-color': '#0f766e',
+							'fill-opacity': 0.22
+						}
+					},
+					{
+						id: 'limra-lines',
+						type: 'line',
+						source: 'limra',
+						filter: [
+							'any',
+							['==', ['geometry-type'], 'LineString'],
+							['==', ['geometry-type'], 'MultiLineString'],
+							['==', ['geometry-type'], 'Polygon'],
+							['==', ['geometry-type'], 'MultiPolygon']
+						],
+						paint: {
+							'line-color': '#0f766e',
+							'line-width': 3,
+							'line-opacity': 0.82
+						}
+					},
+					{
 						id: 'limra-points',
 						type: 'circle',
 						source: 'limra',
+						filter: [
+							'any',
+							['==', ['geometry-type'], 'Point'],
+							['==', ['geometry-type'], 'MultiPoint']
+						],
 						paint: {
 							'circle-radius': 7,
 							'circle-color': '#2563eb',

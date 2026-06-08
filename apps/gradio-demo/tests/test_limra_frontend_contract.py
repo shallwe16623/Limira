@@ -397,6 +397,37 @@ def test_limra_graph_and_map_use_required_frontend_libraries_with_empty_states()
     assert "bind:this={mapContainer}" in page
 
 
+def test_limra_map_panel_renders_point_line_and_polygon_geometry_layers():
+    page = _read(LIMRA_PAGE)
+
+    assert "const supportedMapGeometryTypes = new Set([" in page
+    for geometry_type in [
+        "'Point'",
+        "'MultiPoint'",
+        "'LineString'",
+        "'MultiLineString'",
+        "'Polygon'",
+        "'MultiPolygon'",
+    ]:
+        assert geometry_type in page
+
+    assert "const normalizeMapGeometry = (rawGeometry: unknown) =>" in page
+    assert "const collectCoordinatePairs = (coordinates: unknown): [number, number][] =>" in page
+    assert "item.geometry ?? item.payload?.geometry ?? item.geojson ?? item.payload?.geojson" in page
+    assert "id: 'limra-polygons'" in page
+    assert "type: 'fill'" in page
+    assert "id: 'limra-lines'" in page
+    assert "type: 'line'" in page
+    assert "id: 'limra-points'" in page
+    assert "type: 'circle'" in page
+    assert "['==', ['geometry-type'], 'LineString']" in page
+    assert "['==', ['geometry-type'], 'MultiLineString']" in page
+    assert "['==', ['geometry-type'], 'Polygon']" in page
+    assert "['==', ['geometry-type'], 'MultiPolygon']" in page
+    assert "['==', ['geometry-type'], 'Point']" in page
+    assert "['==', ['geometry-type'], 'MultiPoint']" in page
+
+
 def test_limra_web_declares_graph_and_map_dependencies_for_docker_build():
     package = json.loads(_read(PACKAGE_JSON))
     lock = json.loads(_read(PACKAGE_LOCK))
