@@ -5067,6 +5067,128 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
 
 
 @pytest.mark.asyncio
+async def test_postgres_event_proxy_persists_final_summary_show_text_as_report_section():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-finalpgopenai123456",
+        "Bearer final-pg-bearer-token-123456",
+        "RUNNER_SERVICE_TOKEN=final-pg-runner-token-123456",
+    ]
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {
+                        "text": (
+                            "# Final answer\n\n"
+                            "BYD is not on the active list. [EVID-001]\n\n"
+                            + "\n".join(raw_secret_values)
+                        )
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "start_of_agent",
+        "tool_call",
+        "report_section_generated",
+        "end_of_agent",
+        "status",
+    ]
+    report_event = events[2]
+    assert report_event["payload"]["title"] == "最终回答"
+    assert report_event["payload"]["evidence_refs"] == ["EVID-001"]
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_events
+    assert limra.LIMRA_SECRET_REDACTION in serialized_events
+    _assert_no_browser_leak(events)
+
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    assert len(artifacts["report_sections"]) == 1
+    report_section = artifacts["report_sections"][0]
+    assert report_section["section_id"] == "REPORT-001"
+    assert report_section["markdown"].startswith("# Final answer")
+    assert report_section["source_event_type"] == "final_summary_show_text"
+    assert limra.LIMRA_SECRET_REDACTION in report_section["markdown"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(artifacts, ensure_ascii=False)
+
+    persisted_report = engine.generated_reports[(task_id, "REPORT-001")]
+    assert persisted_report["creator_user_id"] == "user-a"
+    assert persisted_report["markdown"] == report_section["markdown"]
+    assert persisted_report["evidence_refs"] == ["EVID-001"]
+    assert json.loads(persisted_report["metadata"])["source_event_type"] == (
+        "final_summary_show_text"
+    )
+
+    reports = repo.list_task_reports(task_id=task_id)
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].markdown == report_section["markdown"]
+
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert "# Final answer" in members["report.md"]
+    assert limra.LIMRA_SECRET_REDACTION in members["report.md"]
+    assert limra.LIMRA_SECRET_REDACTION in members["trace.json"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(members, ensure_ascii=False)
+    trace = json.loads(members["trace.json"])
+    assert trace["artifact_events"][0]["type"] == "report_section_generated"
+    assert trace["artifact_events"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+    assert trace["artifact_events"][0]["local_artifact_id"] == "REPORT-001"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert repo.get_task(task_id).archive_object_key in storage.objects
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
 async def test_record_research_artifact_tool_call_reaches_artifacts_and_archive_trace():
     from main import filter_message
 
@@ -6692,20 +6814,21 @@ class FakeLimraPostgresEngine:
             ]
             return FakeLimraPostgresResult(rows)
 
-        if "insert into limra_generated_reports" in sql and "returning" in sql:
+        if "insert into limra_generated_reports" in sql:
             row = {
                 "report_id": params["report_id"],
                 "task_id": params["task_id"],
-                "report_type": params["report_type"],
+                "report_type": params.get("report_type") or "section",
                 "markdown": params["markdown"],
                 "html": params["html"],
-                "pdf_object_key": params["pdf_object_key"],
+                "pdf_object_key": params.get("pdf_object_key"),
                 "evidence_refs": params["evidence_refs"],
                 "creator_user_id": params["creator_user_id"],
                 "metadata": params["metadata"],
             }
             self.generated_reports[(params["task_id"], params["report_id"])] = row
-            return FakeLimraPostgresResult([row])
+            self.typed_inserts["limra_generated_reports"].append(dict(params))
+            return FakeLimraPostgresResult([row] if "returning" in sql else [])
 
         if "from limra_generated_reports" in sql and "report_id = :report_id" in sql:
             task = self.tasks.get(params["task_id"])
