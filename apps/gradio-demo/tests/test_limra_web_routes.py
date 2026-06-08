@@ -288,6 +288,154 @@ async def test_archive_proxy_scrubs_allowed_text_members_before_download():
 
 
 @pytest.mark.asyncio
+async def test_archive_download_regenerates_after_task_scoped_writes():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-fresh-archive",
+        owner_user_id=user.id,
+        query="fresh archive",
+        scenario=None,
+        runner_task_id="runner-fresh-archive",
+    )
+    task.archive_status = "ready"
+
+    first_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    first_sha = task.archive_zip_sha256
+    first_members = _archive_member_texts(first_response.body)
+    assert "Fresh report" not in first_members["report.md"]
+
+    repo.record_generated_report(
+        report_id="report-fresh",
+        task_id=task.task_id,
+        report_type="final",
+        markdown="Fresh report [EVID-FRESH]",
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=["EVID-FRESH"],
+        creator_user_id=user.id,
+        metadata={},
+    )
+    assert task.archive_object_key is None
+    assert task.archive_zip_sha256 is None
+
+    second_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    second_sha = task.archive_zip_sha256
+    second_members = _archive_member_texts(second_response.body)
+    assert second_sha != first_sha
+    assert "Fresh report [EVID-FRESH]" in second_members["report.md"]
+
+    repo.record_uploaded_document(
+        document_id="doc-fresh",
+        owner_user_id=user.id,
+        task_id=task.task_id,
+        original_filename="brief.txt",
+        content_type="text/plain",
+        byte_size=5,
+        minio_bucket="limra-artifacts",
+        object_key="limra/users/hash/tasks/task-fresh-archive/uploads/doc-fresh.txt",
+        extracted_text="brief",
+        language=None,
+        metadata={},
+    )
+    assert task.archive_object_key is None
+    assert task.archive_zip_sha256 is None
+
+    third_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    third_sha = task.archive_zip_sha256
+    third_trace = json.loads(_archive_member_texts(third_response.body)["trace.json"])
+    assert third_sha != second_sha
+    assert third_trace["uploaded_documents"][0]["document_id"] == "doc-fresh"
+
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-NEW",
+            "summary": "new evidence",
+            "source_url": "https://example.test/new",
+        },
+    )
+    assert task.archive_object_key is None
+    assert task.archive_zip_sha256 is None
+
+    fourth_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    fourth_trace = json.loads(_archive_member_texts(fourth_response.body)["trace.json"])
+    assert fourth_trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-NEW"
+    assert task.archive_object_key in storage.objects
+    assert storage.objects[task.archive_object_key]["content_type"] == "application/zip"
+
+
+@pytest.mark.asyncio
+async def test_untasked_upload_does_not_invalidate_task_archive():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-unlinked-upload",
+        owner_user_id=user.id,
+        query="unlinked upload",
+        scenario=None,
+        runner_task_id="runner-unlinked-upload",
+    )
+    task.archive_status = "ready"
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_key = task.archive_object_key
+    archive_sha = task.archive_zip_sha256
+
+    repo.record_uploaded_document(
+        document_id="doc-unlinked",
+        owner_user_id=user.id,
+        task_id=None,
+        original_filename="unlinked.txt",
+        content_type="text/plain",
+        byte_size=8,
+        minio_bucket="limra-artifacts",
+        object_key="limra/users/hash/uploads/doc-unlinked.txt",
+        extracted_text="unlinked",
+        language=None,
+        metadata={},
+    )
+
+    assert task.archive_object_key == archive_key
+    assert task.archive_zip_sha256 == archive_sha
+    second_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    assert second_response.body == response.body
+
+
+@pytest.mark.asyncio
 async def test_admin_access_requires_explicit_admin_route():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
@@ -1447,6 +1595,103 @@ def test_postgres_repository_records_generated_report_pdf_metadata():
     assert reports[0].markdown == "Final report [EVID-001]"
 
 
+def test_postgres_repository_invalidates_archive_metadata_on_task_scoped_writes():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-archive-invalidated",
+        owner_user_id="user-a",
+        query="archive invalidation",
+        scenario=None,
+        runner_task_id="runner-archive-invalidated",
+    )
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_status="ready",
+        archive_object_key="limra/users/hash/tasks/task-archive-invalidated/archives/a.zip",
+        archive_zip_sha256="sha-a",
+    )
+    repo.record_generated_report(
+        report_id="report-invalidates",
+        task_id="task-archive-invalidated",
+        report_type="final",
+        markdown="new report",
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=[],
+        creator_user_id="user-a",
+        metadata={},
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_object_key"] is None
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] is None
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_object_key="limra/users/hash/tasks/task-archive-invalidated/archives/b.zip",
+        archive_zip_sha256="sha-b",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-invalidates",
+        owner_user_id="user-a",
+        task_id="task-archive-invalidated",
+        original_filename="brief.txt",
+        content_type="text/plain",
+        byte_size=5,
+        minio_bucket="limra-artifacts",
+        object_key="limra/users/hash/tasks/task-archive-invalidated/uploads/doc.txt",
+        extracted_text="brief",
+        language=None,
+        metadata={},
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_object_key"] is None
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] is None
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_object_key="limra/users/hash/tasks/task-archive-invalidated/archives/c.zip",
+        archive_zip_sha256="sha-c",
+    )
+    repo.record_artifact(
+        "task-archive-invalidated",
+        "evidence",
+        {
+            "evidence_id": "EVID-INVALIDATES",
+            "summary": "new evidence",
+            "source_url": "https://example.test/source",
+        },
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_object_key"] is None
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] is None
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_object_key="limra/users/hash/tasks/task-archive-invalidated/archives/d.zip",
+        archive_zip_sha256="sha-d",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-unlinked-does-not-invalidate",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="unlinked.txt",
+        content_type="text/plain",
+        byte_size=8,
+        minio_bucket="limra-artifacts",
+        object_key="limra/users/hash/uploads/doc-unlinked.txt",
+        extracted_text="unlinked",
+        language=None,
+        metadata={},
+    )
+    assert (
+        engine.tasks["task-archive-invalidated"]["archive_object_key"]
+        == "limra/users/hash/tasks/task-archive-invalidated/archives/d.zip"
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] == "sha-d"
+
+
 @pytest.mark.asyncio
 async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     repo = limra.InMemoryLimraTaskRepository()
@@ -2246,6 +2491,14 @@ def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) ->
         if extra_member:
             archive.writestr(".env", "RUNNER_SERVICE_TOKEN=secret")
     return buffer.getvalue()
+
+
+def _archive_member_texts(archive_bytes: bytes) -> dict[str, str]:
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        return {
+            member_name: archive.read(member_name).decode("utf-8")
+            for member_name in archive.namelist()
+        }
 
 
 def _parse_sse_chunks(chunks):

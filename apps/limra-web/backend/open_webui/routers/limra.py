@@ -482,6 +482,15 @@ class InMemoryLimraTaskRepository:
                 setattr(task, field_name, value)
         return task
 
+    def _invalidate_archive_metadata(self, task_id: str | None) -> None:
+        if not task_id:
+            return
+        task = self.get_task(task_id)
+        if not task or (task.archive_object_key is None and task.archive_zip_sha256 is None):
+            return
+        task.archive_object_key = None
+        task.archive_zip_sha256 = None
+
     def record_artifact(
         self,
         task_id: str,
@@ -491,6 +500,7 @@ class InMemoryLimraTaskRepository:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
         bucket = ARTIFACT_BUCKETS[artifact_type]
         task_artifacts[bucket].append(artifact)
+        self._invalidate_archive_metadata(task_id)
 
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
         task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
@@ -525,6 +535,7 @@ class InMemoryLimraTaskRepository:
             metadata=dict(metadata or {}),
         )
         self.uploaded_documents[document_id] = document
+        self._invalidate_archive_metadata(task_id)
         return document
 
     def get_user_document(
@@ -576,6 +587,7 @@ class InMemoryLimraTaskRepository:
             metadata=dict(metadata or {}),
         )
         self.generated_reports[(task_id, report_id)] = report
+        self._invalidate_archive_metadata(task_id)
         return report
 
     def get_user_report(
@@ -1447,6 +1459,21 @@ class PostgresLimraTaskRepository:
             raise KeyError(task_id)
         return _task_from_row(row)
 
+    def _invalidate_archive_metadata(self, task_id: str | None) -> None:
+        if not task_id:
+            return
+        try:
+            self.update_task(
+                task_id,
+                archive_object_key=None,
+                archive_zip_sha256=None,
+            )
+        except KeyError:
+            log.warning(
+                "Unable to invalidate limra archive metadata for missing task",
+                extra={"task_id": task_id},
+            )
+
     def record_artifact(
         self,
         task_id: str,
@@ -1471,6 +1498,7 @@ class PostgresLimraTaskRepository:
             self._record_typed_artifact(task_id, artifact_type, artifact, artifact_id)
         except Exception:
             log.exception("Failed to persist typed limra artifact %s", artifact_id)
+        self._invalidate_archive_metadata(task_id)
 
     def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
         artifacts = _empty_artifact_buckets()
@@ -1517,6 +1545,7 @@ class PostgresLimraTaskRepository:
         )
         if not row:
             raise RuntimeError("limra_uploaded_document_insert_failed")
+        self._invalidate_archive_metadata(task_id)
         return _uploaded_document_from_row(row)
 
     def get_user_document(
@@ -1571,6 +1600,7 @@ class PostgresLimraTaskRepository:
         )
         if not row:
             raise RuntimeError("limra_generated_report_insert_failed")
+        self._invalidate_archive_metadata(task_id)
         return _generated_report_from_row(row)
 
     def get_user_report(
