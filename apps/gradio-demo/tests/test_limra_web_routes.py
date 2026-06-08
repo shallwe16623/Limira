@@ -2805,12 +2805,15 @@ async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browse
         "OPENAI_API_KEY=sk-statussecret123456",
         "Authorization: Bearer status-secret-123456",
         "RUNNER_SERVICE_TOKEN=status-runner-token-123456",
+        "OPENAI_API_KEY=sk-timestampsecret123456",
+        "Authorization: Bearer timestamp-secret-123456",
     ]
     research = FakeResearchClient(
         events=[
             {
                 "task_id": "runner-task-a",
                 "type": "status",
+                "timestamp": f"{raw_secret_values[3]} {raw_secret_values[4]}",
                 "payload": {
                     "status": "running",
                     "error": f"{raw_secret_values[0]} {raw_secret_values[1]}",
@@ -2819,6 +2822,7 @@ async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browse
             {
                 "task_id": "runner-task-a",
                 "type": "error",
+                "timestamp": f"{raw_secret_values[4]} {raw_secret_values[3]}",
                 "payload": {
                     "error": f"runner failed {raw_secret_values[2]}",
                 },
@@ -2847,6 +2851,10 @@ async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browse
     task_payload = await limra.get_task(task_id, user=user, repo=repo)
 
     assert [event["type"] for event in events] == ["status", "error"]
+    assert all(event["task_id"] == task_id for event in events)
+    assert limra.LIMRA_SECRET_REDACTION in events[0]["timestamp"]
+    assert limra.LIMRA_SECRET_REDACTION in events[1]["timestamp"]
+    assert limra.LIMRA_SECRET_REDACTION in runtime_snapshot["last_event"]["timestamp"]
     serialized = json.dumps(
         {
             "events": events,

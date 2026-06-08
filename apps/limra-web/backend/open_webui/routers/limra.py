@@ -3586,7 +3586,7 @@ async def _limra_event_stream(
                 current_agent_name=current_agent_name,
             )
             event = _scrub_runner_artifact_event(event)
-            event = _scrub_runner_event_payload(event)
+            event = _scrub_runner_event(event, task_id=task.task_id)
             applied_status = _apply_task_status_from_event(repo, task.task_id, event)
             saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
             warning = _record_artifact_from_event(repo, task, event)
@@ -4078,13 +4078,12 @@ def _scrub_runner_artifact_event(event: dict[str, Any]) -> dict[str, Any]:
     return scrubbed_event
 
 
-def _scrub_runner_event_payload(event: dict[str, Any]) -> dict[str, Any]:
-    payload = event.get("payload")
-    scrubbed_payload = scrub_limra_secrets(payload)
-    if scrubbed_payload == payload:
-        return event
-    scrubbed_event = dict(event)
-    scrubbed_event["payload"] = scrubbed_payload
+def _scrub_runner_event(event: dict[str, Any], *, task_id: str) -> dict[str, Any]:
+    event_type = str(event.get("type") or "runner_event")
+    scrubbed_value = scrub_limra_secrets(event)
+    scrubbed_event = dict(scrubbed_value) if isinstance(scrubbed_value, dict) else {}
+    scrubbed_event["task_id"] = task_id
+    scrubbed_event["type"] = str(scrub_limra_secrets(event_type))
     return scrubbed_event
 
 
