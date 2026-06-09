@@ -6,15 +6,6 @@ RUNTIME_DIR="${LIMIRA_RUNTIME_DIR:-"$ROOT_DIR/limira-runtime"}"
 LOG_DIR="$RUNTIME_DIR/logs"
 PID_DIR="$RUNTIME_DIR/pids"
 
-RUNNER_PORT="${LIMIRA_RUNNER_INTERNAL_PORT:-8091}"
-BACKEND_PORT="${LIMIRA_BACKEND_PORT:-8080}"
-FRONTEND_PORT="${LIMIRA_STANDALONE_PORT:-5173}"
-FRONTEND_HOST="${LIMIRA_STANDALONE_HOST:-0.0.0.0}"
-
-RUNNER_PYTHON="${LIMIRA_RUNNER_PYTHON:-"$ROOT_DIR/apps/limira-runner/.venv/bin/python"}"
-BACKEND_PYTHON="${LIMIRA_BACKEND_PYTHON:-"$ROOT_DIR/apps/limira-web/.venv/bin/python"}"
-NODE_BIN="${LIMIRA_NODE_BIN:-}"
-
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
 load_env_file() {
@@ -30,6 +21,15 @@ load_env_file() {
 load_env_file "$ROOT_DIR/.env"
 load_env_file "$ROOT_DIR/apps/limira-agent/.env"
 load_env_file "$ROOT_DIR/apps/limira-runner/.env"
+
+RUNNER_PORT="${LIMIRA_RUNNER_INTERNAL_PORT:-8091}"
+BACKEND_PORT="${LIMIRA_BACKEND_PORT:-8080}"
+FRONTEND_PORT="${LIMIRA_STANDALONE_PORT:-5173}"
+FRONTEND_HOST="${LIMIRA_STANDALONE_HOST:-0.0.0.0}"
+
+RUNNER_PYTHON="${LIMIRA_RUNNER_PYTHON:-"$ROOT_DIR/apps/limira-runner/.venv/bin/python"}"
+BACKEND_PYTHON="${LIMIRA_BACKEND_PYTHON:-"$ROOT_DIR/apps/limira-web/.venv/bin/python"}"
+NODE_BIN="${LIMIRA_NODE_BIN:-}"
 
 if [[ ! -x "$RUNNER_PYTHON" ]]; then
 	RUNNER_PYTHON="$(command -v python3 || command -v python || true)"
