@@ -766,6 +766,22 @@ a:hover {
 	text-decoration: underline;
 }
 
+.google-auth-button {
+	width: 100%;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--surface-muted);
+	color: var(--text);
+	font-weight: 700;
+	padding: 0.85rem 1rem;
+	cursor: pointer;
+}
+
+.google-auth-button:hover {
+	border-color: var(--accent);
+	background: var(--surface);
+}
+
 .segmented-control {
 	display: grid;
 	grid-template-columns: 1fr 1fr;

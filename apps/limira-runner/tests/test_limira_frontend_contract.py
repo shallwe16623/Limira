@@ -197,6 +197,7 @@ def test_limira_standalone_proxy_only_forwards_limira_api_namespace():
 
 def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     app = _read(LIMIRA_STANDALONE_APP)
+    index = _read(LIMIRA_STANDALONE_INDEX)
     server = _read(LIMIRA_STANDALONE_SERVER)
 
     assert "/api/limira/auth/signup" in app
@@ -207,8 +208,14 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/resend-verification" in app
     assert "/api/limira/auth/password-reset/request" in app
     assert "/api/limira/auth/password-reset/confirm" in app
+    assert "/api/limira/auth/google/config" in app
+    assert "/api/limira/auth/google/start" in app
+    assert 'id="googleSigninButton"' in index
+    assert "googleAuthEnabled" in app
     assert "verify_email_token" in app
     assert "reset_password_token" in app
+    assert "auth_error" in app
+    assert "google_auth" in app
     assert "x-forwarded-host" in server
     assert "x-forwarded-proto" in server
     assert LEGACY_AUTH_PREFIX not in app

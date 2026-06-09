@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
 try:
@@ -113,10 +113,18 @@ LIMIRA_SMTP_USERNAME_ENV = "LIMIRA_SMTP_USERNAME"
 LIMIRA_SMTP_PASSWORD_ENV = "LIMIRA_SMTP_PASSWORD"
 LIMIRA_SMTP_FROM_ENV = "LIMIRA_SMTP_FROM"
 LIMIRA_SMTP_TLS_ENV = "LIMIRA_SMTP_TLS"
+LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV = "LIMIRA_GOOGLE_OAUTH_CLIENT_ID"
+LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV = "LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET"
+LIMIRA_GOOGLE_OAUTH_REDIRECT_URI_ENV = "LIMIRA_GOOGLE_OAUTH_REDIRECT_URI"
+LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV = "LIMIRA_GOOGLE_OAUTH_AUTH_URL"
+LIMIRA_GOOGLE_OAUTH_TOKEN_URL_ENV = "LIMIRA_GOOGLE_OAUTH_TOKEN_URL"
+LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL_ENV = "LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL"
 LIMIRA_AUTH_COOKIE_NAME = "limira_session"
+LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME = "limira_google_oauth_state"
 LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS = 60 * 60 * 24
 LIMIRA_AUTH_DEFAULT_PASSWORD_RESET_TTL_SECONDS = 60 * 60
+LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS = 10 * 60
 LIMIRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 OBJECT_KEY_FORBIDDEN_FIELDS = {
@@ -2879,6 +2887,42 @@ def _limira_auth_email_outbox_path(env: Any = os.environ) -> str:
     return os.path.join(_limira_data_dir(env), "limira_auth_email_outbox.jsonl")
 
 
+def _limira_google_oauth_client_id(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV) or "").strip()
+
+
+def _limira_google_oauth_client_secret(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV) or "").strip()
+
+
+def _limira_google_oauth_enabled(env: Any = os.environ) -> bool:
+    return bool(
+        _limira_google_oauth_client_id(env)
+        and _limira_google_oauth_client_secret(env)
+    )
+
+
+def _limira_google_oauth_auth_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV)
+        or "https://accounts.google.com/o/oauth2/v2/auth"
+    ).strip()
+
+
+def _limira_google_oauth_token_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_GOOGLE_OAUTH_TOKEN_URL_ENV)
+        or "https://oauth2.googleapis.com/token"
+    ).strip()
+
+
+def _limira_google_oauth_tokeninfo_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL_ENV)
+        or "https://oauth2.googleapis.com/tokeninfo"
+    ).strip()
+
+
 def _limira_auth_connect(env: Any = os.environ) -> sqlite3.Connection:
     database_path = _limira_auth_sqlite_path(env)
     os.makedirs(os.path.dirname(database_path), exist_ok=True)
@@ -3423,6 +3467,187 @@ def _limira_auth_send_password_reset_email(
     )
 
 
+def _limira_google_oauth_state(env: Any = os.environ) -> str:
+    payload = {
+        "nonce": secrets.token_urlsafe(18),
+        "exp": int(time.time()) + LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS,
+    }
+    encoded_payload = _limira_auth_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signature = hmac.new(
+        _limira_auth_secret(env),
+        f"google-oauth-state:{encoded_payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded_payload}.{_limira_auth_b64encode(signature)}"
+
+
+def _limira_verify_google_oauth_state(state: str, env: Any = os.environ) -> bool:
+    try:
+        encoded_payload, encoded_signature = str(state).split(".", 1)
+    except ValueError:
+        return False
+    expected = hmac.new(
+        _limira_auth_secret(env),
+        f"google-oauth-state:{encoded_payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    try:
+        supplied = _limira_auth_b64decode(encoded_signature)
+    except Exception:
+        return False
+    if not hmac.compare_digest(expected, supplied):
+        return False
+    try:
+        payload = json.loads(_limira_auth_b64decode(encoded_payload).decode("utf-8"))
+    except Exception:
+        return False
+    return int(payload.get("exp") or 0) >= int(time.time())
+
+
+def _limira_google_oauth_redirect_uri(
+    request: Request | None,
+    env: Any = os.environ,
+) -> str:
+    configured = str(env.get(LIMIRA_GOOGLE_OAUTH_REDIRECT_URI_ENV) or "").strip()
+    if configured:
+        return configured
+    return f"{_limira_public_base_url(request, env)}/api/limira/auth/google/callback"
+
+
+def _limira_google_oauth_login_redirect_url(
+    request: Request | None,
+    env: Any = os.environ,
+    *,
+    success: bool,
+) -> str:
+    key = "google_auth" if success else "auth_error"
+    value = "success" if success else "google_auth_failed"
+    return f"{_limira_public_base_url(request, env)}/limira?{urlencode({key: value})}"
+
+
+def _limira_google_oauth_authorize_url(
+    *,
+    request: Request | None,
+    state: str,
+    env: Any = os.environ,
+) -> str:
+    params = {
+        "client_id": _limira_google_oauth_client_id(env),
+        "redirect_uri": _limira_google_oauth_redirect_uri(request, env),
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+    }
+    return f"{_limira_google_oauth_auth_url(env)}?{urlencode(params)}"
+
+
+async def _limira_google_userinfo_from_code(
+    *,
+    code: str,
+    request: Request | None,
+    env: Any = os.environ,
+) -> dict[str, Any]:
+    client_id = _limira_google_oauth_client_id(env)
+    async with httpx.AsyncClient(timeout=15) as client:
+        token_response = await client.post(
+            _limira_google_oauth_token_url(env),
+            data={
+                "client_id": client_id,
+                "client_secret": _limira_google_oauth_client_secret(env),
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": _limira_google_oauth_redirect_uri(request, env),
+            },
+        )
+        if token_response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="google_oauth_exchange_failed")
+        token_payload = token_response.json()
+        id_token = str(token_payload.get("id_token") or "").strip()
+        if not id_token:
+            raise HTTPException(status_code=502, detail="google_oauth_exchange_failed")
+        identity_response = await client.get(
+            _limira_google_oauth_tokeninfo_url(env),
+            params={"id_token": id_token},
+        )
+        if identity_response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="google_oauth_exchange_failed")
+        identity = identity_response.json()
+    if str(identity.get("aud") or "") != client_id:
+        raise HTTPException(status_code=401, detail="invalid_google_identity")
+    email = _normalize_auth_email(str(identity.get("email") or ""))
+    email_verified = identity.get("email_verified")
+    if not (
+        email_verified is True
+        or str(email_verified).strip().lower() in TRUTHY_ENV_VALUES
+    ):
+        raise HTTPException(status_code=401, detail="google_email_not_verified")
+    return {
+        "google_sub": str(identity.get("sub") or ""),
+        "email": email,
+        "name": str(identity.get("name") or identity.get("given_name") or email).strip() or email,
+    }
+
+
+def _limira_auth_upsert_google_user(
+    *,
+    email: str,
+    name: str,
+    env: Any = os.environ,
+) -> LimiraAuthRecord:
+    normalized_email = _normalize_auth_email(email)
+    normalized_name = str(name or normalized_email).strip() or normalized_email
+    now = int(time.time())
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            """
+            SELECT id, email, name, role, password_hash, active, email_verified_at
+            FROM limira_auth_users
+            WHERE lower(email) = lower(?)
+            """,
+            (normalized_email,),
+        ).fetchone()
+        if row is not None:
+            if not bool(row["active"]):
+                raise HTTPException(status_code=401, detail="invalid_credentials")
+            connection.execute(
+                """
+                UPDATE limira_auth_users
+                SET email_verified_at = COALESCE(email_verified_at, ?), updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, str(row["id"])),
+            )
+            connection.commit()
+            user_id = str(row["id"])
+        else:
+            user_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO limira_auth_users (
+                    id, email, name, role, password_hash, active,
+                    email_verified_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 'user', ?, 1, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    normalized_email,
+                    normalized_name,
+                    _limira_hash_password(secrets.token_urlsafe(32)),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+    user = _limira_auth_get_user_by_id(user_id, env)
+    if user is None:
+        raise HTTPException(status_code=500, detail="auth_user_create_failed")
+    return user
+
+
 def _limira_auth_public_user(
     user: LimiraAuthRecord | LimiraUser,
     *,
@@ -3921,6 +4146,77 @@ async def limira_auth_signup(
     payload["email_verification_required"] = True
     payload["email_delivery"] = delivery
     return payload
+
+
+@router.get("/auth/google/config")
+async def limira_auth_google_config() -> dict[str, bool]:
+    return {"enabled": _limira_google_oauth_enabled()}
+
+
+@router.get("/auth/google/start")
+async def limira_auth_google_start(request: Request) -> RedirectResponse:
+    if not _limira_google_oauth_enabled():
+        raise HTTPException(status_code=404, detail="google_oauth_not_configured")
+    state = _limira_google_oauth_state()
+    response = RedirectResponse(
+        _limira_google_oauth_authorize_url(request=request, state=state),
+        status_code=303,
+    )
+    response.set_cookie(
+        LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME,
+        state,
+        httponly=True,
+        secure=_limira_auth_cookie_secure(),
+        samesite="lax",
+        max_age=LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS,
+        path="/api/limira/auth/google",
+    )
+    return response
+
+
+@router.get("/auth/google/callback")
+async def limira_auth_google_callback(
+    request: Request,
+    response: Response,
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+) -> RedirectResponse:
+    redirect_response = RedirectResponse(
+        _limira_google_oauth_login_redirect_url(request, success=False),
+        status_code=303,
+    )
+    redirect_response.delete_cookie(
+        LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME,
+        path="/api/limira/auth/google",
+    )
+    if error:
+        return redirect_response
+    expected_state = request.cookies.get(LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME)
+    if (
+        not code
+        or not state
+        or not expected_state
+        or not hmac.compare_digest(str(state), str(expected_state))
+        or not _limira_verify_google_oauth_state(str(state))
+    ):
+        raise HTTPException(status_code=400, detail="invalid_google_oauth_state")
+    identity = await _limira_google_userinfo_from_code(code=code, request=request)
+    user = _limira_auth_upsert_google_user(
+        email=str(identity["email"]),
+        name=str(identity.get("name") or identity["email"]),
+    )
+    session_token = _limira_issue_auth_token(user)
+    redirect_response = RedirectResponse(
+        _limira_google_oauth_login_redirect_url(request, success=True),
+        status_code=303,
+    )
+    redirect_response.delete_cookie(
+        LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME,
+        path="/api/limira/auth/google",
+    )
+    _set_limira_auth_cookie(redirect_response, session_token)
+    return redirect_response
 
 
 @router.post("/auth/verify-email")

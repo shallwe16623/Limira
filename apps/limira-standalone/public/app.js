@@ -80,6 +80,7 @@ const state = {
 	token: localStorage.getItem('limiraToken') || '',
 	user: null,
 	pendingAuthEmail: '',
+	googleAuthEnabled: false,
 	scenarios: [],
 	selectedScenario: '',
 	savedUserId: '',
@@ -131,6 +132,7 @@ function bindEvents() {
 	dom.signupModeButton.addEventListener('click', () => setAuthMode('signup'));
 	dom.forgotPasswordButton.addEventListener('click', () => setAuthMode('forgot'));
 	dom.resendVerificationButton.addEventListener('click', () => void resendVerificationEmail());
+	dom.googleSigninButton.addEventListener('click', googleSignIn);
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
@@ -166,6 +168,7 @@ function bindEvents() {
 async function boot() {
 	clearLegacyWorkspaceStorage();
 	restoreWorkspace();
+	await loadAuthOptions();
 	const authLinkState = await handleAuthLinkTokens();
 	if (authLinkState === 'signed-in') {
 		await loadScenarios();
@@ -222,6 +225,10 @@ function renderAuthMode() {
 	dom.passwordInput.required = state.authMode !== 'forgot';
 	dom.resetTokenInput.disabled = state.authMode !== 'reset';
 	dom.resetTokenInput.required = state.authMode === 'reset';
+	dom.googleSigninButton.classList.toggle(
+		'hidden',
+		!state.googleAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
+	);
 	const submitText = {
 		signin: '登录',
 		signup: '注册',
@@ -233,10 +240,23 @@ function renderAuthMode() {
 		state.authMode === 'signin' ? 'current-password' : 'new-password';
 }
 
+async function loadAuthOptions() {
+	try {
+		const config = await api('/api/limira/auth/google/config');
+		state.googleAuthEnabled = Boolean(config?.enabled);
+	} catch {
+		state.googleAuthEnabled = false;
+	}
+}
+
 function setAuthMode(mode) {
 	state.authMode = mode;
 	dom.authMessage.textContent = '';
 	renderAuthMode();
+}
+
+function googleSignIn() {
+	window.location.href = '/api/limira/auth/google/start';
 }
 
 async function authenticate() {
@@ -324,6 +344,18 @@ async function handleAuthLinkTokens() {
 	const url = new URL(window.location.href);
 	const verifyToken = url.searchParams.get('verify_email_token');
 	const resetToken = url.searchParams.get('reset_password_token');
+	const authError = url.searchParams.get('auth_error');
+	const googleAuth = url.searchParams.get('google_auth');
+	if (authError) {
+		clearAuthUrlParams(['auth_error']);
+		setAuthMode('signin');
+		dom.authMessage.textContent = localizedErrorDetail(authError);
+		return 'pending';
+	}
+	if (googleAuth === 'success') {
+		clearAuthUrlParams(['google_auth']);
+		return '';
+	}
 	if (verifyToken) {
 		setAuthMode('signin');
 		dom.authMessage.textContent = '正在验证邮箱...';
@@ -1785,8 +1817,13 @@ function localizedErrorDetail(detail) {
 		not_authenticated: '请先登录。',
 		admin_required: '当前账号没有管理员权限。',
 		email_already_registered: '这个邮箱已经注册。',
+		email_not_verified: '请先打开验证邮件完成邮箱验证。',
 		invalid_email: '请输入有效邮箱。',
-		password_too_long: '密码太长，请使用 72 字节以内的密码。'
+		password_too_long: '密码太长，请使用 72 字节以内的密码。',
+		google_auth_failed: 'Google 登录失败，请重试。',
+		google_oauth_not_configured: 'Google 登录暂未配置。',
+		invalid_google_identity: 'Google 账号验证失败。',
+		google_email_not_verified: '这个 Google 账号尚未完成邮箱验证。'
 	};
 	return messages[detail] || detail;
 }

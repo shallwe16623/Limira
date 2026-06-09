@@ -372,6 +372,106 @@ async def test_limira_auth_email_links_use_forwarded_public_origin(
 
 
 @pytest.mark.asyncio
+async def test_limira_google_oauth_config_and_start_are_env_gated(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.delenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, raising=False)
+    monkeypatch.delenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, raising=False)
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        disabled = await client.get("/api/limira/auth/google/config")
+        assert disabled.status_code == 200
+        assert disabled.json() == {"enabled": False}
+
+        disabled_start = await client.get("/api/limira/auth/google/start")
+        assert disabled_start.status_code == 404
+        assert disabled_start.json() == {"detail": "google_oauth_not_configured"}
+
+        monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, "google-client-id")
+        monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, "google-secret")
+        monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV, "https://google.example/auth")
+
+        enabled = await client.get("/api/limira/auth/google/config")
+        assert enabled.status_code == 200
+        assert enabled.json() == {"enabled": True}
+
+        start = await client.get("/api/limira/auth/google/start", follow_redirects=False)
+        assert start.status_code == 303
+        location = start.headers["location"]
+        parsed = urlsplit(location)
+        params = parse_qs(parsed.query)
+        assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://google.example/auth"
+        assert params["client_id"] == ["google-client-id"]
+        assert params["response_type"] == ["code"]
+        assert params["scope"] == ["openid email profile"]
+        assert params["redirect_uri"] == ["http://limira.test/api/limira/auth/google/callback"]
+        assert params["state"][0]
+        assert limira.LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME in start.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_limira_google_oauth_callback_creates_verified_session_user(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, "google-client-id")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, "google-secret")
+
+    async def fake_google_userinfo_from_code(*, code, request, env=os.environ):
+        assert code == "google-code"
+        return {
+            "google_sub": "google-user-123",
+            "email": "google@example.test",
+            "name": "Google User",
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_limira_google_userinfo_from_code",
+        fake_google_userinfo_from_code,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        start = await client.get("/api/limira/auth/google/start", follow_redirects=False)
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+
+        callback = await client.get(
+            "/api/limira/auth/google/callback",
+            params={"code": "google-code", "state": state},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "http://limira.test/limira?google_auth=success"
+        assert "limira_session=" in callback.headers.get("set-cookie", "")
+
+        session = await client.get("/api/limira/auth/session")
+        assert session.status_code == 200
+        assert session.json()["email"] == "google@example.test"
+        assert session.json()["name"] == "Google User"
+        assert session.json()["role"] == "user"
+        assert session.json()["email_verified"] is True
+
+
+@pytest.mark.asyncio
 async def test_limira_native_auth_migrates_existing_legacy_sqlite_user_once(
     tmp_path,
     monkeypatch,
@@ -8339,6 +8439,9 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/auth/resend-verification", "POST"),
         ("/auth/password-reset/request", "POST"),
         ("/auth/password-reset/confirm", "POST"),
+        ("/auth/google/config", "GET"),
+        ("/auth/google/start", "GET"),
+        ("/auth/google/callback", "GET"),
         ("/scenarios", "GET"),
         ("/research", "POST"),
         ("/tasks/{task_id}", "GET"),
