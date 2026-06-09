@@ -1529,6 +1529,46 @@ async def _abort_playwright_route(route: Any) -> None:
     await route.abort()
 
 
+def _playwright_fontconfig_file(runtime_path: str) -> str | None:
+    font_dirs = [
+        os.path.join(runtime_path, "usr", "share", "fonts"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "fonts"),
+    ]
+    font_dirs = [
+        os.path.abspath(font_dir) for font_dir in font_dirs if os.path.isdir(font_dir)
+    ]
+    if not font_dirs:
+        return None
+
+    cache_dir = os.path.join(runtime_path, "font-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    dir_entries = "".join(
+        f"  <dir>{html.escape(font_dir, quote=False)}</dir>\n"
+        for font_dir in font_dirs
+    )
+    content = (
+        "<?xml version=\"1.0\"?>\n"
+        "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
+        "<fontconfig>\n"
+        f"{dir_entries}"
+        f"  <cachedir>{html.escape(cache_dir, quote=False)}</cachedir>\n"
+        "  <config></config>\n"
+        "</fontconfig>\n"
+    )
+    fontconfig_file = os.path.join(runtime_path, "limira-fonts.conf")
+    try:
+        existing = ""
+        if os.path.isfile(fontconfig_file):
+            with open(fontconfig_file, encoding="utf-8") as handle:
+                existing = handle.read()
+        if existing != content:
+            with open(fontconfig_file, "w", encoding="utf-8") as handle:
+                handle.write(content)
+    except OSError:
+        return None
+    return fontconfig_file
+
+
 def _playwright_chromium_launch_env() -> dict[str, str] | None:
     configured_path = str(os.getenv(LIMIRA_PLAYWRIGHT_RUNTIME_PATH_ENV) or "").strip()
     runtime_path = configured_path or os.path.abspath(
@@ -1551,8 +1591,8 @@ def _playwright_chromium_launch_env() -> dict[str, str] | None:
     if library_path_parts:
         env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path_parts)
 
-    fontconfig_file = os.path.join(runtime_path, "fonts.conf")
-    if os.path.isfile(fontconfig_file):
+    fontconfig_file = _playwright_fontconfig_file(runtime_path)
+    if fontconfig_file and os.path.isfile(fontconfig_file):
         env["FONTCONFIG_FILE"] = fontconfig_file
     env["FONTCONFIG_PATH"] = runtime_path
     return env
@@ -1563,99 +1603,30 @@ class PlaywrightLimiraPdfExporter:
         try:
             from playwright.async_api import async_playwright
         except Exception as exc:  # pragma: no cover - depends on runtime image
-            log.warning("Playwright PDF dependency unavailable; using fallback exporter")
-            return _render_report_pdf_fallback(html_content)
+            raise RuntimeError("limira_pdf_playwright_dependency_missing") from exc
 
-        try:
-            async with async_playwright() as playwright:
-                launch_kwargs: dict[str, Any] = {"args": ["--no-sandbox"]}
-                launch_env = _playwright_chromium_launch_env()
-                if launch_env is not None:
-                    launch_kwargs["env"] = launch_env
-                browser = await playwright.chromium.launch(**launch_kwargs)
-                try:
-                    page = await browser.new_page()
-                    await page.route("**/*", _abort_playwright_route)
-                    await page.set_content(html_content, wait_until="load")
-                    visible_text = await page.evaluate(
-                        "() => document.body ? document.body.innerText : ''"
-                    )
-                    if not str(visible_text or "").strip():
-                        raise RuntimeError("limira_pdf_blank_rendered_body")
-                    await page.emulate_media(media="print")
-                    pdf_bytes = await page.pdf(format="A4", print_background=True)
-                    if _persisted_report_pdf_appears_blank(pdf_bytes):
-                        raise RuntimeError("limira_pdf_blank_rendered_pdf")
-                finally:
-                    await browser.close()
-            return bytes(pdf_bytes)
-        except Exception as exc:
-            log.warning("Playwright PDF export failed; using fallback exporter: %s", exc)
-            return _render_report_pdf_fallback(html_content)
-
-
-def _render_report_pdf_fallback(html_content: str) -> bytes:
-    text = _plain_text_from_report_html(html_content)
-    if not text.strip():
-        raise RuntimeError("limira_pdf_blank_rendered_body")
-    try:
-        from fpdf import FPDF
-    except Exception as exc:  # pragma: no cover - depends on runtime image
-        raise RuntimeError("limira_pdf_fallback_dependency_missing") from exc
-
-    pdf = FPDF(format="A4")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    font_name = "Helvetica"
-    font_path = _report_pdf_font_path()
-    if font_path:
-        pdf.add_font("NotoSansSC", "", font_path)
-        font_name = "NotoSansSC"
-    pdf.set_font(font_name, size=11)
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            pdf.ln(4)
-            continue
-        try:
-            pdf.multi_cell(pdf.epw, 6, line)
-        except Exception:
-            for chunk in _chunk_report_pdf_text_line(line):
-                pdf.multi_cell(pdf.epw, 6, chunk)
-    rendered = pdf.output()
-    if isinstance(rendered, (bytes, bytearray)):
-        return bytes(rendered)
-    return str(rendered).encode("latin-1")
-
-
-def _plain_text_from_report_html(html_content: str) -> str:
-    try:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(html_content, "html.parser")
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-        raw_text = soup.get_text("\n")
-    except Exception:
-        raw_text = re.sub(r"(?i)<br\s*/?>", "\n", html_content)
-        raw_text = re.sub(r"(?i)</(?:p|div|h[1-6]|li|tr)>", "\n", raw_text)
-        raw_text = re.sub(r"<[^>]+>", " ", raw_text)
-    lines = [html.unescape(line).strip() for line in raw_text.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def _chunk_report_pdf_text_line(line: str, chunk_size: int = 80) -> list[str]:
-    return [line[index : index + chunk_size] for index in range(0, len(line), chunk_size)]
-
-
-def _report_pdf_font_path() -> str | None:
-    font_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "static",
-        "fonts",
-        "NotoSansSC-Regular.ttf",
-    )
-    return font_path if os.path.exists(font_path) else None
+        async with async_playwright() as playwright:
+            launch_kwargs: dict[str, Any] = {"args": ["--no-sandbox"]}
+            launch_env = _playwright_chromium_launch_env()
+            if launch_env is not None:
+                launch_kwargs["env"] = launch_env
+            browser = await playwright.chromium.launch(**launch_kwargs)
+            try:
+                page = await browser.new_page()
+                await page.route("**/*", _abort_playwright_route)
+                await page.set_content(html_content, wait_until="load")
+                visible_text = await page.evaluate(
+                    "() => document.body ? document.body.textContent : ''"
+                )
+                if not str(visible_text or "").strip():
+                    raise RuntimeError("limira_pdf_blank_rendered_body")
+                await page.emulate_media(media="print")
+                pdf_bytes = await page.pdf(format="A4", print_background=True)
+                if _persisted_report_pdf_appears_blank(pdf_bytes):
+                    raise RuntimeError("limira_pdf_blank_rendered_pdf")
+            finally:
+                await browser.close()
+        return bytes(pdf_bytes)
 
 
 class PostgresLimiraTaskRepository:
@@ -4006,6 +3977,11 @@ async def export_task_pdf(
         if _persisted_report_pdf_appears_blank(pdf_bytes):
             raise RuntimeError("limira_pdf_blank_rendered_pdf")
     except Exception as exc:
+        log.exception(
+            "Limira PDF export failed for task_id=%s report_id=%s",
+            task.task_id,
+            report_id,
+        )
         raise HTTPException(status_code=503, detail="pdf_export_failed") from exc
     pdf_debug_artifacts = _write_pdf_debug_artifacts(
         task_id=task.task_id,
@@ -4436,7 +4412,15 @@ def _persisted_report_pdf_appears_blank(pdf_bytes: bytes) -> bool:
         int(match.group(1))
         for match in re.finditer(rb"/Length\s+(\d+)\s*>>\s*stream", pdf_bytes)
     ]
-    return bool(stream_lengths) and all(length == 0 for length in stream_lengths)
+    if bool(stream_lengths) and all(length == 0 for length in stream_lengths):
+        return True
+    if (
+        b"/Type /Page" in pdf_bytes
+        and b"/Font" not in pdf_bytes
+        and re.search(rb"\b(?:Tj|TJ)\b", pdf_bytes) is None
+    ):
+        return True
+    return False
 
 
 def _drop_report_pdf_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:

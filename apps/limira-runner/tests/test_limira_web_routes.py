@@ -3534,9 +3534,13 @@ async def test_pdf_route_rejects_blank_exporter_output_before_storage():
     )
     blank_pdf_bytes = (
         b"%PDF-1.4\n"
-        b"3 0 obj\n"
-        b"<</Length 0>> stream\n"
+        b"1 0 obj\n"
+        b"<</Length 300>> stream\n"
+        b"compressed paint state without text or fonts\n"
         b"endstream\n"
+        b"endobj\n"
+        b"2 0 obj\n"
+        b"<</Type /Page /Contents 1 0 R>>\n"
         b"endobj\n"
         b"%%EOF"
     )
@@ -4073,10 +4077,15 @@ def test_playwright_pdf_exporter_builds_local_runtime_launch_env(monkeypatch, tm
     runtime_path = tmp_path / "playwright-runtime"
     usr_lib = runtime_path / "usr/lib/x86_64-linux-gnu"
     lib = runtime_path / "lib/x86_64-linux-gnu"
+    runtime_fonts = runtime_path / "usr/share/fonts"
     usr_lib.mkdir(parents=True)
     lib.mkdir(parents=True)
+    runtime_fonts.mkdir(parents=True)
     fonts_conf = runtime_path / "fonts.conf"
-    fonts_conf.write_text("<fontconfig />", encoding="utf-8")
+    fonts_conf.write_text(
+        "<fontconfig><dir>/stale/renamed/project/fonts</dir></fontconfig>",
+        encoding="utf-8",
+    )
 
     monkeypatch.setenv(limira.LIMIRA_PLAYWRIGHT_RUNTIME_PATH_ENV, str(runtime_path))
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
@@ -4091,7 +4100,11 @@ def test_playwright_pdf_exporter_builds_local_runtime_launch_env(monkeypatch, tm
         str(lib),
         "/existing/lib",
     ]
-    assert launch_env["FONTCONFIG_FILE"] == str(fonts_conf)
+    generated_fonts_conf = Path(launch_env["FONTCONFIG_FILE"])
+    assert generated_fonts_conf == runtime_path / "limira-fonts.conf"
+    generated_fonts_conf_text = generated_fonts_conf.read_text(encoding="utf-8")
+    assert str(runtime_fonts) in generated_fonts_conf_text
+    assert "/stale/renamed/project/fonts" not in generated_fonts_conf_text
     assert launch_env["FONTCONFIG_PATH"] == str(runtime_path)
 
 
@@ -4186,7 +4199,7 @@ async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypa
             "wait_until": "load",
         }
     ]
-    assert page.evaluate_calls == ["() => document.body ? document.body.innerText : ''"]
+    assert page.evaluate_calls == ["() => document.body ? document.body.textContent : ''"]
     assert page.emulate_media_calls == [{"media": "print"}]
     assert page.pdf_calls == [{"format": "A4", "print_background": True}]
     assert len(page.routes) == 1
@@ -4266,14 +4279,17 @@ async def test_playwright_pdf_exporter_rejects_blank_rendered_body(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_playwright_pdf_exporter_falls_back_when_rendered_pdf_is_blank(monkeypatch):
+async def test_playwright_pdf_exporter_rejects_blank_rendered_pdf(monkeypatch):
     calls = {"closed": False}
-    fallback_lines: list[str] = []
     blank_pdf_bytes = (
         b"%PDF-1.4\n"
-        b"3 0 obj\n"
-        b"<</Length 0>> stream\n"
+        b"1 0 obj\n"
+        b"<</Length 300>> stream\n"
+        b"compressed paint state without text or fonts\n"
         b"endstream\n"
+        b"endobj\n"
+        b"2 0 obj\n"
+        b"<</Type /Page /Contents 1 0 R>>\n"
         b"endobj\n"
         b"%%EOF"
     )
@@ -4312,82 +4328,21 @@ async def test_playwright_pdf_exporter_falls_back_when_rendered_pdf_is_blank(mon
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    class FakeFPDF:
-        def __init__(self, **_kwargs):
-            self.epw = 180
-
-        def set_auto_page_break(self, **_kwargs):
-            return None
-
-        def add_page(self):
-            return None
-
-        def add_font(self, *_args, **_kwargs):
-            return None
-
-        def set_font(self, *_args, **_kwargs):
-            return None
-
-        def ln(self, *_args, **_kwargs):
-            fallback_lines.append("")
-
-        def multi_cell(self, _width, _height, text):
-            fallback_lines.append(text)
-
-        def output(self):
-            body = "\n".join(fallback_lines).encode()
-            return b"%PDF-1.7\n" + body + b"\n%%EOF"
-
     async_api_module = types.ModuleType("playwright.async_api")
     async_api_module.async_playwright = lambda: FakePlaywrightContext()
-    fpdf_module = types.ModuleType("fpdf")
-    fpdf_module.FPDF = FakeFPDF
     monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
     monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
-    monkeypatch.setitem(sys.modules, "fpdf", fpdf_module)
 
-    pdf_bytes = await limira.PlaywrightLimiraPdfExporter().render_pdf(
-        "<!doctype html><html><body><h1>Visible report text</h1><p>中文正文</p></body></html>"
-    )
+    with pytest.raises(RuntimeError, match="limira_pdf_blank_rendered_pdf"):
+        await limira.PlaywrightLimiraPdfExporter().render_pdf(
+            "<!doctype html><html><body><h1>Visible report text</h1><p>中文正文</p></body></html>"
+        )
 
     assert calls["closed"] is True
-    assert pdf_bytes.startswith(b"%PDF-1.7")
-    assert not limira._persisted_report_pdf_appears_blank(pdf_bytes)
-    assert "Visible report text" in "\n".join(fallback_lines)
-    assert "中文正文" in "\n".join(fallback_lines)
 
 
 @pytest.mark.asyncio
-async def test_playwright_pdf_exporter_falls_back_when_browser_launch_fails(monkeypatch):
-    fallback_lines: list[str] = []
-
-    class FakeFPDF:
-        def __init__(self, **_kwargs):
-            self.epw = 180
-            return None
-
-        def set_auto_page_break(self, **_kwargs):
-            return None
-
-        def add_page(self):
-            return None
-
-        def add_font(self, *_args, **_kwargs):
-            return None
-
-        def set_font(self, *_args, **_kwargs):
-            return None
-
-        def ln(self, *_args, **_kwargs):
-            fallback_lines.append("")
-
-        def multi_cell(self, _width, _height, text):
-            fallback_lines.append(text)
-
-        def output(self):
-            body = "\n".join(fallback_lines).encode()
-            return b"%PDF-1.7\n" + body + b"\n%%EOF"
-
+async def test_playwright_pdf_exporter_raises_when_browser_launch_fails(monkeypatch):
     class FakeChromium:
         async def launch(self, **_kwargs):
             raise RuntimeError("missing browser deps")
@@ -4401,19 +4356,13 @@ async def test_playwright_pdf_exporter_falls_back_when_browser_launch_fails(monk
 
     async_api_module = types.ModuleType("playwright.async_api")
     async_api_module.async_playwright = lambda: FakePlaywrightContext()
-    fpdf_module = types.ModuleType("fpdf")
-    fpdf_module.FPDF = FakeFPDF
     monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
     monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
-    monkeypatch.setitem(sys.modules, "fpdf", fpdf_module)
 
-    pdf_bytes = await limira.PlaywrightLimiraPdfExporter().render_pdf(
-        "<!doctype html><html><body><h1>Fallback title</h1><p>中文正文</p></body></html>"
-    )
-
-    assert pdf_bytes.startswith(b"%PDF-1.7")
-    assert "Fallback title" in "\n".join(fallback_lines)
-    assert "中文正文" in "\n".join(fallback_lines)
+    with pytest.raises(RuntimeError, match="missing browser deps"):
+        await limira.PlaywrightLimiraPdfExporter().render_pdf(
+            "<!doctype html><html><body><h1>Report title</h1><p>中文正文</p></body></html>"
+        )
 
 
 def test_postgres_repository_sql_targets_limira_task_and_artifact_tables():
