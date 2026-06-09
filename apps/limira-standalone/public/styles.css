@@ -158,6 +158,16 @@ label {
 	flex-direction: column;
 	gap: 1.25rem;
 	height: calc(100vh - 90px);
+	min-height: 0;
+}
+
+.left-pane {
+	overflow-y: auto;
+}
+
+.side-pane .panel:last-child {
+	flex: 1;
+	min-height: 0;
 }
 
 /* Panels */
@@ -224,6 +234,7 @@ label {
 	border-radius: var(--radius);
 	padding: 1.25rem;
 	box-shadow: var(--shadow-sm);
+	flex-shrink: 0;
 }
 
 /* Buttons */
@@ -285,6 +296,7 @@ label {
 	border-radius: var(--radius);
 	border: 1px solid var(--border);
 	box-shadow: var(--shadow-sm);
+	flex-shrink: 0;
 }
 
 .scenario-bar label {
@@ -300,6 +312,7 @@ label {
 	font-size: 0.9rem;
 	line-height: 1.5;
 	border: 1px solid var(--border);
+	flex-shrink: 0;
 }
 
 /* Research Form */
@@ -312,6 +325,7 @@ label {
 	border-radius: var(--radius);
 	border: 1px solid var(--border);
 	box-shadow: var(--shadow-sm);
+	flex-shrink: 0;
 }
 
 .action-row {
@@ -333,6 +347,7 @@ label {
 	overflow-y: auto;
 	flex: 1;
 	padding-right: 0.25rem;
+	min-height: 0;
 }
 
 .history-item {
@@ -383,6 +398,7 @@ label {
 	border: 1px solid var(--border);
 	box-shadow: var(--shadow-sm);
 	overflow-x: auto;
+	flex-shrink: 0;
 }
 
 .tabs button {
@@ -413,6 +429,7 @@ label {
 	flex: 1;
 	overflow-y: auto;
 	padding-right: 0.5rem;
+	min-height: 0;
 }
 
 .artifact-grid {
@@ -465,6 +482,7 @@ label {
 	display: flex;
 	gap: 0.5rem;
 	margin: 1rem 0;
+	flex-shrink: 0;
 }
 
 .compact-list {
@@ -474,6 +492,7 @@ label {
 	overflow-y: auto;
 	flex: 1;
 	max-height: 250px;
+	min-height: 0;
 }
 
 .upload-card {
@@ -489,6 +508,7 @@ label {
 	overflow-y: auto;
 	flex: 1;
 	padding-right: 0.25rem;
+	min-height: 0;
 }
 
 .message {
