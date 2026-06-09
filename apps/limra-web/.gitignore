@@ -1,4 +1,5 @@
 .venv/
+.playwright-local-libs/
 __pycache__/
 *.py[cod]
 backend/__pycache__/

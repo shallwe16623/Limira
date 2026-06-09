@@ -84,6 +84,7 @@ LIMRA_EMBEDDING_PROVIDER_ENV = "LIMRA_EMBEDDING_PROVIDER"
 LIMRA_EMBEDDING_MODEL_ENV = "LIMRA_EMBEDDING_MODEL"
 LIMRA_EMBEDDING_DIMENSIONS_ENV = "LIMRA_EMBEDDING_DIMENSIONS"
 LIMRA_PDF_DEBUG_DIR_ENV = "LIMRA_PDF_DEBUG_DIR"
+LIMRA_PLAYWRIGHT_RUNTIME_PATH_ENV = "LIMRA_PLAYWRIGHT_RUNTIME_PATH"
 LIMRA_AUTH_SQLITE_PATH_ENV = "LIMRA_AUTH_SQLITE_PATH"
 LIMRA_LEGACY_AUTH_SQLITE_PATH_ENV = "LIMRA_LEGACY_AUTH_SQLITE_PATH"
 LIMRA_AUTH_SECRET_ENV = "LIMRA_AUTH_SECRET"
@@ -1472,6 +1473,35 @@ async def _abort_playwright_route(route: Any) -> None:
     await route.abort()
 
 
+def _playwright_chromium_launch_env() -> dict[str, str] | None:
+    configured_path = str(os.getenv(LIMRA_PLAYWRIGHT_RUNTIME_PATH_ENV) or "").strip()
+    runtime_path = configured_path or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".playwright-local-libs")
+    )
+    if not os.path.isdir(runtime_path):
+        return None
+
+    env = dict(os.environ)
+    library_dirs = [
+        os.path.join(runtime_path, "usr", "lib", "x86_64-linux-gnu"),
+        os.path.join(runtime_path, "lib", "x86_64-linux-gnu"),
+    ]
+    existing_library_path = str(env.get("LD_LIBRARY_PATH") or "").strip()
+    library_path_parts = [
+        library_dir for library_dir in library_dirs if os.path.isdir(library_dir)
+    ]
+    if existing_library_path:
+        library_path_parts.append(existing_library_path)
+    if library_path_parts:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path_parts)
+
+    fontconfig_file = os.path.join(runtime_path, "fonts.conf")
+    if os.path.isfile(fontconfig_file):
+        env["FONTCONFIG_FILE"] = fontconfig_file
+    env["FONTCONFIG_PATH"] = runtime_path
+    return env
+
+
 class PlaywrightLimraPdfExporter:
     async def render_pdf(self, html_content: str) -> bytes:
         try:
@@ -1482,7 +1512,11 @@ class PlaywrightLimraPdfExporter:
 
         try:
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(args=["--no-sandbox"])
+                launch_kwargs: dict[str, Any] = {"args": ["--no-sandbox"]}
+                launch_env = _playwright_chromium_launch_env()
+                if launch_env is not None:
+                    launch_kwargs["env"] = launch_env
+                browser = await playwright.chromium.launch(**launch_kwargs)
                 try:
                     page = await browser.new_page()
                     await page.route("**/*", _abort_playwright_route)

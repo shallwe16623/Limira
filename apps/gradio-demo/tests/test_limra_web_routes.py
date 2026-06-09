@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import zipfile
 import asyncio
@@ -4018,9 +4019,35 @@ def test_limra_secret_scrubber_redacts_nested_payloads_and_urls():
     )
 
 
+def test_playwright_pdf_exporter_builds_local_runtime_launch_env(monkeypatch, tmp_path):
+    runtime_path = tmp_path / "playwright-runtime"
+    usr_lib = runtime_path / "usr/lib/x86_64-linux-gnu"
+    lib = runtime_path / "lib/x86_64-linux-gnu"
+    usr_lib.mkdir(parents=True)
+    lib.mkdir(parents=True)
+    fonts_conf = runtime_path / "fonts.conf"
+    fonts_conf.write_text("<fontconfig />", encoding="utf-8")
+
+    monkeypatch.setenv(limra.LIMRA_PLAYWRIGHT_RUNTIME_PATH_ENV, str(runtime_path))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
+    monkeypatch.delenv("FONTCONFIG_FILE", raising=False)
+    monkeypatch.delenv("FONTCONFIG_PATH", raising=False)
+
+    launch_env = limra._playwright_chromium_launch_env()
+
+    assert launch_env is not None
+    assert launch_env["LD_LIBRARY_PATH"].split(os.pathsep) == [
+        str(usr_lib),
+        str(lib),
+        "/existing/lib",
+    ]
+    assert launch_env["FONTCONFIG_FILE"] == str(fonts_conf)
+    assert launch_env["FONTCONFIG_PATH"] == str(runtime_path)
+
+
 @pytest.mark.asyncio
 async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypatch):
-    calls = {"launch_args": None, "closed": False}
+    calls = {"launch_args": None, "launch_env": None, "closed": False}
 
     class FakeRoute:
         def __init__(self):
@@ -4071,8 +4098,9 @@ async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypa
         def __init__(self, browser):
             self.browser = browser
 
-        async def launch(self, args):
-            calls["launch_args"] = args
+        async def launch(self, **kwargs):
+            calls["launch_args"] = kwargs["args"]
+            calls["launch_env"] = kwargs.get("env")
             return self.browser
 
     class FakePlaywrightContext:
@@ -4099,6 +4127,8 @@ async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypa
 
     assert pdf_bytes.startswith(b"%PDF")
     assert calls["launch_args"] == ["--no-sandbox"]
+    if calls["launch_env"] is not None:
+        assert calls["launch_env"]["LD_LIBRARY_PATH"]
     assert calls["closed"] is True
     assert page.set_content_calls == [
         {
@@ -4155,7 +4185,7 @@ async def test_playwright_pdf_exporter_rejects_blank_rendered_body(monkeypatch):
         def __init__(self, browser):
             self.browser = browser
 
-        async def launch(self, args):
+        async def launch(self, **_kwargs):
             return self.browser
 
     class FakePlaywrightContext:
@@ -4222,7 +4252,7 @@ async def test_playwright_pdf_exporter_falls_back_when_rendered_pdf_is_blank(mon
             calls["closed"] = True
 
     class FakeChromium:
-        async def launch(self, args):
+        async def launch(self, **_kwargs):
             return FakeBrowser()
 
     class FakePlaywrightContext:
@@ -4309,7 +4339,7 @@ async def test_playwright_pdf_exporter_falls_back_when_browser_launch_fails(monk
             return b"%PDF-1.7\n" + body + b"\n%%EOF"
 
     class FakeChromium:
-        async def launch(self, args):
+        async def launch(self, **_kwargs):
             raise RuntimeError("missing browser deps")
 
     class FakePlaywrightContext:
