@@ -24,7 +24,7 @@ LIMIRA_BACKEND_ROOT = LIMIRA_WEB_ROOT / "backend" / "limira_backend"
 LIMIRA_BACKEND_ROUTER = LIMIRA_BACKEND_ROOT / "routers" / "limira.py"
 LIMIRA_NATIVE_APP = LIMIRA_WEB_ROOT / "backend" / "limira_native.py"
 LEGACY_PY_PACKAGE = "open" + "_" + "web" + "ui"
-LEGACY_APP_DIR = "open-" + "web" + "ui-mirothinker"
+LEGACY_APP_DIR = "open-" + "web" + "ui-limira-runner"
 LEGACY_AUTH_PREFIX = "/" + "api" + "/" + "v1" + "/" + "auths"
 
 
@@ -174,7 +174,7 @@ def test_limira_standalone_proxy_only_forwards_limira_api_namespace():
             f"{LEGACY_AUTH_PREFIX}/",
             f"{LEGACY_AUTH_PREFIX}/update/timezone",
             "/api/config",
-            "/mirothinker/tasks/task-a/events",
+            "/limira-runner/tasks/task-a/events",
         ]:
             blocked_status, blocked_body = _read_url(f"{base_url}{blocked_path}")
             assert blocked_status == 404

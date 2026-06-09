@@ -21,15 +21,15 @@ from task_store import TaskStore
 
 
 USER_A_HEADERS = {
-    "X-MiroThinker-Service-Token": "shared",
+    "X-Limira-Runner-Service-Token": "shared",
     "X-Limira-User-Id": "user-a",
 }
 USER_B_HEADERS = {
-    "X-MiroThinker-Service-Token": "shared",
+    "X-Limira-Runner-Service-Token": "shared",
     "X-Limira-User-Id": "user-b",
 }
 ADMIN_HEADERS = {
-    "X-MiroThinker-Service-Token": "shared",
+    "X-Limira-Runner-Service-Token": "shared",
     "X-Limira-User-Id": "admin-user",
     "X-Limira-User-Role": "admin",
 }
@@ -260,7 +260,7 @@ def test_create_app_preserves_partial_helper_overrides(tmp_path, monkeypatch):
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):
     response = await client.post(
-        "/mirothinker/research",
+        "/limira-runner/research",
         headers=headers,
         json={"query": query, "client_options": {"stream": True}},
     )
@@ -272,7 +272,7 @@ async def complete_task(client, headers=USER_A_HEADERS):
     start_payload = await start_task(client, headers=headers)
     task_id = start_payload["task_id"]
     events_response = await client.get(
-        f"/mirothinker/tasks/{task_id}/events",
+        f"/limira-runner/tasks/{task_id}/events",
         headers=headers,
     )
     assert events_response.status == 200
@@ -305,7 +305,7 @@ def assert_diagnostic_archive(store, task_id, expected_status, forbidden_text):
     assert metadata["status"] == expected_status
     assert trace["events"]
     assert report.strip()
-    assert f"MiroThinker Research {expected_status.title()}" in report
+    assert f"Limira Research {expected_status.title()}" in report
     assert "<!doctype html>" in report_html
     assert forbidden_text not in json.dumps(metadata)
     assert forbidden_text not in json.dumps(trace)
@@ -325,7 +325,7 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         task_id = start_payload["task_id"]
 
         events_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert events_response.status == 200
@@ -336,7 +336,7 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         assert sse_events[1]["payload"]["event"] == "message"
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_A_HEADERS,
         )
         status_payload = await status_response.json()
@@ -344,7 +344,7 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         assert status_payload["archive_status"] == "ready"
         assert (
             status_payload["download_url"]
-            == f"/mirothinker/tasks/{task_id}/archive.zip"
+            == f"/limira-runner/tasks/{task_id}/archive.zip"
         )
 
         record = store.get_task(task_id)
@@ -358,7 +358,7 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         assert "final from state" in report
 
         download_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/archive.zip",
+            f"/limira-runner/tasks/{task_id}/archive.zip",
             headers=USER_A_HEADERS,
         )
         assert download_response.status == 200
@@ -409,14 +409,14 @@ async def test_runner_api_scrubs_structured_secrets_before_report_rendering(
         task_id = start_payload["task_id"]
 
         events_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert events_response.status == 200
         sse_payload = await events_response.text()
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_A_HEADERS,
         )
         status_payload = await status_response.json()
@@ -456,14 +456,14 @@ async def test_runner_api_stream_setup_failure_finalizes_claimed_task(tmp_path):
         task_id = start_payload["task_id"]
 
         events_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert events_response.status == 500
         assert await events_response.json() == {"error": "stream_setup_failed"}
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_A_HEADERS,
         )
         status_payload = await status_response.json()
@@ -483,7 +483,7 @@ async def test_runner_api_stream_setup_failure_finalizes_claimed_task(tmp_path):
         assert "setupsecret123456" not in json.dumps(record.to_dict())
 
         retry_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert retry_response.status == 409
@@ -502,14 +502,14 @@ async def test_runner_api_archive_finalization_failure_finalizes_claimed_task(
         task_id = start_payload["task_id"]
 
         events_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert events_response.status == 200
         await events_response.text()
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_A_HEADERS,
         )
         status_payload = await status_response.json()
@@ -535,7 +535,7 @@ async def test_runner_api_archive_finalization_failure_finalizes_claimed_task(
         assert "finalsecret123456" not in json.dumps(record.to_dict())
 
         retry_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert retry_response.status == 409
@@ -555,14 +555,14 @@ async def test_runner_api_renderer_failure_finalizes_claimed_task(tmp_path):
         task_id = start_payload["task_id"]
 
         events_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert events_response.status == 200
         await events_response.text()
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_A_HEADERS,
         )
         status_payload = await status_response.json()
@@ -587,7 +587,7 @@ async def test_runner_api_renderer_failure_finalizes_claimed_task(tmp_path):
         assert "rendersecret123456" not in json.dumps(record.to_dict())
 
         retry_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert retry_response.status == 409
@@ -604,19 +604,19 @@ async def test_runner_api_rejects_foreign_user_and_not_ready_download(tmp_path):
         task_id = start_payload["task_id"]
 
         foreign_status = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_B_HEADERS,
         )
         assert foreign_status.status == 404
 
         foreign_events = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_B_HEADERS,
         )
         assert foreign_events.status == 404
 
         not_ready_download = await client.get(
-            f"/mirothinker/tasks/{task_id}/archive.zip",
+            f"/limira-runner/tasks/{task_id}/archive.zip",
             headers=USER_A_HEADERS,
         )
         assert not_ready_download.status == 409
@@ -632,26 +632,26 @@ async def test_runner_api_allows_admin_but_blocks_foreign_download(tmp_path):
         start_payload = await start_task(client)
         task_id = start_payload["task_id"]
         events_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert events_response.status == 200
         await events_response.text()
 
         foreign_download = await client.get(
-            f"/mirothinker/tasks/{task_id}/archive.zip",
+            f"/limira-runner/tasks/{task_id}/archive.zip",
             headers=USER_B_HEADERS,
         )
         assert foreign_download.status == 404
 
         admin_status = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=ADMIN_HEADERS,
         )
         assert admin_status.status == 200
 
         admin_download = await client.get(
-            f"/mirothinker/tasks/{task_id}/archive.zip",
+            f"/limira-runner/tasks/{task_id}/archive.zip",
             headers=ADMIN_HEADERS,
         )
         assert admin_download.status == 200
@@ -665,7 +665,7 @@ async def test_runner_api_foreign_user_denied_for_status(tmp_path):
     try:
         start_payload = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{start_payload['task_id']}",
+            f"/limira-runner/tasks/{start_payload['task_id']}",
             headers=USER_B_HEADERS,
         )
         assert response.status == 404
@@ -679,7 +679,7 @@ async def test_runner_api_foreign_user_denied_for_events(tmp_path):
     try:
         start_payload = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{start_payload['task_id']}/events",
+            f"/limira-runner/tasks/{start_payload['task_id']}/events",
             headers=USER_B_HEADERS,
         )
         assert response.status == 404
@@ -693,7 +693,7 @@ async def test_runner_api_foreign_user_denied_for_archive_download(tmp_path):
     try:
         task_id = await complete_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{task_id}/archive.zip",
+            f"/limira-runner/tasks/{task_id}/archive.zip",
             headers=USER_B_HEADERS,
         )
         assert response.status == 404
@@ -707,7 +707,7 @@ async def test_runner_api_foreign_user_denied_for_cancel(tmp_path):
     try:
         start_payload = await start_task(client)
         response = await client.post(
-            f"/mirothinker/tasks/{start_payload['task_id']}/cancel",
+            f"/limira-runner/tasks/{start_payload['task_id']}/cancel",
             headers=USER_B_HEADERS,
         )
         assert response.status == 404
@@ -721,7 +721,7 @@ async def test_runner_api_admin_allowed_for_status(tmp_path):
     try:
         start_payload = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{start_payload['task_id']}",
+            f"/limira-runner/tasks/{start_payload['task_id']}",
             headers=ADMIN_HEADERS,
         )
         assert response.status == 200
@@ -737,7 +737,7 @@ async def test_runner_api_admin_allowed_for_events(tmp_path):
     try:
         start_payload = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{start_payload['task_id']}/events",
+            f"/limira-runner/tasks/{start_payload['task_id']}/events",
             headers=ADMIN_HEADERS,
         )
         assert response.status == 200
@@ -753,7 +753,7 @@ async def test_runner_api_admin_allowed_for_archive_download(tmp_path):
     try:
         task_id = await complete_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{task_id}/archive.zip",
+            f"/limira-runner/tasks/{task_id}/archive.zip",
             headers=ADMIN_HEADERS,
         )
         assert response.status == 200
@@ -769,7 +769,7 @@ async def test_runner_api_admin_allowed_for_cancel(tmp_path):
     try:
         start_payload = await start_task(client)
         response = await client.post(
-            f"/mirothinker/tasks/{start_payload['task_id']}/cancel",
+            f"/limira-runner/tasks/{start_payload['task_id']}/cancel",
             headers=ADMIN_HEADERS,
         )
         assert response.status == 200
@@ -791,7 +791,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         task_id = start_payload["task_id"]
         events_task = asyncio.create_task(
             client.get(
-                f"/mirothinker/tasks/{task_id}/events",
+                f"/limira-runner/tasks/{task_id}/events",
                 headers=USER_A_HEADERS,
             )
         )
@@ -799,7 +799,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         assert task_id in client.server.app[ACTIVE_TASKS_KEY]
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -812,7 +812,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         assert probe.check_count > 0
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task_id}",
+            f"/limira-runner/tasks/{task_id}",
             headers=USER_A_HEADERS,
         )
         status_payload = await status_response.json()
@@ -824,7 +824,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         metadata = json.loads((archive_dir / "metadata.json").read_text())
         assert metadata["status"] == "cancelled"
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
-        assert "MiroThinker Research Cancelled" in report
+        assert "Limira Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
         assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
     finally:
@@ -845,7 +845,7 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
         assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -855,7 +855,7 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
         assert cancel_payload["status"] == "cancelled"
         assert cancel_payload["archive_status"] == "ready"
         assert cancel_payload["download_url"] == (
-            f"/mirothinker/tasks/{task_id}/archive.zip"
+            f"/limira-runner/tasks/{task_id}/archive.zip"
         )
         assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
         assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
@@ -871,11 +871,11 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
             "task cancelled because no active stream worker was registered"
         )
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
-        assert "MiroThinker Research Cancelled" in report
+        assert "Limira Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
 
         retry_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert retry_response.status == 409
@@ -892,7 +892,7 @@ async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
         task_id = start_payload["task_id"]
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -908,7 +908,7 @@ async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
         assert metadata["status"] == "cancelled"
         assert metadata["error"] == "task cancelled before stream started"
         report = (archive_dir / "report.md").read_text(encoding="utf-8")
-        assert "MiroThinker Research Cancelled" in report
+        assert "Limira Research Cancelled" in report
         assert_zip_members(record.archive_zip_path)
     finally:
         await client.close()
@@ -922,7 +922,7 @@ async def test_runner_api_queued_cancel_start_failure_sets_archive_failed(tmp_pa
         task_id = start_payload["task_id"]
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -958,7 +958,7 @@ async def test_runner_api_queued_cancel_complete_failure_sets_archive_failed(tmp
         task_id = start_payload["task_id"]
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -995,7 +995,7 @@ async def test_runner_api_queued_cancel_keeps_signal_when_stream_claim_wins(tmp_
         task_id = start_payload["task_id"]
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -1025,14 +1025,14 @@ async def test_runner_api_rejects_duplicate_running_event_stream(tmp_path):
         task_id = start_payload["task_id"]
         events_task = asyncio.create_task(
             client.get(
-                f"/mirothinker/tasks/{task_id}/events",
+                f"/limira-runner/tasks/{task_id}/events",
                 headers=USER_A_HEADERS,
             )
         )
         await asyncio.wait_for(probe.started.wait(), timeout=1)
 
         duplicate_response = await client.get(
-            f"/mirothinker/tasks/{task_id}/events",
+            f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
         assert duplicate_response.status == 409
@@ -1040,7 +1040,7 @@ async def test_runner_api_rejects_duplicate_running_event_stream(tmp_path):
         assert probe.stream_count == 1
 
         cancel_response = await client.post(
-            f"/mirothinker/tasks/{task_id}/cancel",
+            f"/limira-runner/tasks/{task_id}/cancel",
             headers=USER_A_HEADERS,
         )
         assert cancel_response.status == 200
@@ -1069,7 +1069,7 @@ async def test_runner_api_transport_close_stops_active_stream(tmp_path):
         task_id = start_payload["task_id"]
         events_task = asyncio.create_task(
             client.get(
-                f"/mirothinker/tasks/{task_id}/events",
+                f"/limira-runner/tasks/{task_id}/events",
                 headers=USER_A_HEADERS,
             )
         )
@@ -1089,7 +1089,7 @@ async def test_runner_api_transport_close_stops_active_stream(tmp_path):
         status_payload = None
         for _ in range(20):
             status_response = await client.get(
-                f"/mirothinker/tasks/{task_id}",
+                f"/limira-runner/tasks/{task_id}",
                 headers=USER_A_HEADERS,
             )
             status_payload = await status_response.json()
@@ -1108,14 +1108,14 @@ async def test_runner_api_cancel_endpoint_enforces_owner_and_admin(tmp_path):
     try:
         foreign_task = await start_task(client)
         foreign_cancel = await client.post(
-            f"/mirothinker/tasks/{foreign_task['task_id']}/cancel",
+            f"/limira-runner/tasks/{foreign_task['task_id']}/cancel",
             headers=USER_B_HEADERS,
         )
         assert foreign_cancel.status == 404
 
         admin_task = await start_task(client)
         admin_cancel = await client.post(
-            f"/mirothinker/tasks/{admin_task['task_id']}/cancel",
+            f"/limira-runner/tasks/{admin_task['task_id']}/cancel",
             headers=ADMIN_HEADERS,
         )
         assert admin_cancel.status == 200
@@ -1129,7 +1129,7 @@ async def test_runner_api_cancel_endpoint_enforces_owner_and_admin(tmp_path):
         assert record.archive_zip_path is not None
 
         completed_events = await client.get(
-            f"/mirothinker/tasks/{admin_task['task_id']}/events",
+            f"/limira-runner/tasks/{admin_task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert completed_events.status == 409
@@ -1142,20 +1142,20 @@ async def test_runner_api_validation_rejects_untrusted_inputs(tmp_path):
     client, _store = await make_client(tmp_path)
     try:
         missing_auth = await client.post(
-            "/mirothinker/research",
+            "/limira-runner/research",
             json={"query": "x"},
         )
         assert missing_auth.status == 401
 
         body_user = await client.post(
-            "/mirothinker/research",
+            "/limira-runner/research",
             headers=USER_A_HEADERS,
             json={"query": "x", "user_id": "attacker"},
         )
         assert body_user.status == 400
 
         empty_query = await client.post(
-            "/mirothinker/research",
+            "/limira-runner/research",
             headers=USER_A_HEADERS,
             json={"query": "  "},
         )
@@ -1170,14 +1170,14 @@ async def test_runner_api_failed_outcome_writes_scrubbed_diagnostic_archive(tmp_
     try:
         task = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}/events",
+            f"/limira-runner/tasks/{task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert response.status == 200
         await response.text()
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}",
+            f"/limira-runner/tasks/{task['task_id']}",
             headers=USER_A_HEADERS,
         )
         payload = await status_response.json()
@@ -1203,14 +1203,14 @@ async def test_runner_api_cancelled_outcome_writes_scrubbed_diagnostic_archive(
     try:
         task = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}/events",
+            f"/limira-runner/tasks/{task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert response.status == 200
         await response.text()
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}",
+            f"/limira-runner/tasks/{task['task_id']}",
             headers=USER_A_HEADERS,
         )
         payload = await status_response.json()
@@ -1236,14 +1236,14 @@ async def test_runner_api_archive_failed_exposes_warning_without_failing_researc
     try:
         task = await start_task(client)
         response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}/events",
+            f"/limira-runner/tasks/{task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert response.status == 200
         await response.text()
 
         status_response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}",
+            f"/limira-runner/tasks/{task['task_id']}",
             headers=USER_A_HEADERS,
         )
         payload = await status_response.json()
@@ -1258,7 +1258,7 @@ async def test_runner_api_archive_failed_exposes_warning_without_failing_researc
         assert record.archive_zip_path is None
 
         download_response = await client.get(
-            f"/mirothinker/tasks/{task['task_id']}/archive.zip",
+            f"/limira-runner/tasks/{task['task_id']}/archive.zip",
             headers=USER_A_HEADERS,
         )
         assert download_response.status == 409
@@ -1274,12 +1274,12 @@ async def test_runner_api_failed_cancelled_and_archive_failed_outcomes(tmp_path)
     try:
         failed_task = await start_task(failed_client)
         failed_events = await failed_client.get(
-            f"/mirothinker/tasks/{failed_task['task_id']}/events",
+            f"/limira-runner/tasks/{failed_task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert failed_events.status == 200
         failed_status = await failed_client.get(
-            f"/mirothinker/tasks/{failed_task['task_id']}",
+            f"/limira-runner/tasks/{failed_task['task_id']}",
             headers=USER_A_HEADERS,
         )
         failed_payload = await failed_status.json()
@@ -1296,12 +1296,12 @@ async def test_runner_api_failed_cancelled_and_archive_failed_outcomes(tmp_path)
     try:
         cancelled_task = await start_task(cancelled_client)
         cancelled_events = await cancelled_client.get(
-            f"/mirothinker/tasks/{cancelled_task['task_id']}/events",
+            f"/limira-runner/tasks/{cancelled_task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert cancelled_events.status == 200
         cancelled_status = await cancelled_client.get(
-            f"/mirothinker/tasks/{cancelled_task['task_id']}",
+            f"/limira-runner/tasks/{cancelled_task['task_id']}",
             headers=USER_A_HEADERS,
         )
         cancelled_payload = await cancelled_status.json()
@@ -1317,12 +1317,12 @@ async def test_runner_api_failed_cancelled_and_archive_failed_outcomes(tmp_path)
     try:
         archive_failed_task = await start_task(archive_failed_client)
         archive_failed_events = await archive_failed_client.get(
-            f"/mirothinker/tasks/{archive_failed_task['task_id']}/events",
+            f"/limira-runner/tasks/{archive_failed_task['task_id']}/events",
             headers=USER_A_HEADERS,
         )
         assert archive_failed_events.status == 200
         archive_failed_status = await archive_failed_client.get(
-            f"/mirothinker/tasks/{archive_failed_task['task_id']}",
+            f"/limira-runner/tasks/{archive_failed_task['task_id']}",
             headers=USER_A_HEADERS,
         )
         archive_failed_payload = await archive_failed_status.json()
@@ -1330,7 +1330,7 @@ async def test_runner_api_failed_cancelled_and_archive_failed_outcomes(tmp_path)
         assert archive_failed_payload["archive_status"] == "failed"
 
         archive_failed_download = await archive_failed_client.get(
-            f"/mirothinker/tasks/{archive_failed_task['task_id']}/archive.zip",
+            f"/limira-runner/tasks/{archive_failed_task['task_id']}/archive.zip",
             headers=USER_A_HEADERS,
         )
         assert archive_failed_download.status == 409

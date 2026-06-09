@@ -29,7 +29,7 @@ const server = createServer(async (req, res) => {
 			await proxyApi(req, res, requestUrl);
 			return;
 		}
-		if (requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/mirothinker/')) {
+		if (requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/limira-runner/')) {
 			rejectPrivateApi(res);
 			return;
 		}

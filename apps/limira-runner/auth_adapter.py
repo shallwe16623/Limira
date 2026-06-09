@@ -3,8 +3,8 @@ from dataclasses import dataclass
 from typing import Mapping
 
 
-SERVICE_TOKEN_ENV = "MIROTHINKER_SERVICE_TOKEN"
-SERVICE_TOKEN_HEADER = "X-MiroThinker-Service-Token"
+SERVICE_TOKEN_ENV = "LIMIRA_RUNNER_SERVICE_TOKEN"
+SERVICE_TOKEN_HEADER = "X-Limira-Runner-Service-Token"
 USER_ID_HEADER = "X-Limira-User-Id"
 USER_ROLE_HEADER = "X-Limira-User-Role"
 

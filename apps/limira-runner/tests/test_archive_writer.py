@@ -106,7 +106,7 @@ def test_failed_task_without_report_gets_diagnostic_report(tmp_path):
         (result.archive_dir / "metadata.json").read_text(encoding="utf-8")
     )
 
-    assert "MiroThinker Research Failed" in report
+    assert "Limira Research Failed" in report
     assert "Captured events: 1" in report
     assert "failuresecret123456" not in report
     assert metadata["status"] == "failed"
@@ -126,7 +126,7 @@ def test_cancelled_task_without_report_gets_diagnostic_report(tmp_path):
         (result.archive_dir / "metadata.json").read_text(encoding="utf-8")
     )
 
-    assert "MiroThinker Research Cancelled" in report
+    assert "Limira Research Cancelled" in report
     assert "Captured events: 1" in report
     assert "abc def" not in report
     assert metadata["status"] == "cancelled"

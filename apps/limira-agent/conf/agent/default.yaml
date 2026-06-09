@@ -1,0 +1,14 @@
+main_agent:
+  tools:
+    - search_and_scrape_webpage
+    - jina_scrape_llm_summary
+    - limira_artifact_recorder
+    - tool-python
+  tool_blacklist:
+    - ["tool-python", "download_file_from_sandbox_to_local"]
+  max_turns: 20
+
+sub_agents:
+
+keep_tool_result: -1
+context_compress_limit: 0

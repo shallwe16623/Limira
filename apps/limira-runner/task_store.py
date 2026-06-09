@@ -63,7 +63,7 @@ class TaskStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO mirothinker_research_tasks (
+                INSERT INTO limira_runner_research_tasks (
                     task_id, user_id, query, status, archive_status,
                     archive_dir, archive_zip_path, created_at, started_at,
                     completed_at, error, model_summary, warnings
@@ -76,7 +76,7 @@ class TaskStore:
     def get_task(self, task_id: str) -> TaskRecord | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM mirothinker_research_tasks WHERE task_id = ?",
+                "SELECT * FROM limira_runner_research_tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
         return self._row_to_record(row) if row else None
@@ -85,7 +85,7 @@ class TaskStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT * FROM mirothinker_research_tasks
+                SELECT * FROM limira_runner_research_tasks
                 WHERE user_id = ?
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -136,7 +136,7 @@ class TaskStore:
         values.append(task_id)
         with self._connect() as conn:
             cursor = conn.execute(
-                f"UPDATE mirothinker_research_tasks SET {assignments} WHERE task_id = ?",
+                f"UPDATE limira_runner_research_tasks SET {assignments} WHERE task_id = ?",
                 values,
             )
             if cursor.rowcount == 0:
@@ -150,7 +150,7 @@ class TaskStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                UPDATE mirothinker_research_tasks
+                UPDATE limira_runner_research_tasks
                 SET status = ?, started_at = ?
                 WHERE task_id = ? AND status = ?
                 """,
@@ -171,7 +171,7 @@ class TaskStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                UPDATE mirothinker_research_tasks
+                UPDATE limira_runner_research_tasks
                 SET status = ?, started_at = ?, completed_at = ?, error = ?
                 WHERE task_id = ? AND status = ?
                 """,
@@ -186,7 +186,7 @@ class TaskStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS mirothinker_research_tasks (
+                CREATE TABLE IF NOT EXISTS limira_runner_research_tasks (
                     task_id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
                     query TEXT NOT NULL,
@@ -205,8 +205,8 @@ class TaskStore:
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_mirothinker_tasks_user_created
-                ON mirothinker_research_tasks (user_id, created_at)
+                CREATE INDEX IF NOT EXISTS idx_limira_runner_tasks_user_created
+                ON limira_runner_research_tasks (user_id, created_at)
                 """
             )
 

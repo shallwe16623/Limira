@@ -234,7 +234,7 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "where task_id = %s" in sql
     assert "and status = 'queued'" in sql
     assert "returning" in sql
-    assert "mirothinker_research_tasks" not in sql
+    assert "limira_runner_research_tasks" not in sql
 
 
 def test_postgres_task_store_matches_runner_task_store_contract():
@@ -315,7 +315,7 @@ def test_postgres_task_store_matches_runner_task_store_contract():
 def test_auth_adapter_accepts_trusted_headers_only():
     auth = authenticate_headers(
         {
-            "X-MiroThinker-Service-Token": "shared",
+            "X-Limira-Runner-Service-Token": "shared",
             "X-Limira-User-Id": "user-a",
             "X-Limira-User-Role": "admin",
         },
@@ -330,7 +330,7 @@ def test_auth_adapter_rejects_invalid_or_body_user_id():
     with pytest.raises(AuthError) as invalid_token:
         authenticate_headers(
             {
-                "X-MiroThinker-Service-Token": "wrong",
+                "X-Limira-Runner-Service-Token": "wrong",
                 "X-Limira-User-Id": "user-a",
             },
             service_token="shared",
@@ -339,7 +339,7 @@ def test_auth_adapter_rejects_invalid_or_body_user_id():
 
     with pytest.raises(AuthError) as missing_user:
         authenticate_headers(
-            {"X-MiroThinker-Service-Token": "shared"},
+            {"X-Limira-Runner-Service-Token": "shared"},
             service_token="shared",
         )
     assert missing_user.value.code == "missing_user_id"

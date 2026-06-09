@@ -87,7 +87,7 @@ services:
       timeout: 3s
       retries: 20
     environment:
-      MIROTHINKER_RUNNER_PORT: "8091"
+      LIMIRA_RUNNER_INTERNAL_PORT: "8091"
       RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?set RUNNER_SERVICE_TOKEN}
       RUNNER_TASK_STORE_BACKEND: postgres
       RUNNER_DATABASE_URL: postgresql://${POSTGRES_USER:-limira}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-limira}
@@ -103,10 +103,9 @@ services:
       SERPER_API_KEY: ${SERPER_API_KEY:-}
       JINA_API_KEY: ${JINA_API_KEY:-}
       E2B_API_KEY: ${E2B_API_KEY:-}
-      SUMMARY_LLM_PROVIDER: ${SUMMARY_LLM_PROVIDER:-}
-      SUMMARY_MODEL_NAME: ${SUMMARY_MODEL_NAME:-}
-      SUMMARY_BASE_URL: ${SUMMARY_BASE_URL:-}
-      SUMMARY_API_KEY: ${SUMMARY_API_KEY:-}
+      SUMMARY_LLM_MODEL_NAME: ${SUMMARY_LLM_MODEL_NAME:-}
+      SUMMARY_LLM_BASE_URL: ${SUMMARY_LLM_BASE_URL:-}
+      SUMMARY_LLM_API_KEY: ${SUMMARY_LLM_API_KEY:-}
     volumes:
       - limira_runner_archives:/app/apps/limira-runner/archives
       - limira_runner_runtime:/app/apps/limira-runner/runtime

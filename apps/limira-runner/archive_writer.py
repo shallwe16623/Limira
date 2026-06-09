@@ -275,7 +275,7 @@ class ResearchArchiveWriter:
             raise ValueError("completed archives require rendered report markdown")
 
         lines = [
-            f"# MiroThinker Research {status.title()}",
+            f"# Limira Research {status.title()}",
             "",
             f"- Task ID: {self.task_id}",
             f"- Status: {status}",
@@ -300,7 +300,7 @@ class ResearchArchiveWriter:
             '<html lang="en">\n'
             "  <head>\n"
             '    <meta charset="utf-8" />\n'
-            "    <title>MiroThinker Research Report</title>\n"
+            "    <title>Limira Research Report</title>\n"
             "  </head>\n"
             "  <body>\n"
             "    <main>\n"

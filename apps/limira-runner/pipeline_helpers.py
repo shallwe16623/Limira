@@ -17,7 +17,7 @@ from src.config.settings import expose_sub_agents_as_tools
 from src.core.pipeline import create_pipeline_components, execute_task_pipeline
 from utils import replace_chinese_punctuation
 
-# Apply custom system prompt patch (adds MiroThinker identity)
+# Apply custom system prompt patch for Limira output formatting.
 apply_prompt_patch()
 
 # Create global cleanup thread pool for operations that won't be affected by asyncio.cancel
@@ -39,27 +39,27 @@ load_dotenv()
 _hydra_initialized = False
 
 
-def load_miroflow_config(config_overrides: Optional[dict] = None) -> DictConfig:
+def load_limira_config(config_overrides: Optional[dict] = None) -> DictConfig:
     """
-    Load the full MiroFlow configuration using Hydra, similar to how benchmarks work.
+    Load the Limira agent configuration with Hydra.
     """
     global _hydra_initialized
 
-    # Get the path to the miroflow agent config directory
-    miroflow_config_dir = Path(__file__).parent.parent / "miroflow-agent" / "conf"
-    miroflow_config_dir = miroflow_config_dir.resolve()
-    logger.debug(f"Config dir: {miroflow_config_dir}")
+    # Get the path to the agent config directory.
+    limira_config_dir = Path(__file__).parent.parent / "limira-agent" / "conf"
+    limira_config_dir = limira_config_dir.resolve()
+    logger.debug(f"Config dir: {limira_config_dir}")
 
-    if not miroflow_config_dir.exists():
+    if not limira_config_dir.exists():
         raise FileNotFoundError(
-            f"MiroFlow config directory not found: {miroflow_config_dir}"
+            f"Limira agent config directory not found: {limira_config_dir}"
         )
 
     # Initialize Hydra if not already done
     if not _hydra_initialized:
         try:
             initialize_config_dir(
-                config_dir=str(miroflow_config_dir), version_base=None
+                config_dir=str(limira_config_dir), version_base=None
             )
             _hydra_initialized = True
         except Exception as e:
@@ -68,14 +68,10 @@ def load_miroflow_config(config_overrides: Optional[dict] = None) -> DictConfig:
     # Compose configuration with environment variable overrides
     overrides = []
 
-    # Add environment variable based overrides (refer to scripts/debug.sh)
-    llm_provider = os.getenv(
-        "DEFAULT_LLM_PROVIDER", "qwen"
-    )  # debug.sh defaults to qwen
-    model_name = os.getenv(
-        "DEFAULT_MODEL_NAME", "MiroThinker"
-    )  # debug.sh default model
-    agent_set = os.getenv("DEFAULT_AGENT_SET", "demo")  # Use demo config
+    # Add environment-variable based overrides.
+    llm_provider = os.getenv("DEFAULT_LLM_PROVIDER", "qwen")
+    model_name = os.getenv("DEFAULT_MODEL_NAME", "Limira")
+    agent_set = os.getenv("DEFAULT_AGENT_SET", "demo")
     base_url = os.getenv("BASE_URL", "http://localhost:11434")
     api_key = os.getenv("API_KEY", "")  # API key for LLM endpoint
     logger.debug(f"LLM base_url: {base_url}")
@@ -100,7 +96,7 @@ def load_miroflow_config(config_overrides: Optional[dict] = None) -> DictConfig:
             f"llm.api_key={api_key}",
             f"agent={agent_set}",
             "agent.main_agent.max_turns=50",
-            "benchmark=gaia-validation",  # refer to debug.sh
+            "benchmark=default",
         ]
     )
 
@@ -146,7 +142,7 @@ def _ensure_preloaded():
             return
 
         logger.info("Loading pipeline components (first request)...")
-        cfg = load_miroflow_config(None)
+        cfg = load_limira_config(None)
         main_agent_tool_manager, sub_agent_tool_managers, output_formatter = (
             create_pipeline_components(cfg)
         )

@@ -34,7 +34,7 @@ ARCHIVE_JSON_MEMBERS = {"metadata.json", "trace.json"}
 ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 LIMIRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
-    "/mirothinker/",
+    "/limira-runner/",
     "limira-runner:8091",
     "localhost:8091",
     "RUNNER_SERVICE_TOKEN",
@@ -184,7 +184,7 @@ SECRET_TEXT_PATTERNS = (
 )
 INTERNAL_ERROR_TEXT_PATTERNS = (
     re.compile(r"(?i)\bhttps?://"),
-    re.compile(r"/mirothinker/"),
+    re.compile(r"/limira-runner/"),
     re.compile(r"\blimira/users/"),
     re.compile(
         r"(?i)\b(?:object_key|minio_object_key|pdf_object_key|archive_object_key)\b"
@@ -3325,7 +3325,7 @@ class RunnerResearchClient:
         if scenario:
             payload["scenario"] = scenario
 
-        url = f"{self.runner_url}/mirothinker/research"
+        url = f"{self.runner_url}/limira-runner/research"
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 url,
@@ -3348,7 +3348,7 @@ class RunnerResearchClient:
         if not task.runner_task_id:
             raise HTTPException(status_code=500, detail="runner_task_id_missing")
 
-        url = f"{self.runner_url}/mirothinker/tasks/{task.runner_task_id}/events"
+        url = f"{self.runner_url}/limira-runner/tasks/{task.runner_task_id}/events"
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
                 "GET",
@@ -3374,7 +3374,7 @@ class RunnerResearchClient:
         if not task.runner_task_id:
             raise HTTPException(status_code=500, detail="runner_task_id_missing")
 
-        url = f"{self.runner_url}/mirothinker/tasks/{task.runner_task_id}"
+        url = f"{self.runner_url}/limira-runner/tasks/{task.runner_task_id}"
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
                 url,
@@ -3403,7 +3403,7 @@ class RunnerArchiveClient:
         if not self.runner_url:
             raise HTTPException(status_code=503, detail="runner_url_not_configured")
         runner_task_id = task.runner_task_id or task.task_id
-        url = f"{self.runner_url}/mirothinker/tasks/{runner_task_id}/archive.zip"
+        url = f"{self.runner_url}/limira-runner/tasks/{runner_task_id}/archive.zip"
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.get(url, headers=runner_service_headers(user, self.service_token))
         if response.status_code == 404:
@@ -3421,7 +3421,7 @@ def runner_service_headers(user: LimiraUser, service_token: str | None) -> dict[
         "X-Limira-User-Role": user.role,
     }
     if service_token:
-        headers["X-MiroThinker-Service-Token"] = service_token
+        headers["X-Limira-Runner-Service-Token"] = service_token
     return headers
 
 

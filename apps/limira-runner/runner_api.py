@@ -98,11 +98,11 @@ def create_app(
     app[CANCELLED_TASKS_KEY] = set()
     app[ACTIVE_TASKS_KEY] = set()
 
-    app.router.add_post("/mirothinker/research", start_research)
-    app.router.add_get("/mirothinker/tasks/{task_id}", get_task_status)
-    app.router.add_post("/mirothinker/tasks/{task_id}/cancel", cancel_task)
-    app.router.add_get("/mirothinker/tasks/{task_id}/events", stream_task_events)
-    app.router.add_get("/mirothinker/tasks/{task_id}/archive.zip", download_archive)
+    app.router.add_post("/limira-runner/research", start_research)
+    app.router.add_get("/limira-runner/tasks/{task_id}", get_task_status)
+    app.router.add_post("/limira-runner/tasks/{task_id}/cancel", cancel_task)
+    app.router.add_get("/limira-runner/tasks/{task_id}/events", stream_task_events)
+    app.router.add_get("/limira-runner/tasks/{task_id}/archive.zip", download_archive)
     app.router.add_get("/health", healthcheck)
     return app
 
@@ -145,8 +145,8 @@ async def start_research(request: web.Request) -> web.Response:
         {
             "task_id": task_id,
             "status": "queued",
-            "stream_url": f"/mirothinker/tasks/{task_id}/events",
-            "task_url": f"/mirothinker/tasks/{task_id}",
+            "stream_url": f"/limira-runner/tasks/{task_id}/events",
+            "task_url": f"/limira-runner/tasks/{task_id}",
         },
         status=202,
     )
@@ -581,7 +581,7 @@ def _task_response(record: TaskRecord) -> dict[str, Any]:
         "user_id": record.user_id,
         "status": record.status,
         "archive_status": record.archive_status,
-        "download_url": f"/mirothinker/tasks/{record.task_id}/archive.zip"
+        "download_url": f"/limira-runner/tasks/{record.task_id}/archive.zip"
         if record.archive_status == "ready"
         else None,
         "created_at": record.created_at,
@@ -654,5 +654,5 @@ def _load_pipeline_helpers() -> PipelineHelpers:
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("MIROTHINKER_RUNNER_PORT", "8081"))
+    port = int(os.getenv("LIMIRA_RUNNER_INTERNAL_PORT", "8081"))
     web.run_app(create_app(), host="0.0.0.0", port=port)

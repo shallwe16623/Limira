@@ -14,7 +14,7 @@ MIGRATION_FILE = (
     ROOT / "deploy/limira/postgres/migrations/001_limira_osint_schema.sql"
 )
 LEGACY_PY_PACKAGE = "open" + "_" + "web" + "ui"
-LEGACY_APP_DIR = "open-" + "web" + "ui-mirothinker"
+LEGACY_APP_DIR = "open-" + "web" + "ui-limira-runner"
 LEGACY_WEB_NAME_KEY = "WEB" + "UI_NAME"
 
 
@@ -61,7 +61,7 @@ def test_limira_compose_defines_stack_contract():
 
     runner = services["limira-runner"]
     assert runner["build"]["dockerfile"] == "deploy/limira/runner.Dockerfile"
-    assert runner["environment"]["MIROTHINKER_RUNNER_PORT"] == "8091"
+    assert runner["environment"]["LIMIRA_RUNNER_INTERNAL_PORT"] == "8091"
     assert "${RUNNER_SERVICE_TOKEN" in runner["environment"]["RUNNER_SERVICE_TOKEN"]
     assert runner["environment"]["RUNNER_TASK_STORE_BACKEND"] == "postgres"
     assert runner["environment"]["RUNNER_DATABASE_URL"].startswith("postgresql://")
@@ -193,7 +193,9 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
         "SERPER_API_KEY",
         "JINA_API_KEY",
         "E2B_API_KEY",
-        "SUMMARY_API_KEY",
+        "SUMMARY_LLM_API_KEY",
+        "SUMMARY_LLM_BASE_URL",
+        "SUMMARY_LLM_MODEL_NAME",
         "EMBEDDING_API_KEY",
     }
     assert required.issubset(env)

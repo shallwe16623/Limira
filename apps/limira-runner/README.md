@@ -7,7 +7,7 @@ It is not a browser UI. The user-facing UI lives in `apps/limira-standalone`, an
 ## Responsibilities
 
 - Accept authenticated internal research requests from the Limira backend.
-- Execute the MiroFlow research pipeline.
+- Execute the Limira research pipeline.
 - Stream normalized research events back to the backend.
 - Persist task state through the configured task store.
 - Build archive-compatible report artifacts for completed tasks.
@@ -24,11 +24,11 @@ Run the runner API:
 
 ```bash
 RUNNER_SERVICE_TOKEN=dev-token \
-MIROTHINKER_RUNNER_PORT=8091 \
+LIMIRA_RUNNER_INTERNAL_PORT=8091 \
 uv run runner_api.py
 ```
 
-The service exposes the internal runner API under `/mirothinker/*`. Browser traffic should not call these routes directly; the standalone frontend only proxies `/api/limira/*` to the Limira backend.
+The service exposes the internal runner API under `/limira-runner/*`. Browser traffic should not call these routes directly; the standalone frontend only proxies `/api/limira/*` to the Limira backend.
 
 ## Notes
 

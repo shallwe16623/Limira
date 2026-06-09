@@ -41,11 +41,11 @@ apps/limira-web/backend/
 apps/limira-runner/
   runner 服务、研究 pipeline helper 和测试。当前网页入口不从这里启动。
 
-apps/miroflow-agent/
-  底层研究 agent / runner 相关代码。
+apps/limira-agent/
+  runner 依赖的最小 agent runtime。只保留当前研究链路需要的 src/ 和 Hydra 配置。
 
-libs/miroflow-tools/
-  runner 使用的工具库。
+libs/limira-tools/
+  runner 使用的最小工具库：搜索/抓取、Jina 摘要、结构化成果记录和 Python 沙盒。
 
 deploy/limira/
   Docker 部署所需的 Postgres、MinIO、runner 和 nginx 配置。

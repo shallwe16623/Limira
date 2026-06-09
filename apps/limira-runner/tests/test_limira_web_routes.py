@@ -63,8 +63,8 @@ class FakeResearchClient:
         return {
             "task_id": self.runner_task_id,
             "status": "queued",
-            "stream_url": f"/mirothinker/tasks/{self.runner_task_id}/events",
-            "task_url": f"/mirothinker/tasks/{self.runner_task_id}",
+            "stream_url": f"/limira-runner/tasks/{self.runner_task_id}/events",
+            "task_url": f"/limira-runner/tasks/{self.runner_task_id}",
         }
 
     async def stream_events(self, *, task, user):
@@ -374,7 +374,7 @@ async def test_create_research_records_failed_web_task_when_runner_start_fails()
 async def test_create_research_hides_internal_runner_start_error_details_and_headers_from_browser_and_task_state():
     app, repo, _storage = _limira_asgi_app()
     internal_detail = (
-        "runner create failed at http://10.20.30.40:8091/mirothinker/research "
+        "runner create failed at http://10.20.30.40:8091/limira-runner/research "
         "for limira/users/hash/tasks/task-a/uploads/doc.txt "
         "OPENAI_API_KEY=sk-researchstartinternal123456"
     )
@@ -392,7 +392,7 @@ async def test_create_research_hides_internal_runner_start_error_details_and_hea
                 status_code=503,
                 detail=internal_detail,
                 headers={
-                    "X-MiroThinker-Service-Token": "server-only-token-123",
+                    "X-Limira-Runner-Service-Token": "server-only-token-123",
                     "Authorization": "Bearer research-start-token-123",
                     "Set-Cookie": "limira_session=research-start-cookie-123",
                     "X-API-Key": "sk-researchheader123456",
@@ -425,7 +425,7 @@ async def test_create_research_hides_internal_runner_start_error_details_and_hea
     assert task.error == "runner_research_start_failed"
     assert task.runner_task_id is None
     for header in (
-        "x-mirothinker-service-token",
+        "x-limira-runner-service-token",
         "authorization",
         "set-cookie",
         "x-api-key",
@@ -1486,7 +1486,7 @@ async def test_task_payload_hides_internal_model_summary_identifiers():
             "runner_task_id": "runner-task-secret",
             "object_key": "limira/users/hash/tasks/task-summary/uploads/doc.txt",
             "endpoint": (
-                "http://10.20.30.40:8091/mirothinker/tasks/runner-task-secret"
+                "http://10.20.30.40:8091/limira-runner/tasks/runner-task-secret"
             ),
             "nested": {
                 "archive_object_key": (
@@ -1516,7 +1516,7 @@ async def test_task_payload_hides_internal_model_summary_identifiers():
             "archive_object_key",
             "limira/users/hash",
             "http://10.20.30.40:8091",
-            "/mirothinker/",
+            "/limira-runner/",
         ):
             assert leaked not in serialized
         _assert_no_browser_leak(payload)
@@ -1612,7 +1612,7 @@ async def test_postgres_task_detail_route_is_owner_scoped_and_hides_internal_ide
         "archive_zip_sha256",
         "limira/users/",
         "http://10.20.30.40:8091",
-        "/mirothinker/",
+        "/limira-runner/",
     ):
         assert leaked not in serialized
     _assert_no_browser_leak(payload)
@@ -1626,7 +1626,7 @@ async def test_postgres_task_detail_route_is_owner_scoped_and_hides_internal_ide
         "user-b",
         "limira/users/user-b",
         "http://10.20.30.40:8091",
-        "/mirothinker/",
+        "/limira-runner/",
     ):
         assert leaked not in serialized_foreign
     _assert_no_browser_leak(foreign_response.json())
@@ -1734,7 +1734,7 @@ async def test_postgres_task_history_route_is_owner_scoped_and_public_serialized
         "archive_zip_sha256",
         "limira/users/",
         "http://10.20.30.40:8091",
-        "/mirothinker/",
+        "/limira-runner/",
     ):
         assert leaked not in serialized
     _assert_no_browser_leak(payload)
@@ -1783,7 +1783,7 @@ def test_runner_service_headers_are_server_side_only():
     assert headers == {
         "X-Limira-User-Id": "user-a",
         "X-Limira-User-Role": "admin",
-        "X-MiroThinker-Service-Token": "server-only-token",
+        "X-Limira-Runner-Service-Token": "server-only-token",
     }
 
 
@@ -8073,7 +8073,7 @@ def test_limira_router_defines_required_browser_facing_paths():
 
     assert route_contract <= actual
     for path, _method in actual:
-        assert "/mirothinker/" not in path
+        assert "/limira-runner/" not in path
 
 
 def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) -> bytes:
@@ -8236,7 +8236,7 @@ def _archive_zip_with_invalid_json_metadata_members(task_id: str) -> bytes:
     buffer = io.BytesIO()
     internal_metadata = (
         "runner_task_id=runner-invalid-json-123\n"
-        "url=http://10.20.30.40:8091/mirothinker/tasks/runner-invalid-json-123\n"
+        "url=http://10.20.30.40:8091/limira-runner/tasks/runner-invalid-json-123\n"
         f"object_key=limira/users/hash/tasks/{task_id}/archives/archive.zip\n"
     )
     internal_trace = (
@@ -8269,7 +8269,7 @@ def _internal_model_summary(
         "provider": "deepseek",
         "runner_task_id": runner_task_id,
         "object_key": f"limira/users/hash/tasks/{task_id}/uploads/doc.txt",
-        "endpoint": f"http://10.20.30.40:8091/mirothinker/tasks/{runner_task_id}",
+        "endpoint": f"http://10.20.30.40:8091/limira-runner/tasks/{runner_task_id}",
         "nested": {
             "archive_object_key": (
                 f"limira/users/hash/tasks/{task_id}/archives/archive.zip"
@@ -8308,7 +8308,7 @@ def _assert_archive_hides_internal_model_summary_identifiers(
         "archive_object_key",
         "limira/users/hash",
         "http://10.20.30.40:8091",
-        "/mirothinker/",
+        "/limira-runner/",
     ):
         assert leaked not in serialized
     _assert_no_browser_leak(serialized)
@@ -8321,7 +8321,7 @@ def _assert_archive_hides_invalid_json_member_identifiers(archive_bytes: bytes) 
     json.loads(members["trace.json"])
     serialized = json.dumps(members, ensure_ascii=False)
     for leaked in (
-        "/mirothinker/",
+        "/limira-runner/",
         "runner_task_id",
         "runner-invalid-json-123",
         "object_key",
