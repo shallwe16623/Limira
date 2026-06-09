@@ -4037,6 +4037,10 @@ async def test_pdf_route_scrubs_report_secrets_before_persistence_and_export():
 
 
 def test_limira_secret_scrubber_redacts_nested_payloads_and_urls():
+    news_url = (
+        "https://www.scmp.com/news/china/diplomacy/article/3356419/"
+        "us-adds-alibaba-byd-and-other-chinese-tech-champions-military-company-list"
+    )
     payload = {
         "headers": {
             "Authorization": "Bearer report-bearer-secret-123456",
@@ -4046,7 +4050,12 @@ def test_limira_secret_scrubber_redacts_nested_payloads_and_urls():
         "nested": [
             "OPENAI_API_KEY=sk-reportopenai123456",
             {
+                "news_url": news_url,
+                "news_result": json.dumps({"title": "SCMP result", "url": news_url}),
                 "safe": "https://example.test/path?token=report-url-token-123456",
+                "userinfo_url": (
+                    "https://user:password-secret-123456@example.test/path?topic=byd"
+                ),
                 "jina_api_key": "nested-jina-secret-123456",
                 "Authorization: Bearer nested-key-secret-123456": "nested key secret",
             },
@@ -4064,8 +4073,17 @@ def test_limira_secret_scrubber_redacts_nested_payloads_and_urls():
     serialized = json.dumps(scrubbed, ensure_ascii=False)
     assert "sk-headerkeysecret123456" not in serialized
     assert "nested-key-secret-123456" not in serialized
+    assert "password-secret-123456" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "Authorization: Bearer" not in serialized
+    assert scrubbed["nested"][1]["news_url"] == news_url
+    assert news_url in scrubbed["nested"][1]["news_result"]
+    assert scrubbed["nested"][1]["userinfo_url"] == (
+        "https://example.test/path?topic=byd"
+    )
+    assert scrubbed["nested"][1]["safe"].startswith("https://example.test/path?")
+    assert "report-url-token-123456" not in scrubbed["nested"][1]["safe"]
+    assert "topic=byd" in scrubbed["nested"][1]["userinfo_url"]
     assert limira.LIMIRA_SECRET_REDACTION in scrubbed["headers"]
     assert any(
         str(key).startswith(limira.LIMIRA_SECRET_REDACTION)

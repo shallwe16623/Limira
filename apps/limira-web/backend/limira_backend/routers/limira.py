@@ -17,6 +17,7 @@ import zipfile
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, UploadFile
@@ -182,6 +183,27 @@ SECRET_TEXT_PATTERNS = (
         r"[^&#\s<>'\"]+"
     ),
 )
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+SENSITIVE_URL_QUERY_KEYS = {
+    "api_key",
+    "apikey",
+    "key",
+    "token",
+    "access_token",
+    "id_token",
+    "refresh_token",
+    "auth",
+    "authorization",
+    "cookie",
+    "secret",
+    "password",
+    "runner_service_token",
+    "serper_api_key",
+    "jina_api_key",
+    "e2b_api_key",
+    "openai_api_key",
+    "deepseek_api_key",
+}
 INTERNAL_ERROR_TEXT_PATTERNS = (
     re.compile(r"(?i)\bhttps?://"),
     re.compile(r"/limira-runner/"),
@@ -6283,6 +6305,60 @@ def _is_secret_field_name(value: Any) -> bool:
 
 
 def _scrub_secret_text(value: str) -> str:
+    protected_urls: list[str] = []
+
+    def protect_url(match: re.Match[str]) -> str:
+        protected_urls.append(_scrub_url_text(match.group(0)))
+        return f"__LIMIRA_URL_{len(protected_urls) - 1}__"
+
+    redacted = URL_PATTERN.sub(protect_url, value)
+    redacted = _scrub_non_url_secret_text(redacted)
+    for index, url in enumerate(protected_urls):
+        redacted = redacted.replace(f"__LIMIRA_URL_{index}__", url)
+    return redacted
+
+
+def _scrub_url_text(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return LIMIRA_SECRET_REDACTION
+
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return value
+
+    hostname = parts.hostname
+    if not hostname:
+        return value
+    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return LIMIRA_SECRET_REDACTION
+    if port is not None:
+        host = f"{host}:{port}"
+
+    query = urlencode(
+        [
+            (
+                key,
+                LIMIRA_SECRET_REDACTION
+                if _is_sensitive_url_query_key(key)
+                else _scrub_non_url_secret_text(value),
+            )
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ],
+        doseq=True,
+    )
+    return urlunsplit((parts.scheme, host, parts.path, query, parts.fragment))
+
+
+def _is_sensitive_url_query_key(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_")
+    return normalized in SENSITIVE_URL_QUERY_KEYS or _is_secret_field_name(normalized)
+
+
+def _scrub_non_url_secret_text(value: str) -> str:
     redacted = value
     for pattern in SECRET_TEXT_PATTERNS:
         if pattern.groups:
