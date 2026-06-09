@@ -37,6 +37,16 @@ load_dotenv()
 
 # Global Hydra initialization flag
 _hydra_initialized = False
+DEFAULT_LLM_PROVIDER = "openai"
+DEFAULT_MODEL_NAME = "deepseek-v4-pro"
+DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
+
+
+def _env_or_default(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip()
 
 
 def load_limira_config(config_overrides: Optional[dict] = None) -> DictConfig:
@@ -69,11 +79,11 @@ def load_limira_config(config_overrides: Optional[dict] = None) -> DictConfig:
     overrides = []
 
     # Add environment-variable based overrides.
-    llm_provider = os.getenv("DEFAULT_LLM_PROVIDER", "qwen")
-    model_name = os.getenv("DEFAULT_MODEL_NAME", "Limira")
-    agent_set = os.getenv("DEFAULT_AGENT_SET", "demo")
-    base_url = os.getenv("BASE_URL", "http://localhost:11434")
-    api_key = os.getenv("API_KEY", "")  # API key for LLM endpoint
+    llm_provider = _env_or_default("DEFAULT_LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+    model_name = _env_or_default("DEFAULT_MODEL_NAME", DEFAULT_MODEL_NAME)
+    agent_set = _env_or_default("DEFAULT_AGENT_SET", "demo")
+    base_url = _env_or_default("BASE_URL", DEFAULT_LLM_BASE_URL)
+    api_key = os.getenv("API_KEY", "").strip()  # API key for LLM endpoint
     logger.debug(f"LLM base_url: {base_url}")
 
     # Map provider names to config files

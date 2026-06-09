@@ -84,9 +84,10 @@ AWS_SECRET_ACCESS_KEY=
 如果要真实跑研究任务，还需要配置模型和工具相关变量，例如：
 
 ```bash
-BASE_URL=
-DEFAULT_LLM_PROVIDER=
-DEFAULT_MODEL_NAME=
+BASE_URL=https://api.deepseek.com
+DEFAULT_LLM_PROVIDER=openai
+DEFAULT_MODEL_NAME=deepseek-v4-pro
+API_KEY=
 SERPER_API_KEY=
 JINA_API_KEY=
 E2B_API_KEY=

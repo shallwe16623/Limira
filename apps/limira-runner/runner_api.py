@@ -46,6 +46,16 @@ TRANSPORT_CLOSING_KEY = web.AppKey("transport_closing", object)
 CANCELLED_TASKS_KEY = web.AppKey("cancelled_tasks", set[str])
 ACTIVE_TASKS_KEY = web.AppKey("active_tasks", set[str])
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+DEFAULT_LLM_PROVIDER = "openai"
+DEFAULT_MODEL_NAME = "deepseek-v4-pro"
+DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
+
+
+def _env_or_default(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip()
 
 
 def create_app(
@@ -631,9 +641,11 @@ def _raise_http_error(code: str, status: int) -> None:
 
 def _model_summary_from_env() -> dict[str, Any]:
     return {
-        "provider": os.getenv("DEFAULT_LLM_PROVIDER"),
-        "model": os.getenv("DEFAULT_MODEL_NAME"),
-        "base_url_host": base_url_host(os.getenv("BASE_URL")),
+        "provider": _env_or_default("DEFAULT_LLM_PROVIDER", DEFAULT_LLM_PROVIDER),
+        "model": _env_or_default("DEFAULT_MODEL_NAME", DEFAULT_MODEL_NAME),
+        "base_url_host": base_url_host(
+            _env_or_default("BASE_URL", DEFAULT_LLM_BASE_URL)
+        ),
     }
 
 

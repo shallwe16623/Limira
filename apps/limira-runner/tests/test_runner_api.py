@@ -396,6 +396,28 @@ async def test_runner_api_persists_host_only_model_summary(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_runner_api_uses_deepseek_defaults_for_model_summary(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("DEFAULT_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("DEFAULT_MODEL_NAME", raising=False)
+    monkeypatch.delenv("BASE_URL", raising=False)
+    client, store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        record = store.get_task(start_payload["task_id"])
+
+        assert record.model_summary == {
+            "provider": "openai",
+            "model": "deepseek-v4-pro",
+            "base_url_host": "api.deepseek.com",
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_runner_api_scrubs_structured_secrets_before_report_rendering(
     tmp_path,
 ):

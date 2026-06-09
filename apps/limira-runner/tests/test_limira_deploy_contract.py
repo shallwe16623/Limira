@@ -71,6 +71,21 @@ def test_limira_compose_defines_stack_contract():
     assert runner["environment"]["AWS_SECRET_ACCESS_KEY"] == (
         "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
     )
+    assert runner["environment"]["BASE_URL"] == (
+        "${BASE_URL:-https://api.deepseek.com}"
+    )
+    assert runner["environment"]["DEFAULT_LLM_PROVIDER"] == (
+        "${DEFAULT_LLM_PROVIDER:-openai}"
+    )
+    assert runner["environment"]["DEFAULT_MODEL_NAME"] == (
+        "${DEFAULT_MODEL_NAME:-deepseek-v4-pro}"
+    )
+    assert runner["environment"]["SUMMARY_LLM_BASE_URL"] == (
+        "${SUMMARY_LLM_BASE_URL:-https://api.deepseek.com/chat/completions}"
+    )
+    assert runner["environment"]["SUMMARY_LLM_MODEL_NAME"] == (
+        "${SUMMARY_LLM_MODEL_NAME:-deepseek-v4-pro}"
+    )
     assert "RUNNER_ALLOW_SQLITE_TASK_STORE" not in runner["environment"]
 
     web = services["limira-web"]
@@ -189,6 +204,7 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "BASE_URL",
+        "DEFAULT_LLM_PROVIDER",
         "DEFAULT_MODEL_NAME",
         "SERPER_API_KEY",
         "JINA_API_KEY",
@@ -224,6 +240,11 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
     assert env["RUNNER_TASK_STORE_BACKEND"] == "postgres"
     assert env["RUNNER_DATABASE_URL"] == ""
     assert env["RUNNER_ALLOW_SQLITE_TASK_STORE"] == "false"
+    assert env["BASE_URL"] == "https://api.deepseek.com"
+    assert env["DEFAULT_LLM_PROVIDER"] == "openai"
+    assert env["DEFAULT_MODEL_NAME"] == "deepseek-v4-pro"
+    assert env["SUMMARY_LLM_BASE_URL"] == "https://api.deepseek.com/chat/completions"
+    assert env["SUMMARY_LLM_MODEL_NAME"] == "deepseek-v4-pro"
 
     secret_keys = [
         key

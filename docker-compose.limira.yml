@@ -97,14 +97,14 @@ services:
       S3_BUCKET: ${MINIO_BUCKET:-limira-artifacts}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-limira_minio}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
-      BASE_URL: ${BASE_URL:-}
-      DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-}
-      DEFAULT_LLM_PROVIDER: ${DEFAULT_LLM_PROVIDER:-}
+      BASE_URL: ${BASE_URL:-https://api.deepseek.com}
+      DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-deepseek-v4-pro}
+      DEFAULT_LLM_PROVIDER: ${DEFAULT_LLM_PROVIDER:-openai}
       SERPER_API_KEY: ${SERPER_API_KEY:-}
       JINA_API_KEY: ${JINA_API_KEY:-}
       E2B_API_KEY: ${E2B_API_KEY:-}
-      SUMMARY_LLM_MODEL_NAME: ${SUMMARY_LLM_MODEL_NAME:-}
-      SUMMARY_LLM_BASE_URL: ${SUMMARY_LLM_BASE_URL:-}
+      SUMMARY_LLM_MODEL_NAME: ${SUMMARY_LLM_MODEL_NAME:-deepseek-v4-pro}
+      SUMMARY_LLM_BASE_URL: ${SUMMARY_LLM_BASE_URL:-https://api.deepseek.com/chat/completions}
       SUMMARY_LLM_API_KEY: ${SUMMARY_LLM_API_KEY:-}
     volumes:
       - limira_runner_archives:/app/apps/limira-runner/archives
