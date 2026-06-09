@@ -30,6 +30,7 @@ from ..logging.task_logger import (
     get_utc_plus_8_time,
 )
 from .orchestrator import Orchestrator
+from .research_graph import build_initial_research_graph, graph_bootstrap_events
 
 
 async def execute_task_pipeline(
@@ -93,6 +94,14 @@ async def execute_task_pipeline(
             sub_agent_tool_manager.set_task_log(task_log)
 
     try:
+        if stream_queue is not None:
+            graph_state = build_initial_research_graph(
+                task_id=task_id,
+                query=task_description,
+            )
+            for event in graph_bootstrap_events(graph_state):
+                await stream_queue.put(event)
+
         # Initialize LLM client
         random_uuid = str(uuid.uuid4())
         unique_id = f"{task_id}-{random_uuid}"

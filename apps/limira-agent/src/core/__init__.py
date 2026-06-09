@@ -6,14 +6,40 @@
 from .answer_generator import AnswerGenerator
 from .orchestrator import Orchestrator
 from .pipeline import create_pipeline_components, execute_task_pipeline
+from .research_graph import (
+    CompressedFinding,
+    EvidenceItem,
+    ResearchBrief,
+    ResearchGraphState,
+    ResearchPhase,
+    ResearchPlan,
+    ResearchUnit,
+    SourcePolicy,
+    VerifiedClaim,
+    build_initial_research_graph,
+    evidence_id_for_source,
+    graph_bootstrap_events,
+)
 from .stream_handler import StreamHandler
 from .tool_executor import ToolExecutor
 
 __all__ = [
     "AnswerGenerator",
+    "CompressedFinding",
+    "EvidenceItem",
     "Orchestrator",
+    "ResearchBrief",
+    "ResearchGraphState",
+    "ResearchPhase",
+    "ResearchPlan",
+    "ResearchUnit",
+    "SourcePolicy",
     "StreamHandler",
     "ToolExecutor",
+    "VerifiedClaim",
+    "build_initial_research_graph",
     "create_pipeline_components",
+    "evidence_id_for_source",
     "execute_task_pipeline",
+    "graph_bootstrap_events",
 ]

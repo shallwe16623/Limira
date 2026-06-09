@@ -1,0 +1,152 @@
+import pytest
+from omegaconf import OmegaConf
+
+from src.core import pipeline as pipeline_module
+from src.core.research_graph import (
+    ResearchPhase,
+    build_initial_research_graph,
+    evidence_id_for_source,
+    graph_bootstrap_events,
+)
+
+
+class _CaptureQueue:
+    def __init__(self):
+        self.items = []
+
+    async def put(self, item):
+        self.items.append(item)
+
+
+class _FakeToolManager:
+    def __init__(self):
+        self.task_log = None
+
+    def set_task_log(self, task_log):
+        self.task_log = task_log
+
+
+class _FakeClientFactory:
+    def __init__(self, **_kwargs):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeOrchestrator:
+    def __init__(self, *, stream_queue=None, **_kwargs):
+        self.stream_queue = stream_queue
+
+    async def run_main_agent(self, **_kwargs):
+        await self.stream_queue.put(
+            {"event": "message", "data": {"delta": {"content": "legacy executor"}}}
+        )
+        return "summary", "final", None
+
+
+def test_initial_research_graph_creates_bounded_scope_and_plan():
+    state = build_initial_research_graph(
+        task_id="task-graph",
+        query="  Track BYD Section 1260H list status.  ",
+        scenario="sanctions_export_controls",
+        max_units=3,
+    )
+
+    assert state.phase == ResearchPhase.PLAN
+    assert state.brief.original_query == "Track BYD Section 1260H list status."
+    assert "sanctions_export_controls" in state.brief.scope
+    assert len(state.plan.research_units) == 3
+    assert state.plan.research_units[0].id.startswith("unit-1-")
+    assert state.plan.research_units[0].search_queries
+    assert "evidence" in state.plan.expected_artifacts
+    assert "Cross-check" in state.plan.verification_strategy
+
+
+def test_research_graph_bootstrap_events_are_serializable_and_ordered():
+    state = build_initial_research_graph(
+        task_id="task-graph",
+        query="Verify a company designation with primary sources",
+    )
+
+    events = graph_bootstrap_events(state)
+
+    assert [event["event"] for event in events] == [
+        "research_brief_created",
+        "research_plan_created",
+    ]
+    assert events[0]["data"]["phase"] == "scope"
+    assert events[0]["data"]["brief"]["original_query"] == (
+        "Verify a company designation with primary sources"
+    )
+    assert events[1]["data"]["phase"] == "plan"
+    assert events[1]["data"]["plan"]["research_units"]
+
+
+def test_evidence_id_for_source_is_stable_per_task_source_and_index():
+    first = evidence_id_for_source(task_id="task-a", source="https://example.test", index=0)
+    second = evidence_id_for_source(task_id="task-a", source="https://example.test", index=0)
+    different_index = evidence_id_for_source(
+        task_id="task-a",
+        source="https://example.test",
+        index=1,
+    )
+
+    assert first == second
+    assert first.startswith("EVID-")
+    assert first != different_index
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    cfg = OmegaConf.create(
+        {
+            "llm": {
+                "provider": "openai-compatible",
+                "base_url": "https://llm.test",
+                "model_name": "test-model",
+                "temperature": 0,
+                "top_p": 1,
+                "min_p": 0,
+                "top_k": 0,
+                "max_tokens": 4096,
+                "repetition_penalty": 1,
+                "async_client": False,
+            },
+            "agent": {
+                "keep_tool_result": True,
+                "main_agent": {"max_turns": 1},
+                "sub_agents": None,
+            },
+        }
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=cfg,
+        task_id="task-pipeline-graph",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "summary"
+    assert [item["event"] for item in stream_queue.items[:3]] == [
+        "research_brief_created",
+        "research_plan_created",
+        "message",
+    ]
+    assert (
+        stream_queue.items[0]["data"]["brief"]["original_query"]
+        == "Verify a company designation with primary sources"
+    )
+    assert stream_queue.items[1]["data"]["plan"]["research_units"]
