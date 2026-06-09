@@ -10,23 +10,10 @@
 	</head>
 	<body>
 		<div class="app-shell">
-			<header class="topbar">
-				<div>
-					<div class="brand">limira OSINT</div>
-					<div class="subtitle">独立研究工作台</div>
-				</div>
-				<div class="session-panel">
-					<span id="sessionLabel" class="session-label">正在检查登录状态</span>
-					<button id="signOutButton" class="ghost-button hidden" type="button">退出登录</button>
-				</div>
-			</header>
-
 			<section id="authPanel" class="auth-layout hidden">
 				<div class="auth-copy">
 					<h1>研究、证据与导出集中在一个工作台。</h1>
-					<p>
-						此页面直接连接 limira 后端，不加载旧聊天壳、模型选择器或通用应用布局。
-					</p>
+					<p>此页面直接连接 limira 后端，不加载旧聊天壳、模型选择器或通用应用布局。</p>
 				</div>
 				<form id="authForm" class="auth-card">
 					<div class="segmented-control" role="tablist" aria-label="账号类型">
@@ -58,12 +45,8 @@
 						<input id="resetTokenInput" autocomplete="one-time-code" readonly />
 					</label>
 					<button id="authSubmitButton" class="primary-button" type="submit">登录</button>
-					<button id="googleSigninButton" class="google-auth-button hidden" type="button">
-						使用 Google 登录
-					</button>
-					<button id="wechatSigninButton" class="google-auth-button hidden" type="button">
-						使用微信登录
-					</button>
+					<button id="googleSigninButton" class="google-auth-button hidden" type="button">使用 Google 登录</button>
+					<button id="wechatSigninButton" class="google-auth-button hidden" type="button">使用微信登录</button>
 					<div class="auth-links">
 						<button id="forgotPasswordButton" type="button">忘记密码？</button>
 						<button id="resendVerificationButton" type="button">重发验证邮件</button>
@@ -73,110 +56,141 @@
 			</section>
 
 			<main id="workspace" class="workspace hidden">
-				<section class="left-pane">
-					<div class="control-row">
-						<div>
-							<div class="section-label">研究任务</div>
-							<div id="statusLabel" class="status-pill">ready</div>
-						</div>
-						<div id="taskLabel" class="task-label">暂无任务</div>
+				<!-- Sidebar (ChatGPT style Left Pane) -->
+				<aside class="sidebar">
+					<div class="sidebar-header">
+						<button id="newChatButton" class="new-chat-btn" type="button">
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+							<span>新研究</span>
+						</button>
 					</div>
-
-					<section class="panel history-panel">
-						<div class="panel-header">
-							<h2>历史聊天</h2>
-							<div class="history-actions">
-								<button id="newChatButton" class="ghost-button compact" type="button">新聊天</button>
-								<button id="refreshHistoryButton" class="ghost-button compact" type="button">刷新</button>
-							</div>
-						</div>
+					<div class="sidebar-body">
+						<div class="sidebar-section-title">历史记录</div>
 						<div id="historyMessage" class="inline-message"></div>
 						<div id="historyList" class="history-list"></div>
-					</section>
-
-					<div class="scenario-bar">
-						<label>
-							场景
-							<select id="scenarioSelect"></select>
-						</label>
-						<button id="useScenarioButton" class="ghost-button" type="button">使用场景问题</button>
+						<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
+							<div class="enterprise-admin-header">
+								<div class="sidebar-section-title">单位管理</div>
+								<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
+							</div>
+							<div id="enterpriseUsageSummary" class="inline-message"></div>
+							<form id="enterpriseMemberForm" class="compact-form">
+								<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
+								<input id="enterpriseMemberEmailInput" type="email" placeholder="member@example.com" autocomplete="off" />
+								<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
+								<select id="enterpriseMemberRoleSelect">
+									<option value="member">成员</option>
+									<option value="admin">管理员</option>
+								</select>
+								<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加账号</button>
+							</form>
+							<div id="enterpriseMemberMessage" class="inline-message"></div>
+							<div id="enterpriseMemberList" class="compact-list"></div>
+						</div>
 					</div>
-					<div id="scenarioDetails" class="scenario-details"></div>
-
-					<form id="researchForm" class="research-form">
-						<textarea
-							id="queryInput"
-							rows="5"
-							placeholder="输入一个 OSINT 研究问题"
-							required
-						></textarea>
-						<div class="action-row">
-							<button id="submitResearchButton" class="primary-button" type="submit">开始研究</button>
-							<button id="refreshArtifactsButton" class="ghost-button" type="button">刷新成果</button>
-							<button id="downloadArchiveButton" class="ghost-button" type="button" disabled>下载归档</button>
+					<div class="sidebar-footer">
+						<div class="task-status-row">
+							<span id="statusLabel" class="status-pill">ready</span>
+							<span id="taskLabel" class="task-label">暂无任务</span>
 						</div>
-					</form>
-
-				</section>
-
-				<section class="right-pane">
-					<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
-					<section id="artifactContent" class="artifact-content"></section>
-				</section>
-
-				<aside class="side-pane">
-					<section class="panel">
-						<div class="panel-header">
-							<h2>上传资料</h2>
-							<button id="refreshUploadsButton" class="ghost-button compact" type="button">刷新</button>
+						<div class="user-row">
+							<span id="sessionLabel" class="session-label">正在检查登录状态</span>
+							<button id="signOutButton" class="ghost-button compact" type="button">退出</button>
 						</div>
-						<input id="uploadInput" type="file" />
-						<button id="uploadButton" class="secondary-button" type="button">上传文档</button>
-						<div id="uploadMessage" class="inline-message"></div>
-						<div class="search-row">
-							<input id="uploadSearchInput" placeholder="搜索已上传资料" />
-							<button id="uploadSearchButton" class="ghost-button" type="button">搜索</button>
-						</div>
-						<div id="uploadList" class="compact-list"></div>
-					</section>
-
-					<section class="panel">
-						<div class="panel-header">
-							<h2>报告导出</h2>
-						</div>
-						<button id="exportPdfButton" class="secondary-button" type="button" disabled>导出并下载 PDF</button>
-						<div id="reportMessage" class="inline-message"></div>
-					</section>
-
-					<section id="enterpriseAdminPanel" class="panel hidden">
-						<div class="panel-header">
-							<h2>单位管理</h2>
-							<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
-						</div>
-						<div id="enterpriseUsageSummary" class="inline-message"></div>
-						<form id="enterpriseMemberForm" class="compact-form">
-							<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
-							<input id="enterpriseMemberEmailInput" type="email" placeholder="member@example.com" autocomplete="off" />
-							<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
-							<select id="enterpriseMemberRoleSelect">
-								<option value="member">成员</option>
-								<option value="admin">管理员</option>
-							</select>
-							<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加账号</button>
-						</form>
-						<div id="enterpriseMemberMessage" class="inline-message"></div>
-						<div id="enterpriseMemberList" class="compact-list"></div>
-					</section>
-
-					<section class="panel">
-						<div class="panel-header">
-							<h2>实时进展</h2>
-							<button id="clearStreamButton" class="ghost-button compact" type="button">清空</button>
-						</div>
-						<div id="messageList" class="message-list"></div>
-					</section>
+					</div>
 				</aside>
+
+				<!-- Main Canvas -->
+				<section class="main-content">
+					<!-- Topbar integrated into main content area -->
+					<header class="main-header">
+						<div class="brand">limira OSINT</div>
+						<div class="header-actions">
+							<!-- Grouped Downloads -->
+							<div class="download-group">
+								<button id="exportPdfButton" class="ghost-button compact" type="button" title="导出并下载 PDF" aria-label="导出并下载 PDF" disabled>↓ PDF</button>
+								<button id="downloadArchiveButton" class="ghost-button compact" type="button" disabled>↓ 归档</button>
+							</div>
+						</div>
+					</header>
+
+					<!-- Content Area -->
+						<div class="scrollable-canvas">
+							<!-- Tabs centered at top -->
+							<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
+
+							<section id="artifactContent" class="artifact-content"></section>
+
+						<!-- Hidden elements to preserve JS bindings -->
+						<div class="hidden">
+							<button id="refreshHistoryButton" type="button"></button>
+							<button id="refreshArtifactsButton" type="button"></button>
+							<button id="refreshUploadsButton" type="button"></button>
+							<button id="uploadButton" type="button"></button>
+							<div id="uploadMessage"></div>
+							<input id="uploadSearchInput" />
+							<button id="uploadSearchButton" type="button"></button>
+							<div id="uploadList"></div>
+							<div id="reportMessage"></div>
+							<button id="clearStreamButton" type="button"></button>
+							<div id="scenarioDetails"></div>
+						</div>
+					</div>
+
+					<!-- Bottom Input Area (ChatGPT Style) -->
+					<div class="input-container">
+						<!-- Realtime Progress just above the input box -->
+						<div id="messageList" class="message-list-bottom" aria-label="实时进展"></div>
+
+						<form id="researchForm" class="chat-input-box">
+							<div class="chat-input-top-bar">
+								<!-- Upload Integration -->
+								<label class="icon-button upload-trigger" title="上传知识库资料">
+										<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M9 7C9 4.23858 11.2386 2 14 2C16.7614 2 19 4.23858 19 7V15C19 18.866 16.7614 22 14 22C11.2386 22 9 18.866 9 15V9C9 8.44772 9.44772 8 10 8C10.5523 8 11 8.44772 11 9V15C11 16.6569 12.3431 18 14 18C15.6569 18 17 16.6569 17 15V7C17 5.34315 15.6569 4 14 4C12.3431 4 11 5.34315 11 7V15C11 15.5523 11.4477 16 12 16C12.5523 16 13 15.5523 13 15V9C13 8.44772 13.4477 8 14 8C14.5523 8 15 8.44772 15 9V15C15 16.6569 13.6569 18 12 18C10.3431 18 9 16.6569 9 15V7Z" fill="currentColor"/></svg>
+										<input id="uploadInput" type="file" class="hidden" />
+									</label>
+
+									<!-- Scenario Dropdown -->
+								<div class="scenario-selector">
+									<select id="scenarioSelect" class="subtle-select"></select>
+									<button id="useScenarioButton" class="ghost-button compact" type="button">填入模板</button>
+								</div>
+							</div>
+
+							<div class="chat-input-wrapper">
+								<textarea id="queryInput" rows="1" placeholder="发送消息以开始 OSINT 研究..." required></textarea>
+								<button id="submitResearchButton" class="send-button" type="submit" title="发送">
+									<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 11L12 6L17 11M12 18V7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+								</button>
+							</div>
+						</form>
+						<div class="input-footer">
+							limira OSINT 可能会犯错。请核查重要信息。
+						</div>
+					</div>
+				</section>
 			</main>
+		</div>
+
+		<!-- Sandbox Modal for Evidence Links -->
+		<div id="sandboxModal" class="sandbox-modal hidden">
+			<div class="sandbox-backdrop"></div>
+			<div class="sandbox-content">
+				<div class="sandbox-header">
+					<div class="sandbox-title" id="sandboxTitle">网页预览</div>
+					<div class="sandbox-actions">
+						<a id="sandboxExternalLink" href="#" target="_blank" rel="noopener noreferrer" class="ghost-button compact" title="在新标签页中打开">
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M18 13V19C18 19.5304 17.5523 20 17 20H5C4.44772 20 4 19.5304 4 19V7C4 6.44772 4.44772 6 5 6H11M15 4H20M20 4V9M20 4L10 14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+						</a>
+						<button id="sandboxCloseButton" class="ghost-button compact" type="button" title="关闭预览">
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M18 6L6 18M6 6L18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+						</button>
+					</div>
+				</div>
+				<div class="sandbox-iframe-container">
+					<iframe id="sandboxIframe" src="" sandbox="allow-same-origin allow-scripts allow-popups allow-forms" title="Evidence Preview"></iframe>
+				</div>
+			</div>
 		</div>
 	</body>
 </html>

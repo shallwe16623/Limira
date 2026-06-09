@@ -168,6 +168,7 @@ function bindEvents() {
 	});
 	dom.refreshUploadsButton.addEventListener('click', () => void loadUploads());
 	dom.uploadButton.addEventListener('click', () => void uploadDocument());
+	dom.uploadInput.addEventListener('change', () => void uploadDocument());
 	dom.uploadSearchButton.addEventListener('click', () => void searchUploads());
 	dom.uploadSearchInput.addEventListener('keydown', (event) => {
 		if (event.key === 'Enter') {
@@ -180,6 +181,26 @@ function bindEvents() {
 	dom.enterpriseMemberForm.addEventListener('submit', (event) => {
 		event.preventDefault();
 		void createEnterpriseMember();
+	});
+
+	// Sandbox Event Bindings
+		dom.artifactContent.addEventListener('click', (event) => {
+			const link = event.target.closest('.sandbox-link');
+			if (link) {
+				event.preventDefault();
+				const url = link.href;
+				const title = link.getAttribute('data-title') || '网页预览';
+
+				dom.sandboxIframe.src = url;
+				dom.sandboxTitle.textContent = title;
+				dom.sandboxExternalLink.href = url;
+				dom.sandboxModal.classList.remove('hidden');
+		}
+	});
+
+	dom.sandboxCloseButton.addEventListener('click', () => {
+		dom.sandboxModal.classList.add('hidden');
+		dom.sandboxIframe.src = ''; // clear iframe
 	});
 }
 
@@ -1478,7 +1499,7 @@ function evidenceCard(item, index) {
 			${item.published_at ? `<span>${escapeHtml(item.published_at)}</span>` : ''}
 		</div>
 		<div class="artifact-body">${escapeHtml(summary)}</div>
-		${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
+		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
 	</article>`;
 }
 
