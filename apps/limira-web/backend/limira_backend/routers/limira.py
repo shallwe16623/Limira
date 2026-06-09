@@ -119,12 +119,20 @@ LIMIRA_GOOGLE_OAUTH_REDIRECT_URI_ENV = "LIMIRA_GOOGLE_OAUTH_REDIRECT_URI"
 LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV = "LIMIRA_GOOGLE_OAUTH_AUTH_URL"
 LIMIRA_GOOGLE_OAUTH_TOKEN_URL_ENV = "LIMIRA_GOOGLE_OAUTH_TOKEN_URL"
 LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL_ENV = "LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL"
+LIMIRA_WECHAT_OAUTH_APP_ID_ENV = "LIMIRA_WECHAT_OAUTH_APP_ID"
+LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV = "LIMIRA_WECHAT_OAUTH_APP_SECRET"
+LIMIRA_WECHAT_OAUTH_REDIRECT_URI_ENV = "LIMIRA_WECHAT_OAUTH_REDIRECT_URI"
+LIMIRA_WECHAT_OAUTH_AUTH_URL_ENV = "LIMIRA_WECHAT_OAUTH_AUTH_URL"
+LIMIRA_WECHAT_OAUTH_TOKEN_URL_ENV = "LIMIRA_WECHAT_OAUTH_TOKEN_URL"
+LIMIRA_WECHAT_OAUTH_USERINFO_URL_ENV = "LIMIRA_WECHAT_OAUTH_USERINFO_URL"
 LIMIRA_AUTH_COOKIE_NAME = "limira_session"
 LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME = "limira_google_oauth_state"
+LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME = "limira_wechat_oauth_state"
 LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS = 60 * 60 * 24
 LIMIRA_AUTH_DEFAULT_PASSWORD_RESET_TTL_SECONDS = 60 * 60
 LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS = 10 * 60
+LIMIRA_WECHAT_OAUTH_STATE_TTL_SECONDS = 10 * 60
 LIMIRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 OBJECT_KEY_FORBIDDEN_FIELDS = {
@@ -2923,6 +2931,42 @@ def _limira_google_oauth_tokeninfo_url(env: Any = os.environ) -> str:
     ).strip()
 
 
+def _limira_wechat_oauth_app_id(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_WECHAT_OAUTH_APP_ID_ENV) or "").strip()
+
+
+def _limira_wechat_oauth_app_secret(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV) or "").strip()
+
+
+def _limira_wechat_oauth_enabled(env: Any = os.environ) -> bool:
+    return bool(
+        _limira_wechat_oauth_app_id(env)
+        and _limira_wechat_oauth_app_secret(env)
+    )
+
+
+def _limira_wechat_oauth_auth_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_WECHAT_OAUTH_AUTH_URL_ENV)
+        or "https://open.weixin.qq.com/connect/qrconnect"
+    ).strip()
+
+
+def _limira_wechat_oauth_token_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_WECHAT_OAUTH_TOKEN_URL_ENV)
+        or "https://api.weixin.qq.com/sns/oauth2/access_token"
+    ).strip()
+
+
+def _limira_wechat_oauth_userinfo_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_WECHAT_OAUTH_USERINFO_URL_ENV)
+        or "https://api.weixin.qq.com/sns/userinfo"
+    ).strip()
+
+
 def _limira_auth_connect(env: Any = os.environ) -> sqlite3.Connection:
     database_path = _limira_auth_sqlite_path(env)
     os.makedirs(os.path.dirname(database_path), exist_ok=True)
@@ -2983,6 +3027,26 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_limira_auth_tokens_user_kind
         ON limira_auth_tokens(user_id, kind, consumed_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS limira_auth_identities (
+            provider TEXT NOT NULL,
+            provider_subject TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            display_name TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(provider, provider_subject),
+            FOREIGN KEY(user_id) REFERENCES limira_auth_users(id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_limira_auth_identities_user
+        ON limira_auth_identities(user_id)
         """
     )
     connection.commit()
@@ -3506,6 +3570,45 @@ def _limira_verify_google_oauth_state(state: str, env: Any = os.environ) -> bool
     return int(payload.get("exp") or 0) >= int(time.time())
 
 
+def _limira_wechat_oauth_state(env: Any = os.environ) -> str:
+    payload = {
+        "nonce": secrets.token_urlsafe(18),
+        "exp": int(time.time()) + LIMIRA_WECHAT_OAUTH_STATE_TTL_SECONDS,
+    }
+    encoded_payload = _limira_auth_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signature = hmac.new(
+        _limira_auth_secret(env),
+        f"wechat-oauth-state:{encoded_payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded_payload}.{_limira_auth_b64encode(signature)}"
+
+
+def _limira_verify_wechat_oauth_state(state: str, env: Any = os.environ) -> bool:
+    try:
+        encoded_payload, encoded_signature = str(state).split(".", 1)
+    except ValueError:
+        return False
+    expected = hmac.new(
+        _limira_auth_secret(env),
+        f"wechat-oauth-state:{encoded_payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    try:
+        supplied = _limira_auth_b64decode(encoded_signature)
+    except Exception:
+        return False
+    if not hmac.compare_digest(expected, supplied):
+        return False
+    try:
+        payload = json.loads(_limira_auth_b64decode(encoded_payload).decode("utf-8"))
+    except Exception:
+        return False
+    return int(payload.get("exp") or 0) >= int(time.time())
+
+
 def _limira_google_oauth_redirect_uri(
     request: Request | None,
     env: Any = os.environ,
@@ -3516,6 +3619,16 @@ def _limira_google_oauth_redirect_uri(
     return f"{_limira_public_base_url(request, env)}/api/limira/auth/google/callback"
 
 
+def _limira_wechat_oauth_redirect_uri(
+    request: Request | None,
+    env: Any = os.environ,
+) -> str:
+    configured = str(env.get(LIMIRA_WECHAT_OAUTH_REDIRECT_URI_ENV) or "").strip()
+    if configured:
+        return configured
+    return f"{_limira_public_base_url(request, env)}/api/limira/auth/wechat/callback"
+
+
 def _limira_google_oauth_login_redirect_url(
     request: Request | None,
     env: Any = os.environ,
@@ -3524,6 +3637,17 @@ def _limira_google_oauth_login_redirect_url(
 ) -> str:
     key = "google_auth" if success else "auth_error"
     value = "success" if success else "google_auth_failed"
+    return f"{_limira_public_base_url(request, env)}/limira?{urlencode({key: value})}"
+
+
+def _limira_wechat_oauth_login_redirect_url(
+    request: Request | None,
+    env: Any = os.environ,
+    *,
+    success: bool,
+) -> str:
+    key = "wechat_auth" if success else "auth_error"
+    value = "success" if success else "wechat_auth_failed"
     return f"{_limira_public_base_url(request, env)}/limira?{urlencode({key: value})}"
 
 
@@ -3542,6 +3666,22 @@ def _limira_google_oauth_authorize_url(
         "prompt": "select_account",
     }
     return f"{_limira_google_oauth_auth_url(env)}?{urlencode(params)}"
+
+
+def _limira_wechat_oauth_authorize_url(
+    *,
+    request: Request | None,
+    state: str,
+    env: Any = os.environ,
+) -> str:
+    params = {
+        "appid": _limira_wechat_oauth_app_id(env),
+        "redirect_uri": _limira_wechat_oauth_redirect_uri(request, env),
+        "response_type": "code",
+        "scope": "snsapi_login",
+        "state": state,
+    }
+    return f"{_limira_wechat_oauth_auth_url(env)}?{urlencode(params)}#wechat_redirect"
 
 
 async def _limira_google_userinfo_from_code(
@@ -3591,10 +3731,61 @@ async def _limira_google_userinfo_from_code(
     }
 
 
+async def _limira_wechat_userinfo_from_code(
+    *,
+    code: str,
+    env: Any = os.environ,
+) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=15) as client:
+        token_response = await client.get(
+            _limira_wechat_oauth_token_url(env),
+            params={
+                "appid": _limira_wechat_oauth_app_id(env),
+                "secret": _limira_wechat_oauth_app_secret(env),
+                "code": code,
+                "grant_type": "authorization_code",
+            },
+        )
+        if token_response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="wechat_oauth_exchange_failed")
+        token_payload = token_response.json()
+        if token_payload.get("errcode") is not None:
+            raise HTTPException(status_code=502, detail="wechat_oauth_exchange_failed")
+        access_token = str(token_payload.get("access_token") or "").strip()
+        openid = str(token_payload.get("openid") or "").strip()
+        if not access_token or not openid:
+            raise HTTPException(status_code=502, detail="wechat_oauth_exchange_failed")
+        userinfo_response = await client.get(
+            _limira_wechat_oauth_userinfo_url(env),
+            params={
+                "access_token": access_token,
+                "openid": openid,
+                "lang": "zh_CN",
+            },
+        )
+        if userinfo_response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="wechat_oauth_exchange_failed")
+        userinfo = userinfo_response.json()
+        if userinfo.get("errcode") is not None:
+            raise HTTPException(status_code=502, detail="wechat_oauth_exchange_failed")
+    unionid = str(userinfo.get("unionid") or token_payload.get("unionid") or "").strip()
+    provider_subject = unionid or openid
+    if not provider_subject:
+        raise HTTPException(status_code=401, detail="invalid_wechat_identity")
+    nickname = str(userinfo.get("nickname") or "微信用户").strip() or "微信用户"
+    return {
+        "wechat_sub": provider_subject,
+        "openid": openid,
+        "unionid": unionid,
+        "name": nickname,
+    }
+
+
 def _limira_auth_upsert_google_user(
     *,
     email: str,
     name: str,
+    provider_subject: str | None = None,
     env: Any = os.environ,
 ) -> LimiraAuthRecord:
     normalized_email = _normalize_auth_email(email)
@@ -3642,6 +3833,140 @@ def _limira_auth_upsert_google_user(
                 ),
             )
             connection.commit()
+    user = _limira_auth_get_user_by_id(user_id, env)
+    if user is None:
+        raise HTTPException(status_code=500, detail="auth_user_create_failed")
+    if provider_subject:
+        _limira_auth_bind_provider_identity(
+            user_id=user.id,
+            provider="google",
+            provider_subject=provider_subject,
+            display_name=normalized_name,
+            env=env,
+        )
+    return user
+
+
+def _limira_auth_bind_provider_identity(
+    *,
+    user_id: str,
+    provider: str,
+    provider_subject: str,
+    display_name: str | None = None,
+    env: Any = os.environ,
+) -> None:
+    subject = str(provider_subject or "").strip()
+    if not subject:
+        raise HTTPException(status_code=401, detail="invalid_oauth_identity")
+    now = int(time.time())
+    with _limira_auth_connect(env) as connection:
+        connection.execute(
+            """
+            INSERT INTO limira_auth_identities (
+                provider, provider_subject, user_id, display_name, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, provider_subject) DO UPDATE SET
+                user_id = excluded.user_id,
+                display_name = excluded.display_name,
+                updated_at = excluded.updated_at
+            """,
+            (
+                provider,
+                subject,
+                str(user_id),
+                str(display_name or "").strip() or None,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+
+
+def _limira_auth_get_user_by_provider_identity(
+    *,
+    provider: str,
+    provider_subject: str,
+    env: Any = os.environ,
+) -> LimiraAuthRecord | None:
+    subject = str(provider_subject or "").strip()
+    if not subject:
+        return None
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                users.id, users.email, users.name, users.role,
+                users.password_hash, users.active, users.email_verified_at
+            FROM limira_auth_identities AS identities
+            JOIN limira_auth_users AS users ON users.id = identities.user_id
+            WHERE identities.provider = ? AND identities.provider_subject = ?
+            """,
+            (provider, subject),
+        ).fetchone()
+    return _limira_auth_user_from_row(row) if row else None
+
+
+def _limira_synthetic_oauth_email(provider: str, provider_subject: str) -> str:
+    digest = hashlib.sha256(f"{provider}:{provider_subject}".encode("utf-8")).hexdigest()[:32]
+    return f"{provider}-{digest}@auth.limira.local"
+
+
+def _limira_auth_upsert_wechat_user(
+    *,
+    provider_subject: str,
+    name: str,
+    env: Any = os.environ,
+) -> LimiraAuthRecord:
+    subject = str(provider_subject or "").strip()
+    if not subject:
+        raise HTTPException(status_code=401, detail="invalid_wechat_identity")
+    existing = _limira_auth_get_user_by_provider_identity(
+        provider="wechat",
+        provider_subject=subject,
+        env=env,
+    )
+    now = int(time.time())
+    display_name = str(name or "微信用户").strip() or "微信用户"
+    if existing is not None:
+        if not existing.active:
+            raise HTTPException(status_code=401, detail="invalid_credentials")
+        _limira_auth_bind_provider_identity(
+            user_id=existing.id,
+            provider="wechat",
+            provider_subject=subject,
+            display_name=display_name,
+            env=env,
+        )
+        return existing
+
+    email = _limira_synthetic_oauth_email("wechat", subject)
+    user_id = str(uuid.uuid4())
+    with _limira_auth_connect(env) as connection:
+        connection.execute(
+            """
+            INSERT INTO limira_auth_users (
+                id, email, name, role, password_hash, active,
+                email_verified_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 'user', ?, 1, ?, ?, ?)
+            """,
+            (
+                user_id,
+                email,
+                display_name,
+                _limira_hash_password(secrets.token_urlsafe(32)),
+                now,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    _limira_auth_bind_provider_identity(
+        user_id=user_id,
+        provider="wechat",
+        provider_subject=subject,
+        display_name=display_name,
+        env=env,
+    )
     user = _limira_auth_get_user_by_id(user_id, env)
     if user is None:
         raise HTTPException(status_code=500, detail="auth_user_create_failed")
@@ -4153,6 +4478,11 @@ async def limira_auth_google_config() -> dict[str, bool]:
     return {"enabled": _limira_google_oauth_enabled()}
 
 
+@router.get("/auth/wechat/config")
+async def limira_auth_wechat_config() -> dict[str, bool]:
+    return {"enabled": _limira_wechat_oauth_enabled()}
+
+
 @router.get("/auth/google/start")
 async def limira_auth_google_start(request: Request) -> RedirectResponse:
     if not _limira_google_oauth_enabled():
@@ -4170,6 +4500,27 @@ async def limira_auth_google_start(request: Request) -> RedirectResponse:
         samesite="lax",
         max_age=LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS,
         path="/api/limira/auth/google",
+    )
+    return response
+
+
+@router.get("/auth/wechat/start")
+async def limira_auth_wechat_start(request: Request) -> RedirectResponse:
+    if not _limira_wechat_oauth_enabled():
+        raise HTTPException(status_code=404, detail="wechat_oauth_not_configured")
+    state = _limira_wechat_oauth_state()
+    response = RedirectResponse(
+        _limira_wechat_oauth_authorize_url(request=request, state=state),
+        status_code=303,
+    )
+    response.set_cookie(
+        LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME,
+        state,
+        httponly=True,
+        secure=_limira_auth_cookie_secure(),
+        samesite="lax",
+        max_age=LIMIRA_WECHAT_OAUTH_STATE_TTL_SECONDS,
+        path="/api/limira/auth/wechat",
     )
     return response
 
@@ -4205,6 +4556,7 @@ async def limira_auth_google_callback(
     user = _limira_auth_upsert_google_user(
         email=str(identity["email"]),
         name=str(identity.get("name") or identity["email"]),
+        provider_subject=str(identity.get("google_sub") or identity["email"]),
     )
     session_token = _limira_issue_auth_token(user)
     redirect_response = RedirectResponse(
@@ -4214,6 +4566,50 @@ async def limira_auth_google_callback(
     redirect_response.delete_cookie(
         LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME,
         path="/api/limira/auth/google",
+    )
+    _set_limira_auth_cookie(redirect_response, session_token)
+    return redirect_response
+
+
+@router.get("/auth/wechat/callback")
+async def limira_auth_wechat_callback(
+    request: Request,
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+) -> RedirectResponse:
+    redirect_response = RedirectResponse(
+        _limira_wechat_oauth_login_redirect_url(request, success=False),
+        status_code=303,
+    )
+    redirect_response.delete_cookie(
+        LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME,
+        path="/api/limira/auth/wechat",
+    )
+    if error:
+        return redirect_response
+    expected_state = request.cookies.get(LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME)
+    if (
+        not code
+        or not state
+        or not expected_state
+        or not hmac.compare_digest(str(state), str(expected_state))
+        or not _limira_verify_wechat_oauth_state(str(state))
+    ):
+        raise HTTPException(status_code=400, detail="invalid_wechat_oauth_state")
+    identity = await _limira_wechat_userinfo_from_code(code=code)
+    user = _limira_auth_upsert_wechat_user(
+        provider_subject=str(identity["wechat_sub"]),
+        name=str(identity.get("name") or "微信用户"),
+    )
+    session_token = _limira_issue_auth_token(user)
+    redirect_response = RedirectResponse(
+        _limira_wechat_oauth_login_redirect_url(request, success=True),
+        status_code=303,
+    )
+    redirect_response.delete_cookie(
+        LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME,
+        path="/api/limira/auth/wechat",
     )
     _set_limira_auth_cookie(redirect_response, session_token)
     return redirect_response

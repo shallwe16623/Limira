@@ -472,6 +472,125 @@ async def test_limira_google_oauth_callback_creates_verified_session_user(
 
 
 @pytest.mark.asyncio
+async def test_limira_wechat_oauth_config_and_start_are_env_gated(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.delenv(limira.LIMIRA_WECHAT_OAUTH_APP_ID_ENV, raising=False)
+    monkeypatch.delenv(limira.LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV, raising=False)
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        disabled = await client.get("/api/limira/auth/wechat/config")
+        assert disabled.status_code == 200
+        assert disabled.json() == {"enabled": False}
+
+        disabled_start = await client.get("/api/limira/auth/wechat/start")
+        assert disabled_start.status_code == 404
+        assert disabled_start.json() == {"detail": "wechat_oauth_not_configured"}
+
+        monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_ID_ENV, "wechat-app-id")
+        monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV, "wechat-secret")
+        monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_AUTH_URL_ENV, "https://wechat.example/connect")
+
+        enabled = await client.get("/api/limira/auth/wechat/config")
+        assert enabled.status_code == 200
+        assert enabled.json() == {"enabled": True}
+
+        start = await client.get("/api/limira/auth/wechat/start", follow_redirects=False)
+        assert start.status_code == 303
+        location = start.headers["location"]
+        parsed = urlsplit(location)
+        params = parse_qs(parsed.query)
+        assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://wechat.example/connect"
+        assert parsed.fragment == "wechat_redirect"
+        assert params["appid"] == ["wechat-app-id"]
+        assert params["response_type"] == ["code"]
+        assert params["scope"] == ["snsapi_login"]
+        assert params["redirect_uri"] == ["http://limira.test/api/limira/auth/wechat/callback"]
+        assert params["state"][0]
+        assert limira.LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME in start.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_limira_wechat_oauth_callback_creates_verified_session_user(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_ID_ENV, "wechat-app-id")
+    monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV, "wechat-secret")
+
+    async def fake_wechat_userinfo_from_code(*, code, env=os.environ):
+        assert code == "wechat-code"
+        return {
+            "wechat_sub": "wechat-unionid-123",
+            "openid": "wechat-openid-123",
+            "unionid": "wechat-unionid-123",
+            "name": "微信测试用户",
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_limira_wechat_userinfo_from_code",
+        fake_wechat_userinfo_from_code,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        start = await client.get("/api/limira/auth/wechat/start", follow_redirects=False)
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+
+        callback = await client.get(
+            "/api/limira/auth/wechat/callback",
+            params={"code": "wechat-code", "state": state},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "http://limira.test/limira?wechat_auth=success"
+        assert "limira_session=" in callback.headers.get("set-cookie", "")
+
+        session = await client.get("/api/limira/auth/session")
+        assert session.status_code == 200
+        session_payload = session.json()
+        assert session_payload["email"].endswith("@auth.limira.local")
+        assert session_payload["name"] == "微信测试用户"
+        assert session_payload["role"] == "user"
+        assert session_payload["email_verified"] is True
+
+        second_start = await client.get("/api/limira/auth/wechat/start", follow_redirects=False)
+        second_state = parse_qs(urlsplit(second_start.headers["location"]).query)["state"][0]
+        second_callback = await client.get(
+            "/api/limira/auth/wechat/callback",
+            params={"code": "wechat-code", "state": second_state},
+            follow_redirects=False,
+        )
+        assert second_callback.status_code == 303
+        assert "limira_session=" in second_callback.headers.get("set-cookie", "")
+
+        with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
+            user_count = connection.execute("SELECT COUNT(*) FROM limira_auth_users").fetchone()[0]
+            identity_count = connection.execute("SELECT COUNT(*) FROM limira_auth_identities").fetchone()[0]
+        assert user_count == 1
+        assert identity_count == 1
+
+
+@pytest.mark.asyncio
 async def test_limira_native_auth_migrates_existing_legacy_sqlite_user_once(
     tmp_path,
     monkeypatch,
@@ -8442,6 +8561,9 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/auth/google/config", "GET"),
         ("/auth/google/start", "GET"),
         ("/auth/google/callback", "GET"),
+        ("/auth/wechat/config", "GET"),
+        ("/auth/wechat/start", "GET"),
+        ("/auth/wechat/callback", "GET"),
         ("/scenarios", "GET"),
         ("/research", "POST"),
         ("/tasks/{task_id}", "GET"),

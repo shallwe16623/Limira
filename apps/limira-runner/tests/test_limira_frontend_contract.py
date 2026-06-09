@@ -210,12 +210,17 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/password-reset/confirm" in app
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
+    assert "/api/limira/auth/wechat/config" in app
+    assert "/api/limira/auth/wechat/start" in app
     assert 'id="googleSigninButton"' in index
+    assert 'id="wechatSigninButton"' in index
     assert "googleAuthEnabled" in app
+    assert "wechatAuthEnabled" in app
     assert "verify_email_token" in app
     assert "reset_password_token" in app
     assert "auth_error" in app
     assert "google_auth" in app
+    assert "wechat_auth" in app
     assert "x-forwarded-host" in server
     assert "x-forwarded-proto" in server
     assert LEGACY_AUTH_PREFIX not in app

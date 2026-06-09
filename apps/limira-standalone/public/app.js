@@ -81,6 +81,7 @@ const state = {
 	user: null,
 	pendingAuthEmail: '',
 	googleAuthEnabled: false,
+	wechatAuthEnabled: false,
 	scenarios: [],
 	selectedScenario: '',
 	savedUserId: '',
@@ -133,6 +134,7 @@ function bindEvents() {
 	dom.forgotPasswordButton.addEventListener('click', () => setAuthMode('forgot'));
 	dom.resendVerificationButton.addEventListener('click', () => void resendVerificationEmail());
 	dom.googleSigninButton.addEventListener('click', googleSignIn);
+	dom.wechatSigninButton.addEventListener('click', wechatSignIn);
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
@@ -229,6 +231,10 @@ function renderAuthMode() {
 		'hidden',
 		!state.googleAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
 	);
+	dom.wechatSigninButton.classList.toggle(
+		'hidden',
+		!state.wechatAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
+	);
 	const submitText = {
 		signin: '登录',
 		signup: '注册',
@@ -242,10 +248,15 @@ function renderAuthMode() {
 
 async function loadAuthOptions() {
 	try {
-		const config = await api('/api/limira/auth/google/config');
-		state.googleAuthEnabled = Boolean(config?.enabled);
+		const [googleConfig, wechatConfig] = await Promise.all([
+			api('/api/limira/auth/google/config'),
+			api('/api/limira/auth/wechat/config')
+		]);
+		state.googleAuthEnabled = Boolean(googleConfig?.enabled);
+		state.wechatAuthEnabled = Boolean(wechatConfig?.enabled);
 	} catch {
 		state.googleAuthEnabled = false;
+		state.wechatAuthEnabled = false;
 	}
 }
 
@@ -257,6 +268,10 @@ function setAuthMode(mode) {
 
 function googleSignIn() {
 	window.location.href = '/api/limira/auth/google/start';
+}
+
+function wechatSignIn() {
+	window.location.href = '/api/limira/auth/wechat/start';
 }
 
 async function authenticate() {
@@ -346,6 +361,7 @@ async function handleAuthLinkTokens() {
 	const resetToken = url.searchParams.get('reset_password_token');
 	const authError = url.searchParams.get('auth_error');
 	const googleAuth = url.searchParams.get('google_auth');
+	const wechatAuth = url.searchParams.get('wechat_auth');
 	if (authError) {
 		clearAuthUrlParams(['auth_error']);
 		setAuthMode('signin');
@@ -354,6 +370,10 @@ async function handleAuthLinkTokens() {
 	}
 	if (googleAuth === 'success') {
 		clearAuthUrlParams(['google_auth']);
+		return '';
+	}
+	if (wechatAuth === 'success') {
+		clearAuthUrlParams(['wechat_auth']);
 		return '';
 	}
 	if (verifyToken) {
@@ -1823,7 +1843,10 @@ function localizedErrorDetail(detail) {
 		google_auth_failed: 'Google 登录失败，请重试。',
 		google_oauth_not_configured: 'Google 登录暂未配置。',
 		invalid_google_identity: 'Google 账号验证失败。',
-		google_email_not_verified: '这个 Google 账号尚未完成邮箱验证。'
+		google_email_not_verified: '这个 Google 账号尚未完成邮箱验证。',
+		wechat_auth_failed: '微信登录失败，请重试。',
+		wechat_oauth_not_configured: '微信登录暂未配置。',
+		invalid_wechat_identity: '微信账号验证失败。'
 	};
 	return messages[detail] || detail;
 }
