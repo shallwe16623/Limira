@@ -93,9 +93,46 @@ JINA_API_KEY=
 E2B_API_KEY=
 ```
 
-### 2. 启动后端基础服务
+### 2. 一键启动本地开发服务
 
-推荐用 Docker Compose 启动后端、runner、Postgres、Redis 和 MinIO：
+本地开发和调试推荐直接运行启动脚本：
+
+```bash
+./scripts/start-local.sh
+```
+
+脚本会自动启动：
+
+- runner：`http://127.0.0.1:8091`
+- 后端：`http://127.0.0.1:8080`
+- 独立前端：`http://127.0.0.1:5173/limira`
+
+它会先停止当前端口上的旧进程，再重新启动三段服务，并把日志写到：
+
+```text
+limira-runtime/logs/
+```
+
+PID 文件写到：
+
+```text
+limira-runtime/pids/
+```
+
+常用命令：
+
+```bash
+./scripts/start-local.sh          # 默认 restart
+./scripts/start-local.sh restart
+./scripts/start-local.sh stop
+./scripts/start-local.sh status
+```
+
+脚本默认使用 SQLite、本地文件对象存储和内存 runtime state，适合本机开发。模型 API、搜索 API 等真实研究所需变量仍从 `.env`、`apps/limira-agent/.env` 和 `apps/limira-runner/.env` 读取。
+
+### 3. Docker Compose 部署
+
+如果要跑更接近生产的 Postgres、Redis、MinIO 组合，可以用 Docker Compose：
 
 ```bash
 docker compose -f docker-compose.limira.yml up --build
@@ -107,32 +144,18 @@ docker compose -f docker-compose.limira.yml up --build
 http://127.0.0.1:3001/api/limira
 ```
 
-健康检查：
-
-```bash
-curl http://127.0.0.1:3001/health
-```
-
-### 3. 启动独立前端
-
-另开一个终端：
+Docker 模式下独立前端可以另开一个终端启动，并代理到 compose 后端：
 
 ```bash
 LIMIRA_BACKEND_URL=http://127.0.0.1:3001 \
 node apps/limira-standalone/server.mjs
 ```
 
-打开：
-
-```text
-http://127.0.0.1:5173/limira
-```
-
 前端服务只允许代理 `/api/limira/*`，其它通用 API 路径会被拒绝。
 
 ## 开发模式
 
-如果你只想改后端代码，可以在 `apps/limira-web/backend` 下直接启动 FastAPI：
+如果你只想改后端代码，也可以在 `apps/limira-web/backend` 下直接启动 FastAPI：
 
 ```bash
 cd apps/limira-web/backend
