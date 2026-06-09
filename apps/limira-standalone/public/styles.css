@@ -336,8 +336,8 @@ label {
 
 .action-row {
 	display: flex;
-	gap: 0.75rem;
-	flex-wrap: wrap;
+	gap: 0.5rem;
+	flex-wrap: nowrap;
 }
 
 /* History List */
@@ -516,9 +516,20 @@ label {
 }
 
 .upload-card {
-	padding: 0.75rem 1rem;
+	padding: 0.5rem 0;
 	font-size: 0.85rem;
-	border-radius: var(--radius-sm);
+	border: none;
+	border-bottom: 1px solid var(--border);
+	border-radius: 0;
+	box-shadow: none;
+	background: transparent;
+}
+.upload-card:last-child {
+	border-bottom: none;
+}
+.upload-card:hover {
+	box-shadow: none;
+	border-color: var(--border);
 }
 
 .message-list {
