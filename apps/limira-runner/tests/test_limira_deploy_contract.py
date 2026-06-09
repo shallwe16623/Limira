@@ -250,6 +250,7 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
         key
         for key in env
         if any(marker in key for marker in ("PASSWORD", "TOKEN", "API_KEY", "SECRET"))
+        and not key.endswith("_TTL_SECONDS")
     ]
     for key in secret_keys:
         value = env[key]

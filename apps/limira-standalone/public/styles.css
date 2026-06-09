@@ -491,7 +491,7 @@ label {
 	display: flex;
 	flex-direction: column;
 }
-.side-pane .panel:nth-child(3) { /* Realtime progress */
+.side-pane .panel:nth-child(4) { /* Realtime progress */
 	flex: 1;
 	min-height: 0;
 	display: flex;
@@ -530,6 +530,30 @@ label {
 .upload-card:hover {
 	box-shadow: none;
 	border-color: var(--border);
+}
+
+.compact-form {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	margin: 0.75rem 0;
+}
+
+.compact-form input, .compact-form select {
+	width: 100%;
+}
+
+.management-card {
+	padding: 0.65rem 0;
+	border-bottom: 1px solid var(--border);
+}
+
+.management-card:last-child {
+	border-bottom: none;
+}
+
+#enterpriseAdminPanel {
+	max-height: 42vh;
 }
 
 .message-list {

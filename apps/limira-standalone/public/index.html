@@ -29,10 +29,18 @@
 					</p>
 				</div>
 				<form id="authForm" class="auth-card">
-					<div class="segmented-control" role="tablist" aria-label="登录模式">
+					<div class="segmented-control" role="tablist" aria-label="账号类型">
+						<button id="personalScopeButton" class="active" type="button">个人方式登录</button>
+						<button id="enterpriseScopeButton" type="button">企业登录</button>
+					</div>
+					<div id="authModeControl" class="segmented-control" role="tablist" aria-label="登录模式">
 						<button id="signinModeButton" class="active" type="button">登录</button>
 						<button id="signupModeButton" type="button">注册</button>
 					</div>
+					<label id="organizationLabel" class="hidden">
+						单位
+						<select id="organizationSelect"></select>
+					</label>
 					<label id="nameLabel">
 						姓名
 						<input id="nameInput" autocomplete="name" placeholder="请输入姓名" />
@@ -138,6 +146,26 @@
 						</div>
 						<button id="exportPdfButton" class="secondary-button" type="button" disabled>导出并下载 PDF</button>
 						<div id="reportMessage" class="inline-message"></div>
+					</section>
+
+					<section id="enterpriseAdminPanel" class="panel hidden">
+						<div class="panel-header">
+							<h2>单位管理</h2>
+							<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
+						</div>
+						<div id="enterpriseUsageSummary" class="inline-message"></div>
+						<form id="enterpriseMemberForm" class="compact-form">
+							<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
+							<input id="enterpriseMemberEmailInput" type="email" placeholder="member@example.com" autocomplete="off" />
+							<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
+							<select id="enterpriseMemberRoleSelect">
+								<option value="member">成员</option>
+								<option value="admin">管理员</option>
+							</select>
+							<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加账号</button>
+						</form>
+						<div id="enterpriseMemberMessage" class="inline-message"></div>
+						<div id="enterpriseMemberList" class="compact-list"></div>
 					</section>
 
 					<section class="panel">

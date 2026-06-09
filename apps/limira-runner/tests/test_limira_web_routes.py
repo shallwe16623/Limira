@@ -235,6 +235,10 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
             "name": "Analyst",
             "role": "user",
             "email_verified": True,
+            "account_type": "personal",
+            "organization_id": None,
+            "organization_role": None,
+            "daily_research_limit": 1,
         }
 
         scenarios = await client.get(
@@ -330,6 +334,258 @@ async def test_limira_native_auth_password_reset_uses_email_token(
         )
         assert new_password.status_code == 200
         assert new_password.json()["email"] == "reset@example.test"
+
+
+@pytest.mark.asyncio
+async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_management(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+
+    organization = limira._limira_auth_create_organization(
+        name="Example Intelligence Unit",
+        slug="example-unit",
+    )
+    admin = limira._limira_auth_insert_user(
+        email="unit-admin@example.test",
+        password="enterprise-password",
+        name="Unit Admin",
+        account_type="enterprise",
+        organization_id=organization.id,
+        organization_role="admin",
+        email_verified_at=1,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        organizations = await client.get("/api/limira/auth/organizations")
+        assert organizations.status_code == 200
+        assert organizations.json()["organizations"] == [
+            {
+                "id": organization.id,
+                "name": "Example Intelligence Unit",
+                "slug": "example-unit",
+                "billing_mode": "metered",
+            }
+        ]
+
+        personal_signin = await client.post(
+            "/api/limira/auth/signin",
+            json={
+                "email": "unit-admin@example.test",
+                "password": "enterprise-password",
+            },
+        )
+        assert personal_signin.status_code == 403
+        assert personal_signin.json() == {"detail": "enterprise_login_required"}
+
+        signin = await client.post(
+            "/api/limira/auth/enterprise/signin",
+            json={
+                "organization_id": organization.id,
+                "email": "unit-admin@example.test",
+                "password": "enterprise-password",
+            },
+        )
+        assert signin.status_code == 200
+        payload = signin.json()
+        assert payload["id"] == admin.id
+        assert payload["account_type"] == "enterprise"
+        assert payload["organization_id"] == organization.id
+        assert payload["organization_role"] == "admin"
+        assert payload["organization"]["billing_mode"] == "metered"
+        token = payload["token"]
+
+        members = await client.get(
+            "/api/limira/enterprise/members",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert members.status_code == 200
+        assert members.json()["count"] == 1
+        assert members.json()["members"][0]["email"] == "unit-admin@example.test"
+
+        created = await client.post(
+            "/api/limira/enterprise/members",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "email": "analyst-unit@example.test",
+                "name": "Unit Analyst",
+                "password": "member-password",
+                "organization_role": "member",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["member"]["account_type"] == "enterprise"
+        assert created.json()["member"]["organization_id"] == organization.id
+        assert created.json()["member"]["organization_role"] == "member"
+
+        usage = await client.get(
+            "/api/limira/enterprise/usage",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert usage.status_code == 200
+        assert usage.json()["organization"]["id"] == organization.id
+        assert usage.json()["usage"]["totals"] == {}
+
+
+@pytest.mark.asyncio
+async def test_personal_auth_research_is_limited_to_one_task_per_utc_day(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async def task_repository_override():
+        return repo
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    app.dependency_overrides[limira.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            json={
+                "email": "quota@example.test",
+                "name": "Quota User",
+                "password": "quota-password",
+            },
+        )
+        assert signup.status_code == 201
+        verify_token = _latest_auth_link_token(outbox_path, "verify_email_token")
+        verified = await client.post(
+            "/api/limira/auth/verify-email",
+            json={"token": verify_token},
+        )
+        assert verified.status_code == 200
+        token = verified.json()["token"]
+
+        first = await client.post(
+            "/api/limira/research",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"query": "first personal quota task"},
+        )
+        assert first.status_code == 202
+
+        second = await client.post(
+            "/api/limira/research",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"query": "second personal quota task"},
+        )
+        assert second.status_code == 429
+        assert second.json() == {"detail": "personal_daily_quota_exceeded"}
+
+    assert len(research.create_calls) == 1
+    with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
+        usage_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM limira_auth_usage_events
+            WHERE account_type = 'personal'
+                AND event_type = 'research_task'
+            """
+        ).fetchone()[0]
+    assert usage_count == 1
+
+
+@pytest.mark.asyncio
+async def test_enterprise_auth_research_records_metered_usage_without_daily_limit(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+
+    organization = limira._limira_auth_create_organization(
+        name="Metered Research Unit",
+        slug="metered-unit",
+    )
+    limira._limira_auth_insert_user(
+        email="metered@example.test",
+        password="metered-password",
+        name="Metered User",
+        account_type="enterprise",
+        organization_id=organization.id,
+        organization_role="member",
+        email_verified_at=1,
+    )
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async def task_repository_override():
+        return repo
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    app.dependency_overrides[limira.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signin = await client.post(
+            "/api/limira/auth/enterprise/signin",
+            json={
+                "organization_id": organization.id,
+                "email": "metered@example.test",
+                "password": "metered-password",
+            },
+        )
+        assert signin.status_code == 200
+        token = signin.json()["token"]
+
+        for query in ("first enterprise task", "second enterprise task"):
+            response = await client.post(
+                "/api/limira/research",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"query": query},
+            )
+            assert response.status_code == 202
+
+    assert len(research.create_calls) == 2
+    with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
+        usage = connection.execute(
+            """
+            SELECT organization_id, account_type, event_type, COUNT(*), SUM(quantity)
+            FROM limira_auth_usage_events
+            GROUP BY organization_id, account_type, event_type
+            """
+        ).fetchone()
+    assert usage == (
+        organization.id,
+        "enterprise",
+        "research_task",
+        2,
+        2,
+    )
 
 
 @pytest.mark.asyncio
@@ -8558,6 +8814,8 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/auth/resend-verification", "POST"),
         ("/auth/password-reset/request", "POST"),
         ("/auth/password-reset/confirm", "POST"),
+        ("/auth/organizations", "GET"),
+        ("/auth/enterprise/signin", "POST"),
         ("/auth/google/config", "GET"),
         ("/auth/google/start", "GET"),
         ("/auth/google/callback", "GET"),
@@ -8577,6 +8835,10 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/uploads/{document_id}/download", "GET"),
         ("/tasks/{task_id}/reports/pdf", "POST"),
         ("/tasks/{task_id}/reports/{report_id}/pdf", "GET"),
+        ("/enterprise/members", "GET"),
+        ("/enterprise/members", "POST"),
+        ("/enterprise/usage", "GET"),
+        ("/admin/organizations", "POST"),
         ("/admin/tasks/{task_id}", "GET"),
         ("/admin/tasks/{task_id}/event-logs", "GET"),
         ("/admin/tasks/{task_id}/archive.zip", "GET"),

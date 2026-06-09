@@ -208,6 +208,15 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/resend-verification" in app
     assert "/api/limira/auth/password-reset/request" in app
     assert "/api/limira/auth/password-reset/confirm" in app
+    assert "/api/limira/auth/organizations" in app
+    assert "/api/limira/auth/enterprise/signin" in app
+    assert "/api/limira/enterprise/members" in app
+    assert "/api/limira/enterprise/usage" in app
+    assert 'id="personalScopeButton"' in index
+    assert 'id="enterpriseScopeButton"' in index
+    assert 'id="organizationSelect"' in index
+    assert 'id="enterpriseAdminPanel"' in index
+    assert 'id="enterpriseMemberForm"' in index
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
     assert "/api/limira/auth/wechat/config" in app
@@ -216,6 +225,9 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="wechatSigninButton"' in index
     assert "googleAuthEnabled" in app
     assert "wechatAuthEnabled" in app
+    assert "authScope: 'personal'" in app
+    assert "accountLabel(user)" in app
+    assert "personal_daily_quota_exceeded" in app
     assert "verify_email_token" in app
     assert "reset_password_token" in app
     assert "auth_error" in app

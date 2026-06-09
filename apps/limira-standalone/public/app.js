@@ -76,12 +76,18 @@ const SCENARIO_TEXT = {
 };
 
 const state = {
+	authScope: 'personal',
 	authMode: 'signin',
 	token: localStorage.getItem('limiraToken') || '',
 	user: null,
 	pendingAuthEmail: '',
 	googleAuthEnabled: false,
 	wechatAuthEnabled: false,
+	organizations: [],
+	selectedOrganizationId: '',
+	enterpriseMembers: [],
+	enterpriseUsage: null,
+	isLoadingEnterpriseAdmin: false,
 	scenarios: [],
 	selectedScenario: '',
 	savedUserId: '',
@@ -129,8 +135,13 @@ function bindEvents() {
 		event.preventDefault();
 		void authenticate();
 	});
+	dom.personalScopeButton.addEventListener('click', () => setAuthScope('personal'));
+	dom.enterpriseScopeButton.addEventListener('click', () => setAuthScope('enterprise'));
 	dom.signinModeButton.addEventListener('click', () => setAuthMode('signin'));
 	dom.signupModeButton.addEventListener('click', () => setAuthMode('signup'));
+	dom.organizationSelect.addEventListener('change', () => {
+		state.selectedOrganizationId = dom.organizationSelect.value;
+	});
 	dom.forgotPasswordButton.addEventListener('click', () => setAuthMode('forgot'));
 	dom.resendVerificationButton.addEventListener('click', () => void resendVerificationEmail());
 	dom.googleSigninButton.addEventListener('click', googleSignIn);
@@ -165,6 +176,11 @@ function bindEvents() {
 		}
 	});
 	dom.exportPdfButton.addEventListener('click', () => void exportPdf());
+	dom.refreshEnterpriseAdminButton.addEventListener('click', () => void loadEnterpriseAdmin());
+	dom.enterpriseMemberForm.addEventListener('submit', (event) => {
+		event.preventDefault();
+		void createEnterpriseMember();
+	});
 }
 
 async function boot() {
@@ -187,6 +203,7 @@ async function boot() {
 		await loadSession();
 		await loadScenarios();
 		await loadTaskHistory();
+		await loadEnterpriseAdmin();
 		await resumeWorkspace();
 	} catch {
 		state.user = null;
@@ -200,7 +217,7 @@ function renderShell() {
 	dom.workspace.classList.toggle('hidden', !signedIn);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
 	dom.sessionLabel.textContent = signedIn
-		? `${state.user.name || state.user.email || '已登录'} · ${roleLabel(state.user.role)}`
+		? `${state.user.name || state.user.email || '已登录'} · ${accountLabel(state.user)}`
 		: '未登录';
 	renderAuthMode();
 	renderStatus();
@@ -210,30 +227,39 @@ function renderShell() {
 	renderTabs();
 	renderUploads();
 	renderReportControls();
+	renderEnterpriseAdmin();
 }
 
 function renderAuthMode() {
+	const personalScope = state.authScope === 'personal';
+	dom.personalScopeButton.classList.toggle('active', personalScope);
+	dom.enterpriseScopeButton.classList.toggle('active', !personalScope);
+	dom.authModeControl.classList.toggle('hidden', !personalScope);
 	dom.signinModeButton.classList.toggle('active', state.authMode === 'signin');
 	dom.signupModeButton.classList.toggle('active', state.authMode === 'signup');
-	dom.nameLabel.classList.toggle('hidden', state.authMode !== 'signup');
+	dom.organizationLabel.classList.toggle('hidden', personalScope);
+	dom.organizationSelect.disabled = personalScope;
+	dom.organizationSelect.required = !personalScope;
+	renderOrganizationOptions();
+	dom.nameLabel.classList.toggle('hidden', !personalScope || state.authMode !== 'signup');
 	dom.emailLabel.classList.toggle('hidden', state.authMode === 'reset');
-	dom.passwordLabel.classList.toggle('hidden', state.authMode === 'forgot');
-	dom.resetTokenLabel.classList.toggle('hidden', state.authMode !== 'reset');
-	dom.forgotPasswordButton.classList.toggle('hidden', state.authMode !== 'signin');
-	dom.resendVerificationButton.classList.toggle('hidden', state.authMode === 'reset');
-	dom.emailInput.disabled = state.authMode === 'reset';
-	dom.emailInput.required = state.authMode !== 'reset';
-	dom.passwordInput.disabled = state.authMode === 'forgot';
-	dom.passwordInput.required = state.authMode !== 'forgot';
-	dom.resetTokenInput.disabled = state.authMode !== 'reset';
-	dom.resetTokenInput.required = state.authMode === 'reset';
+	dom.passwordLabel.classList.toggle('hidden', personalScope && state.authMode === 'forgot');
+	dom.resetTokenLabel.classList.toggle('hidden', !personalScope || state.authMode !== 'reset');
+	dom.forgotPasswordButton.classList.toggle('hidden', !personalScope || state.authMode !== 'signin');
+	dom.resendVerificationButton.classList.toggle('hidden', !personalScope || state.authMode === 'reset');
+	dom.emailInput.disabled = personalScope && state.authMode === 'reset';
+	dom.emailInput.required = !personalScope || state.authMode !== 'reset';
+	dom.passwordInput.disabled = personalScope && state.authMode === 'forgot';
+	dom.passwordInput.required = !personalScope || state.authMode !== 'forgot';
+	dom.resetTokenInput.disabled = !personalScope || state.authMode !== 'reset';
+	dom.resetTokenInput.required = personalScope && state.authMode === 'reset';
 	dom.googleSigninButton.classList.toggle(
 		'hidden',
-		!state.googleAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
+		!personalScope || !state.googleAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
 	);
 	dom.wechatSigninButton.classList.toggle(
 		'hidden',
-		!state.wechatAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
+		!personalScope || !state.wechatAuthEnabled || state.authMode === 'forgot' || state.authMode === 'reset'
 	);
 	const submitText = {
 		signin: '登录',
@@ -241,29 +267,65 @@ function renderAuthMode() {
 		forgot: '发送重置邮件',
 		reset: '重置密码'
 	};
-	dom.authSubmitButton.textContent = submitText[state.authMode] || '登录';
+	dom.authSubmitButton.textContent = personalScope
+		? submitText[state.authMode] || '登录'
+		: '登录单位账号';
 	dom.passwordInput.autocomplete =
-		state.authMode === 'signin' ? 'current-password' : 'new-password';
+		personalScope && state.authMode !== 'signin' ? 'new-password' : 'current-password';
 }
 
 async function loadAuthOptions() {
 	try {
-		const [googleConfig, wechatConfig] = await Promise.all([
+		const [googleConfig, wechatConfig, organizations] = await Promise.all([
 			api('/api/limira/auth/google/config'),
-			api('/api/limira/auth/wechat/config')
+			api('/api/limira/auth/wechat/config'),
+			api('/api/limira/auth/organizations')
 		]);
 		state.googleAuthEnabled = Boolean(googleConfig?.enabled);
 		state.wechatAuthEnabled = Boolean(wechatConfig?.enabled);
+		state.organizations = Array.isArray(organizations?.organizations)
+			? organizations.organizations
+			: [];
+		if (!state.selectedOrganizationId && state.organizations[0]) {
+			state.selectedOrganizationId = state.organizations[0].id;
+		}
 	} catch {
 		state.googleAuthEnabled = false;
 		state.wechatAuthEnabled = false;
+		state.organizations = [];
 	}
+}
+
+function setAuthScope(scope) {
+	state.authScope = scope === 'enterprise' ? 'enterprise' : 'personal';
+	if (state.authScope === 'enterprise') {
+		state.authMode = 'signin';
+	}
+	dom.authMessage.textContent = '';
+	renderAuthMode();
 }
 
 function setAuthMode(mode) {
 	state.authMode = mode;
 	dom.authMessage.textContent = '';
 	renderAuthMode();
+}
+
+function renderOrganizationOptions() {
+	if (!dom.organizationSelect) {
+		return;
+	}
+	if (!state.organizations.length) {
+		dom.organizationSelect.innerHTML = '<option value="">暂无可选单位</option>';
+		return;
+	}
+	dom.organizationSelect.innerHTML = state.organizations
+		.map((organization) => {
+			const id = String(organization.id || '');
+			const selected = id === state.selectedOrganizationId ? ' selected' : '';
+			return `<option value="${escapeAttr(id)}"${selected}>${escapeHtml(organization.name || id)}</option>`;
+		})
+		.join('');
 }
 
 function googleSignIn() {
@@ -280,6 +342,23 @@ async function authenticate() {
 	const name = dom.nameInput.value.trim();
 	dom.authMessage.textContent = '处理中...';
 	try {
+		if (state.authScope === 'enterprise') {
+			if (!state.selectedOrganizationId) {
+				dom.authMessage.textContent = '请先选择单位。';
+				return;
+			}
+			const user = await api('/api/limira/auth/enterprise/signin', {
+				method: 'POST',
+				body: {
+					organization_id: state.selectedOrganizationId,
+					email,
+					password
+				}
+			});
+			await finishAuthenticated(user);
+			dom.authMessage.textContent = '';
+			return;
+		}
 		if (state.authMode === 'forgot') {
 			await api('/api/limira/auth/password-reset/request', {
 				method: 'POST',
@@ -333,6 +412,7 @@ async function finishAuthenticated(user) {
 	await loadScenarios();
 	await loadTaskHistory();
 	await loadUploads();
+	await loadEnterpriseAdmin();
 	renderShell();
 }
 
@@ -778,6 +858,9 @@ async function signOut() {
 	state.restoreBlocked = false;
 	state.user = null;
 	state.token = '';
+	state.enterpriseMembers = [];
+	state.enterpriseUsage = null;
+	state.isLoadingEnterpriseAdmin = false;
 	resetWorkspaceState();
 	clearWorkspaceStorage();
 	localStorage.removeItem('limiraToken');
@@ -1119,6 +1202,85 @@ async function searchUploads() {
 		if (isCurrentAsyncContext(context)) {
 			state.isSearching = false;
 		}
+	}
+}
+
+function isEnterpriseAdmin() {
+	return (
+		state.user?.account_type === 'enterprise' &&
+		state.user?.organization_id &&
+		state.user?.organization_role === 'admin'
+	);
+}
+
+async function loadEnterpriseAdmin() {
+	if (!isEnterpriseAdmin()) {
+		state.enterpriseMembers = [];
+		state.enterpriseUsage = null;
+		renderEnterpriseAdmin();
+		return;
+	}
+	if (state.isLoadingEnterpriseAdmin) {
+		return;
+	}
+	state.isLoadingEnterpriseAdmin = true;
+	if (dom.enterpriseMemberMessage) {
+		dom.enterpriseMemberMessage.textContent = '正在加载单位账号...';
+	}
+	try {
+		const [members, usage] = await Promise.all([
+			api('/api/limira/enterprise/members'),
+			api('/api/limira/enterprise/usage')
+		]);
+		state.enterpriseMembers = Array.isArray(members?.members) ? members.members : [];
+		state.enterpriseUsage = usage?.usage || null;
+		if (dom.enterpriseMemberMessage) {
+			dom.enterpriseMemberMessage.textContent = '';
+		}
+	} catch (error) {
+		if (dom.enterpriseMemberMessage) {
+			dom.enterpriseMemberMessage.textContent = `单位管理加载失败：${errorMessage(error)}`;
+		}
+	} finally {
+		state.isLoadingEnterpriseAdmin = false;
+		renderEnterpriseAdmin();
+	}
+}
+
+async function createEnterpriseMember() {
+	if (!isEnterpriseAdmin()) {
+		return;
+	}
+	const email = dom.enterpriseMemberEmailInput.value.trim();
+	const password = dom.enterpriseMemberPasswordInput.value;
+	const name = dom.enterpriseMemberNameInput.value.trim();
+	const organizationRole = dom.enterpriseMemberRoleSelect.value || 'member';
+	if (!email || !password) {
+		dom.enterpriseMemberMessage.textContent = '请输入邮箱和初始密码。';
+		return;
+	}
+	dom.createEnterpriseMemberButton.disabled = true;
+	dom.enterpriseMemberMessage.textContent = '正在添加单位账号...';
+	try {
+		await api('/api/limira/enterprise/members', {
+			method: 'POST',
+			body: {
+				email,
+				password,
+				name: name || email,
+				organization_role: organizationRole
+			}
+		});
+		dom.enterpriseMemberNameInput.value = '';
+		dom.enterpriseMemberEmailInput.value = '';
+		dom.enterpriseMemberPasswordInput.value = '';
+		dom.enterpriseMemberRoleSelect.value = 'member';
+		dom.enterpriseMemberMessage.textContent = '单位账号已添加。';
+		await loadEnterpriseAdmin();
+	} catch (error) {
+		dom.enterpriseMemberMessage.textContent = errorMessage(error);
+	} finally {
+		dom.createEnterpriseMemberButton.disabled = false;
 	}
 }
 
@@ -1659,6 +1821,32 @@ function renderReportControls() {
 	dom.exportPdfButton.disabled = state.restoreBlocked || !state.taskId || !hasMarkdown || state.isExporting;
 }
 
+function renderEnterpriseAdmin() {
+	if (!dom.enterpriseAdminPanel) {
+		return;
+	}
+	const visible = Boolean(state.user) && isEnterpriseAdmin();
+	dom.enterpriseAdminPanel.classList.toggle('hidden', !visible);
+	if (!visible) {
+		return;
+	}
+	dom.refreshEnterpriseAdminButton.disabled = state.isLoadingEnterpriseAdmin;
+	const researchTasks = Number(state.enterpriseUsage?.totals?.research_task || 0);
+	const days = Number(state.enterpriseUsage?.days || 30);
+	dom.enterpriseUsageSummary.textContent = `${days} 天内已计量研究任务 ${researchTasks} 次。`;
+	dom.enterpriseMemberList.innerHTML = state.enterpriseMembers.length
+		? state.enterpriseMembers
+				.map((member) => {
+					const role = member.organization_role === 'admin' ? '管理员' : '成员';
+					return `<article class="management-card">
+						<div class="artifact-title">${escapeHtml(member.name || member.email || '单位账号')}</div>
+						<div class="artifact-meta"><span>${escapeHtml(member.email || '')}</span><span>${role}</span></div>
+					</article>`;
+				})
+				.join('')
+		: '<div class="empty-state compact-empty">暂无单位账号。</div>';
+}
+
 function bumpWorkspaceGeneration() {
 	state.workspaceGeneration += 1;
 	return state.workspaceGeneration;
@@ -1840,6 +2028,13 @@ function localizedErrorDetail(detail) {
 		email_not_verified: '请先打开验证邮件完成邮箱验证。',
 		invalid_email: '请输入有效邮箱。',
 		password_too_long: '密码太长，请使用 72 字节以内的密码。',
+		enterprise_login_required: '这是单位账号，请切换到企业登录。',
+		organization_not_found: '没有找到这个单位。',
+		organization_required: '请选择单位。',
+		enterprise_admin_required: '当前账号没有单位管理权限。',
+		organization_already_exists: '这个单位已经存在。',
+		personal_daily_quota_exceeded: '个人方式登录每天只能创建一次研究任务。',
+		invalid_organization_role: '单位角色无效。',
 		google_auth_failed: 'Google 登录失败，请重试。',
 		google_oauth_not_configured: 'Google 登录暂未配置。',
 		invalid_google_identity: 'Google 账号验证失败。',
@@ -2075,6 +2270,15 @@ function archiveStatusLabel(status) {
 
 function roleLabel(role) {
 	return ROLE_LABELS[String(role || '').toLowerCase()] || String(role || '用户');
+}
+
+function accountLabel(user) {
+	if (user?.account_type === 'enterprise') {
+		const organizationName = user.organization?.name || user.organization_name || '单位账号';
+		const role = user.organization_role === 'admin' ? '管理员' : '成员';
+		return `${organizationName} · ${role}`;
+	}
+	return `个人账号 · ${roleLabel(user?.role)}`;
 }
 
 function eventLabel(eventType) {
