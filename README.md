@@ -130,7 +130,63 @@ limira-runtime/pids/
 
 脚本默认使用 SQLite、本地文件对象存储和内存 runtime state，适合本机开发。模型 API、搜索 API 等真实研究所需变量仍从 `.env`、`apps/limira-agent/.env` 和 `apps/limira-runner/.env` 读取。
 
-### 3. Docker Compose 部署
+### 3. 绑定域名和 HTTPS
+
+项目提供 Caddy 反向代理脚本：
+
+```bash
+./scripts/start-https.sh
+```
+
+默认域名是：
+
+```text
+limira-inc.com
+```
+
+使用前需要先在 DNS 服务商处添加 A 记录：
+
+```text
+Type: A
+Host: @
+Value: 服务器公网 IPv4
+```
+
+脚本会把 `https://limira-inc.com` 反向代理到本地前端：
+
+```text
+127.0.0.1:5173
+```
+
+并让 Caddy 自动申请和续期证书。常用命令：
+
+```bash
+./scripts/start-https.sh restart
+./scripts/start-https.sh stop
+./scripts/start-https.sh status
+```
+
+如果当前用户没有绑定 80/443 端口的权限，脚本会提示执行一次：
+
+```bash
+sudo setcap cap_net_bind_service=+ep limira-runtime/caddy/caddy
+```
+
+之后重新运行：
+
+```bash
+./scripts/start-https.sh restart
+```
+
+可以通过这些变量覆盖默认配置：
+
+```bash
+LIMIRA_DOMAIN=limira-inc.com
+CADDY_ACME_EMAIL=admin@limira-inc.com
+LIMIRA_FRONTEND_UPSTREAM=127.0.0.1:5173
+```
+
+### 4. Docker Compose 部署
 
 如果要跑更接近生产的 Postgres、Redis、MinIO 组合，可以用 Docker Compose：
 
