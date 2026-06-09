@@ -1258,10 +1258,35 @@ async def test_archive_download_regenerates_after_task_scoped_writes():
 
 
 @pytest.mark.asyncio
-async def test_archive_download_includes_evidence_web_snapshots():
+async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()
     user = limira.LimiraUser("user-a")
+    fetched_url = "https://example.test/port"
+
+    async def fake_fetch_evidence_page_snapshots(_artifacts):
+        return {
+            fetched_url: limira.EvidencePageSnapshot(
+                url=fetched_url,
+                final_url="https://example.test/port?print=1",
+                status_code=200,
+                content_type="text/html; charset=utf-8",
+                html=(
+                    "<!doctype html><html><head><title>Original page</title>"
+                    "<script>window.evil=true</script></head>"
+                    '<body onload="steal()">'
+                    "<article id=\"original\">Original archived page body.</article>"
+                    '<a href="javascript:alert(1)">bad link</a>'
+                    "</body></html>"
+                ),
+            )
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_fetch_evidence_page_snapshots",
+        fake_fetch_evidence_page_snapshots,
+    )
     task = repo.create_task(
         task_id="task-evidence-snapshots",
         owner_user_id=user.id,
@@ -1316,12 +1341,23 @@ async def test_archive_download_includes_evidence_web_snapshots():
     snapshot = manifest["snapshots"][0]
     assert snapshot["evidence_id"] == "EVID-001"
     assert snapshot["url"] == "https://example.test/port"
-    assert snapshot["snapshot_source"] == "task_event_log"
-    snapshot_html = members[snapshot["member_name"]]
-    assert "Port authority bulletin" in snapshot_html
-    assert "https://example.test/port" in snapshot_html
-    assert "Captured page text: terminal policy changed." in snapshot_html
-    assert "New inspection rule published" in snapshot_html
+    assert snapshot["page_snapshot_available"] is True
+    assert snapshot["page_snapshot_source"] == "fetched_url"
+    assert snapshot["summary_source"] == "task_event_log"
+    assert snapshot["page_status_code"] == 200
+    page_html = members[snapshot["page_member_name"]]
+    summary_html = members[snapshot["summary_member_name"]]
+    assert "Limira archived webpage snapshot" in page_html
+    assert "Original archived page body." in page_html
+    assert "https://example.test/port?print=1" in page_html
+    assert "<script" not in page_html.lower()
+    assert "onload=" not in page_html.lower()
+    assert "javascript:alert" not in page_html.lower()
+    assert 'href="#"' in page_html
+    assert "Port authority bulletin" in summary_html
+    assert "https://example.test/port" in summary_html
+    assert "Captured page text: terminal policy changed." in summary_html
+    assert "New inspection rule published" in summary_html
     metadata = json.loads(members["metadata.json"])
     trace = json.loads(members["trace.json"])
     assert metadata["evidence_snapshots"] == manifest["snapshots"]
@@ -1391,9 +1427,13 @@ async def test_archive_download_regenerates_reused_archive_missing_evidence_snap
     members = _archive_member_texts(response.body)
     manifest = json.loads(members["evidence_snapshots/manifest.json"])
     assert manifest["snapshots"][0]["evidence_id"] == "EVID-REUSE"
-    snapshot_html = members[manifest["snapshots"][0]["member_name"]]
-    assert "Reusable evidence" in snapshot_html
-    assert "Snapshot must be regenerated." in snapshot_html
+    snapshot = manifest["snapshots"][0]
+    assert snapshot["page_snapshot_available"] is False
+    page_html = members[snapshot["page_member_name"]]
+    summary_html = members[snapshot["summary_member_name"]]
+    assert "网页原始 HTML 快照不可用" in page_html
+    assert "Reusable evidence" in summary_html
+    assert "Snapshot must be regenerated." in summary_html
     assert task.archive_object_key == stored.object_key
     assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
     repaired = storage.objects[stored.object_key]

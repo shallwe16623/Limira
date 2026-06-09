@@ -5,6 +5,7 @@ import base64
 import hashlib
 import html
 import hmac
+import ipaddress
 import io
 import json
 import logging
@@ -38,6 +39,9 @@ ARCHIVE_SNAPSHOT_MEMBER_PATTERN = re.compile(
 )
 ARCHIVE_JSON_MEMBERS = {"metadata.json", "trace.json", ARCHIVE_SNAPSHOT_MANIFEST}
 ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+ARCHIVE_SNAPSHOT_TIMEOUT_ENV = "LIMIRA_ARCHIVE_SNAPSHOT_TIMEOUT_SECONDS"
+ARCHIVE_SNAPSHOT_MAX_BYTES_ENV = "LIMIRA_ARCHIVE_SNAPSHOT_MAX_BYTES"
+ARCHIVE_SNAPSHOT_MAX_PAGES_ENV = "LIMIRA_ARCHIVE_SNAPSHOT_MAX_PAGES"
 LIMIRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
     "/limira-runner/",
@@ -689,6 +693,16 @@ class LimiraStoredObject:
     size_bytes: int
     sha256: str
     metadata: dict[str, str]
+
+
+@dataclass(frozen=True)
+class EvidencePageSnapshot:
+    url: str
+    final_url: str
+    status_code: int
+    content_type: str
+    html: str
+    truncated: bool = False
 
 
 class LimiraObjectStorage(Protocol):
@@ -4182,7 +4196,13 @@ async def _load_or_create_persisted_archive(
             )
             _clear_persisted_archive_metadata(task, repo=repo)
 
-    archive_bytes = _build_persisted_archive_zip(task, repo)
+    archive_artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
+    page_snapshots = await _fetch_evidence_page_snapshots(archive_artifacts)
+    archive_bytes = _build_persisted_archive_zip(
+        task,
+        repo,
+        page_snapshots=page_snapshots,
+    )
     validate_archive_zip(archive_bytes)
     archive_bytes = _scrub_archive_zip(archive_bytes)
     validate_archive_zip(archive_bytes)
@@ -4472,6 +4492,8 @@ def _drop_report_pdf_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
 def _build_persisted_archive_zip(
     task: LimiraTask,
     repo: LimiraTaskRepository,
+    *,
+    page_snapshots: Mapping[str, EvidencePageSnapshot] | None = None,
 ) -> bytes:
     artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
     artifact_events = _normalize_report_section_trace_events(
@@ -4497,6 +4519,7 @@ def _build_persisted_archive_zip(
     snapshot_manifest, snapshot_members = _build_evidence_snapshot_members(
         artifacts,
         task_event_logs,
+        page_snapshots or {},
     )
     metadata = {
         "task": {
@@ -4592,6 +4615,7 @@ def _archive_report_markdown(
 def _build_evidence_snapshot_members(
     artifacts: dict[str, list[dict[str, Any]]],
     task_event_logs: list[dict[str, Any]],
+    page_snapshots: Mapping[str, EvidencePageSnapshot],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     manifest: list[dict[str, Any]] = []
     members: dict[str, str] = {}
@@ -4603,22 +4627,48 @@ def _build_evidence_snapshot_members(
             or evidence.get("id")
             or f"EVID-{index:03d}"
         )
-        member_name = _unique_snapshot_member_name(evidence_id, index, used_names)
+        page_member_name, summary_member_name = _unique_snapshot_member_names(
+            evidence_id,
+            index,
+            used_names,
+        )
         url = _evidence_url(evidence)
+        page_snapshot = (
+            page_snapshots.get(_normalize_snapshot_url(url) or "") if url else None
+        )
         snapshot_text, snapshot_source = _evidence_snapshot_text(
             evidence,
             url=url,
             task_event_logs=task_event_logs,
         )
+        page_snapshot_available = page_snapshot is not None and bool(
+            page_snapshot.html.strip()
+        )
         entry = {
             "evidence_id": evidence_id,
             "title": _evidence_title(evidence, evidence_id),
             "url": url,
-            "member_name": member_name,
-            "snapshot_source": snapshot_source,
+            "member_name": page_member_name,
+            "page_member_name": page_member_name,
+            "summary_member_name": summary_member_name,
+            "page_snapshot_available": page_snapshot_available,
+            "page_snapshot_source": (
+                "fetched_url" if page_snapshot_available else "unavailable"
+            ),
+            "summary_source": snapshot_source,
         }
+        if page_snapshot is not None:
+            entry["page_status_code"] = page_snapshot.status_code
+            entry["page_final_url"] = page_snapshot.final_url
+            entry["page_content_type"] = page_snapshot.content_type
+            entry["page_truncated"] = page_snapshot.truncated
         manifest.append(entry)
-        members[member_name] = _render_evidence_snapshot_html(
+        members[page_member_name] = _render_evidence_page_snapshot_html(
+            evidence,
+            manifest_entry=entry,
+            page_snapshot=page_snapshot,
+        )
+        members[summary_member_name] = _render_evidence_summary_snapshot_html(
             evidence,
             manifest_entry=entry,
             snapshot_text=snapshot_text,
@@ -4636,27 +4686,38 @@ def _expected_archive_snapshot_member_names(
     repo: LimiraTaskRepository,
 ) -> list[str]:
     artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
-    manifest, _members = _build_evidence_snapshot_members(artifacts, [])
+    manifest, _members = _build_evidence_snapshot_members(artifacts, [], {})
     if not manifest:
         return []
-    return [ARCHIVE_SNAPSHOT_MANIFEST, *[entry["member_name"] for entry in manifest]]
+    expected = [ARCHIVE_SNAPSHOT_MANIFEST]
+    for entry in manifest:
+        expected.append(str(entry["page_member_name"]))
+        expected.append(str(entry["summary_member_name"]))
+    return expected
 
 
-def _unique_snapshot_member_name(
+def _unique_snapshot_member_names(
     evidence_id: str,
     index: int,
     used_names: set[str],
-) -> str:
+) -> tuple[str, str]:
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", evidence_id).strip(".-_")
     if not stem:
         stem = f"EVID-{index:03d}"
-    candidate = f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem[:80]}.html"
-    suffix = 2
-    while candidate in used_names:
-        candidate = f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem[:72]}-{suffix}.html"
-        suffix += 1
-    used_names.add(candidate)
-    return candidate
+    stem = stem[:72]
+
+    def unique(kind: str) -> str:
+        candidate = f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem}-{kind}.html"
+        suffix = 2
+        while candidate in used_names:
+            candidate = (
+                f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem}-{kind}-{suffix}.html"
+            )
+            suffix += 1
+        used_names.add(candidate)
+        return candidate
+
+    return unique("page"), unique("summary")
 
 
 def _evidence_url(evidence: Mapping[str, Any]) -> str | None:
@@ -4761,6 +4822,159 @@ def _snapshot_text_from_mapping(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+async def _fetch_evidence_page_snapshots(
+    artifacts: dict[str, list[dict[str, Any]]],
+) -> dict[str, EvidencePageSnapshot]:
+    urls: list[str] = []
+    for evidence in artifacts.get("evidence", []):
+        url = _evidence_url(evidence)
+        normalized_url = _normalize_snapshot_url(url)
+        if not normalized_url or normalized_url in urls:
+            continue
+        if not _snapshot_url_fetch_allowed(normalized_url):
+            continue
+        urls.append(normalized_url)
+
+    max_pages = _env_int(ARCHIVE_SNAPSHOT_MAX_PAGES_ENV, default=8, minimum=0)
+    if max_pages <= 0:
+        return {}
+    urls = urls[:max_pages]
+    if not urls:
+        return {}
+
+    timeout_seconds = _env_float(
+        ARCHIVE_SNAPSHOT_TIMEOUT_ENV,
+        default=3.0,
+        minimum=0.1,
+    )
+    max_bytes = _env_int(
+        ARCHIVE_SNAPSHOT_MAX_BYTES_ENV,
+        default=2_000_000,
+        minimum=10_000,
+    )
+    snapshots: dict[str, EvidencePageSnapshot] = {}
+    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 1.5))
+    headers = {
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        "User-Agent": "Limira Evidence Snapshot/1.0",
+    }
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        for url in urls:
+            snapshot = await _fetch_single_evidence_page_snapshot(
+                client,
+                url,
+                max_bytes=max_bytes,
+            )
+            if snapshot is not None:
+                snapshots[url] = snapshot
+    return snapshots
+
+
+async def _fetch_single_evidence_page_snapshot(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+) -> EvidencePageSnapshot | None:
+    try:
+        async with client.stream("GET", url) as response:
+            content_type = str(response.headers.get("content-type") or "")
+            if not _snapshot_content_type_is_html(content_type):
+                return None
+            buffer = bytearray()
+            truncated = False
+            async for chunk in response.aiter_bytes():
+                if not chunk:
+                    continue
+                remaining = max_bytes - len(buffer)
+                if remaining <= 0:
+                    truncated = True
+                    break
+                if len(chunk) > remaining:
+                    buffer.extend(chunk[:remaining])
+                    truncated = True
+                    break
+                buffer.extend(chunk)
+            encoding = response.encoding or "utf-8"
+            html_text = bytes(buffer).decode(encoding, errors="replace")
+            if not html_text.strip():
+                return None
+            return EvidencePageSnapshot(
+                url=url,
+                final_url=str(response.url),
+                status_code=response.status_code,
+                content_type=content_type,
+                html=html_text,
+                truncated=truncated,
+            )
+    except Exception:
+        log.info(
+            "Failed to fetch limira evidence page snapshot",
+            extra={"url_host": urlsplit(url).netloc},
+            exc_info=True,
+        )
+        return None
+
+
+def _snapshot_url_fetch_allowed(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in {"http", "https"}:
+        return False
+    if parts.username or parts.password:
+        return False
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in {"localhost", "0.0.0.0"}:
+        return False
+    if host.endswith((".local", ".test", ".invalid", ".localhost")):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _snapshot_content_type_is_html(content_type: str) -> bool:
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    return content_type in {
+        "",
+        "text/html",
+        "application/xhtml+xml",
+    }
+
+
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    try:
+        value = int(str(os.getenv(name) or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _env_float(name: str, *, default: float, minimum: float) -> float:
+    try:
+        value = float(str(os.getenv(name) or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
 def _normalize_snapshot_url(value: str | None) -> str | None:
     if not value:
         return None
@@ -4781,13 +4995,193 @@ def _normalize_snapshot_url(value: str | None) -> str | None:
     )
 
 
-def _render_evidence_snapshot_html(
+def _render_evidence_page_snapshot_html(
+    evidence: Mapping[str, Any],
+    *,
+    manifest_entry: Mapping[str, Any],
+    page_snapshot: EvidencePageSnapshot | None,
+) -> str:
+    title = str(
+        manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence"
+    )
+    url = str(manifest_entry.get("url") or "")
+    if page_snapshot is None or not page_snapshot.html.strip():
+        return _render_snapshot_unavailable_html(evidence, manifest_entry=manifest_entry)
+    return _staticize_archived_webpage_html(
+        page_snapshot.html,
+        title=title,
+        url=url,
+        final_url=page_snapshot.final_url,
+        status_code=page_snapshot.status_code,
+        content_type=page_snapshot.content_type,
+        truncated=page_snapshot.truncated,
+    )
+
+
+def _render_snapshot_unavailable_html(
+    evidence: Mapping[str, Any],
+    *,
+    manifest_entry: Mapping[str, Any],
+) -> str:
+    title = str(
+        manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence"
+    )
+    url = str(manifest_entry.get("url") or "")
+    summary = str(evidence.get("summary") or evidence.get("description") or "")
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{html.escape(title)} - page snapshot unavailable</title>\n"
+        "</head>\n"
+        "<body>\n"
+        f"<h1>{html.escape(title)}</h1>\n"
+        "<p>网页原始 HTML 快照不可用；请查看同目录的 summary 文件。</p>\n"
+        f"<p>URL: {html.escape(url)}</p>\n"
+        f"<p>{html.escape(str(scrub_limira_secrets(summary)))}</p>\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _staticize_archived_webpage_html(
+    raw_html: str,
+    *,
+    title: str,
+    url: str,
+    final_url: str,
+    status_code: int,
+    content_type: str,
+    truncated: bool,
+) -> str:
+    document = str(scrub_limira_secrets(raw_html))
+    already_archived = 'data-limira-evidence-snapshot="metadata"' in document
+    document = _remove_active_html_blocks(document)
+    document = _remove_active_html_attributes(document)
+    document = _neutralize_active_html_urls(document)
+    if already_archived:
+        return document
+    document = _inject_snapshot_head(document, title=title)
+    banner = _archived_snapshot_banner(
+        title=title,
+        url=url,
+        final_url=final_url,
+        status_code=status_code,
+        content_type=content_type,
+        truncated=truncated,
+    )
+    document = _inject_snapshot_body_banner(document, banner)
+    return document
+
+
+def _remove_active_html_blocks(document: str) -> str:
+    document = re.sub(
+        r"(?is)<script\b[^>]*>.*?</script\s*>",
+        "<!-- Limira removed active script from archived snapshot -->",
+        document,
+    )
+    document = re.sub(
+        r"(?is)<(?:iframe|object|embed)\b[^>]*>.*?</(?:iframe|object|embed)\s*>",
+        "<!-- Limira removed active embedded content from archived snapshot -->",
+        document,
+    )
+    document = re.sub(
+        r"(?is)<meta\b[^>]*http-equiv\s*=\s*['\"]?refresh[^>]*>",
+        "",
+        document,
+    )
+    return document
+
+
+def _remove_active_html_attributes(document: str) -> str:
+    return re.sub(
+        r"\s+on[a-zA-Z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        "",
+        document,
+    )
+
+
+def _neutralize_active_html_urls(document: str) -> str:
+    return re.sub(
+        r"(?is)\b(href|src|action|formaction)\s*=\s*([\"'])\s*(?:javascript|data):[^\"']*\2",
+        r'\1="#"',
+        document,
+    )
+
+
+def _inject_snapshot_head(document: str, *, title: str) -> str:
+    head_injection = (
+        '<meta charset="utf-8">\n'
+        '<meta http-equiv="Content-Security-Policy" '
+        'content="default-src \'none\'; img-src data: blob:; '
+        'style-src \'unsafe-inline\'; font-src data:; media-src data: blob:; '
+        'base-uri \'none\'; form-action \'none\'">\n'
+        f"<title>{html.escape(title)}</title>\n"
+    )
+    if re.search(r"(?is)<head\b[^>]*>", document):
+        return re.sub(
+            r"(?is)(<head\b[^>]*>)",
+            r"\1\n" + head_injection,
+            document,
+            count=1,
+        )
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n'
+        "<head>\n"
+        f"{head_injection}"
+        "</head>\n"
+        "<body>\n"
+        f"{document}\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _archived_snapshot_banner(
+    *,
+    title: str,
+    url: str,
+    final_url: str,
+    status_code: int,
+    content_type: str,
+    truncated: bool,
+) -> str:
+    return (
+        '<aside data-limira-evidence-snapshot="metadata" '
+        'style="font-family:Arial,sans-serif;line-height:1.45;'
+        'border:1px solid #d0d7de;background:#f6f8fa;color:#17202a;'
+        'padding:12px;margin:0 0 16px 0;">'
+        "<strong>Limira archived webpage snapshot</strong>"
+        f"<div>Title: {html.escape(title)}</div>"
+        f"<div>Original URL: {html.escape(url)}</div>"
+        f"<div>Fetched URL: {html.escape(final_url)}</div>"
+        f"<div>Status: {html.escape(str(status_code))}</div>"
+        f"<div>Content-Type: {html.escape(content_type)}</div>"
+        f"<div>Truncated: {html.escape(str(bool(truncated)).lower())}</div>"
+        "</aside>\n"
+    )
+
+
+def _inject_snapshot_body_banner(document: str, banner: str) -> str:
+    if re.search(r"(?is)<body\b[^>]*>", document):
+        return re.sub(
+            r"(?is)(<body\b[^>]*>)",
+            r"\1\n" + banner,
+            document,
+            count=1,
+        )
+    return banner + document
+
+
+def _render_evidence_summary_snapshot_html(
     evidence: Mapping[str, Any],
     *,
     manifest_entry: Mapping[str, Any],
     snapshot_text: str,
 ) -> str:
-    title = str(manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence")
+    title = str(
+        manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence"
+    )
     url = str(manifest_entry.get("url") or "")
     summary = str(evidence.get("summary") or evidence.get("description") or "")
     source = str(evidence.get("source") or "")
@@ -4815,7 +5209,8 @@ def _render_evidence_snapshot_html(
         f"<dt>Source</dt><dd>{html.escape(source)}</dd>\n"
         f"<dt>Published At</dt><dd>{html.escape(published_at)}</dd>\n"
         f"<dt>Confidence</dt><dd>{html.escape(confidence_text)}</dd>\n"
-        f"<dt>Snapshot Source</dt><dd>{html.escape(str(manifest_entry.get('snapshot_source') or ''))}</dd>\n"
+        f"<dt>Summary Source</dt><dd>{html.escape(str(manifest_entry.get('summary_source') or ''))}</dd>\n"
+        f"<dt>Page Snapshot</dt><dd>{html.escape(str(manifest_entry.get('page_member_name') or ''))}</dd>\n"
         "</dl>\n"
         f"<h2>Summary</h2>\n<p>{html.escape(summary)}</p>\n"
         f"<h2>Captured Text</h2>\n<pre>{html.escape(body)}</pre>\n"
@@ -5002,6 +5397,16 @@ def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
     if _is_archive_json_member(member_name):
         payload = _parse_archive_json_member(text)
         return _archive_json_text(payload, member_name=member_name)
+    if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(member_name):
+        return _staticize_archived_webpage_html(
+            text,
+            title=member_name,
+            url="",
+            final_url="",
+            status_code=0,
+            content_type="text/html",
+            truncated=False,
+        )
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
