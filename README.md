@@ -1,19 +1,19 @@
-# Limra OSINT Research Workbench
+# Limira OSINT Research Workbench
 
-这是当前项目的主仓库说明。这个仓库现在服务的是一套独立的网页研究工作台：浏览器只进入我们自己写的前端，前端只代理 `limra` API 到自研后端，不再把旧的通用聊天壳作为用户入口。
+这是当前项目的主仓库说明。这个仓库现在服务的是一套独立的网页研究工作台：浏览器只进入我们自己写的前端，前端只代理 `limira` API 到自研后端，不再把旧的通用聊天壳作为用户入口。
 
 ## 当前定位
 
-Limra 是面向 OSINT / 深度研究工作流的网页应用。它把研究提问、实时进展、历史聊天、资料上传、成果查看、PDF 导出和归档下载放在一个独立工作台里。
+Limira 是面向 OSINT / 深度研究工作流的网页应用。它把研究提问、实时进展、历史聊天、资料上传、成果查看、PDF 导出和归档下载放在一个独立工作台里。
 
 当前主链路是：
 
 ```text
 Browser
-  -> apps/limra-standalone
-  -> /api/limra/*
-  -> apps/limra-web/backend/limra_native.py
-  -> limra runner / database / object storage
+  -> apps/limira-standalone
+  -> /api/limira/*
+  -> apps/limira-web/backend/limira_native.py
+  -> limira runner / database / object storage
 ```
 
 ## 主要功能
@@ -32,14 +32,14 @@ Browser
 ## 目录结构
 
 ```text
-apps/limra-standalone/
+apps/limira-standalone/
   独立用户前端。public/ 内是浏览器页面，server.mjs 负责静态文件和 API 代理。
 
-apps/limra-web/backend/
-  自研 FastAPI 后端入口。limra_native.py 挂载 /api/limra 路由。
+apps/limira-web/backend/
+  自研 FastAPI 后端入口。limira_native.py 挂载 /api/limira 路由。
 
-apps/gradio-demo/
-  测试、runner 兼容代码和部分历史开发资产。当前网页入口不从这里启动。
+apps/limira-runner/
+  runner 服务、研究 pipeline helper 和测试。当前网页入口不从这里启动。
 
 apps/miroflow-agent/
   底层研究 agent / runner 相关代码。
@@ -47,10 +47,10 @@ apps/miroflow-agent/
 libs/miroflow-tools/
   runner 使用的工具库。
 
-deploy/limra/
+deploy/limira/
   Docker 部署所需的 Postgres、MinIO、runner 和 nginx 配置。
 
-docker-compose.limra-aggressive.yml
+docker-compose.limira.yml
   本项目的生产式本地部署编排。
 ```
 
@@ -74,7 +74,7 @@ cp .env.example .env
 至少需要填写：
 
 ```bash
-LIMRA_AUTH_SECRET=
+LIMIRA_AUTH_SECRET=
 RUNNER_SERVICE_TOKEN=
 POSTGRES_PASSWORD=
 MINIO_ROOT_PASSWORD=
@@ -97,13 +97,13 @@ E2B_API_KEY=
 推荐用 Docker Compose 启动后端、runner、Postgres、Redis 和 MinIO：
 
 ```bash
-docker compose -f docker-compose.limra-aggressive.yml up --build
+docker compose -f docker-compose.limira.yml up --build
 ```
 
 默认后端 API 会发布到：
 
 ```text
-http://127.0.0.1:3001/api/limra
+http://127.0.0.1:3001/api/limira
 ```
 
 健康检查：
@@ -117,32 +117,32 @@ curl http://127.0.0.1:3001/health
 另开一个终端：
 
 ```bash
-LIMRA_BACKEND_URL=http://127.0.0.1:3001 \
-node apps/limra-standalone/server.mjs
+LIMIRA_BACKEND_URL=http://127.0.0.1:3001 \
+node apps/limira-standalone/server.mjs
 ```
 
 打开：
 
 ```text
-http://127.0.0.1:5173/limra
+http://127.0.0.1:5173/limira
 ```
 
-前端服务只允许代理 `/api/limra/*`，其它通用 API 路径会被拒绝。
+前端服务只允许代理 `/api/limira/*`，其它通用 API 路径会被拒绝。
 
 ## 开发模式
 
-如果你只想改后端代码，可以在 `apps/limra-web/backend` 下直接启动 FastAPI：
+如果你只想改后端代码，可以在 `apps/limira-web/backend` 下直接启动 FastAPI：
 
 ```bash
-cd apps/limra-web/backend
-uvicorn limra_native:app --host 0.0.0.0 --port 8080 --reload
+cd apps/limira-web/backend
+uvicorn limira_native:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 然后启动前端：
 
 ```bash
-LIMRA_BACKEND_URL=http://127.0.0.1:8080 \
-node apps/limra-standalone/server.mjs
+LIMIRA_BACKEND_URL=http://127.0.0.1:8080 \
+node apps/limira-standalone/server.mjs
 ```
 
 注意：真实研究任务仍然需要 runner、数据库、Redis 和对象存储。单独启动后端只适合调试 API、登录、前端交互或使用测试替身。
@@ -152,7 +152,7 @@ node apps/limra-standalone/server.mjs
 当前用户只应该访问：
 
 ```text
-/limra
+/limira
 ```
 
 不要再把旧的通用应用页面作为产品入口。登录、历史聊天、上传资料、研究任务、PDF 导出和归档下载都在独立前端里完成。
@@ -162,7 +162,7 @@ node apps/limra-standalone/server.mjs
 后端统一挂载在：
 
 ```text
-/api/limra
+/api/limira
 ```
 
 常用接口：
@@ -210,7 +210,7 @@ GET  /admin/tasks/{task_id}/archive.zip
 后端优先使用 Playwright 渲染 PDF；如果不可用，会走文本 fallback。可以设置下面的变量保存 PDF 调试文件：
 
 ```bash
-LIMRA_PDF_DEBUG_DIR=/tmp/limra-pdf-debug
+LIMIRA_PDF_DEBUG_DIR=/tmp/limira-pdf-debug
 ```
 
 调试文件和本地运行产物不要提交到 Git。
@@ -222,7 +222,7 @@ LIMRA_PDF_DEBUG_DIR=/tmp/limra-pdf-debug
 - Postgres：任务、报告、上传资料和事件日志
 - Redis：运行时状态和流状态
 - MinIO / S3：上传文件、报告 PDF、归档 zip
-- SQLite：本地认证数据，默认位置由 `LIMRA_AUTH_SQLITE_PATH` 控制
+- SQLite：本地认证数据，默认位置由 `LIMIRA_AUTH_SQLITE_PATH` 控制
 
 本地开发时可以用测试替身或内存后端，但不要在生产 Compose 里启用内存存储。
 
@@ -231,28 +231,28 @@ LIMRA_PDF_DEBUG_DIR=/tmp/limra-pdf-debug
 常用后端和前端契约测试：
 
 ```bash
-cd apps/gradio-demo
+cd apps/limira-runner
 UV_CACHE_DIR=/tmp/uv-cache uv run python -m py_compile \
-  ../limra-web/backend/limra_native.py \
-  ../limra-web/backend/limra_backend/routers/limra.py \
-  tests/test_limra_web_routes.py \
-  tests/test_limra_frontend_contract.py
+  ../limira-web/backend/limira_native.py \
+  ../limira-web/backend/limira_backend/routers/limira.py \
+  tests/test_limira_web_routes.py \
+  tests/test_limira_frontend_contract.py
 ```
 
 ```bash
-cd apps/gradio-demo
+cd apps/limira-runner
 UV_CACHE_DIR=/tmp/uv-cache uv run pytest \
-  tests/test_limra_deploy_contract.py \
-  tests/test_limra_web_routes.py \
-  tests/test_limra_frontend_contract.py \
+  tests/test_limira_deploy_contract.py \
+  tests/test_limira_web_routes.py \
+  tests/test_limira_frontend_contract.py \
   tests/test_task_store_and_auth.py \
-  -q -k 'not test_limra_standalone_proxy_only_forwards_limra_api_namespace'
+  -q -k 'not test_limira_standalone_proxy_only_forwards_limira_api_namespace'
 ```
 
 如果本机有 Node：
 
 ```bash
-node --check apps/limra-standalone/public/app.js
+node --check apps/limira-standalone/public/app.js
 ```
 
 如果环境允许本地 socket，再单独运行 standalone proxy 的 socket 契约测试。
@@ -281,13 +281,13 @@ git push
 当前仓库 remote 应指向：
 
 ```text
-https://github.com/shallwe16623/MiroThinker-limra-aggressive.git
+https://github.com/shallwe16623/Limira.git
 ```
 
 ## 注意事项
 
 - 不要提交 `.env`、数据库文件、虚拟环境、缓存、PDF 调试目录或本地运行产物。
 - 用户入口只保留独立前端；旧的通用 UI 不应再作为产品入口。
-- 前端只代理 `/api/limra/*`，不要扩大代理范围。
+- 前端只代理 `/api/limira/*`，不要扩大代理范围。
 - 新增下载或导出能力时，必须检查用户归属、对象 key、文件内容和浏览器可见 payload。
 - 新增事件类型时，如果它会产生用户可见成果，要同步更新前端 artifact 刷新契约测试。

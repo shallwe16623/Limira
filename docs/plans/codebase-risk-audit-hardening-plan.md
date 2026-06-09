@@ -31,7 +31,7 @@ This plan is not a feature expansion plan. Changes should be narrowly scoped to 
 
 ## Priority Rules
 
-- **P0 must fix:** Confirmed authentication bypass, cross-user data access, secret leakage, path traversal, unsafe arbitrary file access, broken deployed startup, data loss, or a bug that blocks the main limra workflow from completing safely.
+- **P0 must fix:** Confirmed authentication bypass, cross-user data access, secret leakage, path traversal, unsafe arbitrary file access, broken deployed startup, data loss, or a bug that blocks the main limira workflow from completing safely.
 - **P1 must fix:** Confirmed reliability, persistence, API contract, archive/PDF/download, frontend interaction, or concurrency/state bug with realistic user impact and a bounded fix.
 - **P2 fix when low cost:** Defensive improvements, missing focused tests around known-sensitive boundaries, clearer error handling, minor deployment hardening, or non-blocking consistency gaps.
 - **Do not fix:** Pure style concerns, speculative issues without evidence, large rewrites, or behavior changes that are not tied to a confirmed risk.
@@ -42,7 +42,7 @@ This plan is not a feature expansion plan. Changes should be narrowly scoped to 
 - Any P2 fixes included are small, low-risk, and directly improve a reviewed hardening boundary.
 - Each code change has a clear risk explanation, affected files, and verification evidence in the round summary.
 - Existing behavior is preserved unless the current behavior is itself the confirmed risk.
-- Browser-facing APIs remain under the limra namespace and do not expose internal Runner URLs, object keys, secrets, stack traces, cookies, service tokens, or raw provider credentials.
+- Browser-facing APIs remain under the limira namespace and do not expose internal Runner URLs, object keys, secrets, stack traces, cookies, service tokens, or raw provider credentials.
 - User-scoped resources remain owner-isolated for tasks, artifacts, uploads, reports, PDFs, archives, and search results.
 - Generated archives, reports, PDFs, and metadata remain scrubbed for known secret patterns.
 - Repository persistence remains restart-safe for the configured local and production-style backends covered by tests.
@@ -52,7 +52,7 @@ This plan is not a feature expansion plan. Changes should be narrowly scoped to 
 
 - Add or update focused tests for every confirmed P0/P1 fix when the behavior can be exercised locally.
 - Prefer route-level, repository-level, storage-level, and contract tests that exercise real data flow over source-string-only checks.
-- Run the smallest focused test set that proves the fix, plus a broader limra contract subset when the touched surface is shared.
+- Run the smallest focused test set that proves the fix, plus a broader limira contract subset when the touched surface is shared.
 - Run syntax/compile checks for edited Python and JavaScript files.
 - Do not add tests that snapshot or print secrets, tokens, cookies, `.env` values, or Authorization headers.
 - If full-suite execution is blocked by the environment, run the largest relevant non-blocked subset and document the blocker.

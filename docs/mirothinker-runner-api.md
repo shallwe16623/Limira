@@ -1,10 +1,10 @@
 # MiroThinker Runner API
 
-Phase 1 exposes a backend-only Runner API for curl and test-client validation before the standalone Limra frontend is connected.
+Phase 1 exposes a backend-only Runner API for curl and test-client validation before the standalone Limira frontend is connected.
 
 ## Start
 
-From `apps/gradio-demo`:
+From `apps/limira-runner`:
 
 ```bash
 export MIROTHINKER_SERVICE_TOKEN="dev-shared-secret"
@@ -15,9 +15,9 @@ uv run runner_api.py
 The dev identity bridge requires both headers:
 
 - `X-MiroThinker-Service-Token`: must match `MIROTHINKER_SERVICE_TOKEN`
-- `X-Limra-User-Id`: trusted user ID injected by the backend/proxy
+- `X-Limira-User-Id`: trusted user ID injected by the backend/proxy
 
-Do not send `user_id` in the JSON body. Production identity must come from Limra backend token verification or a trusted service proxy.
+Do not send `user_id` in the JSON body. Production identity must come from Limira backend token verification or a trusted service proxy.
 
 ## Curl Smoke
 
@@ -25,7 +25,7 @@ Do not send `user_id` in the JSON body. Production identity must come from Limra
 curl -X POST http://localhost:8081/mirothinker/research \
   -H "Content-Type: application/json" \
   -H "X-MiroThinker-Service-Token: dev-shared-secret" \
-  -H "X-Limra-User-Id: user-a" \
+  -H "X-Limira-User-Id: user-a" \
   -d '{"query":"测试研究问题","client_options":{"stream":true}}'
 ```
 
@@ -34,13 +34,13 @@ The response contains `task_id`, `stream_url`, and `task_url`.
 ```bash
 curl -N http://localhost:8081/mirothinker/tasks/<task_id>/events \
   -H "X-MiroThinker-Service-Token: dev-shared-secret" \
-  -H "X-Limra-User-Id: user-a"
+  -H "X-Limira-User-Id: user-a"
 ```
 
 ```bash
 curl http://localhost:8081/mirothinker/tasks/<task_id> \
   -H "X-MiroThinker-Service-Token: dev-shared-secret" \
-  -H "X-Limra-User-Id: user-a"
+  -H "X-Limira-User-Id: user-a"
 ```
 
 To request cancellation for a queued or running task:
@@ -48,15 +48,15 @@ To request cancellation for a queued or running task:
 ```bash
 curl -X POST http://localhost:8081/mirothinker/tasks/<task_id>/cancel \
   -H "X-MiroThinker-Service-Token: dev-shared-secret" \
-  -H "X-Limra-User-Id: user-a"
+  -H "X-Limira-User-Id: user-a"
 ```
 
-Only the task owner or an explicit admin identity may cancel a task. The browser must never submit `user_id`; it must be injected by the trusted Limra backend/proxy path.
+Only the task owner or an explicit admin identity may cancel a task. The browser must never submit `user_id`; it must be injected by the trusted Limira backend/proxy path.
 
 ```bash
 curl -OJ http://localhost:8081/mirothinker/tasks/<task_id>/archive.zip \
   -H "X-MiroThinker-Service-Token: dev-shared-secret" \
-  -H "X-Limra-User-Id: user-a"
+  -H "X-Limira-User-Id: user-a"
 ```
 
 ## Archive Contract

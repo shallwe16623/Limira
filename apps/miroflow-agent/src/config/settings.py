@@ -334,16 +334,16 @@ def create_mcp_server_parameters(cfg: DictConfig, agent_cfg: DictConfig):
 
     if (
         agent_cfg.get("tools", None) is not None
-        and "limra_artifact_recorder" in agent_cfg["tools"]
+        and "limira_artifact_recorder" in agent_cfg["tools"]
     ):
         configs.append(
             {
-                "name": "limra_artifact_recorder",
+                "name": "limira_artifact_recorder",
                 "params": StdioServerParameters(
                     command=sys.executable,
                     args=[
                         "-m",
-                        "miroflow_tools.dev_mcp_servers.limra_artifact_recorder",
+                        "miroflow_tools.dev_mcp_servers.limira_artifact_recorder",
                     ],
                 ),
             }
