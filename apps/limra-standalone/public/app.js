@@ -160,7 +160,7 @@ function bindEvents() {
 		}
 	});
 	dom.exportPdfButton.addEventListener('click', () => void exportPdf());
-	dom.downloadPdfButton.addEventListener('click', downloadPdf);
+	dom.downloadPdfButton.addEventListener('click', () => void downloadPdf());
 }
 
 async function boot() {
@@ -992,7 +992,7 @@ async function exportPdf() {
 		saveWorkspace();
 		renderReportControls();
 		if (pdfUrl) {
-			window.location.href = pdfUrl;
+			await downloadPdf();
 		}
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
@@ -1007,7 +1007,7 @@ async function exportPdf() {
 	}
 }
 
-function downloadPdf() {
+async function downloadPdf() {
 	if (state.restoreBlocked) {
 		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再下载 PDF。';
 		return;
@@ -1024,7 +1024,42 @@ function downloadPdf() {
 		dom.reportMessage.textContent = '报告内容已更新，请重新导出 PDF。';
 		return;
 	}
-	window.location.href = url;
+	try {
+		await downloadGeneratedPdf(url, `${state.latestReport.report_id}.pdf`);
+	} catch (error) {
+		state.latestReport = null;
+		state.latestReportMarkdown = '';
+		saveWorkspace();
+		renderReportControls();
+		dom.reportMessage.textContent = `PDF 下载失败：${errorMessage(error)}。请重新导出 PDF。`;
+	}
+}
+
+async function downloadGeneratedPdf(url, filename) {
+	const headers = new Headers({ accept: 'application/pdf' });
+	if (state.token) {
+		headers.set('authorization', `Bearer ${state.token}`);
+	}
+	const response = await fetch(url, {
+		method: 'GET',
+		headers,
+		credentials: 'include'
+	});
+	if (!response.ok) {
+		throw new Error(await responseDetail(response));
+	}
+	const blob = await response.blob();
+	if (!blob.size) {
+		throw new Error('empty_pdf_download');
+	}
+	const objectUrl = URL.createObjectURL(blob);
+	const link = document.createElement('a');
+	link.href = objectUrl;
+	link.download = filename;
+	document.body.appendChild(link);
+	link.click();
+	link.remove();
+	window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
 function downloadArchive() {

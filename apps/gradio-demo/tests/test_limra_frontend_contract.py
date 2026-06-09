@@ -236,6 +236,11 @@ def test_limra_standalone_frontend_keeps_pdf_download_bound_to_current_report():
     assert "/api/limra/tasks/${encodeURIComponent(state.taskId)}/reports/pdf" in app
     assert "/api/limra/tasks/${encodeURIComponent(normalized.task_id)}/reports/${encodeURIComponent(" in app
     assert "normalized.report_id" in app
+    assert "async function downloadGeneratedPdf(url, filename)" in app
+    assert "accept: 'application/pdf'" in app
+    assert "URL.createObjectURL(blob)" in app
+    assert "state.latestReport = null;" in app
+    assert "请重新导出 PDF" in app
 
 
 def test_limra_standalone_stream_handler_refreshes_all_artifact_events():
