@@ -1231,6 +1231,68 @@ async def test_admin_access_requires_explicit_admin_route():
 
 
 @pytest.mark.asyncio
+async def test_postgres_admin_archive_download_generates_owner_scoped_archive():
+    app, _memory_repo, storage = _limra_asgi_app()
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    async def admin_user_override():
+        return limra.LimraUser("admin-user", role="admin")
+
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+    app.dependency_overrides[limra.get_current_limra_admin] = admin_user_override
+
+    task_id = "task-postgres-admin-archive"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id="user-a",
+        query="admin archive boundary",
+        scenario=None,
+        runner_task_id="runner-postgres-admin-archive",
+    )
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(f"/api/limra/admin/tasks/{task_id}/archive.zip")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/zip")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+    persisted = engine.tasks[task_id]
+    archive_key = persisted["archive_object_key"]
+    owner_digest = hashlib.sha256(b"user-a").hexdigest()[:24]
+    admin_digest = hashlib.sha256(b"admin-user").hexdigest()[:24]
+    assert f"/users/{owner_digest}/tasks/{task_id}/archives/" in archive_key
+    assert admin_digest not in archive_key
+    assert archive_key in storage.objects
+    stored = storage.objects[archive_key]
+    assert stored["content_type"] == "application/zip"
+    assert stored["metadata"]["owner_user_id"] == "user-a"
+    assert stored["metadata"]["generated_by"] == "admin-user"
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.content).hexdigest()
+    assert stored["sha256"] == persisted["archive_zip_sha256"]
+
+    members = _archive_member_texts(response.content)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["task"]["task_id"] == task_id
+    assert metadata["task"]["owner_user_id"] == "user-a"
+    assert trace["task"]["owner_user_id"] == "user-a"
+    assert "admin-user" not in "\n".join(members.values())
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
 async def test_task_payload_hides_internal_model_summary_identifiers():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")
