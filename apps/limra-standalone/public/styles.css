@@ -317,6 +317,54 @@ label {
 	margin-bottom: 0.75rem;
 }
 
+.history-actions {
+	display: flex;
+	gap: 0.45rem;
+}
+
+.history-list {
+	display: grid;
+	gap: 0.45rem;
+	max-height: 13rem;
+	overflow: auto;
+	margin-top: 0.65rem;
+	padding-right: 0.15rem;
+}
+
+.history-item {
+	display: grid;
+	gap: 0.25rem;
+	width: 100%;
+	text-align: left;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	padding: 0.62rem 0.7rem;
+	background: #fff;
+	color: var(--text);
+}
+
+.history-item:hover,
+.history-item.active {
+	border-color: rgba(15, 118, 110, 0.42);
+	background: #eef8f6;
+}
+
+.history-title {
+	font-size: 0.86rem;
+	font-weight: 740;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.history-meta {
+	color: var(--muted);
+	font-size: 0.74rem;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
 h2 {
 	font-size: 0.95rem;
 	margin: 0;
@@ -511,6 +559,11 @@ h2 {
 	background: var(--surface-muted);
 }
 
+.compact-empty {
+	padding: 0.7rem;
+	font-size: 0.84rem;
+}
+
 .compact-list {
 	display: grid;
 	gap: 0.6rem;
@@ -607,7 +660,8 @@ h2 {
 	.control-row,
 	.action-row,
 	.scenario-bar,
-	.search-row {
+	.search-row,
+	.history-actions {
 		align-items: stretch;
 		flex-direction: column;
 	}

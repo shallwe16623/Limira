@@ -1582,6 +1582,118 @@ async def test_postgres_task_detail_route_is_owner_scoped_and_hides_internal_ide
 
 
 @pytest.mark.asyncio
+async def test_postgres_task_history_route_is_owner_scoped_and_public_serialized():
+    app, _repo, _storage = _limra_asgi_app()
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+
+    older_task = repo.create_task(
+        task_id="task-history-older",
+        owner_user_id="user-a",
+        query="older user task",
+        scenario="sanctions_export_controls",
+        runner_task_id="runner-history-older-secret",
+    )
+    repo.update_task(
+        older_task.task_id,
+        status="running",
+        model_summary=_internal_model_summary(
+            older_task.task_id,
+            runner_task_id="runner-history-older-secret",
+        ),
+    )
+    foreign_task = repo.create_task(
+        task_id="task-history-foreign",
+        owner_user_id="user-b",
+        query="foreign user task",
+        scenario=None,
+        runner_task_id="runner-history-foreign-secret",
+    )
+    repo.update_task(
+        foreign_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limra/users/user-b/tasks/task-history-foreign/archives/archive.zip"
+        ),
+        archive_zip_sha256="b" * 64,
+        model_summary=_internal_model_summary(
+            foreign_task.task_id,
+            runner_task_id="runner-history-foreign-secret",
+        ),
+    )
+    latest_task = repo.create_task(
+        task_id="task-history-latest",
+        owner_user_id="user-a",
+        query="latest user task",
+        scenario=None,
+        runner_task_id="runner-history-latest-secret",
+    )
+    repo.update_task(
+        latest_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limra/users/user-a/tasks/task-history-latest/archives/archive.zip"
+        ),
+        archive_zip_sha256="a" * 64,
+        model_summary=_internal_model_summary(
+            latest_task.task_id,
+            runner_task_id="runner-history-latest-secret",
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get("/api/limra/tasks", params={"limit": 10})
+        limited_response = await client.get("/api/limra/tasks", params={"limit": 1})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 2
+    assert [task["task_id"] for task in payload["tasks"]] == [
+        "task-history-latest",
+        "task-history-older",
+    ]
+    assert payload["tasks"][0]["download_url"] == (
+        "/api/limra/tasks/task-history-latest/archive.zip"
+    )
+    assert payload["tasks"][1]["download_url"] is None
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for leaked in (
+        "owner_user_id",
+        "runner_task_id",
+        "runner-history-latest-secret",
+        "runner-history-older-secret",
+        "runner-history-foreign-secret",
+        "task-history-foreign",
+        "user-b",
+        "object_key",
+        "archive_object_key",
+        "archive_zip_sha256",
+        "limra/users/",
+        "http://10.20.30.40:8091",
+        "/mirothinker/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(payload)
+
+    assert limited_response.status_code == 200
+    assert limited_response.json()["count"] == 1
+    assert limited_response.json()["tasks"][0]["task_id"] == "task-history-latest"
+
+
+@pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
@@ -8233,6 +8345,14 @@ class FakeLimraPostgresEngine:
                 if key != "task_id":
                     row[key] = value
             return FakeLimraPostgresResult([row])
+
+        if "from limra_research_tasks" in sql and "limit :limit" in sql:
+            rows = [
+                row
+                for row in reversed(list(self.tasks.values()))
+                if row["owner_user_id"] == params["owner_user_id"]
+            ]
+            return FakeLimraPostgresResult(rows[: params["limit"]])
 
         if "from limra_research_tasks" in sql:
             row = self.tasks.get(params["task_id"])

@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 LIMRA_WEB_ROOT = REPO_ROOT / "apps" / "limra-web"
 LIMRA_STANDALONE_ROOT = REPO_ROOT / "apps" / "limra-standalone"
 LIMRA_STANDALONE_SERVER = LIMRA_STANDALONE_ROOT / "server.mjs"
+LIMRA_STANDALONE_INDEX = LIMRA_STANDALONE_ROOT / "public" / "index.html"
 LIMRA_STANDALONE_APP = LIMRA_STANDALONE_ROOT / "public" / "app.js"
 LIMRA_BACKEND_ROOT = LIMRA_WEB_ROOT / "backend" / "limra_backend"
 LIMRA_BACKEND_ROUTER = LIMRA_BACKEND_ROOT / "routers" / "limra.py"
@@ -206,6 +207,23 @@ def test_limra_standalone_frontend_uses_native_auth_namespace_only():
     assert LEGACY_AUTH_PREFIX not in server
     assert "isAuthApiPath" not in server
     assert "pathname.startsWith('/api/limra/')" in server
+
+
+def test_limra_standalone_frontend_exposes_native_task_history_controls():
+    app = _read(LIMRA_STANDALONE_APP)
+    index = _read(LIMRA_STANDALONE_INDEX)
+
+    assert 'id="historyList"' in index
+    assert 'id="historyMessage"' in index
+    assert 'id="newChatButton"' in index
+    assert 'id="refreshHistoryButton"' in index
+    assert "function loadTaskHistory()" in app
+    assert "function selectHistoryTask(taskId)" in app
+    assert "function startNewChat()" in app
+    assert "`/api/limra/tasks?limit=${MAX_HISTORY_TASKS}`" in app
+    assert "/api/limra/tasks/${encodeURIComponent(state.taskId)}" in app
+    assert "state.eventSource = new EventSource(`/api/limra/tasks/${state.taskId}/events`)" in app
+    assert LEGACY_AUTH_PREFIX not in app
 
 
 def test_limra_standalone_frontend_keeps_pdf_download_bound_to_current_report():

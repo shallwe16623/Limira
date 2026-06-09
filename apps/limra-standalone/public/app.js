@@ -15,6 +15,7 @@ const STORAGE_KEY = 'limraStandaloneWorkspace:v2';
 const LEGACY_STORAGE_KEYS = ['limraStandaloneWorkspace:v1'];
 const MAX_STORED_MESSAGES = 100;
 const MAX_STORED_EVENTS = 100;
+const MAX_HISTORY_TASKS = 30;
 const STATUS_LABELS = {
 	ready: '就绪',
 	starting: '启动中',
@@ -92,6 +93,7 @@ const state = {
 	isUploading: false,
 	isSearching: false,
 	isExporting: false,
+	isLoadingHistory: false,
 	restoreBlocked: false,
 	workspaceGeneration: 0,
 	latestReport: null,
@@ -102,6 +104,7 @@ const state = {
 	artifacts: emptyArtifacts(),
 	uploads: [],
 	uploadResults: [],
+	taskHistory: [],
 	eventSource: null
 };
 
@@ -128,6 +131,8 @@ function bindEvents() {
 	dom.signinModeButton.addEventListener('click', () => setAuthMode('signin'));
 	dom.signupModeButton.addEventListener('click', () => setAuthMode('signup'));
 	dom.signOutButton.addEventListener('click', () => void signOut());
+	dom.newChatButton.addEventListener('click', startNewChat);
+	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
 	dom.scenarioSelect.addEventListener('change', () => {
 		state.selectedScenario = dom.scenarioSelect.value;
 		saveWorkspace();
@@ -164,6 +169,7 @@ async function boot() {
 	try {
 		await loadSession();
 		await loadScenarios();
+		await loadTaskHistory();
 		await resumeWorkspace();
 	} catch {
 		state.user = null;
@@ -181,6 +187,7 @@ function renderShell() {
 		: '未登录';
 	renderAuthMode();
 	renderStatus();
+	renderHistory();
 	renderScenarios();
 	renderMessages();
 	renderTabs();
@@ -219,6 +226,7 @@ async function authenticate() {
 		setUser(user);
 		dom.authMessage.textContent = '';
 		await loadScenarios();
+		await loadTaskHistory();
 		await loadUploads();
 		renderShell();
 	} catch (error) {
@@ -227,6 +235,7 @@ async function authenticate() {
 				await loadSession();
 				dom.authMessage.textContent = '';
 				await loadScenarios();
+				await loadTaskHistory();
 				await loadUploads();
 				renderShell();
 				return;
@@ -260,6 +269,7 @@ async function resumeWorkspace() {
 	if (state.savedUserId && state.user?.id && state.savedUserId !== state.user.id) {
 		clearWorkspaceStorage();
 		resetWorkspaceState();
+		await loadTaskHistory();
 		await loadUploads();
 		renderShell();
 		return;
@@ -272,6 +282,7 @@ async function resumeWorkspace() {
 		await refreshTask();
 		await loadArtifacts();
 		await loadUploads();
+		await loadTaskHistory();
 		if (!terminalStatuses.has(state.status)) {
 			connectStream();
 		}
@@ -290,6 +301,7 @@ async function resumeWorkspace() {
 		renderTabs();
 		renderReportControls();
 		await loadUploads();
+		await loadTaskHistory();
 	}
 }
 
@@ -305,8 +317,188 @@ async function refreshTask() {
 	state.restoreBlocked = false;
 	state.status = task.status || state.status;
 	updateArchiveState(task);
+	mergeTaskHistory(task);
 	saveWorkspace();
 	renderStatus();
+}
+
+async function loadTaskHistory() {
+	if (!state.user || state.isLoadingHistory) {
+		renderHistory();
+		return;
+	}
+	state.isLoadingHistory = true;
+	const context = captureAsyncContext({ includeTask: false });
+	if (dom.historyMessage) {
+		dom.historyMessage.textContent = '正在加载历史...';
+	}
+	try {
+		const data = await api(`/api/limra/tasks?limit=${MAX_HISTORY_TASKS}`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		state.taskHistory = Array.isArray(data.tasks) ? data.tasks : [];
+		if (dom.historyMessage) {
+			dom.historyMessage.textContent = state.taskHistory.length ? '' : '暂无历史聊天。';
+		}
+	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		if (dom.historyMessage) {
+			dom.historyMessage.textContent = `历史加载失败：${errorMessage(error)}`;
+		}
+	} finally {
+		state.isLoadingHistory = false;
+		if (isCurrentAsyncContext(context)) {
+			renderHistory();
+		}
+	}
+}
+
+function renderHistory() {
+	if (!dom.historyList) {
+		return;
+	}
+	dom.refreshHistoryButton.disabled = !state.user || state.isLoadingHistory;
+	dom.newChatButton.disabled = !state.user;
+	if (!state.user) {
+		dom.historyList.innerHTML = '';
+		dom.historyMessage.textContent = '';
+		return;
+	}
+	if (!state.taskHistory.length) {
+		dom.historyList.innerHTML = '<div class="empty-state compact-empty">暂无历史聊天。</div>';
+		return;
+	}
+	dom.historyList.innerHTML = state.taskHistory
+		.map((task) => {
+			const taskId = String(task.task_id || '');
+			const active = taskId && taskId === state.taskId;
+			return `<button type="button" class="history-item${active ? ' active' : ''}" data-task-id="${escapeAttr(taskId)}">
+				<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
+				<span class="history-meta">${escapeHtml(taskHistoryMeta(task))}</span>
+			</button>`;
+		})
+		.join('');
+	for (const button of dom.historyList.querySelectorAll('.history-item')) {
+		button.addEventListener('click', () => void selectHistoryTask(button.dataset.taskId || ''));
+	}
+}
+
+async function selectHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || state.isSubmitting) {
+		return;
+	}
+	state.eventSource?.close();
+	state.eventSource = null;
+	bumpWorkspaceGeneration();
+	const cached = state.taskHistory.find((task) => task.task_id === normalizedTaskId) || {};
+	resetCurrentTaskView();
+	state.taskId = normalizedTaskId;
+	state.status = cached.status || 'queued';
+	state.archiveStatus = cached.archive_status || 'pending';
+	updateArchiveState(cached);
+	state.savedUserId = state.user?.id || state.savedUserId;
+	state.messages = historyMessages(cached);
+	dom.queryInput.value = cached.query || '';
+	saveWorkspace();
+	renderStatus();
+	renderHistory();
+	renderMessages();
+	renderTabs();
+	renderReportControls();
+	renderEvents();
+	try {
+		await refreshTask();
+		await loadArtifacts();
+		await loadUploads();
+		if (!terminalStatuses.has(state.status)) {
+			connectStream();
+		}
+	} catch (error) {
+		if (isAuthoritativeRestoreRejection(error)) {
+			clearRestoredTaskState();
+			saveWorkspace();
+			renderStatus();
+			renderHistory();
+			renderTabs();
+			renderReportControls();
+			renderEvents();
+		}
+		addMessage('error', `无法加载历史任务：${errorMessage(error)}`);
+	}
+}
+
+function startNewChat() {
+	state.eventSource?.close();
+	state.eventSource = null;
+	bumpWorkspaceGeneration();
+	resetCurrentTaskView();
+	dom.queryInput.value = '';
+	saveWorkspace();
+	renderStatus();
+	renderHistory();
+	renderMessages();
+	renderTabs();
+	renderReportControls();
+	renderEvents();
+	void loadUploads();
+}
+
+function resetCurrentTaskView() {
+	state.savedUserId = state.user?.id || state.savedUserId || '';
+	state.taskId = '';
+	state.status = 'ready';
+	state.archiveStatus = 'pending';
+	state.archiveDownloadUrl = '';
+	state.restoreBlocked = false;
+	state.isSubmitting = false;
+	state.isSearching = false;
+	state.activeTab = '证据';
+	state.latestReport = null;
+	state.latestReportMarkdown = '';
+	state.finalReportText = '';
+	state.messages = initialMessages();
+	state.events = [];
+	state.artifacts = emptyArtifacts();
+	state.uploadResults = [];
+}
+
+function mergeTaskHistory(task) {
+	if (!task || typeof task !== 'object' || !task.task_id) {
+		return;
+	}
+	const taskId = String(task.task_id);
+	const next = [task, ...state.taskHistory.filter((item) => item.task_id !== taskId)];
+	state.taskHistory = next.slice(0, MAX_HISTORY_TASKS);
+	renderHistory();
+}
+
+function taskHistoryTitle(task) {
+	const query = String(task.query || '').replace(/\s+/g, ' ').trim();
+	return query || `任务 ${task.task_id || ''}` || '历史任务';
+}
+
+function taskHistoryMeta(task) {
+	const parts = [statusLabel(task.status), `归档${archiveStatusLabel(task.archive_status)}`];
+	if (task.scenario) {
+		parts.push(task.scenario);
+	}
+	return parts.filter(Boolean).join(' · ');
+}
+
+function historyMessages(task) {
+	const query = String(task.query || '').trim();
+	return [
+		query ? { role: 'user', content: query, time: now() } : null,
+		{
+			role: 'assistant',
+			content: `已载入历史任务：${statusLabel(task.status || state.status)}。`,
+			time: now()
+		}
+	].filter(Boolean);
 }
 
 function clearLegacyWorkspaceStorage() {
@@ -402,6 +594,7 @@ function resetWorkspaceState() {
 	state.isUploading = false;
 	state.isSearching = false;
 	state.isExporting = false;
+	state.isLoadingHistory = false;
 	state.activeTab = '证据';
 	state.latestReport = null;
 	state.latestReportMarkdown = '';
@@ -411,6 +604,7 @@ function resetWorkspaceState() {
 	state.artifacts = emptyArtifacts();
 	state.uploads = [];
 	state.uploadResults = [];
+	state.taskHistory = [];
 }
 
 async function signOut() {
@@ -513,6 +707,7 @@ async function submitResearch() {
 		state.taskId = task.task_id || '';
 		state.status = task.status || 'queued';
 		updateArchiveState(task);
+		mergeTaskHistory(task);
 		state.savedUserId = state.user?.id || state.savedUserId;
 		dom.queryInput.value = '';
 		addMessage('assistant', `研究任务 ${state.taskId || '已创建'}：${statusLabel(state.status)}。`);
@@ -520,6 +715,7 @@ async function submitResearch() {
 		connectStream();
 		await loadArtifacts();
 		await loadUploads();
+		await loadTaskHistory();
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
@@ -610,6 +806,7 @@ function handleStreamEvent(payload) {
 		state.eventSource = null;
 		void loadArtifacts();
 		void loadUploads();
+		void loadTaskHistory();
 	}
 
 	renderStatus();

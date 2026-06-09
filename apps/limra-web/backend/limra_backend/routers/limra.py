@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 import httpx
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -494,6 +494,8 @@ class LimraTaskRepository(Protocol):
 
     def get_user_task(self, task_id: str, owner_user_id: str) -> LimraTask | None: ...
 
+    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimraTask]: ...
+
     def update_task(self, task_id: str, **updates: Any) -> LimraTask: ...
 
     def record_artifact(
@@ -713,6 +715,14 @@ class InMemoryLimraTaskRepository:
         if not task or task.owner_user_id != owner_user_id:
             return None
         return task
+
+    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimraTask]:
+        tasks = [
+            task
+            for task in reversed(list(self.tasks.values()))
+            if task.owner_user_id == owner_user_id
+        ]
+        return tasks[:limit]
 
     def update_task(self, task_id: str, **updates: Any) -> LimraTask:
         task = self.get_task(task_id)
@@ -1643,6 +1653,13 @@ class PostgresLimraTaskRepository:
         WHERE task_id = :task_id
           AND owner_user_id = :owner_user_id
     """
+    SELECT_USER_TASKS_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limra_research_tasks
+        WHERE owner_user_id = :owner_user_id
+        ORDER BY created_at DESC, task_id DESC
+        LIMIT :limit
+    """
     INSERT_ARTIFACT_EVENT_SQL = """
         INSERT INTO limra_artifact_events (
             task_id,
@@ -2092,6 +2109,13 @@ class PostgresLimraTaskRepository:
             {"task_id": task_id, "owner_user_id": owner_user_id},
         )
         return _task_from_row(row) if row else None
+
+    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimraTask]:
+        rows = self._fetch_all(
+            self.SELECT_USER_TASKS_SQL,
+            {"owner_user_id": owner_user_id, "limit": limit},
+        )
+        return [_task_from_row(row) for row in rows]
 
     def update_task(self, task_id: str, **updates: Any) -> LimraTask:
         allowed = {
@@ -3459,6 +3483,17 @@ async def create_research_task(
             "artifacts_url": f"/api/limra/tasks/{task.task_id}/artifacts",
         }
     )
+
+
+@router.get("/tasks")
+async def list_tasks(
+    limit: int = Query(default=30, ge=1, le=100),
+    user: LimraUser = Depends(get_current_limra_user),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    tasks = repo.list_user_tasks(owner_user_id=user.id, limit=limit)
+    payload = {"tasks": [task.public_dict() for task in tasks], "count": len(tasks)}
+    return _assert_browser_safe(payload)
 
 
 @router.get("/tasks/{task_id}")
