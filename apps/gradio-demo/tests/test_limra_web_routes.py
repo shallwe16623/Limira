@@ -1286,6 +1286,116 @@ async def test_task_payload_hides_internal_model_summary_identifiers():
 
 
 @pytest.mark.asyncio
+async def test_postgres_task_detail_route_is_owner_scoped_and_hides_internal_identifiers():
+    app, _repo, _storage = _limra_asgi_app()
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+    owned_task = repo.create_task(
+        task_id="task-owned-detail",
+        owner_user_id="user-a",
+        query="summarize internal state",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    repo.update_task(
+        owned_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limra/users/user-a/tasks/task-owned-detail/archives/archive.zip"
+        ),
+        archive_zip_sha256="a" * 64,
+        model_summary=_internal_model_summary(
+            owned_task.task_id,
+            runner_task_id="runner-task-secret",
+        ),
+    )
+    foreign_task = repo.create_task(
+        task_id="task-foreign-detail",
+        owner_user_id="user-b",
+        query="foreign internal state",
+        scenario=None,
+        runner_task_id="runner-foreign-secret",
+    )
+    repo.update_task(
+        foreign_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limra/users/user-b/tasks/task-foreign-detail/archives/archive.zip"
+        ),
+        archive_zip_sha256="b" * 64,
+        model_summary=_internal_model_summary(
+            foreign_task.task_id,
+            runner_task_id="runner-foreign-secret",
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        owned_response = await client.get(
+            "/api/limra/tasks/task-owned-detail",
+        )
+        foreign_response = await client.get(
+            "/api/limra/tasks/task-foreign-detail",
+        )
+
+    assert owned_response.status_code == 200
+    payload = owned_response.json()
+    assert payload["task_id"] == "task-owned-detail"
+    assert payload["status"] == "completed"
+    assert payload["archive_status"] == "ready"
+    assert payload["download_url"] == (
+        "/api/limra/tasks/task-owned-detail/archive.zip"
+    )
+    assert "owner_user_id" not in payload
+    assert payload["model_summary"]["provider"] == "deepseek"
+    assert payload["model_summary"]["nested"]["safe"] == "kept"
+    assert payload["model_summary"]["endpoint"] == "limra_internal_value_redacted"
+    assert payload["model_summary"]["nested"]["warning"] == (
+        "limra_internal_value_redacted"
+    )
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for leaked in (
+        "runner_task_id",
+        "runner-task-secret",
+        "runner-foreign-secret",
+        "object_key",
+        "archive_object_key",
+        "archive_zip_sha256",
+        "limra/users/",
+        "http://10.20.30.40:8091",
+        "/mirothinker/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(payload)
+
+    assert foreign_response.status_code == 404
+    assert foreign_response.json()["detail"] == "task_not_found"
+    serialized_foreign = json.dumps(foreign_response.json(), ensure_ascii=False)
+    for leaked in (
+        "task-foreign-detail",
+        "runner-foreign-secret",
+        "user-b",
+        "limra/users/user-b",
+        "http://10.20.30.40:8091",
+        "/mirothinker/",
+    ):
+        assert leaked not in serialized_foreign
+    _assert_no_browser_leak(foreign_response.json())
+
+
+@pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limra.InMemoryLimraTaskRepository()
     storage = limra.InMemoryLimraObjectStorage()
