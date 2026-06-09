@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -20,6 +21,7 @@ LIMRA_STANDALONE_ROOT = REPO_ROOT / "apps" / "limra-standalone"
 LIMRA_STANDALONE_SERVER = LIMRA_STANDALONE_ROOT / "server.mjs"
 LIMRA_STANDALONE_APP = LIMRA_STANDALONE_ROOT / "public" / "app.js"
 BACKEND_ROOT = LIMRA_WEB_ROOT / "backend" / "open_webui"
+LIMRA_BACKEND_ROUTER = BACKEND_ROOT / "routers" / "limra.py"
 LIMRA_PAGE = LIMRA_WEB_ROOT / "src" / "routes" / "(app)" / "limra" / "+page.svelte"
 SIDEBAR = LIMRA_WEB_ROOT / "src" / "lib" / "components" / "layout" / "Sidebar.svelte"
 LIB_ROOT = LIMRA_WEB_ROOT / "src" / "lib"
@@ -68,6 +70,26 @@ USER_VISIBLE_BRAND_SCAN_PATHS = [
     OPENSEARCH,
 ]
 TEXT_SUFFIXES = {".html", ".json", ".py", ".svelte", ".ts", ".xml"}
+
+
+def _backend_artifact_event_types() -> set[str]:
+    module = ast.parse(_read(LIMRA_BACKEND_ROUTER))
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "ARTIFACT_EVENT_TYPES"
+            for target in node.targets
+        ):
+            continue
+        value = ast.literal_eval(node.value)
+        assert isinstance(value, dict)
+        return {str(event_type) for event_type in value}
+    raise AssertionError("ARTIFACT_EVENT_TYPES not found")
+
+
+def _required_frontend_artifact_event_types() -> list[str]:
+    return sorted(_backend_artifact_event_types() | {"record_research_artifact"})
 VISIBLE_WEBUI_PATTERN = re.compile(r"(?<![A-Z_])\bWebUI\b(?![_A-Z])")
 BACKEND_BRAND_PATTERN = re.compile(r"Open WebUI|Open-WebUI|Open_WebUI|OpenWebUI|\bWebUI\b")
 BACKEND_COMPAT_BRAND_ALLOWLIST = (
@@ -1559,17 +1581,8 @@ def test_limra_stream_handler_refreshes_all_first_class_artifact_events():
     page = _read(LIMRA_PAGE)
 
     assert "const artifactRefreshEventTypes = new Set([" in page
-    for event_type in [
-        "'evidence_collected'",
-        "'entity_extracted'",
-        "'relation_extracted'",
-        "'timeline_event_added'",
-        "'map_feature_added'",
-        "'verification_result'",
-        "'report_section_generated'",
-        "'record_research_artifact'",
-    ]:
-        assert event_type in page
+    for event_type in _required_frontend_artifact_event_types():
+        assert repr(event_type) in page
 
     assert "const isArtifactEvent = (eventType: string) => artifactRefreshEventTypes.has(eventType);" in page
     assert "if (isArtifactEvent(eventType))" in page
@@ -1584,17 +1597,8 @@ def test_limra_standalone_stream_handler_refreshes_tool_recorded_artifacts():
     app = _read(LIMRA_STANDALONE_APP)
 
     assert "const artifactEvents = new Set([" in app
-    for event_type in [
-        "'evidence_collected'",
-        "'entity_extracted'",
-        "'relation_extracted'",
-        "'timeline_event_added'",
-        "'map_feature_added'",
-        "'verification_result'",
-        "'report_section_generated'",
-        "'record_research_artifact'",
-    ]:
-        assert event_type in app
+    for event_type in _required_frontend_artifact_event_types():
+        assert repr(event_type) in app
 
     assert "} else if (artifactEvents.has(eventType)) {" in app
     assert "void loadArtifacts();" in app
