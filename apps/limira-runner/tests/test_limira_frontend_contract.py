@@ -262,6 +262,17 @@ def test_limira_standalone_hides_raw_event_log_and_keeps_progress_panel():
     assert 'id="clearStreamButton"' in index
 
 
+def test_limira_standalone_persists_uploaded_documents_across_workspace_restore():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    assert "state.uploads = Array.isArray(saved.uploads) ? saved.uploads : [];" in app
+    assert "state.uploadResults = [];" in app
+    assert "uploads: state.uploads" in app
+    assert "state.uploads = mergeUploadedDocument(state.uploads, uploaded);" in app
+    assert "function mergeUploadedDocument(documents, uploaded)" in app
+    assert "state.uploads = Array.isArray(data.documents) ? data.documents : [];" in app
+
+
 def test_limira_standalone_stream_handler_refreshes_all_artifact_events():
     app = _read(LIMIRA_STANDALONE_APP)
 

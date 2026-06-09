@@ -528,6 +528,8 @@ function restoreWorkspace() {
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
 		: emptyArtifacts();
+	state.uploads = Array.isArray(saved.uploads) ? saved.uploads : [];
+	state.uploadResults = [];
 	if (!latestReportMatchesCurrentMarkdown()) {
 		state.latestReport = null;
 		state.latestReportMarkdown = '';
@@ -547,7 +549,8 @@ function saveWorkspace() {
 		latestReportMarkdown: state.latestReportMarkdown,
 		finalReportText: state.finalReportText,
 		messages: state.messages.slice(-MAX_STORED_MESSAGES),
-		artifacts: state.artifacts
+		artifacts: state.artifacts,
+		uploads: state.uploads
 	};
 	try {
 		localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -874,6 +877,7 @@ async function loadUploads() {
 		}
 		state.uploads = Array.isArray(data.documents) ? data.documents : [];
 		state.uploadResults = [];
+		saveWorkspace();
 		renderUploads();
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
@@ -898,9 +902,14 @@ async function uploadDocument() {
 		form.append('task_id', state.taskId);
 	}
 	try {
-		await api('/api/limira/uploads', { method: 'POST', body: form });
+		const uploaded = await api('/api/limira/uploads', { method: 'POST', body: form });
 		if (!isCurrentAsyncContext(context)) {
 			return;
+		}
+		if (uploaded && typeof uploaded === 'object') {
+			state.uploads = mergeUploadedDocument(state.uploads, uploaded);
+			saveWorkspace();
+			renderUploads();
 		}
 		dom.uploadInput.value = '';
 		dom.uploadMessage.textContent = '上传完成。';
@@ -1463,6 +1472,17 @@ function renderUploads() {
 				})
 				.join('')
 		: '<div class="empty-state">暂无上传文档。</div>';
+}
+
+function mergeUploadedDocument(documents, uploaded) {
+	const documentId = String(uploaded.document_id || '').trim();
+	if (!documentId) {
+		return Array.isArray(documents) ? documents : [];
+	}
+	const next = [uploaded, ...(Array.isArray(documents) ? documents : []).filter(
+		(document) => String(document.document_id || '') !== documentId
+	)];
+	return next;
 }
 
 function renderReportControls() {

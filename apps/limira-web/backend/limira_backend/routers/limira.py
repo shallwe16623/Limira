@@ -31,7 +31,12 @@ except Exception:  # pragma: no cover - depends on optional runtime package
 
 
 ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
-ARCHIVE_JSON_MEMBERS = {"metadata.json", "trace.json"}
+ARCHIVE_SNAPSHOT_DIR = "evidence_snapshots"
+ARCHIVE_SNAPSHOT_MANIFEST = f"{ARCHIVE_SNAPSHOT_DIR}/manifest.json"
+ARCHIVE_SNAPSHOT_MEMBER_PATTERN = re.compile(
+    rf"^{ARCHIVE_SNAPSHOT_DIR}/[A-Za-z0-9._-]+\.html$"
+)
+ARCHIVE_JSON_MEMBERS = {"metadata.json", "trace.json", ARCHIVE_SNAPSHOT_MANIFEST}
 ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 LIMIRA_SECRET_REDACTION = "[REDACTED]"
 FORBIDDEN_BROWSER_SUBSTRINGS = {
@@ -4136,6 +4141,7 @@ async def _load_or_create_persisted_archive(
             reuse_failure = _persisted_archive_reuse_failure_reason(
                 archive_bytes,
                 task=task,
+                repo=repo,
             )
             if reuse_failure is None:
                 public_archive_bytes = _scrub_archive_zip(archive_bytes)
@@ -4236,6 +4242,7 @@ def _persisted_archive_reuse_failure_reason(
     archive_bytes: bytes,
     *,
     task: LimiraTask,
+    repo: LimiraTaskRepository,
 ) -> str | None:
     try:
         validate_archive_zip(archive_bytes)
@@ -4246,6 +4253,15 @@ def _persisted_archive_reuse_failure_reason(
     actual_sha = hashlib.sha256(archive_bytes).hexdigest()
     if actual_sha != task.archive_zip_sha256:
         return "archive_sha_mismatch"
+    expected_snapshot_members = _expected_archive_snapshot_member_names(task, repo)
+    if expected_snapshot_members:
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                names = set(archive.namelist())
+        except zipfile.BadZipFile:
+            return "invalid_archive_zip"
+        if not set(expected_snapshot_members).issubset(names):
+            return "archive_evidence_snapshots_missing"
     return None
 
 
@@ -4469,6 +4485,7 @@ def _build_persisted_archive_zip(
         owner_user_id=task.owner_user_id,
         task_id=task.task_id,
     )
+    task_event_logs = repo.list_task_event_logs(task.task_id, limit=500)
     report = _select_archive_report(reports)
     evidence_refs = _archive_evidence_refs(report, artifacts)
     report_markdown = _archive_report_markdown(task, report, artifacts)
@@ -4477,6 +4494,10 @@ def _build_persisted_archive_zip(
         evidence_refs=evidence_refs,
     )
     public_model_summary = _public_model_summary(task.model_summary or {})
+    snapshot_manifest, snapshot_members = _build_evidence_snapshot_members(
+        artifacts,
+        task_event_logs,
+    )
     metadata = {
         "task": {
             "task_id": task.task_id,
@@ -4496,6 +4517,7 @@ def _build_persisted_archive_zip(
         "artifact_warning_count": len(artifact_warnings),
         "reports": [report.public_dict() for report in reports],
         "uploaded_documents": [document.public_dict() for document in documents],
+        "evidence_snapshots": snapshot_manifest,
     }
     trace = {
         "task": metadata["task"],
@@ -4504,6 +4526,8 @@ def _build_persisted_archive_zip(
         "artifact_warnings": artifact_warnings,
         "reports": [report.public_dict() for report in reports],
         "uploaded_documents": [document.public_dict() for document in documents],
+        "task_event_logs": task_event_logs,
+        "evidence_snapshots": snapshot_manifest,
     }
     members = {
         "metadata.json": _archive_json_text(metadata, member_name="metadata.json"),
@@ -4511,9 +4535,10 @@ def _build_persisted_archive_zip(
         "report.md": str(scrub_limira_secrets(report_markdown)),
         "trace.json": _archive_json_text(trace, member_name="trace.json"),
     }
+    members.update(snapshot_members)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for member_name in ARCHIVE_MEMBER_ORDER:
+        for member_name in _archive_member_write_order(members):
             _write_archive_member(archive, member_name, members[member_name])
     return output.getvalue()
 
@@ -4564,6 +4589,240 @@ def _archive_report_markdown(
     )
 
 
+def _build_evidence_snapshot_members(
+    artifacts: dict[str, list[dict[str, Any]]],
+    task_event_logs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    manifest: list[dict[str, Any]] = []
+    members: dict[str, str] = {}
+    used_names: set[str] = set()
+    for index, evidence in enumerate(artifacts.get("evidence", []), start=1):
+        evidence_id = str(
+            evidence.get("evidence_id")
+            or evidence.get("ref_id")
+            or evidence.get("id")
+            or f"EVID-{index:03d}"
+        )
+        member_name = _unique_snapshot_member_name(evidence_id, index, used_names)
+        url = _evidence_url(evidence)
+        snapshot_text, snapshot_source = _evidence_snapshot_text(
+            evidence,
+            url=url,
+            task_event_logs=task_event_logs,
+        )
+        entry = {
+            "evidence_id": evidence_id,
+            "title": _evidence_title(evidence, evidence_id),
+            "url": url,
+            "member_name": member_name,
+            "snapshot_source": snapshot_source,
+        }
+        manifest.append(entry)
+        members[member_name] = _render_evidence_snapshot_html(
+            evidence,
+            manifest_entry=entry,
+            snapshot_text=snapshot_text,
+        )
+    if manifest:
+        members[ARCHIVE_SNAPSHOT_MANIFEST] = _archive_json_text(
+            {"snapshots": manifest},
+            member_name=ARCHIVE_SNAPSHOT_MANIFEST,
+        )
+    return manifest, members
+
+
+def _expected_archive_snapshot_member_names(
+    task: LimiraTask,
+    repo: LimiraTaskRepository,
+) -> list[str]:
+    artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
+    manifest, _members = _build_evidence_snapshot_members(artifacts, [])
+    if not manifest:
+        return []
+    return [ARCHIVE_SNAPSHOT_MANIFEST, *[entry["member_name"] for entry in manifest]]
+
+
+def _unique_snapshot_member_name(
+    evidence_id: str,
+    index: int,
+    used_names: set[str],
+) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", evidence_id).strip(".-_")
+    if not stem:
+        stem = f"EVID-{index:03d}"
+    candidate = f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem[:80]}.html"
+    suffix = 2
+    while candidate in used_names:
+        candidate = f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem[:72]}-{suffix}.html"
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def _evidence_url(evidence: Mapping[str, Any]) -> str | None:
+    for key in ("url", "source_url", "link", "href"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return str(scrub_limira_secrets(value.strip()))
+    return None
+
+
+def _evidence_title(evidence: Mapping[str, Any], fallback: str) -> str:
+    for key in ("title", "source", "name"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return str(scrub_limira_secrets(value.strip()))
+    return fallback
+
+
+def _evidence_snapshot_text(
+    evidence: Mapping[str, Any],
+    *,
+    url: str | None,
+    task_event_logs: list[dict[str, Any]],
+) -> tuple[str, str]:
+    if url:
+        event_text = _snapshot_text_from_task_event_logs(task_event_logs, url)
+        if event_text:
+            return event_text, "task_event_log"
+    for key in ("content", "text", "quote", "extracted_info", "summary", "description"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return str(scrub_limira_secrets(value.strip())), "evidence_artifact"
+    return "No captured page text was available for this evidence item.", "placeholder"
+
+
+def _snapshot_text_from_task_event_logs(
+    task_event_logs: list[dict[str, Any]],
+    url: str,
+) -> str | None:
+    normalized_url = _normalize_snapshot_url(url)
+    if not normalized_url:
+        return None
+    for event in task_event_logs:
+        for payload in _iter_snapshot_mappings(event):
+            if not _mapping_contains_snapshot_url(payload, normalized_url):
+                continue
+            text = _snapshot_text_from_mapping(payload)
+            if text:
+                return str(scrub_limira_secrets(text.strip()))[:200_000]
+    return None
+
+
+def _iter_snapshot_mappings(value: Any) -> list[Mapping[str, Any]]:
+    mappings: list[Mapping[str, Any]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for nested in item.values():
+                visit(nested)
+            mappings.append(item)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+        elif isinstance(item, str):
+            stripped = item.strip()
+            if not stripped or stripped[0] not in "{[":
+                return
+            try:
+                visit(json.loads(stripped))
+            except json.JSONDecodeError:
+                return
+
+    visit(value)
+    return mappings
+
+
+def _mapping_contains_snapshot_url(
+    payload: Mapping[str, Any],
+    normalized_url: str,
+) -> bool:
+    for key in ("url", "source_url", "link", "href"):
+        value = payload.get(key)
+        if isinstance(value, str) and _normalize_snapshot_url(value) == normalized_url:
+            return True
+    return False
+
+
+def _snapshot_text_from_mapping(payload: Mapping[str, Any]) -> str | None:
+    for key in (
+        "extracted_info",
+        "content",
+        "text",
+        "markdown",
+        "summary",
+        "description",
+        "quote",
+        "result",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _normalize_snapshot_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parts = urlsplit(str(value).strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return None
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path.rstrip("/"),
+            parts.query,
+            "",
+        )
+    )
+
+
+def _render_evidence_snapshot_html(
+    evidence: Mapping[str, Any],
+    *,
+    manifest_entry: Mapping[str, Any],
+    snapshot_text: str,
+) -> str:
+    title = str(manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence")
+    url = str(manifest_entry.get("url") or "")
+    summary = str(evidence.get("summary") or evidence.get("description") or "")
+    source = str(evidence.get("source") or "")
+    published_at = str(evidence.get("published_at") or evidence.get("date") or "")
+    confidence = evidence.get("confidence")
+    confidence_text = "" if confidence is None else str(confidence)
+    body = str(scrub_limira_secrets(snapshot_text))
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{html.escape(title)}</title>\n"
+        "<style>"
+        "body{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.6;color:#17202a;}"
+        "dt{font-weight:700;margin-top:12px;}dd{margin:4px 0 0 0;word-break:break-word;}"
+        "pre{white-space:pre-wrap;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:16px;}"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n"
+        f"<h1>{html.escape(title)}</h1>\n"
+        "<dl>\n"
+        f"<dt>Evidence ID</dt><dd>{html.escape(str(manifest_entry.get('evidence_id') or ''))}</dd>\n"
+        f"<dt>URL</dt><dd>{html.escape(url)}</dd>\n"
+        f"<dt>Source</dt><dd>{html.escape(source)}</dd>\n"
+        f"<dt>Published At</dt><dd>{html.escape(published_at)}</dd>\n"
+        f"<dt>Confidence</dt><dd>{html.escape(confidence_text)}</dd>\n"
+        f"<dt>Snapshot Source</dt><dd>{html.escape(str(manifest_entry.get('snapshot_source') or ''))}</dd>\n"
+        "</dl>\n"
+        f"<h2>Summary</h2>\n<p>{html.escape(summary)}</p>\n"
+        f"<h2>Captured Text</h2>\n<pre>{html.escape(body)}</pre>\n"
+        "</body>\n</html>\n"
+    )
+
+
 def _archive_json_text(value: Any, *, member_name: str | None = None) -> str:
     value = _normalize_archive_json_payload(value, member_name=member_name)
     scrubbed = scrub_limira_secrets(value)
@@ -4609,25 +4868,68 @@ def validate_archive_zip(archive_bytes: bytes) -> None:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
             names = archive.namelist()
-            if names != list(ARCHIVE_MEMBER_ORDER):
+            if not _archive_member_order_is_valid(names):
                 raise HTTPException(status_code=502, detail="invalid_archive_members")
             if any(name.startswith("/") or ".." in name.split("/") for name in names):
                 raise HTTPException(status_code=502, detail="unsafe_archive_member")
-            for member_name in ARCHIVE_MEMBER_ORDER:
+            if any(not _is_allowed_archive_member_name(name) for name in names):
+                raise HTTPException(status_code=502, detail="invalid_archive_members")
+            for member_name in names:
                 text = _decode_archive_text_member(archive.read(member_name))
-                if member_name in ARCHIVE_JSON_MEMBERS:
+                if _is_archive_json_member(member_name):
                     _parse_archive_json_member(text)
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
+
+
+def _archive_member_write_order(members: Mapping[str, Any]) -> list[str]:
+    core = [name for name in ARCHIVE_MEMBER_ORDER if name in members]
+    snapshot_manifest = (
+        [ARCHIVE_SNAPSHOT_MANIFEST] if ARCHIVE_SNAPSHOT_MANIFEST in members else []
+    )
+    snapshot_members = sorted(
+        name
+        for name in members
+        if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name)
+    )
+    return [*core, *snapshot_manifest, *snapshot_members]
+
+
+def _archive_member_order_is_valid(names: list[str]) -> bool:
+    core = list(ARCHIVE_MEMBER_ORDER)
+    if names[: len(core)] != core:
+        return False
+    extra = names[len(core):]
+    if not extra:
+        return True
+    snapshot_members = [
+        name for name in extra if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name)
+    ]
+    if not snapshot_members or ARCHIVE_SNAPSHOT_MANIFEST not in extra:
+        return False
+    return extra == [ARCHIVE_SNAPSHOT_MANIFEST, *sorted(snapshot_members)]
+
+
+def _is_allowed_archive_member_name(name: str) -> bool:
+    return (
+        name in ARCHIVE_MEMBER_ORDER
+        or name == ARCHIVE_SNAPSHOT_MANIFEST
+        or bool(ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name))
+    )
+
+
+def _is_archive_json_member(member_name: str) -> bool:
+    return member_name in ARCHIVE_JSON_MEMBERS
 
 
 def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
     output = io.BytesIO()
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as source:
+            names = source.namelist()
             raw_members = {
                 member_name: source.read(member_name)
-                for member_name in ARCHIVE_MEMBER_ORDER
+                for member_name in names
             }
             try:
                 report_markdown = _scrub_archive_member_text(
@@ -4637,7 +4939,7 @@ def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
             except UnicodeDecodeError:
                 report_markdown = _archive_member_decode_failure_text("report.md")
             with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as target:
-                for member_name in ARCHIVE_MEMBER_ORDER:
+                for member_name in names:
                     raw_member = raw_members[member_name]
                     try:
                         if member_name == "report.md":
@@ -4661,7 +4963,7 @@ def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
                             scrubbed.encode("utf-8"),
                         )
                     except UnicodeDecodeError:
-                        if member_name in ARCHIVE_JSON_MEMBERS:
+                        if _is_archive_json_member(member_name):
                             raise HTTPException(
                                 status_code=502,
                                 detail="invalid_archive_member_encoding",
@@ -4691,13 +4993,13 @@ def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
     try:
         text = raw_member.decode("utf-8")
     except UnicodeDecodeError as exc:
-        if member_name in ARCHIVE_JSON_MEMBERS:
+        if _is_archive_json_member(member_name):
             raise HTTPException(
                 status_code=502,
                 detail="invalid_archive_member_encoding",
             ) from exc
         raise
-    if member_name in ARCHIVE_JSON_MEMBERS:
+    if _is_archive_json_member(member_name):
         payload = _parse_archive_json_member(text)
         return _archive_json_text(payload, member_name=member_name)
     try:

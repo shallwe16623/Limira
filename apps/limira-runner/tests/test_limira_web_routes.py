@@ -496,12 +496,9 @@ async def test_user_isolation_for_task_status_and_archive_download():
 
     assert response.media_type == "application/zip"
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist() == [
-        "metadata.json",
-        "report.html",
-        "report.md",
-        "trace.json",
-    ]
+    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist()[:4] == list(
+        limira.ARCHIVE_MEMBER_ORDER
+    )
     archive_key = repo.tasks[task_id].archive_object_key
     assert archive_key in storage.objects
     assert "/tasks/" in archive_key
@@ -610,12 +607,9 @@ async def test_archive_download_regenerates_invalid_persisted_archive_object():
     assert second_response.body != corrupt_archive
     assert task.archive_object_key == archive_key
     assert task.archive_zip_sha256 == hashlib.sha256(second_response.body).hexdigest()
-    assert zipfile.ZipFile(io.BytesIO(second_response.body)).namelist() == [
-        "metadata.json",
-        "report.html",
-        "report.md",
-        "trace.json",
-    ]
+    assert zipfile.ZipFile(io.BytesIO(second_response.body)).namelist()[:4] == list(
+        limira.ARCHIVE_MEMBER_ORDER
+    )
 
 
 @pytest.mark.asyncio
@@ -647,12 +641,9 @@ async def test_archive_download_regenerates_invalid_persisted_archive_object_key
     assert "/tasks/task-archive-invalid-key/archives/" in task.archive_object_key
     assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
     assert storage.objects[task.archive_object_key]["sha256"] == task.archive_zip_sha256
-    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist() == [
-        "metadata.json",
-        "report.html",
-        "report.md",
-        "trace.json",
-    ]
+    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist()[:4] == list(
+        limira.ARCHIVE_MEMBER_ORDER
+    )
 
 
 @pytest.mark.asyncio
@@ -748,12 +739,7 @@ async def test_archive_proxy_scrubs_allowed_text_members_before_download():
 
     assert response.media_type == "application/zip"
     with zipfile.ZipFile(io.BytesIO(response.body)) as scrubbed_archive:
-        assert scrubbed_archive.namelist() == [
-            "metadata.json",
-            "report.html",
-            "report.md",
-            "trace.json",
-        ]
+        assert scrubbed_archive.namelist()[:4] == list(limira.ARCHIVE_MEMBER_ORDER)
         combined = "\n".join(
             scrubbed_archive.read(member).decode("utf-8")
             for member in scrubbed_archive.namelist()
@@ -1269,6 +1255,151 @@ async def test_archive_download_regenerates_after_task_scoped_writes():
     assert fourth_trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-NEW"
     assert task.archive_object_key in storage.objects
     assert storage.objects[task.archive_object_key]["content_type"] == "application/zip"
+
+
+@pytest.mark.asyncio
+async def test_archive_download_includes_evidence_web_snapshots():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-evidence-snapshots",
+        owner_user_id=user.id,
+        query="snapshot archive",
+        scenario=None,
+        runner_task_id="runner-evidence-snapshots",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "Port authority bulletin",
+            "source": "Example Maritime",
+            "source_url": "https://example.test/port",
+            "published_at": "2026-06-09",
+            "confidence": 0.9,
+            "summary": "New inspection rule published",
+        },
+    )
+    repo.record_task_event_log(
+        task.task_id,
+        {
+            "type": "tool_result",
+            "payload": {
+                "tool_name": "web_fetch",
+                "result": json.dumps(
+                    {
+                        "url": "https://example.test/port/",
+                        "title": "Port authority bulletin",
+                        "extracted_info": (
+                            "Captured page text: terminal policy changed."
+                        ),
+                    }
+                ),
+            },
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    archive_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    members = _archive_member_texts(archive_response.body)
+    assert list(members)[:4] == list(limira.ARCHIVE_MEMBER_ORDER)
+    assert "evidence_snapshots/manifest.json" in members
+    manifest = json.loads(members["evidence_snapshots/manifest.json"])
+    snapshot = manifest["snapshots"][0]
+    assert snapshot["evidence_id"] == "EVID-001"
+    assert snapshot["url"] == "https://example.test/port"
+    assert snapshot["snapshot_source"] == "task_event_log"
+    snapshot_html = members[snapshot["member_name"]]
+    assert "Port authority bulletin" in snapshot_html
+    assert "https://example.test/port" in snapshot_html
+    assert "Captured page text: terminal policy changed." in snapshot_html
+    assert "New inspection rule published" in snapshot_html
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["evidence_snapshots"] == manifest["snapshots"]
+    assert trace["evidence_snapshots"] == manifest["snapshots"]
+    assert task.archive_object_key in storage.objects
+    assert storage.objects[task.archive_object_key]["data"] == archive_response.body
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_missing_evidence_snapshots():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-missing-snapshot-reuse",
+        owner_user_id=user.id,
+        query="missing snapshot archive",
+        scenario=None,
+        runner_task_id="runner-missing-snapshot",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-REUSE",
+            "title": "Reusable evidence",
+            "source_url": "https://example.test/reuse",
+            "summary": "Snapshot must be regenerated.",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+    raw_archive = _archive_zip()
+    assert "evidence_snapshots/manifest.json" not in _archive_member_texts(raw_archive)
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    manifest = json.loads(members["evidence_snapshots/manifest.json"])
+    assert manifest["snapshots"][0]["evidence_id"] == "EVID-REUSE"
+    snapshot_html = members[manifest["snapshots"][0]["member_name"]]
+    assert "Reusable evidence" in snapshot_html
+    assert "Snapshot must be regenerated." in snapshot_html
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
 
 
 @pytest.mark.asyncio
@@ -5583,7 +5714,8 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
     assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
     assert artifacts["evidence"][0]["title"] == "Export control notice"
     assert limira.LIMIRA_SECRET_REDACTION in artifacts["evidence"][0]["summary"]
-    assert limira.LIMIRA_SECRET_REDACTION in artifacts["evidence"][0]["source_url"]
+    assert "%5BREDACTED%5D" in artifacts["evidence"][0]["source_url"]
+    assert "runner-query-secret-123456" not in artifacts["evidence"][0]["source_url"]
     assert artifacts["entities"][0]["entity_id"] == "ENT-001"
     assert artifacts["report_sections"][0]["evidence_refs"] == ["EVID-001"]
     assert artifacts["report_sections"][0]["confidence"] == 0.8
