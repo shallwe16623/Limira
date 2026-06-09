@@ -218,6 +218,8 @@ data/
 
 # limra / MiroThinker local runtime artifacts
 *.sqlite
+data/limra-pdf-debug/
+limra-pdf-debug/
 *.sqlite3
 *.sqlite3-journal
 apps/gradio-demo/archives/

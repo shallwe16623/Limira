@@ -22,16 +22,16 @@ from task_store import TaskStore
 
 USER_A_HEADERS = {
     "X-MiroThinker-Service-Token": "shared",
-    "X-OpenWebUI-User-Id": "user-a",
+    "X-Limra-User-Id": "user-a",
 }
 USER_B_HEADERS = {
     "X-MiroThinker-Service-Token": "shared",
-    "X-OpenWebUI-User-Id": "user-b",
+    "X-Limra-User-Id": "user-b",
 }
 ADMIN_HEADERS = {
     "X-MiroThinker-Service-Token": "shared",
-    "X-OpenWebUI-User-Id": "admin-user",
-    "X-OpenWebUI-User-Role": "admin",
+    "X-Limra-User-Id": "admin-user",
+    "X-Limra-User-Role": "admin",
 }
 ARCHIVE_MEMBERS = [
     "metadata.json",

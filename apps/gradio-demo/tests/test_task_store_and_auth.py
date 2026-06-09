@@ -316,8 +316,8 @@ def test_auth_adapter_accepts_trusted_headers_only():
     auth = authenticate_headers(
         {
             "X-MiroThinker-Service-Token": "shared",
-            "X-OpenWebUI-User-Id": "user-a",
-            "X-OpenWebUI-User-Role": "admin",
+            "X-Limra-User-Id": "user-a",
+            "X-Limra-User-Role": "admin",
         },
         service_token="shared",
     )
@@ -331,7 +331,7 @@ def test_auth_adapter_rejects_invalid_or_body_user_id():
         authenticate_headers(
             {
                 "X-MiroThinker-Service-Token": "wrong",
-                "X-OpenWebUI-User-Id": "user-a",
+                "X-Limra-User-Id": "user-a",
             },
             service_token="shared",
         )

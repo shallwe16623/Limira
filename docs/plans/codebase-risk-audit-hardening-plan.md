@@ -23,7 +23,7 @@ This plan is not a feature expansion plan. Changes should be narrowly scoped to 
 ## Explicitly Out Of Scope
 
 - Large UI redesigns, new research capabilities, new agent strategies, or new scenario workflows unless required to fix a confirmed risk.
-- Broad refactors, framework migration, or replacement of core Open WebUI, Runner, storage, or repository architecture.
+- Broad refactors, framework migration, or replacement of core legacy UI, Runner, storage, or repository architecture.
 - Cosmetic style-only changes, copyediting, naming-only changes, or formatting-only churn.
 - Adding external services or changing production infrastructure assumptions beyond hardening existing configuration.
 - Reading or printing secret values from local `.env` files, databases, cookies, tokens, or service credentials.

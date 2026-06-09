@@ -77,7 +77,7 @@ const SCENARIO_TEXT = {
 
 const state = {
 	authMode: 'signin',
-	token: localStorage.getItem('limraToken') || localStorage.getItem('token') || '',
+	token: localStorage.getItem('limraToken') || '',
 	user: null,
 	scenarios: [],
 	selectedScenario: '',
@@ -95,6 +95,7 @@ const state = {
 	restoreBlocked: false,
 	workspaceGeneration: 0,
 	latestReport: null,
+	latestReportMarkdown: '',
 	finalReportText: '',
 	messages: initialMessages(),
 	events: [],
@@ -207,10 +208,10 @@ async function authenticate() {
 	const email = dom.emailInput.value.trim();
 	const password = dom.passwordInput.value;
 	const name = dom.nameInput.value.trim();
-	const path = state.authMode === 'signup' ? '/api/v1/auths/signup' : '/api/v1/auths/signin';
+	const path = state.authMode === 'signup' ? '/api/limra/auth/signup' : '/api/limra/auth/signin';
 	const payload =
 		state.authMode === 'signup'
-			? { name: name || email, email, password, profile_image_url: '/user.png' }
+			? { name: name || email, email, password }
 			: { email, password };
 	dom.authMessage.textContent = '处理中...';
 	try {
@@ -238,7 +239,7 @@ async function authenticate() {
 }
 
 async function loadSession() {
-	const user = await api('/api/v1/auths/');
+	const user = await api('/api/limra/auth/session');
 	setUser(user);
 }
 
@@ -252,7 +253,6 @@ function setUser(user) {
 	if (user?.token) {
 		state.token = user.token;
 		localStorage.setItem('limraToken', user.token);
-		localStorage.setItem('token', user.token);
 	}
 }
 
@@ -337,12 +337,18 @@ function restoreWorkspace() {
 		? saved.activeTab
 		: LEGACY_TAB_LABELS[saved.activeTab] || '证据';
 	state.latestReport = normalizeGeneratedReport(saved.latestReport);
+	state.latestReportMarkdown =
+		typeof saved.latestReportMarkdown === 'string' ? saved.latestReportMarkdown : '';
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
 	state.events = Array.isArray(saved.events) ? saved.events : [];
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
 		: emptyArtifacts();
+	if (!latestReportMatchesCurrentMarkdown()) {
+		state.latestReport = null;
+		state.latestReportMarkdown = '';
+	}
 }
 
 function saveWorkspace() {
@@ -355,6 +361,7 @@ function saveWorkspace() {
 		archiveDownloadUrl: state.archiveDownloadUrl,
 		activeTab: state.activeTab,
 		latestReport: state.latestReport,
+		latestReportMarkdown: state.latestReportMarkdown,
 		finalReportText: state.finalReportText,
 		messages: state.messages.slice(-MAX_STORED_MESSAGES),
 		events: state.events.slice(-MAX_STORED_EVENTS),
@@ -397,6 +404,7 @@ function resetWorkspaceState() {
 	state.isExporting = false;
 	state.activeTab = '证据';
 	state.latestReport = null;
+	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.messages = initialMessages();
 	state.events = [];
@@ -407,7 +415,7 @@ function resetWorkspaceState() {
 
 async function signOut() {
 	try {
-		await api('/api/v1/auths/signout', { method: 'POST' });
+		await api('/api/limra/auth/signout', { method: 'POST' });
 	} catch {
 		// Local cleanup still matters if the server session is already gone.
 	}
@@ -480,6 +488,7 @@ async function submitResearch() {
 	state.archiveDownloadUrl = '';
 	state.restoreBlocked = false;
 	state.latestReport = null;
+	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
 	state.uploadResults = [];
@@ -612,7 +621,7 @@ function handleToolCall(data) {
 	const toolName = data.tool_name || data.name || 'tool';
 	const input = data.tool_input && typeof data.tool_input === 'object' ? data.tool_input : {};
 	if (toolName === 'show_text' && typeof input.text === 'string') {
-		state.finalReportText = input.text;
+		state.finalReportText = reportTextFromValue(input.text) || input.text;
 		addMessage('assistant', '已收到最终报告，请在“报告”标签页查看。');
 		state.activeTab = '报告';
 		saveWorkspace();
@@ -755,12 +764,12 @@ async function searchUploads() {
 }
 
 async function exportPdf() {
-	const markdown = reportMarkdown();
+	const markdown = reportMarkdown().trim();
 	if (state.restoreBlocked) {
 		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再导出 PDF。';
 		return;
 	}
-	if (!state.taskId || !markdown.trim() || state.isExporting) {
+	if (!state.taskId || !markdown || state.isExporting) {
 		return;
 	}
 	state.isExporting = true;
@@ -780,9 +789,14 @@ async function exportPdf() {
 			return;
 		}
 		state.latestReport = normalizeGeneratedReport(report);
-		dom.reportMessage.textContent = 'PDF 已生成。';
+		state.latestReportMarkdown = markdown;
+		const pdfUrl = latestReportPdfUrl();
+		dom.reportMessage.textContent = pdfUrl ? 'PDF 已生成，正在下载。' : 'PDF 已生成。';
 		saveWorkspace();
 		renderReportControls();
+		if (pdfUrl) {
+			window.location.href = pdfUrl;
+		}
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
@@ -804,9 +818,13 @@ function downloadPdf() {
 	if (!state.taskId || !state.latestReport?.report_id) {
 		return;
 	}
-	const url = reportPdfUrl(state.latestReport);
+	const url = latestReportPdfUrl();
 	if (!url) {
-		dom.reportMessage.textContent = '当前任务没有可下载的 PDF。';
+		state.latestReport = null;
+		state.latestReportMarkdown = '';
+		saveWorkspace();
+		renderReportControls();
+		dom.reportMessage.textContent = '报告内容已更新，请重新导出 PDF。';
 		return;
 	}
 	window.location.href = url;
@@ -1067,7 +1085,7 @@ function renderReport() {
 		.map((section, index) => reportCard(reportTitle(section, index), reportText(section), section.evidence_refs))
 		.join('');
 	const finalCard = state.finalReportText
-		? reportCard('最终回答', state.finalReportText, reportEvidenceRefs())
+		? reportCard('最终回答', reportTextFromValue(state.finalReportText), reportEvidenceRefs())
 		: '';
 	dom.artifactContent.innerHTML =
 		cards || finalCard
@@ -1234,7 +1252,7 @@ function renderUploads() {
 function renderReportControls() {
 	const hasMarkdown = Boolean(reportMarkdown().trim());
 	dom.exportPdfButton.disabled = state.restoreBlocked || !state.taskId || !hasMarkdown || state.isExporting;
-	dom.downloadPdfButton.disabled = state.restoreBlocked || !reportPdfUrl(state.latestReport);
+	dom.downloadPdfButton.disabled = state.restoreBlocked || !latestReportPdfUrl();
 }
 
 function bumpWorkspaceGeneration() {
@@ -1269,6 +1287,7 @@ function clearRestoredTaskState() {
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
 	state.latestReport = null;
+	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
 }
@@ -1337,6 +1356,18 @@ function reportPdfUrl(report) {
 function safeReportPdfUrl(value, taskId, reportId) {
 	const expected = `/api/limra/tasks/${encodeURIComponent(taskId)}/reports/${encodeURIComponent(reportId)}/pdf`;
 	return String(value || '').trim() === expected ? expected : '';
+}
+
+function latestReportMatchesCurrentMarkdown() {
+	if (!reportPdfUrl(state.latestReport)) {
+		return false;
+	}
+	const currentMarkdown = reportMarkdown().trim();
+	return Boolean(currentMarkdown && state.latestReportMarkdown === currentMarkdown);
+}
+
+function latestReportPdfUrl() {
+	return latestReportMatchesCurrentMarkdown() ? reportPdfUrl(state.latestReport) : '';
 }
 
 function renderEvents() {
@@ -1408,10 +1439,23 @@ async function responseDetail(response) {
 	const text = await response.text();
 	try {
 		const json = JSON.parse(text);
-		return typeof json.detail === 'string' ? json.detail : JSON.stringify(json.detail || json);
+		const detail = typeof json.detail === 'string' ? json.detail : JSON.stringify(json.detail || json);
+		return localizedErrorDetail(detail);
 	} catch {
 		return text || response.statusText;
 	}
+}
+
+function localizedErrorDetail(detail) {
+	const messages = {
+		invalid_credentials: '邮箱或密码不正确。',
+		not_authenticated: '请先登录。',
+		admin_required: '当前账号没有管理员权限。',
+		email_already_registered: '这个邮箱已经注册。',
+		invalid_email: '请输入有效邮箱。',
+		password_too_long: '密码太长，请使用 72 字节以内的密码。'
+	};
+	return messages[detail] || detail;
 }
 
 function normalizeArtifacts(data) {
@@ -1503,7 +1547,7 @@ function reportMarkdown() {
 	const sectionText = state.artifacts.report_sections
 		.map((section, index) => `## ${reportTitle(section, index)}\n\n${reportText(section)}`)
 		.join('\n\n');
-	return [state.finalReportText, sectionText].filter(Boolean).join('\n\n');
+	return [reportTextFromValue(state.finalReportText), sectionText].filter(Boolean).join('\n\n');
 }
 
 function reportEvidenceRefs() {
@@ -1518,11 +1562,72 @@ function reportEvidenceRefs() {
 }
 
 function reportTitle(section, index) {
-	return section.title || section.report_type || `报告章节 ${index + 1}`;
+	return (
+		section.title ||
+		reportFieldFromValue(
+			section.markdown || section.content || section.text || section.summary || section,
+			REPORT_TITLE_FIELDS
+		) ||
+		section.report_type ||
+		`报告章节 ${index + 1}`
+	);
 }
 
 function reportText(section) {
-	return section.markdown || section.text || section.summary || stringifyCompact(section);
+	return (
+		reportTextFromValue(section.markdown || section.content || section.text || section.summary || section) ||
+		stringifyCompact(section)
+	);
+}
+
+const REPORT_TEXT_FIELDS = ['markdown', 'content', 'text', 'summary'];
+const REPORT_TITLE_FIELDS = ['title', 'report_title', 'name'];
+
+function reportWrapper(value) {
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		return value;
+	}
+	if (typeof value !== 'string') return null;
+	const trimmed = value.trim();
+	if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+	const parsed = parseJson(trimmed);
+	return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+}
+
+function reportFieldFromValue(value, fields) {
+	const wrapped = reportWrapper(value);
+	if (!wrapped) return null;
+	for (const field of fields) {
+		const raw = wrapped[field];
+		if (raw === undefined || raw === null || typeof raw === 'object') continue;
+		const text = String(raw).trim();
+		if (text) return text;
+	}
+	for (const field of [...REPORT_TEXT_FIELDS, 'payload', 'result']) {
+		const nested = wrapped[field];
+		if (nested === undefined || nested === null || nested === value) continue;
+		const text = reportFieldFromValue(nested, fields);
+		if (text) return text;
+	}
+	return null;
+}
+
+function reportTextFromValue(value) {
+	const wrapped = reportWrapper(value);
+	if (wrapped) {
+		for (const field of REPORT_TEXT_FIELDS) {
+			if (!(field in wrapped)) continue;
+			const text = reportTextFromValue(wrapped[field]);
+			if (text) return text;
+		}
+		if ('payload' in wrapped) {
+			const text = reportTextFromValue(wrapped.payload);
+			if (text) return text;
+		}
+		return '';
+	}
+	if (value === undefined || value === null) return '';
+	return typeof value === 'string' ? value.trim() : String(value).trim();
 }
 
 function relationSource(relation) {

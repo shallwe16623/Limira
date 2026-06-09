@@ -7,6 +7,17 @@ services:
       dockerfile: Dockerfile
       args:
         USE_SLIM: "true"
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "limra_native:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080",
+      ]
     depends_on:
       postgres:
         condition: service_healthy
@@ -22,8 +33,11 @@ services:
         host_ip: "${LIMRA_BIND_ADDRESS:-127.0.0.1}"
     environment:
       PORT: "8080"
-      WEBUI_NAME: limra
+      DATA_DIR: /app/backend/data
       LIMRA_API_BASE_URL: /api/limra
+      LIMRA_AUTH_SQLITE_PATH: /app/backend/data/limra_auth.sqlite3
+      LIMRA_LEGACY_AUTH_SQLITE_PATH: /app/backend/data/legacy_auth.sqlite3
+      LIMRA_AUTH_SECRET: ${LIMRA_AUTH_SECRET:?set LIMRA_AUTH_SECRET}
       LIMRA_RUNNER_INTERNAL_URL: http://limra-runner:8091
       LIMRA_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?set RUNNER_SERVICE_TOKEN}
       LIMRA_REPOSITORY_BACKEND: postgres
@@ -35,12 +49,16 @@ services:
       LIMRA_EMBEDDING_PROVIDER: ${LIMRA_EMBEDDING_PROVIDER:-disabled}
       LIMRA_EMBEDDING_MODEL: ${LIMRA_EMBEDDING_MODEL:-}
       LIMRA_EMBEDDING_DIMENSIONS: ${LIMRA_EMBEDDING_DIMENSIONS:-1536}
+      LIMRA_PDF_DEBUG_DIR: ${LIMRA_PDF_DEBUG_DIR:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-limra}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-limra}
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       S3_BUCKET: ${MINIO_BUCKET:-limra-artifacts}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-limra_minio}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - limra_web_data:/app/backend/data
+      - ${LIMRA_PDF_DEBUG_HOST_DIR:-./data/limra-pdf-debug}:${LIMRA_PDF_DEBUG_DIR:-/tmp/limra-pdf-debug}
     networks:
       - limra
 
@@ -190,6 +208,7 @@ networks:
     name: ${COMPOSE_PROJECT_NAME:-limra_aggressive}_network
 
 volumes:
+  limra_web_data:
   limra_postgres_data:
   limra_redis_data:
   limra_minio_data:

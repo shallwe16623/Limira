@@ -7,12 +7,15 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_FILE = ROOT / "docker-compose.limra-aggressive.yml"
 ENV_EXAMPLE = ROOT / ".env.example"
-LIMRA_WEB_ENV = ROOT / "apps/limra-web/backend/open_webui/env.py"
-LIMRA_WEB_MAIN = ROOT / "apps/limra-web/backend/open_webui/main.py"
+LIMRA_NATIVE_APP = ROOT / "apps/limra-web/backend/limra_native.py"
+LIMRA_BACKEND_ROUTER = ROOT / "apps/limra-web/backend/limra_backend/routers/limra.py"
 RUNNER_API = ROOT / "apps/gradio-demo/runner_api.py"
 MIGRATION_FILE = (
     ROOT / "deploy/limra/postgres/migrations/001_limra_osint_schema.sql"
 )
+LEGACY_PY_PACKAGE = "open" + "_" + "web" + "ui"
+LEGACY_APP_DIR = "open-" + "web" + "ui-mirothinker"
+LEGACY_WEB_NAME_KEY = "WEB" + "UI_NAME"
 
 
 def test_limra_compose_defines_aggressive_stack_contract():
@@ -73,10 +76,30 @@ def test_limra_compose_defines_aggressive_stack_contract():
     web = services["limra-web"]
     assert web["build"]["context"] == "apps/limra-web"
     assert web["build"]["dockerfile"] == "Dockerfile"
+    assert web["command"] == [
+        "python",
+        "-m",
+        "uvicorn",
+        "limra_native:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080",
+    ]
     assert "image" not in web
     assert web["environment"]["PORT"] == "8080"
-    assert web["environment"]["WEBUI_NAME"] == "limra"
+    assert LEGACY_WEB_NAME_KEY not in web["environment"]
+    assert web["environment"]["DATA_DIR"] == "/app/backend/data"
     assert web["environment"]["LIMRA_API_BASE_URL"] == "/api/limra"
+    assert web["environment"]["LIMRA_AUTH_SQLITE_PATH"] == (
+        "/app/backend/data/limra_auth.sqlite3"
+    )
+    assert web["environment"]["LIMRA_LEGACY_AUTH_SQLITE_PATH"] == (
+        "/app/backend/data/legacy_auth.sqlite3"
+    )
+    assert web["environment"]["LIMRA_AUTH_SECRET"] == (
+        "${LIMRA_AUTH_SECRET:?set LIMRA_AUTH_SECRET}"
+    )
     assert web["environment"]["LIMRA_RUNNER_INTERNAL_URL"] == (
         "http://limra-runner:8091"
     )
@@ -111,6 +134,7 @@ def test_limra_compose_defines_aggressive_stack_contract():
     assert web["environment"]["AWS_SECRET_ACCESS_KEY"] == (
         "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}"
     )
+    assert "limra_web_data:/app/backend/data" in web["volumes"]
 
     assert postgres["environment"]["POSTGRES_PASSWORD"] == (
         "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
@@ -131,6 +155,7 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         "LIMRA_BIND_ADDRESS",
         "LIMRA_WEB_PORT",
         "LIMRA_RUNNER_PORT",
+        "LIMRA_AUTH_SECRET",
         "POSTGRES_PORT",
         "REDIS_PORT",
         "MINIO_API_PORT",
@@ -211,21 +236,14 @@ def test_limra_env_example_has_required_placeholders_without_real_secrets():
         assert not value.startswith("eyJ")
 
 
-def test_limra_runtime_product_name_is_not_rewritten_to_open_webui():
-    env_py = LIMRA_WEB_ENV.read_text(encoding="utf-8")
-    main_py = LIMRA_WEB_MAIN.read_text(encoding="utf-8")
+def test_limra_native_backend_entrypoint_has_no_legacy_app_dependency():
+    native_app = LIMRA_NATIVE_APP.read_text(encoding="utf-8")
+    router = LIMRA_BACKEND_ROUTER.read_text(encoding="utf-8")
 
-    assert "WEBUI_NAME = os.getenv('WEBUI_NAME', 'limra')" in env_py
-    assert "WEBUI_NAME += ' (Open WebUI)'" not in env_py
-    assert "if WEBUI_NAME != 'Open WebUI'" not in env_py
-    assert "WEBUI_FAVICON_URL = '/static/favicon.png'" in env_py
-
-    assert "title='limra'" in main_py
-    assert "'name': app.state.WEBUI_NAME" in main_py
-    assert "'short_name': app.state.WEBUI_NAME" in main_py
-    assert "<ShortName>{app.state.WEBUI_NAME}</ShortName>" in main_py
-    assert "<Description>Search {app.state.WEBUI_NAME}</Description>" in main_py
-    assert "limra (Open WebUI)" not in main_py
+    assert "from limra_backend.routers import limra" in native_app
+    assert "app.include_router(limra.router, prefix=\"/api/limra\")" in native_app
+    assert LEGACY_PY_PACKAGE not in native_app
+    assert LEGACY_PY_PACKAGE not in router
 
 
 def test_limra_migration_creates_required_extensions_tables_and_indexes():
@@ -402,9 +420,10 @@ def test_limra_deploy_helper_files_exist_and_are_executable_where_needed():
         ROOT / "deploy/limra/nginx.conf",
         ROOT / "deploy/limra/minio/init-bucket.sh",
         ROOT / "apps/limra-web/Dockerfile",
-        ROOT / "apps/limra-web/package.json",
-        ROOT / "apps/limra-web/backend/open_webui/main.py",
-        ROOT / "apps/limra-web/backend/open_webui/routers/limra.py",
+        ROOT / "apps/limra-web/backend/limra_native.py",
+        ROOT / "apps/limra-web/backend/limra_backend/routers/limra.py",
+        ROOT / "apps/limra-standalone/server.mjs",
+        ROOT / "apps/limra-standalone/public/app.js",
     ]
     for path in required_files:
         assert path.exists(), path
@@ -417,15 +436,17 @@ def test_limra_deploy_helper_files_exist_and_are_executable_where_needed():
     assert 'return web.json_response({"status": True})' in runner_api
 
 
-def test_limra_web_is_real_open_webui_vendor_path_not_placeholder():
+def test_limra_web_uses_native_backend_and_standalone_frontend_only():
     limra_web = ROOT / "apps/limra-web"
-    assert (limra_web / "src/routes").is_dir()
-    assert (limra_web / "backend/open_webui/routers").is_dir()
+    assert (limra_web / "backend/limra_backend/routers").is_dir()
+    assert not (limra_web / "src").exists()
+    assert not (limra_web / "backend" / LEGACY_PY_PACKAGE).exists()
+    assert not (limra_web / "package.json").exists()
+    assert not (ROOT / "apps" / LEGACY_APP_DIR).exists()
     assert not (ROOT / "deploy/limra/web-placeholder/index.html").exists()
-    assert "open-webui" in (limra_web / "package.json").read_text(encoding="utf-8")
-    main_py = (limra_web / "backend/open_webui/main.py").read_text(encoding="utf-8")
-    assert "limra.router" in main_py
-    assert "prefix='/api/limra'" in main_py
+    native_app = (limra_web / "backend/limra_native.py").read_text(encoding="utf-8")
+    assert "limra.router" in native_app
+    assert 'prefix="/api/limra"' in native_app
 
 
 def _read_env_example() -> dict[str, str]:

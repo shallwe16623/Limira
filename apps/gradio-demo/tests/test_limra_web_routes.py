@@ -4,6 +4,7 @@ import sys
 import zipfile
 import asyncio
 import hashlib
+import sqlite3
 import types
 from pathlib import Path
 
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 LIMRA_BACKEND = ROOT / "apps/limra-web/backend"
 sys.path.insert(0, str(LIMRA_BACKEND))
 
-from open_webui.routers import limra  # noqa: E402
+from limra_backend.routers import limra  # noqa: E402
 
 
 class FakeArchiveClient:
@@ -146,6 +147,129 @@ async def test_create_research_rejects_body_user_spoofing_on_actual_http_surface
 
     assert repo.tasks == {}
     assert research.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_limra_native_auth_drives_browser_facing_api_without_legacy_auth_proxy(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limra.LIMRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limra_auth.sqlite3"))
+    monkeypatch.setenv(limra.LIMRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limra.LIMRA_AUTH_SECRET_ENV, "test-limra-auth-secret")
+
+    app = FastAPI()
+    app.include_router(limra.router, prefix="/api/limra")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        unauthenticated = await client.get("/api/limra/scenarios")
+        assert unauthenticated.status_code == 401
+        assert unauthenticated.json() == {"detail": "not_authenticated"}
+
+        signup = await client.post(
+            "/api/limra/auth/signup",
+            json={
+                "email": "analyst@example.test",
+                "name": "Analyst",
+                "password": "correct-password",
+            },
+        )
+        assert signup.status_code == 201
+        signup_payload = signup.json()
+        assert signup_payload["email"] == "analyst@example.test"
+        assert signup_payload["name"] == "Analyst"
+        assert signup_payload["role"] == "user"
+        assert signup_payload["token_type"] == "bearer"
+        token = signup_payload["token"]
+        assert token
+        assert "limra_session=" in signup.headers.get("set-cookie", "")
+
+        session = await client.get(
+            "/api/limra/auth/session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert session.status_code == 200
+        assert session.json() == {
+            "id": signup_payload["id"],
+            "email": "analyst@example.test",
+            "name": "Analyst",
+            "role": "user",
+        }
+
+        scenarios = await client.get(
+            "/api/limra/scenarios",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert scenarios.status_code == 200
+        assert scenarios.json()["count"] == 3
+
+        rejected = await client.post(
+            "/api/limra/auth/signin",
+            json={"email": "analyst@example.test", "password": "wrong-password"},
+        )
+        assert rejected.status_code == 401
+        assert rejected.json() == {"detail": "invalid_credentials"}
+
+        signin = await client.post(
+            "/api/limra/auth/signin",
+            json={"email": "analyst@example.test", "password": "correct-password"},
+        )
+        assert signin.status_code == 200
+        assert signin.json()["email"] == "analyst@example.test"
+
+
+@pytest.mark.asyncio
+async def test_limra_native_auth_migrates_existing_legacy_sqlite_user_once(
+    tmp_path,
+    monkeypatch,
+):
+    auth_path = tmp_path / "limra_auth.sqlite3"
+    legacy_path = tmp_path / "legacy_auth.sqlite3"
+    password_hash = limra._limra_hash_password("existing-password")
+    with sqlite3.connect(legacy_path) as connection:
+        connection.execute(
+            "CREATE TABLE auth (id TEXT PRIMARY KEY, email TEXT, password TEXT, active INTEGER)"
+        )
+        connection.execute('CREATE TABLE "user" (id TEXT PRIMARY KEY, email TEXT, name TEXT, role TEXT)')
+        connection.execute(
+            "INSERT INTO auth (id, email, password, active) VALUES (?, ?, ?, 1)",
+            ("existing-user", "existing@example.test", password_hash),
+        )
+        connection.execute(
+            'INSERT INTO "user" (id, email, name, role) VALUES (?, ?, ?, ?)',
+            ("existing-user", "existing@example.test", "Existing User", "admin"),
+        )
+
+    monkeypatch.setenv(limra.LIMRA_AUTH_SQLITE_PATH_ENV, str(auth_path))
+    monkeypatch.setenv(limra.LIMRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(legacy_path))
+    monkeypatch.setenv(limra.LIMRA_AUTH_SECRET_ENV, "test-limra-auth-secret")
+
+    app = FastAPI()
+    app.include_router(limra.router, prefix="/api/limra")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        signin = await client.post(
+            "/api/limra/auth/signin",
+            json={"email": "existing@example.test", "password": "existing-password"},
+        )
+        assert signin.status_code == 200
+        assert signin.json()["id"] == "existing-user"
+        assert signin.json()["name"] == "Existing User"
+        assert signin.json()["role"] == "admin"
+
+    assert auth_path.exists()
+    with sqlite3.connect(auth_path) as connection:
+        migrated = connection.execute(
+            "SELECT email, name, role FROM limra_auth_users WHERE id = ?",
+            ("existing-user",),
+        ).fetchone()
+    assert migrated == ("existing@example.test", "Existing User", "admin")
 
 
 @pytest.mark.asyncio
@@ -609,7 +733,7 @@ async def test_archive_proxy_scrubs_allowed_text_members_before_download():
         evidence_refs=["EVID-001"],
         creator_user_id=user.id,
         metadata={
-            "cookie": "open_webui_session=session-secret-123456",
+            "cookie": "legacy_session=session-secret-123456",
             "deepseek": "DEEPSEEK_API_KEY=sk-tracedeepseek123456",
         },
     )
@@ -1494,8 +1618,8 @@ def test_runner_service_headers_are_server_side_only():
     )
 
     assert headers == {
-        "X-OpenWebUI-User-Id": "user-a",
-        "X-OpenWebUI-User-Role": "admin",
+        "X-Limra-User-Id": "user-a",
+        "X-Limra-User-Role": "admin",
         "X-MiroThinker-Service-Token": "server-only-token",
     }
 
@@ -3236,6 +3360,117 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
 
 
 @pytest.mark.asyncio
+async def test_pdf_route_unwraps_json_wrapped_markdown_and_rejects_empty_output():
+    app, repo, _storage = _limra_asgi_app()
+    pdf_exporter = app.state.test_pdf_exporter
+    repo.create_task(
+        task_id="task-json-report-pdf",
+        owner_user_id="user-a",
+        query="json report",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    report_body = "## 研究结论\n\nPDF 应包含正文。 [EVID-001]"
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-001",
+            "title": "JSON wrapped report",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        empty_response = await client.post(
+            "/api/limra/tasks/task-json-report-pdf/reports/pdf",
+            json={
+                "report_id": "empty-report",
+                "markdown": json.dumps({"title": "No content"}, ensure_ascii=False),
+                "evidence_refs": [],
+            },
+        )
+        wrapped_response = await client.post(
+            "/api/limra/tasks/task-json-report-pdf/reports/pdf",
+            json={
+                "report_id": "wrapped-report",
+                "markdown": wrapped_report,
+                "evidence_refs": ["EVID-001"],
+            },
+        )
+
+    assert empty_response.status_code == 400
+    assert empty_response.json()["detail"] == "empty_report_markdown"
+    assert wrapped_response.status_code == 201
+    assert len(pdf_exporter.html_inputs) == 1
+    rendered_html = pdf_exporter.html_inputs[0]
+    assert "PDF 应包含正文。" in rendered_html
+    assert "JSON wrapped report" not in rendered_html
+    assert '"content"' not in rendered_html
+    report = repo.get_user_report(
+        task_id="task-json-report-pdf",
+        report_id="wrapped-report",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.markdown == report_body
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_writes_debug_artifacts_when_debug_dir_is_configured(
+    monkeypatch,
+    tmp_path,
+):
+    debug_dir = tmp_path / "limra-pdf-debug"
+    monkeypatch.setenv("LIMRA_PDF_DEBUG_DIR", str(debug_dir))
+    app, repo, _storage = _limra_asgi_app()
+    pdf_exporter = app.state.test_pdf_exporter
+    repo.create_task(
+        task_id="task-debug-pdf",
+        owner_user_id="user-a",
+        query="debug pdf",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/tasks/task-debug-pdf/reports/pdf",
+            json={
+                "report_id": "debug-report",
+                "markdown": "Debug PDF body [EVID-001]",
+                "evidence_refs": ["EVID-001"],
+            },
+        )
+
+    assert response.status_code == 201
+    html_files = list(debug_dir.glob("*.html"))
+    pdf_files = list(debug_dir.glob("*.pdf"))
+    manifest_files = list(debug_dir.glob("*.json"))
+    assert len(html_files) == 1
+    assert len(pdf_files) == 1
+    assert len(manifest_files) == 1
+    assert "Debug PDF body" in html_files[0].read_text(encoding="utf-8")
+    assert pdf_files[0].read_bytes() == pdf_exporter.pdf_bytes
+    manifest = json.loads(manifest_files[0].read_text(encoding="utf-8"))
+    assert manifest["task_id"] == "task-debug-pdf"
+    assert manifest["report_id"] == "debug-report"
+    assert manifest["pdf_bytes"] == len(pdf_exporter.pdf_bytes)
+    report = repo.get_user_report(
+        task_id="task-debug-pdf",
+        report_id="debug-report",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.metadata["pdf_debug"]["pdf_path"] == str(pdf_files[0])
+
+
+@pytest.mark.asyncio
 async def test_pdf_download_clears_invalid_persisted_pdf_object_key():
     app, repo, _storage = _limra_asgi_app()
     repo.create_task(
@@ -3629,9 +3864,13 @@ async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypa
             self.aborted = True
 
     class FakePage:
-        def __init__(self):
+        def __init__(self, visible_text="report"):
             self.routes = []
             self.set_content_calls = []
+            self.evaluate_calls = []
+            self.emulate_media_calls = []
+            self.pdf_calls = []
+            self.visible_text = visible_text
 
         async def route(self, pattern, handler):
             self.routes.append((pattern, handler))
@@ -3641,7 +3880,15 @@ async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypa
                 {"html_content": html_content, "wait_until": wait_until}
             )
 
+        async def evaluate(self, expression):
+            self.evaluate_calls.append(expression)
+            return self.visible_text
+
+        async def emulate_media(self, **kwargs):
+            self.emulate_media_calls.append(kwargs)
+
         async def pdf(self, **kwargs):
+            self.pdf_calls.append(kwargs)
             return b"%PDF-1.7\nfake\n%%EOF"
 
     class FakeBrowser:
@@ -3693,12 +3940,142 @@ async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypa
             "wait_until": "load",
         }
     ]
+    assert page.evaluate_calls == ["() => document.body ? document.body.innerText : ''"]
+    assert page.emulate_media_calls == [{"media": "print"}]
+    assert page.pdf_calls == [{"format": "A4", "print_background": True}]
     assert len(page.routes) == 1
     pattern, handler = page.routes[0]
     assert pattern == "**/*"
     route = FakeRoute()
     await handler(route)
     assert route.aborted is True
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_rejects_blank_rendered_body(monkeypatch):
+    calls = {"closed": False}
+
+    class FakePage:
+        def __init__(self):
+            self.pdf_called = False
+
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def set_content(self, _html_content, **_kwargs):
+            return None
+
+        async def evaluate(self, _expression):
+            return "   "
+
+        async def emulate_media(self, **_kwargs):
+            return None
+
+        async def pdf(self, **_kwargs):
+            self.pdf_called = True
+            return b"%PDF-1.7\nfake\n%%EOF"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_page(self):
+            return self.page
+
+        async def close(self):
+            calls["closed"] = True
+
+    class FakeChromium:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def launch(self, args):
+            return self.browser
+
+    class FakePlaywrightContext:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=self.chromium)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    page = FakePage()
+    browser = FakeBrowser(page)
+    chromium = FakeChromium(browser)
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext(chromium)
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+
+    with pytest.raises(RuntimeError, match="limra_pdf_blank_rendered_body"):
+        await limra.PlaywrightLimraPdfExporter().render_pdf(
+            "<!doctype html><html><body></body></html>"
+        )
+
+    assert page.pdf_called is False
+    assert calls["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_falls_back_when_browser_launch_fails(monkeypatch):
+    fallback_lines: list[str] = []
+
+    class FakeFPDF:
+        def __init__(self, **_kwargs):
+            self.epw = 180
+            return None
+
+        def set_auto_page_break(self, **_kwargs):
+            return None
+
+        def add_page(self):
+            return None
+
+        def add_font(self, *_args, **_kwargs):
+            return None
+
+        def set_font(self, *_args, **_kwargs):
+            return None
+
+        def ln(self, *_args, **_kwargs):
+            fallback_lines.append("")
+
+        def multi_cell(self, _width, _height, text):
+            fallback_lines.append(text)
+
+        def output(self):
+            body = "\n".join(fallback_lines).encode()
+            return b"%PDF-1.7\n" + body + b"\n%%EOF"
+
+    class FakeChromium:
+        async def launch(self, args):
+            raise RuntimeError("missing browser deps")
+
+    class FakePlaywrightContext:
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=FakeChromium())
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext()
+    fpdf_module = types.ModuleType("fpdf")
+    fpdf_module.FPDF = FakeFPDF
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+    monkeypatch.setitem(sys.modules, "fpdf", fpdf_module)
+
+    pdf_bytes = await limra.PlaywrightLimraPdfExporter().render_pdf(
+        "<!doctype html><html><body><h1>Fallback title</h1><p>中文正文</p></body></html>"
+    )
+
+    assert pdf_bytes.startswith(b"%PDF-1.7")
+    assert "Fallback title" in "\n".join(fallback_lines)
+    assert "中文正文" in "\n".join(fallback_lines)
 
 
 def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
@@ -4607,6 +4984,85 @@ async def test_postgres_pdf_download_clears_mismatched_persisted_pdf_object():
     assert persisted["pdf_object_key"] is None
 
 
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_blank_persisted_pdf_object():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limra.InMemoryLimraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-blank-pdf",
+        owner_user_id="user-a",
+        query="postgres blank pdf",
+        scenario=None,
+        runner_task_id="runner-postgres-blank-pdf",
+    )
+    blank_pdf_bytes = (
+        b"%PDF-1.4\n"
+        b"3 0 obj\n"
+        b"<</Length 0>> stream\n"
+        b"endstream\n"
+        b"endobj\n"
+        b"%%EOF"
+    )
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-postgres-blank-pdf",
+        filename="report-postgres-blank.pdf",
+        object_id="report-postgres-blank",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=blank_pdf_bytes,
+        content_type="application/pdf",
+        metadata={"report_id": "report-postgres-blank"},
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-blank",
+        task_id="task-postgres-blank-pdf",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limra",
+            "pdf_sha256": hashlib.sha256(blank_pdf_bytes).hexdigest(),
+            "pdf_size_bytes": len(blank_pdf_bytes),
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limra.download_task_report_pdf(
+            "task-postgres-blank-pdf",
+            "report-postgres-blank",
+            user=limra.LimraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-blank-pdf",
+        report_id="report-postgres-blank",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-blank-pdf", "report-postgres-blank")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
 def test_postgres_repository_invalidates_archive_metadata_on_task_scoped_writes():
     engine = FakeLimraPostgresEngine()
     repo = limra.PostgresLimraTaskRepository(
@@ -5385,6 +5841,214 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
     trace = json.loads(members["trace.json"])
     assert trace["artifact_events"][0]["type"] == "report_section_generated"
     assert trace["artifact_events"][0]["source_event_type"] == "final_summary_show_text"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_unwraps_json_wrapped_final_summary_report_text():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    report_body = (
+        "## 研究结论\n\n"
+        "**比亚迪(BYD Company Limited) 目前已在已生效的1260H清单上。** "
+        "[EVID-001]"
+    )
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-001",
+            "title": "比亚迪(BYD) Section 1260H 清单状态研究报告",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {"text": wrapped_report},
+                },
+            },
+        ]
+    )
+
+    created = await limra.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    assert '"content"' not in serialized_events
+    assert wrapped_report not in serialized_events
+    assert events[1]["payload"]["tool_input"]["text"] == report_body
+    assert events[2]["payload"]["title"] == (
+        "比亚迪(BYD) Section 1260H 清单状态研究报告"
+    )
+    assert events[2]["payload"]["markdown"] == report_body
+    assert events[2]["payload"]["evidence_refs"] == ["EVID-001"]
+
+    artifacts = await limra.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["report_sections"][0]["title"] == (
+        "比亚迪(BYD) Section 1260H 清单状态研究报告"
+    )
+    assert artifacts["report_sections"][0]["markdown"] == report_body
+    assert '"content"' not in json.dumps(artifacts, ensure_ascii=False)
+
+    archive_response = await limra.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert report_body in members["report.md"]
+    assert wrapped_report not in json.dumps(members, ensure_ascii=False)
+    assert '"content"' not in members["trace.json"]
+
+
+@pytest.mark.asyncio
+async def test_artifacts_api_unwraps_legacy_json_wrapped_report_section_text():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-legacy-json-report",
+        owner_user_id=user.id,
+        query="BYD 1260H",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    report_body = "## 研究结论\n\n旧数据应只显示正文。 [EVID-001]"
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-099",
+            "title": "旧报告标题",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-099",
+            "markdown": wrapped_report,
+            "source_event_type": "record_research_artifact",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    artifacts = await limra.get_task_artifacts(task.task_id, user=user, repo=repo)
+
+    section = artifacts["report_sections"][0]
+    assert section["title"] == "旧报告标题"
+    assert section["markdown"] == report_body
+    serialized_artifacts = json.dumps(artifacts, ensure_ascii=False)
+    assert wrapped_report not in serialized_artifacts
+    assert '"content"' not in serialized_artifacts
+
+    archive_response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert report_body in members["report.md"]
+    assert wrapped_report not in json.dumps(members, ensure_ascii=False)
+    assert '"content"' not in members["trace.json"]
+
+
+@pytest.mark.asyncio
+async def test_archive_download_unwraps_json_wrapped_report_members_from_persisted_archive():
+    repo = limra.InMemoryLimraTaskRepository()
+    storage = limra.InMemoryLimraObjectStorage()
+    user = limra.LimraUser("user-a")
+    task = repo.create_task(
+        task_id="task-legacy-json-archive",
+        owner_user_id=user.id,
+        query="BYD 1260H",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    report_body = "## 研究结论\n\n历史 archive 应只下载正文。 [EVID-001]"
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-007",
+            "title": "历史 archive 标题",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+    raw_archive = _archive_zip_with_json_wrapped_report(
+        task_id=task.task_id,
+        owner_user_id=user.id,
+        report_text=wrapped_report,
+    )
+    archive_key = limra.build_limra_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limra.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    assert members["report.md"] == report_body
+    assert "历史 archive 应只下载正文。" in members["report.html"]
+    assert "研究结论" in members["report.html"]
+    assert wrapped_report not in json.dumps(members, ensure_ascii=False)
+    assert '"content"' not in members["trace.json"]
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
 
 
 @pytest.mark.asyncio
@@ -7038,6 +7702,10 @@ def test_runner_research_client_uses_server_side_headers(monkeypatch):
 
 def test_limra_router_defines_required_browser_facing_paths():
     route_contract = {
+        ("/auth/session", "GET"),
+        ("/auth/signin", "POST"),
+        ("/auth/signout", "POST"),
+        ("/auth/signup", "POST"),
         ("/scenarios", "GET"),
         ("/research", "POST"),
         ("/tasks/{task_id}", "GET"),
@@ -7075,7 +7743,7 @@ def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) ->
                 json.dumps(
                     {
                         "Authorization": "Bearer runner-token-123456",
-                        "cookie": "open_webui_session=session-secret-123456",
+                        "cookie": "legacy_session=session-secret-123456",
                         "url": "https://search.test?q=x&token=archive-token-123456",
                     }
                 ),
@@ -7106,6 +7774,58 @@ def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) ->
             archive.writestr("trace.json", "{}")
         if extra_member:
             archive.writestr(".env", "RUNNER_SERVICE_TOKEN=secret")
+    return buffer.getvalue()
+
+
+def _archive_zip_with_json_wrapped_report(
+    *,
+    task_id: str,
+    owner_user_id: str,
+    report_text: str,
+) -> bytes:
+    trace = {
+        "task": {
+            "task_id": task_id,
+            "owner_user_id": owner_user_id,
+            "query": "BYD 1260H",
+            "status": "completed",
+            "archive_status": "ready",
+            "scenario": None,
+            "error": None,
+            "model_summary": {},
+        },
+        "artifacts": {
+            "report_sections": [
+                {
+                    "section_id": "REPORT-007",
+                    "markdown": report_text,
+                    "source_event_type": "record_research_artifact",
+                }
+            ]
+        },
+        "artifact_events": [
+            {
+                "type": "report_section_generated",
+                "artifact_type": "report_section",
+                "bucket": "report_sections",
+                "local_artifact_id": "REPORT-007",
+                "source_event_type": "record_research_artifact",
+                "payload": {
+                    "section_id": "REPORT-007",
+                    "markdown": report_text,
+                },
+            }
+        ],
+        "artifact_warnings": [],
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", json.dumps({"task": trace["task"]}))
+        archive.writestr("report.html", f"<!doctype html><main>{report_text}</main>")
+        archive.writestr("report.md", report_text)
+        archive.writestr("trace.json", json.dumps(trace, ensure_ascii=False))
     return buffer.getvalue()
 
 

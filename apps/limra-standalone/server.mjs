@@ -25,7 +25,7 @@ const mimeTypes = new Map([
 const server = createServer(async (req, res) => {
 	try {
 		const requestUrl = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`);
-		if (isLimraApiPath(requestUrl.pathname)) {
+		if (isAllowedApiPath(requestUrl.pathname)) {
 			await proxyApi(req, res, requestUrl);
 			return;
 		}
@@ -47,6 +47,10 @@ server.listen(port, host, () => {
 	console.log(`limra standalone frontend listening on http://${host}:${port}`);
 	console.log(`proxying /api/limra/* to ${backendUrl}`);
 });
+
+function isAllowedApiPath(pathname) {
+	return isLimraApiPath(pathname);
+}
 
 function isLimraApiPath(pathname) {
 	return pathname === '/api/limra' || pathname.startsWith('/api/limra/');
