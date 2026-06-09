@@ -2824,6 +2824,78 @@ async def test_upload_search_rejects_embedding_dimension_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_postgres_upload_search_rejects_embedding_dimension_mismatch_before_repository_search():
+    app, _repo, _storage = _limra_asgi_app()
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    provider = FakeUploadEmbeddingProvider([1.0])
+
+    async def task_repository_override():
+        return repo
+
+    async def embedding_config_override():
+        return limra.LimraUploadEmbeddingConfig(
+            enabled=True,
+            provider="fake",
+            model="fake-model",
+            dimensions=2,
+        )
+
+    async def embedding_provider_override():
+        return provider
+
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+    app.dependency_overrides[limra.get_upload_embedding_config] = (
+        embedding_config_override
+    )
+    app.dependency_overrides[limra.get_upload_embedding_provider] = (
+        embedding_provider_override
+    )
+    repo.record_uploaded_document(
+        document_id="doc-vector",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="near-vector.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket="limra-artifacts",
+        object_key="limra/users/user-a/uploads/doc-vector.txt",
+        extracted_text="Nickel supply memorandum.",
+        language=None,
+        metadata={},
+        embedding=[1.0, 0.0],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.get(
+            "/api/limra/uploads/search",
+            params={"query": "nickel"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "upload_search_embedding_dimension_mismatch"
+    assert engine.vector_search_calls == []
+    assert provider.calls == [
+        {
+            "text": "nickel",
+            "config": limra.LimraUploadEmbeddingConfig(
+                enabled=True,
+                provider="fake",
+                model="fake-model",
+                dimensions=2,
+            ),
+        }
+    ]
+    assert repo.get_user_document("doc-vector", "user-a") is not None
+
+
+@pytest.mark.asyncio
 async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
     app, repo, _storage = _limra_asgi_app()
     repo.create_task(
