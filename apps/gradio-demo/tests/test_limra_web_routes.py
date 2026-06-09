@@ -5387,6 +5387,72 @@ async def test_event_proxy_ignores_runner_events_after_terminal_status():
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_cancellation_after_terminal_yield_preserves_completed_state():
+    repo = limra.InMemoryLimraTaskRepository()
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    created = await limra.create_research_task(
+        {"query": "terminal cancellation must not regress"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    task = repo.get_task(task_id)
+
+    stream = limra._limra_event_stream(
+        task,
+        user,
+        repo,
+        research,
+        runtime_state,
+    )
+    first_chunk = await stream.__anext__()
+    events = _parse_sse_chunks([first_chunk])
+
+    with pytest.raises(StopAsyncIteration):
+        await stream.athrow(asyncio.CancelledError())
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    persisted_task = repo.get_task(task_id)
+    assert persisted_task.status == "completed"
+    assert persisted_task.archive_status == "ready"
+    assert persisted_task.error is None
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert "error" not in runtime_hash
+    assert json.loads(runtime_hash["last_event"]) == events[-1]
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert research.stream_calls
+    assert research.status_calls == []
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(runtime_hash)
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_records_nested_terminal_status_to_redis():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")

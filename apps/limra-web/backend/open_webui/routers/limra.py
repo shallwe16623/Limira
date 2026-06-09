@@ -4033,6 +4033,19 @@ async def _limra_event_stream(
             )
             yield _sse_bytes(_assert_browser_safe(status_event))
     except asyncio.CancelledError:
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            stream_close_reason = f"terminal_{current.status}"
+            await runtime_state.update_task_runtime(
+                task.task_id,
+                {
+                    "status": current.status,
+                    "archive_status": current.archive_status,
+                    "terminal": True,
+                    "error": current.error,
+                },
+            )
+            return
         stream_close_reason = "event_stream_cancelled"
         repo.update_task(
             task.task_id,
