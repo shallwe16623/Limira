@@ -236,6 +236,26 @@ def test_scrub_secrets_redacts_full_authorization_string_values():
     assert scrubbed["delimited"] == "Authorization: [REDACTED]; next=value"
 
 
+def test_scrub_secrets_preserves_news_urls_with_long_slugs():
+    url = (
+        "https://www.scmp.com/news/china/diplomacy/article/3356419/"
+        "us-adds-alibaba-byd-and-other-chinese-tech-champions-military-company-list"
+    )
+    payload = {
+        "url": url,
+        "search_result": json.dumps({"title": "SCMP result", "url": url}),
+        "source_with_query": f"{url}?api_key=secret-token-123&topic=byd",
+    }
+
+    scrubbed = scrub_secrets(payload)
+
+    assert scrubbed["url"] == url
+    assert url in scrubbed["search_result"]
+    assert scrubbed["source_with_query"].startswith(url)
+    assert "secret-token-123" not in scrubbed["source_with_query"]
+    assert "topic=byd" in scrubbed["source_with_query"]
+
+
 def test_archive_and_extracted_zip_do_not_contain_exact_secret_values(tmp_path):
     secrets = [
         "sk-querysecret123456",

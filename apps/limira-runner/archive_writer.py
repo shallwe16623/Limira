@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 
 REDACTED = "[REDACTED]"
@@ -36,6 +36,7 @@ SENSITIVE_ENV_NAMES = {
 
 AUTHORIZATION_HEADER = re.compile(r"(?im)(\bAuthorization\s*[:=]\s*)([^\r\n;,]+)")
 COOKIE_HEADER = re.compile(r"(?im)(\b(?:Set-)?Cookie\s*[:=]\s*)([^\r\n]+)")
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 SECRET_PATTERNS = (
     re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
@@ -91,9 +92,60 @@ def is_sensitive_key(key: Any) -> bool:
 
 
 def scrub_string(value: str) -> str:
+    protected_urls: list[str] = []
+
+    def protect_url(match: re.Match[str]) -> str:
+        protected_urls.append(scrub_url(match.group(0)))
+        return f"__LIMIRA_URL_{len(protected_urls) - 1}__"
+
+    scrubbed = URL_PATTERN.sub(protect_url, value)
+    scrubbed = scrub_non_url_text(scrubbed)
+    for index, url in enumerate(protected_urls):
+        scrubbed = scrubbed.replace(f"__LIMIRA_URL_{index}__", url)
+    return scrubbed
+
+
+def scrub_url(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return REDACTED
+
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return value
+
+    hostname = parts.hostname
+    if not hostname:
+        return value
+    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return REDACTED
+    if port is not None:
+        host = f"{host}:{port}"
+
+    query = urlencode(
+        [
+            (
+                key,
+                REDACTED
+                if is_sensitive_key(key)
+                else scrub_non_url_text(value, include_long_tokens=False),
+            )
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ],
+        doseq=True,
+    )
+    return urlunsplit((parts.scheme, host, parts.path, query, parts.fragment))
+
+
+def scrub_non_url_text(value: str, *, include_long_tokens: bool = True) -> str:
     scrubbed = AUTHORIZATION_HEADER.sub(r"\1" + REDACTED, value)
     scrubbed = COOKIE_HEADER.sub(r"\1" + REDACTED, scrubbed)
     for pattern in SECRET_PATTERNS:
+        if not include_long_tokens and pattern.pattern == r"\b[A-Za-z0-9_+/=]{40,}\b":
+            continue
         if pattern.pattern.startswith(r"\b("):
             scrubbed = pattern.sub(lambda m: f"{m.group(1)}={REDACTED}", scrubbed)
         elif pattern.pattern.startswith("Bearer"):
