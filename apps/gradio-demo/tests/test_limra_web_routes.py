@@ -3472,6 +3472,60 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
 
 
 @pytest.mark.asyncio
+async def test_pdf_route_rejects_blank_exporter_output_before_storage():
+    app, repo, storage = _limra_asgi_app()
+    repo.create_task(
+        task_id="task-blank-exporter-pdf",
+        owner_user_id="user-a",
+        query="blank exporter",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    blank_pdf_bytes = (
+        b"%PDF-1.4\n"
+        b"3 0 obj\n"
+        b"<</Length 0>> stream\n"
+        b"endstream\n"
+        b"endobj\n"
+        b"%%EOF"
+    )
+
+    class BlankPdfExporter:
+        async def render_pdf(self, _html_content):
+            return blank_pdf_bytes
+
+    async def pdf_exporter_override():
+        return BlankPdfExporter()
+
+    app.dependency_overrides[limra.get_pdf_exporter] = pdf_exporter_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        response = await client.post(
+            "/api/limra/tasks/task-blank-exporter-pdf/reports/pdf",
+            json={
+                "report_id": "blank-exporter",
+                "markdown": "# Visible report\n\n正文存在，但 PDF 输出为空。",
+                "evidence_refs": [],
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "pdf_export_failed"
+    assert not storage.objects
+    assert (
+        repo.get_user_report(
+            task_id="task-blank-exporter-pdf",
+            report_id="blank-exporter",
+            owner_user_id="user-a",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_pdf_route_unwraps_json_wrapped_markdown_and_rejects_empty_output():
     app, repo, _storage = _limra_asgi_app()
     pdf_exporter = app.state.test_pdf_exporter
@@ -4129,6 +4183,98 @@ async def test_playwright_pdf_exporter_rejects_blank_rendered_body(monkeypatch):
 
     assert page.pdf_called is False
     assert calls["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_falls_back_when_rendered_pdf_is_blank(monkeypatch):
+    calls = {"closed": False}
+    fallback_lines: list[str] = []
+    blank_pdf_bytes = (
+        b"%PDF-1.4\n"
+        b"3 0 obj\n"
+        b"<</Length 0>> stream\n"
+        b"endstream\n"
+        b"endobj\n"
+        b"%%EOF"
+    )
+
+    class FakePage:
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def set_content(self, _html_content, **_kwargs):
+            return None
+
+        async def evaluate(self, _expression):
+            return "Visible report text"
+
+        async def emulate_media(self, **_kwargs):
+            return None
+
+        async def pdf(self, **_kwargs):
+            return blank_pdf_bytes
+
+    class FakeBrowser:
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            calls["closed"] = True
+
+    class FakeChromium:
+        async def launch(self, args):
+            return FakeBrowser()
+
+    class FakePlaywrightContext:
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=FakeChromium())
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeFPDF:
+        def __init__(self, **_kwargs):
+            self.epw = 180
+
+        def set_auto_page_break(self, **_kwargs):
+            return None
+
+        def add_page(self):
+            return None
+
+        def add_font(self, *_args, **_kwargs):
+            return None
+
+        def set_font(self, *_args, **_kwargs):
+            return None
+
+        def ln(self, *_args, **_kwargs):
+            fallback_lines.append("")
+
+        def multi_cell(self, _width, _height, text):
+            fallback_lines.append(text)
+
+        def output(self):
+            body = "\n".join(fallback_lines).encode()
+            return b"%PDF-1.7\n" + body + b"\n%%EOF"
+
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext()
+    fpdf_module = types.ModuleType("fpdf")
+    fpdf_module.FPDF = FakeFPDF
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+    monkeypatch.setitem(sys.modules, "fpdf", fpdf_module)
+
+    pdf_bytes = await limra.PlaywrightLimraPdfExporter().render_pdf(
+        "<!doctype html><html><body><h1>Visible report text</h1><p>中文正文</p></body></html>"
+    )
+
+    assert calls["closed"] is True
+    assert pdf_bytes.startswith(b"%PDF-1.7")
+    assert not limra._persisted_report_pdf_appears_blank(pdf_bytes)
+    assert "Visible report text" in "\n".join(fallback_lines)
+    assert "中文正文" in "\n".join(fallback_lines)
 
 
 @pytest.mark.asyncio

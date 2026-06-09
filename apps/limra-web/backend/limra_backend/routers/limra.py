@@ -1494,6 +1494,8 @@ class PlaywrightLimraPdfExporter:
                         raise RuntimeError("limra_pdf_blank_rendered_body")
                     await page.emulate_media(media="print")
                     pdf_bytes = await page.pdf(format="A4", print_background=True)
+                    if _persisted_report_pdf_appears_blank(pdf_bytes):
+                        raise RuntimeError("limra_pdf_blank_rendered_pdf")
                 finally:
                     await browser.close()
             return bytes(pdf_bytes)
@@ -3824,6 +3826,8 @@ async def export_task_pdf(
     )
     try:
         pdf_bytes = await pdf_exporter.render_pdf(report_html)
+        if _persisted_report_pdf_appears_blank(pdf_bytes):
+            raise RuntimeError("limra_pdf_blank_rendered_pdf")
     except Exception as exc:
         raise HTTPException(status_code=503, detail="pdf_export_failed") from exc
     pdf_debug_artifacts = _write_pdf_debug_artifacts(
