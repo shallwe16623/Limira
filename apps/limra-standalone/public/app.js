@@ -160,7 +160,6 @@ function bindEvents() {
 		}
 	});
 	dom.exportPdfButton.addEventListener('click', () => void exportPdf());
-	dom.downloadPdfButton.addEventListener('click', () => void downloadPdf());
 }
 
 async function boot() {
@@ -1484,7 +1483,6 @@ function renderUploads() {
 function renderReportControls() {
 	const hasMarkdown = Boolean(reportMarkdown().trim());
 	dom.exportPdfButton.disabled = state.restoreBlocked || !state.taskId || !hasMarkdown || state.isExporting;
-	dom.downloadPdfButton.disabled = state.restoreBlocked || !latestReportPdfUrl();
 }
 
 function bumpWorkspaceGeneration() {

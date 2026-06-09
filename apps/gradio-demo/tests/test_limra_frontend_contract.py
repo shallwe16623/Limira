@@ -228,6 +228,7 @@ def test_limra_standalone_frontend_exposes_native_task_history_controls():
 
 def test_limra_standalone_frontend_keeps_pdf_download_bound_to_current_report():
     app = _read(LIMRA_STANDALONE_APP)
+    index = _read(LIMRA_STANDALONE_INDEX)
 
     assert "const markdown = reportMarkdown().trim();" in app
     assert "if (!state.taskId || !markdown || state.isExporting)" in app
@@ -241,6 +242,9 @@ def test_limra_standalone_frontend_keeps_pdf_download_bound_to_current_report():
     assert "URL.createObjectURL(blob)" in app
     assert "state.latestReport = null;" in app
     assert "请重新导出 PDF" in app
+    assert "downloadPdfButton" not in app
+    assert "downloadPdfButton" not in index
+    assert "导出并下载 PDF" in index
 
 
 def test_limra_standalone_stream_handler_refreshes_all_artifact_events():
