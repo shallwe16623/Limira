@@ -4272,6 +4272,83 @@ def test_postgres_repository_records_generated_report_pdf_metadata():
 
 
 @pytest.mark.asyncio
+async def test_postgres_report_pdf_download_requires_same_task_report_binding():
+    app, _memory_repo, storage = _limra_asgi_app()
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    app.dependency_overrides[limra.get_task_repository] = task_repository_override
+    repo.create_task(
+        task_id="task-owned-a",
+        owner_user_id="user-a",
+        query="same owner task a",
+        scenario=None,
+        runner_task_id="runner-task-owned-a",
+    )
+    repo.create_task(
+        task_id="task-owned-b",
+        owner_user_id="user-a",
+        query="same owner task b",
+        scenario=None,
+        runner_task_id="runner-task-owned-b",
+    )
+    pdf_bytes = b"%PDF-1.7\nsame owner report\n%%EOF"
+    pdf_key = limra.build_limra_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-owned-b",
+        filename="report-shared.pdf",
+        object_id="report-shared",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=pdf_bytes,
+        content_type="application/pdf",
+        metadata={"task_id": "task-owned-b", "report_id": "report-shared"},
+    )
+    repo.record_generated_report(
+        report_id="report-shared",
+        task_id="task-owned-b",
+        report_type="final",
+        markdown="Same owner report",
+        html="<p>Same owner report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=[],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+            "pdf_size_bytes": len(pdf_bytes),
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limra.test",
+    ) as client:
+        wrong_task_response = await client.get(
+            "/api/limra/tasks/task-owned-a/reports/report-shared/pdf"
+        )
+        correct_task_response = await client.get(
+            "/api/limra/tasks/task-owned-b/reports/report-shared/pdf"
+        )
+
+    assert wrong_task_response.status_code == 404
+    assert wrong_task_response.json()["detail"] == "report_not_found"
+    assert wrong_task_response.content != pdf_bytes
+    _assert_no_browser_leak(wrong_task_response.json())
+    assert correct_task_response.status_code == 200
+    assert correct_task_response.content == pdf_bytes
+    assert correct_task_response.headers["content-type"].startswith("application/pdf")
+    assert correct_task_response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
 async def test_postgres_pdf_download_clears_invalid_persisted_pdf_object_key():
     engine = FakeLimraPostgresEngine()
     repo = limra.PostgresLimraTaskRepository(
