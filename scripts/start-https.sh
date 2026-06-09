@@ -21,7 +21,11 @@ public_ip() {
 
 domain_ipv4_records() {
 	if command -v dig >/dev/null 2>&1; then
-		dig +short A "$LIMIRA_DOMAIN" 2>/dev/null | awk 'NF'
+		{
+			dig +short A "$LIMIRA_DOMAIN" 2>/dev/null
+			dig @1.1.1.1 +short A "$LIMIRA_DOMAIN" 2>/dev/null
+			dig @8.8.8.8 +short A "$LIMIRA_DOMAIN" 2>/dev/null
+		} | awk 'NF' | sort -u
 	else
 		getent ahostsv4 "$LIMIRA_DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u
 	fi
@@ -42,6 +46,9 @@ download_caddy() {
 }
 
 can_bind_low_ports() {
+	if command -v getcap >/dev/null 2>&1 && getcap "$CADDY_BIN" 2>/dev/null | grep -q "cap_net_bind_service=ep"; then
+		return 0
+	fi
 	python3 - <<'PY'
 import socket
 for port in (80, 443):
