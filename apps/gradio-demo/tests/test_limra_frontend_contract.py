@@ -247,6 +247,21 @@ def test_limra_standalone_frontend_keeps_pdf_download_bound_to_current_report():
     assert "导出并下载 PDF" in index
 
 
+def test_limra_standalone_hides_raw_event_log_and_keeps_progress_panel():
+    app = _read(LIMRA_STANDALONE_APP)
+    index = _read(LIMRA_STANDALONE_INDEX)
+
+    assert "事件日志" not in index
+    assert "eventLog" not in index
+    assert "eventLog" not in app
+    assert "state.events" not in app
+    assert "recordEvent(" not in app
+    assert "renderEvents(" not in app
+    assert "实时进展" in index
+    assert 'id="messageList"' in index
+    assert 'id="clearStreamButton"' in index
+
+
 def test_limra_standalone_stream_handler_refreshes_all_artifact_events():
     app = _read(LIMRA_STANDALONE_APP)
 

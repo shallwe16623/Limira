@@ -258,6 +258,7 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
         "limra_research_tasks",
         "limra_artifact_events",
         "limra_artifact_trace_events",
+        "limra_task_event_logs",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
@@ -291,6 +292,11 @@ def test_limra_migration_creates_required_extensions_tables_and_indexes():
     assert (
         "payload jsonb not null default '{}'::jsonb"
         in tables["limra_artifact_trace_events"]["body"]
+    )
+    assert "event_log_id text primary key" in tables["limra_task_event_logs"]["body"]
+    assert (
+        "payload jsonb not null default '{}'::jsonb"
+        in tables["limra_task_event_logs"]["body"]
     )
     assert "evidence_storage_id text primary key" in tables["limra_evidence_items"]["body"]
     assert (

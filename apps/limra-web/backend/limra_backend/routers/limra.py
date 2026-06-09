@@ -516,6 +516,21 @@ class LimraTaskRepository(Protocol):
 
     def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]: ...
 
+    def record_task_event_log(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        source: str = "runner_stream",
+    ) -> None: ...
+
+    def list_task_event_logs(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]: ...
+
     def record_uploaded_document(
         self,
         *,
@@ -684,6 +699,7 @@ class InMemoryLimraTaskRepository:
         self.tasks: dict[str, LimraTask] = {}
         self.artifacts: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self.artifact_trace_events: dict[str, list[dict[str, Any]]] = {}
+        self.task_event_logs: dict[str, list[dict[str, Any]]] = {}
         self.uploaded_documents: dict[str, LimraUploadedDocument] = {}
         self.generated_reports: dict[tuple[str, str], LimraGeneratedReport] = {}
 
@@ -706,6 +722,7 @@ class InMemoryLimraTaskRepository:
         self.tasks[task_id] = task
         self.artifacts[task_id] = _empty_artifact_buckets()
         self.artifact_trace_events[task_id] = []
+        self.task_event_logs[task_id] = []
         return task
 
     def get_task(self, task_id: str) -> LimraTask | None:
@@ -772,6 +789,39 @@ class InMemoryLimraTaskRepository:
 
     def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]:
         return [dict(event) for event in self.artifact_trace_events.get(task_id, [])]
+
+    def record_task_event_log(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        source: str = "runner_stream",
+    ) -> None:
+        event_type = str(event.get("type") or "runner_event")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        self.task_event_logs.setdefault(task_id, []).append(
+            {
+                "event_log_id": str(uuid.uuid4()),
+                "task_id": task_id,
+                "event_type": event_type,
+                "source": source,
+                "payload": scrub_limra_secrets(payload),
+                "created_at": time.time(),
+            }
+        )
+
+    def list_task_event_logs(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(event)
+            for event in self.task_event_logs.get(task_id, [])[-max(1, limit):]
+        ]
 
     def record_uploaded_document(
         self,
@@ -965,6 +1015,11 @@ class SQLiteLimraTaskRepository(InMemoryLimraTaskRepository):
             for task_id, events in (state.get("artifact_trace_events") or {}).items()
             if isinstance(events, list)
         }
+        self.task_event_logs = {
+            str(task_id): [dict(event) for event in events if isinstance(event, dict)]
+            for task_id, events in (state.get("task_event_logs") or {}).items()
+            if isinstance(events, list)
+        }
         self.uploaded_documents = {
             str(document_id): LimraUploadedDocument(**payload)
             for document_id, payload in (state.get("uploaded_documents") or {}).items()
@@ -985,6 +1040,7 @@ class SQLiteLimraTaskRepository(InMemoryLimraTaskRepository):
             },
             "artifacts": self.artifacts,
             "artifact_trace_events": self.artifact_trace_events,
+            "task_event_logs": self.task_event_logs,
             "uploaded_documents": {
                 document_id: asdict(document)
                 for document_id, document in self.uploaded_documents.items()
@@ -1607,6 +1663,7 @@ class PostgresLimraTaskRepository:
         "limra_research_tasks",
         "limra_artifact_events",
         "limra_artifact_trace_events",
+        "limra_task_event_logs",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
@@ -1763,6 +1820,27 @@ class PostgresLimraTaskRepository:
         FROM limra_artifact_trace_events
         WHERE task_id = :task_id
         ORDER BY created_at ASC, trace_event_id ASC
+    """
+    INSERT_TASK_EVENT_LOG_SQL = """
+        INSERT INTO limra_task_event_logs (
+            task_id,
+            event_type,
+            source,
+            payload
+        )
+        VALUES (
+            :task_id,
+            :event_type,
+            :source,
+            CAST(:payload AS jsonb)
+        )
+    """
+    SELECT_TASK_EVENT_LOGS_SQL = """
+        SELECT event_log_id, task_id, event_type, source, payload, created_at
+        FROM limra_task_event_logs
+        WHERE task_id = :task_id
+        ORDER BY created_at DESC, event_log_id DESC
+        LIMIT :limit
     """
     INSERT_EVIDENCE_SQL = """
         INSERT INTO limra_evidence_items (
@@ -2297,6 +2375,50 @@ class PostgresLimraTaskRepository:
             if row.get("source_event_type"):
                 event["source_event_type"] = row["source_event_type"]
             events.append(event)
+        return events
+
+    def record_task_event_log(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        source: str = "runner_stream",
+    ) -> None:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        self._execute(
+            self.INSERT_TASK_EVENT_LOG_SQL,
+            {
+                "task_id": task_id,
+                "event_type": str(event.get("type") or "runner_event"),
+                "source": source,
+                "payload": _json_dumps(scrub_limra_secrets(payload)),
+            },
+        )
+
+    def list_task_event_logs(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rows = self._fetch_all(
+            self.SELECT_TASK_EVENT_LOGS_SQL,
+            {"task_id": task_id, "limit": max(1, limit)},
+        )
+        events: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            events.append(
+                {
+                    "event_log_id": row.get("event_log_id"),
+                    "task_id": row.get("task_id"),
+                    "event_type": row.get("event_type"),
+                    "source": row.get("source"),
+                    "payload": _json_loads(row.get("payload")),
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
         return events
 
     def record_uploaded_document(
@@ -3595,6 +3717,27 @@ async def admin_get_task(
     return _assert_browser_safe(payload)
 
 
+@router.get("/admin/tasks/{task_id}/event-logs")
+async def admin_get_task_event_logs(
+    task_id: str,
+    limit: int = Query(default=500, ge=1, le=2000),
+    user: LimraUser = Depends(get_current_limra_admin),
+    repo: LimraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    task = repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    events = repo.list_task_event_logs(task_id, limit=limit)
+    return _assert_browser_safe(
+        {
+            "task_id": task_id,
+            "count": len(events),
+            "events": events,
+            "admin": user.id,
+        }
+    )
+
+
 @router.get("/admin/tasks/{task_id}/archive.zip")
 async def admin_download_task_archive(
     task_id: str,
@@ -4642,7 +4785,7 @@ async def _limra_event_stream(
     current = repo.get_task(task.task_id) or task
     if current.status in FINAL_TASK_STATUSES:
         terminal_event = _terminal_status_event(current)
-        await _record_runtime_event(runtime_state, task.task_id, terminal_event)
+        await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
         await _mark_terminal_reattach_closed(
             runtime_state,
             task.task_id,
@@ -4662,11 +4805,9 @@ async def _limra_event_stream(
     )
     if not opened:
         runtime_snapshot = await runtime_state.get_task_runtime(task.task_id)
-        yield _sse_bytes(
-            _assert_browser_safe(
-                _active_stream_status_event(current, runtime_snapshot)
-            )
-        )
+        active_event = _active_stream_status_event(current, runtime_snapshot)
+        _record_task_event_log(repo, task.task_id, active_event)
+        yield _sse_bytes(_assert_browser_safe(active_event))
         return
 
     current = repo.update_task(task.task_id, status="running")
@@ -4711,7 +4852,7 @@ async def _limra_event_stream(
                 event,
                 current_agent_name=current_agent_name,
             )
-            await _record_runtime_event(runtime_state, task.task_id, event)
+            await _record_stream_event(repo, runtime_state, task.task_id, event)
             if applied_status in FINAL_TASK_STATUSES:
                 await runtime_state.update_task_runtime(
                     task.task_id,
@@ -4720,10 +4861,10 @@ async def _limra_event_stream(
 
             yield _sse_bytes(_assert_browser_safe(event))
             if warning:
-                await _record_runtime_event(runtime_state, task.task_id, warning)
+                await _record_stream_event(repo, runtime_state, task.task_id, warning)
                 yield _sse_bytes(_assert_browser_safe(warning))
             if final_report_event:
-                await _record_runtime_event(runtime_state, task.task_id, final_report_event)
+                await _record_stream_event(repo, runtime_state, task.task_id, final_report_event)
                 yield _sse_bytes(_assert_browser_safe(final_report_event))
             if applied_status in FINAL_TASK_STATUSES:
                 stream_close_reason = f"terminal_{applied_status}"
@@ -4737,7 +4878,7 @@ async def _limra_event_stream(
                 research_client,
             )
             if status_event:
-                await _record_runtime_event(runtime_state, task.task_id, status_event)
+                await _record_stream_event(repo, runtime_state, task.task_id, status_event)
                 stream_close_reason = _stream_close_reason_from_event(
                     status_event,
                     stream_close_reason,
@@ -4753,7 +4894,7 @@ async def _limra_event_stream(
             reason=exc.reason,
         )
         if status_event:
-            await _record_runtime_event(runtime_state, task.task_id, status_event)
+            await _record_stream_event(repo, runtime_state, task.task_id, status_event)
             stream_close_reason = _stream_close_reason_from_event(
                 status_event,
                 stream_close_reason,
@@ -4795,7 +4936,7 @@ async def _limra_event_stream(
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
             terminal_event = _terminal_status_event(current)
-            await _record_runtime_event(runtime_state, task.task_id, terminal_event)
+            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
             yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
         public_error = _public_error_text(
@@ -4813,14 +4954,14 @@ async def _limra_event_stream(
             "type": "error",
             "payload": {"error": public_error},
         }
-        await _record_runtime_event(runtime_state, task.task_id, error_event)
+        await _record_stream_event(repo, runtime_state, task.task_id, error_event)
         yield _sse_bytes(_assert_browser_safe(error_event))
     except Exception as exc:
         stream_close_reason = "limra_event_proxy_failed"
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
             terminal_event = _terminal_status_event(current)
-            await _record_runtime_event(runtime_state, task.task_id, terminal_event)
+            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
             yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
         repo.update_task(
@@ -4834,7 +4975,7 @@ async def _limra_event_stream(
             "type": "error",
             "payload": {"error": "limra_event_proxy_failed"},
         }
-        await _record_runtime_event(runtime_state, task.task_id, error_event)
+        await _record_stream_event(repo, runtime_state, task.task_id, error_event)
         yield _sse_bytes(_assert_browser_safe(error_event))
     finally:
         await _mark_runtime_stream_closed(
@@ -4965,6 +5106,35 @@ def _active_stream_status_event(
         "type": "status",
         "payload": payload,
     }
+
+
+async def _record_stream_event(
+    repo: LimraTaskRepository,
+    runtime_state: LimraRuntimeState,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    _record_task_event_log(repo, task_id, event)
+    await _record_runtime_event(runtime_state, task_id, event)
+
+
+def _record_task_event_log(
+    repo: LimraTaskRepository,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    try:
+        repo.record_task_event_log(
+            task_id,
+            _assert_browser_safe(event),
+            source="runner_stream",
+        )
+    except Exception:
+        log.warning(
+            "Failed to persist limra task event log",
+            extra={"task_id": task_id},
+            exc_info=True,
+        )
 
 
 async def _record_runtime_event(

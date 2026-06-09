@@ -445,8 +445,7 @@ h2 {
 }
 
 .artifact-card,
-.upload-card,
-.event-card {
+.upload-card {
 	border: 1px solid var(--border);
 	border-radius: 8px;
 	padding: 0.8rem;
@@ -586,18 +585,6 @@ h2 {
 .upload-card a:hover,
 .artifact-card a:hover {
 	text-decoration: underline;
-}
-
-.event-log {
-	display: grid;
-	gap: 0.5rem;
-	max-height: 34vh;
-	overflow: auto;
-}
-
-.event-card {
-	font-size: 0.78rem;
-	color: var(--muted);
 }
 
 .graph-svg,

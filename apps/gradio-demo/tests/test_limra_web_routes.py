@@ -1356,6 +1356,56 @@ async def test_admin_access_requires_explicit_admin_route():
 
 
 @pytest.mark.asyncio
+async def test_admin_task_event_logs_are_persisted_for_operations_only():
+    repo = limra.InMemoryLimraTaskRepository()
+    research = FakeResearchClient(
+        events=[
+            {
+                "event": "start_of_workflow",
+                "data": {"message": "internal-looking user noise"},
+            },
+            {
+                "event": "status",
+                "data": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    user = limra.LimraUser("user-a")
+    admin = limra.LimraUser("admin-user", role="admin")
+    created = await limra.create_research_task(
+        {"query": "ops event log boundary"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    response = await limra.get_task_events(
+        created["task_id"],
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limra.InMemoryLimraRuntimeState(),
+    )
+    streamed_events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    payload = await limra.admin_get_task_event_logs(
+        created["task_id"],
+        limit=500,
+        user=admin,
+        repo=repo,
+    )
+
+    assert payload["admin"] == "admin-user"
+    assert payload["task_id"] == created["task_id"]
+    assert payload["count"] == len(payload["events"])
+    assert [event["event_type"] for event in payload["events"]] == [
+        event["type"] for event in streamed_events
+    ]
+    assert all(event["source"] == "runner_stream" for event in payload["events"])
+    assert all(event["task_id"] == created["task_id"] for event in payload["events"])
+
+
+@pytest.mark.asyncio
 async def test_postgres_admin_archive_download_generates_owner_scoped_archive():
     app, _memory_repo, storage = _limra_asgi_app()
     engine = FakeLimraPostgresEngine()
@@ -4373,6 +4423,7 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
         "limra_research_tasks",
         "limra_artifact_events",
         "limra_artifact_trace_events",
+        "limra_task_event_logs",
         "limra_evidence_items",
         "limra_entities",
         "limra_entity_relations",
@@ -4396,6 +4447,8 @@ def test_postgres_repository_sql_targets_limra_task_and_artifact_tables():
     assert "select artifact_type, payload" in sql
     assert "insert into limra_artifact_trace_events" in sql
     assert "from limra_artifact_trace_events" in sql
+    assert "insert into limra_task_event_logs" in sql
+    assert "from limra_task_event_logs" in sql
     assert "on conflict" in sql
     assert "on conflict (task_id, artifact_type, local_artifact_id)" in sql
     assert "on conflict (task_id, evidence_id)" in sql
@@ -8008,6 +8061,7 @@ def test_limra_router_defines_required_browser_facing_paths():
         ("/tasks/{task_id}/reports/pdf", "POST"),
         ("/tasks/{task_id}/reports/{report_id}/pdf", "GET"),
         ("/admin/tasks/{task_id}", "GET"),
+        ("/admin/tasks/{task_id}/event-logs", "GET"),
         ("/admin/tasks/{task_id}/archive.zip", "GET"),
     }
     actual = {
@@ -8468,6 +8522,7 @@ class FakeLimraPostgresEngine:
         self.tasks = {}
         self.artifact_events = {}
         self.artifact_trace_events = []
+        self.task_event_logs = []
         self.uploaded_documents = {}
         self.vector_search_calls = []
         self.generated_reports = {}
@@ -8583,6 +8638,27 @@ class FakeLimraPostgresEngine:
                 for (task_id, _artifact_type, _local_id), row in self.artifact_events.items()
                 if task_id == params["task_id"]
             ]
+            return FakeLimraPostgresResult(rows)
+
+        if "insert into limra_task_event_logs" in sql:
+            self.task_event_logs.append(
+                {
+                    "event_log_id": f"event-log-{len(self.task_event_logs) + 1}",
+                    "task_id": params["task_id"],
+                    "event_type": params["event_type"],
+                    "source": params["source"],
+                    "payload": params["payload"],
+                    "created_at": f"2026-06-09T00:00:{len(self.task_event_logs):02d}+00:00",
+                }
+            )
+            return FakeLimraPostgresResult([])
+
+        if "from limra_task_event_logs" in sql:
+            rows = [
+                row
+                for row in reversed(self.task_event_logs)
+                if row["task_id"] == params["task_id"]
+            ][: params["limit"]]
             return FakeLimraPostgresResult(rows)
 
         if "insert into limra_uploaded_documents" in sql:

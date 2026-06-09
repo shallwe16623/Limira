@@ -84,6 +84,18 @@ CREATE TABLE IF NOT EXISTS limra_artifact_trace_events (
 CREATE INDEX IF NOT EXISTS idx_limra_artifact_trace_events_task_created
     ON limra_artifact_trace_events (task_id, created_at);
 
+CREATE TABLE IF NOT EXISTS limra_task_event_logs (
+    event_log_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id TEXT NOT NULL REFERENCES limra_research_tasks (task_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'runner_stream',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_limra_task_event_logs_task_created
+    ON limra_task_event_logs (task_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS limra_evidence_items (
     evidence_storage_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     evidence_id TEXT NOT NULL,

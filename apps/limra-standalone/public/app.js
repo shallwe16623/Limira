@@ -14,7 +14,6 @@ const artifactEvents = new Set([
 const STORAGE_KEY = 'limraStandaloneWorkspace:v2';
 const LEGACY_STORAGE_KEYS = ['limraStandaloneWorkspace:v1'];
 const MAX_STORED_MESSAGES = 100;
-const MAX_STORED_EVENTS = 100;
 const MAX_HISTORY_TASKS = 30;
 const STATUS_LABELS = {
 	ready: '就绪',
@@ -100,7 +99,6 @@ const state = {
 	latestReportMarkdown: '',
 	finalReportText: '',
 	messages: initialMessages(),
-	events: [],
 	artifacts: emptyArtifacts(),
 	uploads: [],
 	uploadResults: [],
@@ -192,7 +190,6 @@ function renderShell() {
 	renderTabs();
 	renderUploads();
 	renderReportControls();
-	renderEvents();
 }
 
 function renderAuthMode() {
@@ -408,7 +405,6 @@ async function selectHistoryTask(taskId) {
 	renderMessages();
 	renderTabs();
 	renderReportControls();
-	renderEvents();
 	try {
 		await refreshTask();
 		await loadArtifacts();
@@ -424,7 +420,6 @@ async function selectHistoryTask(taskId) {
 			renderHistory();
 			renderTabs();
 			renderReportControls();
-			renderEvents();
 		}
 		addMessage('error', `无法加载历史任务：${errorMessage(error)}`);
 	}
@@ -442,7 +437,6 @@ function startNewChat() {
 	renderMessages();
 	renderTabs();
 	renderReportControls();
-	renderEvents();
 	void loadUploads();
 }
 
@@ -460,7 +454,6 @@ function resetCurrentTaskView() {
 	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.messages = initialMessages();
-	state.events = [];
 	state.artifacts = emptyArtifacts();
 	state.uploadResults = [];
 }
@@ -532,7 +525,6 @@ function restoreWorkspace() {
 		typeof saved.latestReportMarkdown === 'string' ? saved.latestReportMarkdown : '';
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
-	state.events = Array.isArray(saved.events) ? saved.events : [];
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
 		: emptyArtifacts();
@@ -555,7 +547,6 @@ function saveWorkspace() {
 		latestReportMarkdown: state.latestReportMarkdown,
 		finalReportText: state.finalReportText,
 		messages: state.messages.slice(-MAX_STORED_MESSAGES),
-		events: state.events.slice(-MAX_STORED_EVENTS),
 		artifacts: state.artifacts
 	};
 	try {
@@ -567,7 +558,6 @@ function saveWorkspace() {
 				JSON.stringify({
 					...payload,
 					messages: state.messages.slice(-30),
-					events: state.events.slice(-30),
 					artifacts: emptyArtifacts()
 				})
 			);
@@ -599,7 +589,6 @@ function resetWorkspaceState() {
 	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.messages = initialMessages();
-	state.events = [];
 	state.artifacts = emptyArtifacts();
 	state.uploads = [];
 	state.uploadResults = [];
@@ -769,8 +758,6 @@ function handleStreamEvent(payload) {
 	updateArchiveState(data);
 	updateArchiveState(nested);
 
-	recordEvent(eventType, payload);
-
 	if (status) {
 		state.status = String(status);
 	}
@@ -778,7 +765,6 @@ function handleStreamEvent(payload) {
 	if (eventType === 'heartbeat') {
 		saveWorkspace();
 		renderStatus();
-		renderEvents();
 		return;
 	}
 
@@ -809,7 +795,6 @@ function handleStreamEvent(payload) {
 	}
 
 	renderStatus();
-	renderEvents();
 	saveWorkspace();
 }
 
@@ -1600,29 +1585,10 @@ function latestReportPdfUrl() {
 	return latestReportMatchesCurrentMarkdown() ? reportPdfUrl(state.latestReport) : '';
 }
 
-function renderEvents() {
-	dom.eventLog.innerHTML = state.events
-		.slice(-35)
-		.reverse()
-		.map(
-			(entry) => `<article class="event-card">
-				<strong>${escapeHtml(eventLabel(entry.event))}</strong><br />
-				${escapeHtml(entry.summary)}
-			</article>`
-		)
-		.join('');
-}
-
 function addMessage(role, content) {
 	state.messages = [...state.messages, { role, content: String(content), time: now() }];
 	saveWorkspace();
 	renderMessages();
-}
-
-function recordEvent(event, payload) {
-	const summary = event === 'heartbeat' ? '心跳' : stringifyCompact(payload, 320);
-	state.events = [...state.events.slice(-99), { event, summary }];
-	saveWorkspace();
 }
 
 async function api(path, options = {}) {
