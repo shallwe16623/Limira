@@ -5534,6 +5534,116 @@ async def test_event_proxy_records_authoritative_terminal_status_to_redis():
 
 
 @pytest.mark.asyncio
+async def test_postgres_event_proxy_authoritative_terminal_status_closes_runtime_stream():
+    engine = FakeLimraPostgresEngine()
+    repo = limra.PostgresLimraTaskRepository(
+        "postgresql://limra:test@postgres:5432/limra",
+        engine_factory=lambda _url: engine,
+    )
+    user = limra.LimraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limra.RedisLimraRuntimeState(redis, key_prefix="test:limra")
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "completed",
+            "archive_status": "ready",
+        },
+    )
+    created = await limra.create_research_task(
+        {"query": "postgres authoritative terminal status"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+                "status_source": "runner",
+            },
+        }
+    ]
+    persisted_task = repo.get_task(task_id)
+    assert persisted_task.status == "completed"
+    assert persisted_task.archive_status == "ready"
+    assert persisted_task.error is None
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["last_event"]) == events[-1]
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert len(research.stream_calls) == 1
+    assert len(research.status_calls) == 1
+
+    reattach_research = FakeResearchClient(
+        stream_exception=AssertionError("terminal reattach must not call runner")
+    )
+    reattach_response = await limra.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=reattach_research,
+        runtime_state=runtime_state,
+    )
+    reattach_events = _parse_sse_chunks(
+        [chunk async for chunk in reattach_response.body_iterator]
+    )
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert reattach_events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert reattach_research.stream_calls == []
+    assert reattach_research.status_calls == []
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_reattach"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "reattach_events": reattach_events,
+            "task": (await limra.get_task(task_id, user=user, repo=repo)),
+            "runtime": runtime_hash,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
 async def test_terminal_task_reattach_records_terminal_runtime_state_to_redis():
     repo = limra.InMemoryLimraTaskRepository()
     user = limra.LimraUser("user-a")
