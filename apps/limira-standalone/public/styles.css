@@ -744,6 +744,28 @@ a:hover {
 	box-shadow: var(--shadow-md);
 }
 
+.auth-links {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.75rem;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.auth-links button {
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: var(--accent);
+	font: inherit;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.auth-links button:hover {
+	text-decoration: underline;
+}
+
 .segmented-control {
 	display: grid;
 	grid-template-columns: 1fr 1fr;

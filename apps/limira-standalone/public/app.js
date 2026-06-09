@@ -79,6 +79,7 @@ const state = {
 	authMode: 'signin',
 	token: localStorage.getItem('limiraToken') || '',
 	user: null,
+	pendingAuthEmail: '',
 	scenarios: [],
 	selectedScenario: '',
 	savedUserId: '',
@@ -128,6 +129,8 @@ function bindEvents() {
 	});
 	dom.signinModeButton.addEventListener('click', () => setAuthMode('signin'));
 	dom.signupModeButton.addEventListener('click', () => setAuthMode('signup'));
+	dom.forgotPasswordButton.addEventListener('click', () => setAuthMode('forgot'));
+	dom.resendVerificationButton.addEventListener('click', () => void resendVerificationEmail());
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
@@ -163,6 +166,18 @@ function bindEvents() {
 async function boot() {
 	clearLegacyWorkspaceStorage();
 	restoreWorkspace();
+	const authLinkState = await handleAuthLinkTokens();
+	if (authLinkState === 'signed-in') {
+		await loadScenarios();
+		await loadTaskHistory();
+		await resumeWorkspace();
+		renderShell();
+		return;
+	}
+	if (authLinkState === 'pending') {
+		renderShell();
+		return;
+	}
 	try {
 		await loadSession();
 		await loadScenarios();
@@ -195,10 +210,27 @@ function renderShell() {
 function renderAuthMode() {
 	dom.signinModeButton.classList.toggle('active', state.authMode === 'signin');
 	dom.signupModeButton.classList.toggle('active', state.authMode === 'signup');
-	dom.nameInput.parentElement.classList.toggle('hidden', state.authMode !== 'signup');
-	dom.authSubmitButton.textContent = state.authMode === 'signup' ? '注册' : '登录';
+	dom.nameLabel.classList.toggle('hidden', state.authMode !== 'signup');
+	dom.emailLabel.classList.toggle('hidden', state.authMode === 'reset');
+	dom.passwordLabel.classList.toggle('hidden', state.authMode === 'forgot');
+	dom.resetTokenLabel.classList.toggle('hidden', state.authMode !== 'reset');
+	dom.forgotPasswordButton.classList.toggle('hidden', state.authMode !== 'signin');
+	dom.resendVerificationButton.classList.toggle('hidden', state.authMode === 'reset');
+	dom.emailInput.disabled = state.authMode === 'reset';
+	dom.emailInput.required = state.authMode !== 'reset';
+	dom.passwordInput.disabled = state.authMode === 'forgot';
+	dom.passwordInput.required = state.authMode !== 'forgot';
+	dom.resetTokenInput.disabled = state.authMode !== 'reset';
+	dom.resetTokenInput.required = state.authMode === 'reset';
+	const submitText = {
+		signin: '登录',
+		signup: '注册',
+		forgot: '发送重置邮件',
+		reset: '重置密码'
+	};
+	dom.authSubmitButton.textContent = submitText[state.authMode] || '登录';
 	dom.passwordInput.autocomplete =
-		state.authMode === 'signup' ? 'new-password' : 'current-password';
+		state.authMode === 'signin' ? 'current-password' : 'new-password';
 }
 
 function setAuthMode(mode) {
@@ -211,29 +243,46 @@ async function authenticate() {
 	const email = dom.emailInput.value.trim();
 	const password = dom.passwordInput.value;
 	const name = dom.nameInput.value.trim();
-	const path = state.authMode === 'signup' ? '/api/limira/auth/signup' : '/api/limira/auth/signin';
-	const payload =
-		state.authMode === 'signup'
-			? { name: name || email, email, password }
-			: { email, password };
 	dom.authMessage.textContent = '处理中...';
 	try {
+		if (state.authMode === 'forgot') {
+			await api('/api/limira/auth/password-reset/request', {
+				method: 'POST',
+				body: { email }
+			});
+			state.pendingAuthEmail = email;
+			dom.authMessage.textContent = '如果这个邮箱已注册，我们已经发送了密码重置邮件。';
+			return;
+		}
+		if (state.authMode === 'reset') {
+			const user = await api('/api/limira/auth/password-reset/confirm', {
+				method: 'POST',
+				body: { token: dom.resetTokenInput.value.trim(), password }
+			});
+			await finishAuthenticated(user);
+			dom.authMessage.textContent = '';
+			return;
+		}
+		const path = state.authMode === 'signup' ? '/api/limira/auth/signup' : '/api/limira/auth/signin';
+		const payload =
+			state.authMode === 'signup'
+				? { name: name || email, email, password }
+				: { email, password };
 		const user = await api(path, { method: 'POST', body: payload });
-		setUser(user);
+		if (state.authMode === 'signup' && user?.email_verification_required) {
+			state.pendingAuthEmail = email;
+			setAuthMode('signin');
+			dom.emailInput.value = email;
+			dom.authMessage.textContent = '注册成功，请打开验证邮件完成邮箱验证后再登录。';
+			return;
+		}
+		await finishAuthenticated(user);
 		dom.authMessage.textContent = '';
-		await loadScenarios();
-		await loadTaskHistory();
-		await loadUploads();
-		renderShell();
 	} catch (error) {
 		if (error?.responseOk) {
 			try {
 				await loadSession();
-				dom.authMessage.textContent = '';
-				await loadScenarios();
-				await loadTaskHistory();
-				await loadUploads();
-				renderShell();
+				await finishAuthenticated(state.user);
 				return;
 			} catch {
 				// Fall through to the controlled parse error below.
@@ -241,6 +290,74 @@ async function authenticate() {
 		}
 		dom.authMessage.textContent = errorMessage(error);
 	}
+}
+
+async function finishAuthenticated(user) {
+	setUser(user);
+	dom.authMessage.textContent = '';
+	await loadScenarios();
+	await loadTaskHistory();
+	await loadUploads();
+	renderShell();
+}
+
+async function resendVerificationEmail() {
+	const email = dom.emailInput.value.trim() || state.pendingAuthEmail;
+	if (!email) {
+		dom.authMessage.textContent = '请输入邮箱后再重发验证邮件。';
+		return;
+	}
+	dom.authMessage.textContent = '正在发送验证邮件...';
+	try {
+		await api('/api/limira/auth/resend-verification', {
+			method: 'POST',
+			body: { email }
+		});
+		state.pendingAuthEmail = email;
+		dom.authMessage.textContent = '如果这个邮箱需要验证，我们已经重新发送了验证邮件。';
+	} catch (error) {
+		dom.authMessage.textContent = errorMessage(error);
+	}
+}
+
+async function handleAuthLinkTokens() {
+	const url = new URL(window.location.href);
+	const verifyToken = url.searchParams.get('verify_email_token');
+	const resetToken = url.searchParams.get('reset_password_token');
+	if (verifyToken) {
+		setAuthMode('signin');
+		dom.authMessage.textContent = '正在验证邮箱...';
+		try {
+			const user = await api('/api/limira/auth/verify-email', {
+				method: 'POST',
+				body: { token: verifyToken }
+			});
+			clearAuthUrlParams(['verify_email_token']);
+			await finishAuthenticated(user);
+			return 'signed-in';
+		} catch (error) {
+			clearAuthUrlParams(['verify_email_token']);
+			dom.authMessage.textContent = `邮箱验证失败：${errorMessage(error)}`;
+			return 'pending';
+		}
+	}
+	if (resetToken) {
+		setAuthMode('reset');
+		dom.resetTokenInput.value = resetToken;
+		dom.passwordInput.value = '';
+		clearAuthUrlParams(['reset_password_token']);
+		dom.authMessage.textContent = '请输入新密码完成重置。';
+		return 'pending';
+	}
+	return '';
+}
+
+function clearAuthUrlParams(keys) {
+	const url = new URL(window.location.href);
+	for (const key of keys) {
+		url.searchParams.delete(key);
+	}
+	window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
 async function loadSession() {

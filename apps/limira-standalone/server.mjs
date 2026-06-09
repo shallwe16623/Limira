@@ -67,6 +67,8 @@ function rejectPrivateApi(res) {
 async function proxyApi(req, res, requestUrl) {
 	const target = `${backendUrl}${requestUrl.pathname}${requestUrl.search}`;
 	const headers = { ...req.headers };
+	headers['x-forwarded-host'] = headers['x-forwarded-host'] || req.headers.host || '';
+	headers['x-forwarded-proto'] = headers['x-forwarded-proto'] || 'http';
 	delete headers.host;
 	delete headers.connection;
 	delete headers['content-length'];

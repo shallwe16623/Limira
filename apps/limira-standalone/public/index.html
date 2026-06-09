@@ -33,19 +33,27 @@
 						<button id="signinModeButton" class="active" type="button">登录</button>
 						<button id="signupModeButton" type="button">注册</button>
 					</div>
-					<label>
+					<label id="nameLabel">
 						姓名
 						<input id="nameInput" autocomplete="name" placeholder="请输入姓名" />
 					</label>
-					<label>
+					<label id="emailLabel">
 						邮箱
 						<input id="emailInput" autocomplete="email" type="email" placeholder="you@example.com" required />
 					</label>
-					<label>
+					<label id="passwordLabel">
 						密码
 						<input id="passwordInput" autocomplete="current-password" type="password" required />
 					</label>
+					<label id="resetTokenLabel" class="hidden">
+						重置令牌
+						<input id="resetTokenInput" autocomplete="one-time-code" readonly />
+					</label>
 					<button id="authSubmitButton" class="primary-button" type="submit">登录</button>
+					<div class="auth-links">
+						<button id="forgotPasswordButton" type="button">忘记密码？</button>
+						<button id="resendVerificationButton" type="button">重发验证邮件</button>
+					</div>
 					<div id="authMessage" class="inline-message"></div>
 				</form>
 			</section>

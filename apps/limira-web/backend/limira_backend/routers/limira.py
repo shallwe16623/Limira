@@ -11,12 +11,15 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import smtplib
 import time
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass
+from email.message import EmailMessage
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -100,8 +103,20 @@ LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV = "LIMIRA_LEGACY_AUTH_SQLITE_PATH"
 LIMIRA_AUTH_SECRET_ENV = "LIMIRA_AUTH_SECRET"
 LIMIRA_AUTH_TOKEN_TTL_SECONDS_ENV = "LIMIRA_AUTH_TOKEN_TTL_SECONDS"
 LIMIRA_AUTH_COOKIE_SECURE_ENV = "LIMIRA_AUTH_COOKIE_SECURE"
+LIMIRA_PUBLIC_BASE_URL_ENV = "LIMIRA_PUBLIC_BASE_URL"
+LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV = "LIMIRA_AUTH_EMAIL_OUTBOX_PATH"
+LIMIRA_AUTH_EMAIL_VERIFY_TTL_SECONDS_ENV = "LIMIRA_AUTH_EMAIL_VERIFY_TTL_SECONDS"
+LIMIRA_AUTH_PASSWORD_RESET_TTL_SECONDS_ENV = "LIMIRA_AUTH_PASSWORD_RESET_TTL_SECONDS"
+LIMIRA_SMTP_HOST_ENV = "LIMIRA_SMTP_HOST"
+LIMIRA_SMTP_PORT_ENV = "LIMIRA_SMTP_PORT"
+LIMIRA_SMTP_USERNAME_ENV = "LIMIRA_SMTP_USERNAME"
+LIMIRA_SMTP_PASSWORD_ENV = "LIMIRA_SMTP_PASSWORD"
+LIMIRA_SMTP_FROM_ENV = "LIMIRA_SMTP_FROM"
+LIMIRA_SMTP_TLS_ENV = "LIMIRA_SMTP_TLS"
 LIMIRA_AUTH_COOKIE_NAME = "limira_session"
 LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
+LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS = 60 * 60 * 24
+LIMIRA_AUTH_DEFAULT_PASSWORD_RESET_TTL_SECONDS = 60 * 60
 LIMIRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 OBJECT_KEY_FORBIDDEN_FIELDS = {
@@ -355,12 +370,30 @@ class LimiraAuthSignupRequest(BaseModel):
     name: str | None = Field(default=None, max_length=320)
 
 
+class LimiraAuthVerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=512)
+
+
+class LimiraAuthResendVerificationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class LimiraAuthPasswordResetRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class LimiraAuthPasswordResetConfirmRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=512)
+    password: str = Field(min_length=1, max_length=4096)
+
+
 @dataclass(frozen=True)
 class LimiraUser:
     id: str
     role: str = "user"
     email: str | None = None
     name: str | None = None
+    email_verified_at: int | None = None
 
     @property
     def is_admin(self) -> bool:
@@ -375,6 +408,7 @@ class LimiraAuthRecord:
     role: str
     password_hash: str
     active: bool = True
+    email_verified_at: int | None = None
 
 
 @dataclass
@@ -2813,6 +2847,20 @@ def _limira_auth_token_ttl_seconds(env: Any = os.environ) -> int:
         return LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS
 
 
+def _limira_auth_flow_ttl_seconds(
+    env_name: str,
+    default_seconds: int,
+    env: Any = os.environ,
+) -> int:
+    raw_value = str(env.get(env_name) or "").strip()
+    if not raw_value:
+        return default_seconds
+    try:
+        return max(300, int(raw_value))
+    except ValueError:
+        return default_seconds
+
+
 def _limira_auth_secret(env: Any = os.environ) -> bytes:
     secret = str(env.get(LIMIRA_AUTH_SECRET_ENV) or "").strip()
     if not secret:
@@ -2822,6 +2870,13 @@ def _limira_auth_secret(env: Any = os.environ) -> bytes:
 
 def _limira_auth_cookie_secure(env: Any = os.environ) -> bool:
     return str(env.get(LIMIRA_AUTH_COOKIE_SECURE_ENV) or "").strip().lower() in TRUTHY_ENV_VALUES
+
+
+def _limira_auth_email_outbox_path(env: Any = os.environ) -> str:
+    raw_path = str(env.get(LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV) or "").strip()
+    if raw_path:
+        return os.path.abspath(os.path.expanduser(raw_path))
+    return os.path.join(_limira_data_dir(env), "limira_auth_email_outbox.jsonl")
 
 
 def _limira_auth_connect(env: Any = os.environ) -> sqlite3.Connection:
@@ -2844,13 +2899,47 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
             role TEXT NOT NULL DEFAULT 'user',
             password_hash TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1,
+            email_verified_at INTEGER,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         )
         """
     )
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(limira_auth_users)").fetchall()
+    }
+    if "email_verified_at" not in columns:
+        connection.execute("ALTER TABLE limira_auth_users ADD COLUMN email_verified_at INTEGER")
+        connection.execute(
+            """
+            UPDATE limira_auth_users
+            SET email_verified_at = COALESCE(email_verified_at, created_at)
+            WHERE active = 1
+            """
+        )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_limira_auth_users_email ON limira_auth_users(email)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS limira_auth_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at INTEGER NOT NULL,
+            consumed_at INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES limira_auth_users(id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_limira_auth_tokens_user_kind
+        ON limira_auth_tokens(user_id, kind, consumed_at)
+        """
     )
     connection.commit()
 
@@ -2909,8 +2998,8 @@ def _migrate_legacy_auth_if_needed(connection: sqlite3.Connection, env: Any = os
         connection.execute(
             """
             INSERT OR IGNORE INTO limira_auth_users (
-                id, email, name, role, password_hash, active, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                id, email, name, role, password_hash, active, email_verified_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(row["id"]),
@@ -2919,6 +3008,7 @@ def _migrate_legacy_auth_if_needed(connection: sqlite3.Connection, env: Any = os
                 str(row["role"] or "user"),
                 str(row["password_hash"]),
                 1 if row["active"] else 0,
+                timestamp if row["active"] else None,
                 timestamp,
                 timestamp,
             ),
@@ -2934,6 +3024,7 @@ def _limira_auth_user_from_row(row: sqlite3.Row | Mapping[str, Any]) -> LimiraAu
         role=str(row["role"] or "user"),
         password_hash=str(row["password_hash"]),
         active=bool(row["active"]),
+        email_verified_at=int(row["email_verified_at"]) if row["email_verified_at"] is not None else None,
     )
 
 
@@ -2942,7 +3033,7 @@ def _limira_auth_get_user_by_email(email: str, env: Any = os.environ) -> LimiraA
     with _limira_auth_connect(env) as connection:
         row = connection.execute(
             """
-            SELECT id, email, name, role, password_hash, active
+            SELECT id, email, name, role, password_hash, active, email_verified_at
             FROM limira_auth_users
             WHERE lower(email) = lower(?)
             """,
@@ -2955,7 +3046,7 @@ def _limira_auth_get_user_by_id(user_id: str, env: Any = os.environ) -> LimiraAu
     with _limira_auth_connect(env) as connection:
         row = connection.execute(
             """
-            SELECT id, email, name, role, password_hash, active
+            SELECT id, email, name, role, password_hash, active, email_verified_at
             FROM limira_auth_users
             WHERE id = ?
             """,
@@ -2974,8 +3065,7 @@ def _limira_auth_insert_user(
 ) -> LimiraAuthRecord:
     normalized_email = _normalize_auth_email(email)
     normalized_name = str(name or normalized_email).strip() or normalized_email
-    if len(password.encode("utf-8")) > 72:
-        raise HTTPException(status_code=400, detail="password_too_long")
+    _validate_auth_password(password)
     timestamp = int(time.time())
     password_hash = _limira_hash_password(password)
     user_id = str(uuid.uuid4())
@@ -2984,8 +3074,8 @@ def _limira_auth_insert_user(
             connection.execute(
                 """
                 INSERT INTO limira_auth_users (
-                    id, email, name, role, password_hash, active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    id, email, name, role, password_hash, active, email_verified_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?)
                 """,
                 (
                     user_id,
@@ -3004,6 +3094,11 @@ def _limira_auth_insert_user(
     if created is None:
         raise HTTPException(status_code=500, detail="auth_user_create_failed")
     return created
+
+
+def _validate_auth_password(password: str) -> None:
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="password_too_long")
 
 
 def _normalize_auth_email(email: str) -> str:
@@ -3058,6 +3153,276 @@ def _limira_verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def _limira_auth_one_time_token_hash(
+    *,
+    kind: str,
+    token: str,
+    env: Any = os.environ,
+) -> str:
+    return hmac.new(
+        _limira_auth_secret(env),
+        f"{kind}:{token}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _limira_auth_create_one_time_token(
+    *,
+    user_id: str,
+    kind: str,
+    ttl_seconds: int,
+    env: Any = os.environ,
+) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = _limira_auth_one_time_token_hash(kind=kind, token=token, env=env)
+    now = int(time.time())
+    expires_at = now + ttl_seconds
+    with _limira_auth_connect(env) as connection:
+        connection.execute(
+            """
+            UPDATE limira_auth_tokens
+            SET consumed_at = ?
+            WHERE user_id = ? AND kind = ? AND consumed_at IS NULL
+            """,
+            (now, str(user_id), kind),
+        )
+        connection.execute(
+            """
+            INSERT INTO limira_auth_tokens (
+                id, user_id, kind, token_hash, expires_at, consumed_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (str(uuid.uuid4()), str(user_id), kind, token_hash, expires_at, now),
+        )
+        connection.commit()
+    return token
+
+
+def _limira_auth_verify_email_token(token: str, env: Any = os.environ) -> LimiraAuthRecord:
+    token_hash = _limira_auth_one_time_token_hash(
+        kind="email_verification",
+        token=str(token).strip(),
+        env=env,
+    )
+    now = int(time.time())
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                users.id, users.email, users.name, users.role, users.password_hash,
+                users.active, users.email_verified_at
+            FROM limira_auth_tokens AS tokens
+            JOIN limira_auth_users AS users ON users.id = tokens.user_id
+            WHERE tokens.kind = 'email_verification'
+                AND tokens.token_hash = ?
+                AND tokens.consumed_at IS NULL
+                AND tokens.expires_at >= ?
+            """,
+            (token_hash, now),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=400, detail="invalid_or_expired_auth_token")
+        connection.execute(
+            """
+            UPDATE limira_auth_users
+            SET email_verified_at = COALESCE(email_verified_at, ?), updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, str(row["id"])),
+        )
+        connection.execute(
+            """
+            UPDATE limira_auth_tokens
+            SET consumed_at = ?
+            WHERE kind = 'email_verification' AND token_hash = ?
+            """,
+            (now, token_hash),
+        )
+        connection.commit()
+    user = _limira_auth_get_user_by_id(str(row["id"]), env)
+    if user is None:
+        raise HTTPException(status_code=400, detail="invalid_or_expired_auth_token")
+    return user
+
+
+def _limira_auth_reset_password_with_token(
+    *,
+    token: str,
+    password: str,
+    env: Any = os.environ,
+) -> LimiraAuthRecord:
+    _validate_auth_password(password)
+    token_hash = _limira_auth_one_time_token_hash(
+        kind="password_reset",
+        token=str(token).strip(),
+        env=env,
+    )
+    now = int(time.time())
+    password_hash = _limira_hash_password(password)
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                users.id, users.email, users.name, users.role, users.password_hash,
+                users.active, users.email_verified_at
+            FROM limira_auth_tokens AS tokens
+            JOIN limira_auth_users AS users ON users.id = tokens.user_id
+            WHERE tokens.kind = 'password_reset'
+                AND tokens.token_hash = ?
+                AND tokens.consumed_at IS NULL
+                AND tokens.expires_at >= ?
+            """,
+            (token_hash, now),
+        ).fetchone()
+        if row is None or not bool(row["active"]):
+            raise HTTPException(status_code=400, detail="invalid_or_expired_auth_token")
+        connection.execute(
+            """
+            UPDATE limira_auth_users
+            SET password_hash = ?, email_verified_at = COALESCE(email_verified_at, ?), updated_at = ?
+            WHERE id = ?
+            """,
+            (password_hash, now, now, str(row["id"])),
+        )
+        connection.execute(
+            """
+            UPDATE limira_auth_tokens
+            SET consumed_at = ?
+            WHERE kind = 'password_reset' AND token_hash = ?
+            """,
+            (now, token_hash),
+        )
+        connection.commit()
+    user = _limira_auth_get_user_by_id(str(row["id"]), env)
+    if user is None:
+        raise HTTPException(status_code=400, detail="invalid_or_expired_auth_token")
+    return user
+
+
+def _limira_public_base_url(request: Request | None, env: Any = os.environ) -> str:
+    configured = str(env.get(LIMIRA_PUBLIC_BASE_URL_ENV) or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    if request is not None:
+        forwarded_host = str(request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+        forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+        if forwarded_host:
+            proto = forwarded_proto or request.url.scheme or "https"
+            return f"{proto}://{forwarded_host}".rstrip("/")
+        return str(request.base_url).rstrip("/")
+    return "http://127.0.0.1:5273"
+
+
+def _limira_auth_link(
+    *,
+    request: Request | None,
+    query_key: str,
+    token: str,
+    env: Any = os.environ,
+) -> str:
+    return f"{_limira_public_base_url(request, env)}/limira?{urlencode({query_key: token})}"
+
+
+def _limira_auth_send_email(
+    *,
+    to_email: str,
+    subject: str,
+    body: str,
+    env: Any = os.environ,
+) -> str:
+    from_email = str(env.get(LIMIRA_SMTP_FROM_ENV) or "").strip()
+    smtp_host = str(env.get(LIMIRA_SMTP_HOST_ENV) or "").strip()
+    if smtp_host and from_email:
+        port = int(str(env.get(LIMIRA_SMTP_PORT_ENV) or "587").strip() or "587")
+        username = str(env.get(LIMIRA_SMTP_USERNAME_ENV) or "").strip()
+        password = str(env.get(LIMIRA_SMTP_PASSWORD_ENV) or "")
+        use_tls = str(env.get(LIMIRA_SMTP_TLS_ENV) or "true").strip().lower() in TRUTHY_ENV_VALUES
+        message = EmailMessage()
+        message["From"] = from_email
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.set_content(body)
+        try:
+            with smtplib.SMTP(smtp_host, port, timeout=15) as server:
+                if use_tls:
+                    server.starttls()
+                if username:
+                    server.login(username, password)
+                server.send_message(message)
+            return "smtp"
+        except Exception:
+            log.exception("limira auth email smtp delivery failed; writing to outbox")
+    outbox_path = _limira_auth_email_outbox_path(env)
+    os.makedirs(os.path.dirname(outbox_path), exist_ok=True)
+    with open(outbox_path, "a", encoding="utf-8") as outbox:
+        outbox.write(
+            json.dumps(
+                {
+                    "created_at": int(time.time()),
+                    "to": to_email,
+                    "subject": subject,
+                    "body": body,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    return "outbox"
+
+
+def _limira_auth_send_verification_email(
+    *,
+    user: LimiraAuthRecord,
+    token: str,
+    request: Request | None,
+    env: Any = os.environ,
+) -> str:
+    link = _limira_auth_link(
+        request=request,
+        query_key="verify_email_token",
+        token=token,
+        env=env,
+    )
+    return _limira_auth_send_email(
+        to_email=user.email,
+        subject="验证你的 Limira 邮箱",
+        body=(
+            f"{user.name}，你好：\n\n"
+            "请打开下面的链接完成 Limira 邮箱验证：\n"
+            f"{link}\n\n"
+            "如果不是你本人注册，可以忽略这封邮件。"
+        ),
+        env=env,
+    )
+
+
+def _limira_auth_send_password_reset_email(
+    *,
+    user: LimiraAuthRecord,
+    token: str,
+    request: Request | None,
+    env: Any = os.environ,
+) -> str:
+    link = _limira_auth_link(
+        request=request,
+        query_key="reset_password_token",
+        token=token,
+        env=env,
+    )
+    return _limira_auth_send_email(
+        to_email=user.email,
+        subject="重置你的 Limira 密码",
+        body=(
+            f"{user.name}，你好：\n\n"
+            "请打开下面的链接重置 Limira 密码：\n"
+            f"{link}\n\n"
+            "如果不是你本人操作，可以忽略这封邮件。"
+        ),
+        env=env,
+    )
+
+
 def _limira_auth_public_user(
     user: LimiraAuthRecord | LimiraUser,
     *,
@@ -3068,6 +3433,7 @@ def _limira_auth_public_user(
         "email": getattr(user, "email", None),
         "name": getattr(user, "name", None),
         "role": user.role,
+        "email_verified": getattr(user, "email_verified_at", None) is not None,
     }
     if token is not None:
         payload["token"] = token
@@ -3076,7 +3442,13 @@ def _limira_auth_public_user(
 
 
 def _limira_user_from_auth_record(user: LimiraAuthRecord) -> LimiraUser:
-    return LimiraUser(id=user.id, role=user.role, email=user.email, name=user.name)
+    return LimiraUser(
+        id=user.id,
+        role=user.role,
+        email=user.email,
+        name=user.name,
+        email_verified_at=user.email_verified_at,
+    )
 
 
 def _limira_auth_b64encode(payload: bytes) -> str:
@@ -3172,7 +3544,7 @@ def _limira_auth_user_from_request(
     if not user_id:
         raise HTTPException(status_code=401, detail="not_authenticated")
     user = _limira_auth_get_user_by_id(user_id, env)
-    if user is None or not user.active:
+    if user is None or not user.active or user.email_verified_at is None:
         raise HTTPException(status_code=401, detail="not_authenticated")
     if require_admin and user.role != "admin":
         raise HTTPException(status_code=403, detail="admin_required")
@@ -3528,13 +3900,92 @@ def get_pdf_exporter(request: Request) -> LimiraPdfExporter:
 
 @router.post("/auth/signup", status_code=201)
 async def limira_auth_signup(
+    request: Request,
     request_data: LimiraAuthSignupRequest,
-    response: Response,
 ) -> dict[str, Any]:
     user = _limira_auth_insert_user(
         email=request_data.email,
         password=request_data.password,
         name=request_data.name,
+    )
+    token = _limira_auth_create_one_time_token(
+        user_id=user.id,
+        kind="email_verification",
+        ttl_seconds=_limira_auth_flow_ttl_seconds(
+            LIMIRA_AUTH_EMAIL_VERIFY_TTL_SECONDS_ENV,
+            LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS,
+        ),
+    )
+    delivery = _limira_auth_send_verification_email(user=user, token=token, request=request)
+    payload = _limira_auth_public_user(user)
+    payload["email_verification_required"] = True
+    payload["email_delivery"] = delivery
+    return payload
+
+
+@router.post("/auth/verify-email")
+async def limira_auth_verify_email(
+    request_data: LimiraAuthVerifyEmailRequest,
+    response: Response,
+) -> dict[str, Any]:
+    user = _limira_auth_verify_email_token(request_data.token)
+    token = _limira_issue_auth_token(user)
+    _set_limira_auth_cookie(response, token)
+    return _limira_auth_public_user(user, token=token)
+
+
+@router.post("/auth/resend-verification")
+async def limira_auth_resend_verification(
+    request: Request,
+    request_data: LimiraAuthResendVerificationRequest,
+) -> dict[str, Any]:
+    try:
+        user = _limira_auth_get_user_by_email(request_data.email)
+    except HTTPException:
+        user = None
+    if user is not None and user.active and user.email_verified_at is None:
+        token = _limira_auth_create_one_time_token(
+            user_id=user.id,
+            kind="email_verification",
+            ttl_seconds=_limira_auth_flow_ttl_seconds(
+                LIMIRA_AUTH_EMAIL_VERIFY_TTL_SECONDS_ENV,
+                LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS,
+            ),
+        )
+        _limira_auth_send_verification_email(user=user, token=token, request=request)
+    return {"ok": True}
+
+
+@router.post("/auth/password-reset/request")
+async def limira_auth_password_reset_request(
+    request: Request,
+    request_data: LimiraAuthPasswordResetRequest,
+) -> dict[str, Any]:
+    try:
+        user = _limira_auth_get_user_by_email(request_data.email)
+    except HTTPException:
+        user = None
+    if user is not None and user.active:
+        token = _limira_auth_create_one_time_token(
+            user_id=user.id,
+            kind="password_reset",
+            ttl_seconds=_limira_auth_flow_ttl_seconds(
+                LIMIRA_AUTH_PASSWORD_RESET_TTL_SECONDS_ENV,
+                LIMIRA_AUTH_DEFAULT_PASSWORD_RESET_TTL_SECONDS,
+            ),
+        )
+        _limira_auth_send_password_reset_email(user=user, token=token, request=request)
+    return {"ok": True}
+
+
+@router.post("/auth/password-reset/confirm")
+async def limira_auth_password_reset_confirm(
+    request_data: LimiraAuthPasswordResetConfirmRequest,
+    response: Response,
+) -> dict[str, Any]:
+    user = _limira_auth_reset_password_with_token(
+        token=request_data.token,
+        password=request_data.password,
     )
     token = _limira_issue_auth_token(user)
     _set_limira_auth_cookie(response, token)
@@ -3552,6 +4003,8 @@ async def limira_auth_signin(
         user.password_hash,
     ):
         raise HTTPException(status_code=401, detail="invalid_credentials")
+    if user.email_verified_at is None:
+        raise HTTPException(status_code=403, detail="email_not_verified")
     token = _limira_issue_auth_token(user)
     _set_limira_auth_cookie(response, token)
     return _limira_auth_public_user(user, token=token)

@@ -8,6 +8,7 @@ import hashlib
 import sqlite3
 import types
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import httpx
@@ -19,6 +20,17 @@ LIMIRA_BACKEND = ROOT / "apps/limira-web/backend"
 sys.path.insert(0, str(LIMIRA_BACKEND))
 
 from limira_backend.routers import limira  # noqa: E402
+
+
+def _latest_auth_link_token(outbox_path: Path, query_key: str) -> str:
+    records = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
+    for record in reversed(records):
+        for word in str(record.get("body") or "").split():
+            parsed = urlsplit(word.strip())
+            values = parse_qs(parsed.query).get(query_key)
+            if values:
+                return values[0]
+    raise AssertionError(f"missing {query_key} token in auth email outbox")
 
 
 class FakeArchiveClient:
@@ -158,6 +170,8 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
     monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
     monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
     monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
 
     app = FastAPI()
     app.include_router(limira.router, prefix="/api/limira")
@@ -183,10 +197,32 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
         assert signup_payload["email"] == "analyst@example.test"
         assert signup_payload["name"] == "Analyst"
         assert signup_payload["role"] == "user"
-        assert signup_payload["token_type"] == "bearer"
-        token = signup_payload["token"]
+        assert signup_payload["email_verified"] is False
+        assert signup_payload["email_verification_required"] is True
+        assert signup_payload["email_delivery"] == "outbox"
+        assert "token" not in signup_payload
+        assert "limira_session=" not in signup.headers.get("set-cookie", "")
+
+        unverified_signin = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "analyst@example.test", "password": "correct-password"},
+        )
+        assert unverified_signin.status_code == 403
+        assert unverified_signin.json() == {"detail": "email_not_verified"}
+
+        verify_token = _latest_auth_link_token(outbox_path, "verify_email_token")
+        verified = await client.post(
+            "/api/limira/auth/verify-email",
+            json={"token": verify_token},
+        )
+        assert verified.status_code == 200
+        verified_payload = verified.json()
+        assert verified_payload["email"] == "analyst@example.test"
+        assert verified_payload["email_verified"] is True
+        assert verified_payload["token_type"] == "bearer"
+        token = verified_payload["token"]
         assert token
-        assert "limira_session=" in signup.headers.get("set-cookie", "")
+        assert "limira_session=" in verified.headers.get("set-cookie", "")
 
         session = await client.get(
             "/api/limira/auth/session",
@@ -198,6 +234,7 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
             "email": "analyst@example.test",
             "name": "Analyst",
             "role": "user",
+            "email_verified": True,
         }
 
         scenarios = await client.get(
@@ -220,6 +257,118 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
         )
         assert signin.status_code == 200
         assert signin.json()["email"] == "analyst@example.test"
+        assert signin.json()["email_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_limira_native_auth_password_reset_uses_email_token(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            json={
+                "email": "reset@example.test",
+                "name": "Reset User",
+                "password": "old-password",
+            },
+        )
+        assert signup.status_code == 201
+
+        verify_token = _latest_auth_link_token(outbox_path, "verify_email_token")
+        verified = await client.post("/api/limira/auth/verify-email", json={"token": verify_token})
+        assert verified.status_code == 200
+
+        requested = await client.post(
+            "/api/limira/auth/password-reset/request",
+            json={"email": "reset@example.test"},
+        )
+        assert requested.status_code == 200
+        assert requested.json() == {"ok": True}
+
+        reset_token = _latest_auth_link_token(outbox_path, "reset_password_token")
+        reset = await client.post(
+            "/api/limira/auth/password-reset/confirm",
+            json={"token": reset_token, "password": "new-password"},
+        )
+        assert reset.status_code == 200
+        reset_payload = reset.json()
+        assert reset_payload["email"] == "reset@example.test"
+        assert reset_payload["email_verified"] is True
+        assert reset_payload["token"]
+        assert "limira_session=" in reset.headers.get("set-cookie", "")
+
+        reused = await client.post(
+            "/api/limira/auth/password-reset/confirm",
+            json={"token": reset_token, "password": "another-password"},
+        )
+        assert reused.status_code == 400
+        assert reused.json() == {"detail": "invalid_or_expired_auth_token"}
+
+        old_password = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "reset@example.test", "password": "old-password"},
+        )
+        assert old_password.status_code == 401
+
+        new_password = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "reset@example.test", "password": "new-password"},
+        )
+        assert new_password.status_code == 200
+        assert new_password.json()["email"] == "reset@example.test"
+
+
+@pytest.mark.asyncio
+async def test_limira_auth_email_links_use_forwarded_public_origin(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://internal-backend.test",
+    ) as client:
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            headers={
+                "x-forwarded-host": "limira-public.example",
+                "x-forwarded-proto": "https",
+            },
+            json={
+                "email": "forwarded@example.test",
+                "name": "Forwarded User",
+                "password": "correct-password",
+            },
+        )
+        assert signup.status_code == 201
+
+    outbox = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
+    body = outbox[-1]["body"]
+    assert "https://limira-public.example/limira?verify_email_token=" in body
+    assert "internal-backend.test" not in body
+    assert "127.0.0.1" not in body
 
 
 @pytest.mark.asyncio
@@ -8186,6 +8335,10 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/auth/signin", "POST"),
         ("/auth/signout", "POST"),
         ("/auth/signup", "POST"),
+        ("/auth/verify-email", "POST"),
+        ("/auth/resend-verification", "POST"),
+        ("/auth/password-reset/request", "POST"),
+        ("/auth/password-reset/confirm", "POST"),
         ("/scenarios", "GET"),
         ("/research", "POST"),
         ("/tasks/{task_id}", "GET"),

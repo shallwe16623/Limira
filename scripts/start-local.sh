@@ -35,7 +35,11 @@ if [[ ! -x "$RUNNER_PYTHON" ]]; then
 	RUNNER_PYTHON="$(command -v python3 || command -v python || true)"
 fi
 if [[ ! -x "$BACKEND_PYTHON" ]]; then
-	BACKEND_PYTHON="$(command -v python3 || command -v python || true)"
+	if [[ -x "$ROOT_DIR/apps/limira-runner/.venv/bin/python" ]]; then
+		BACKEND_PYTHON="$ROOT_DIR/apps/limira-runner/.venv/bin/python"
+	else
+		BACKEND_PYTHON="$(command -v python3 || command -v python || true)"
+	fi
 fi
 if [[ -z "$NODE_BIN" ]]; then
 	if command -v node >/dev/null 2>&1; then

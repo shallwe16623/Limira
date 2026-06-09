@@ -203,6 +203,14 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/signin" in app
     assert "/api/limira/auth/session" in app
     assert "/api/limira/auth/signout" in app
+    assert "/api/limira/auth/verify-email" in app
+    assert "/api/limira/auth/resend-verification" in app
+    assert "/api/limira/auth/password-reset/request" in app
+    assert "/api/limira/auth/password-reset/confirm" in app
+    assert "verify_email_token" in app
+    assert "reset_password_token" in app
+    assert "x-forwarded-host" in server
+    assert "x-forwarded-proto" in server
     assert LEGACY_AUTH_PREFIX not in app
     assert LEGACY_AUTH_PREFIX not in server
     assert "isAuthApiPath" not in server
