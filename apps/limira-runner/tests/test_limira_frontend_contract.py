@@ -425,10 +425,18 @@ def test_limira_standalone_archive_download_uses_authenticated_fetch():
 def test_limira_standalone_evidence_preview_uses_local_srcdoc_fallback():
     app = _read(LIMIRA_STANDALONE_APP)
 
-    assert "function evidencePreviewHtml({ title, url, summary })" in app
-    assert "dom.sandboxIframe.srcdoc = evidencePreviewHtml({ title, url, summary });" in app
+    assert "function evidencePreviewHtml({ title, url, summary, notice })" in app
+    assert "function evidencePreviewMode(url)" in app
+    assert "function showEvidenceIframePreview({ url, title, summary })" in app
+    assert "function redirectBlockedEvidenceSource({ url, title, summary })" in app
+    assert "DIRECT_EXTERNAL_EVIDENCE_HOSTS" in app
+    assert "dom.sandboxIframe.src = url;" in app
+    assert "openExternalEvidenceUrl(safeUrl);" in app
+    assert "link.rel = 'noopener noreferrer';" in app
+    assert "link.referrerPolicy = 'no-referrer';" in app
     assert "dom.sandboxIframe.removeAttribute('src');" in app
     assert "部分网站禁止被第三方页面嵌入预览" in app
+    assert "已自动尝试在新标签页打开" in app
     assert 'data-summary="${escapeAttr(summary)}"' in app
     assert '<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>' in app
     assert "const safeSummary = renderMarkdown(summary || '该来源没有可用的本地摘要。');" in app

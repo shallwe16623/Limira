@@ -49,6 +49,31 @@ const ORGANIZATION_CATEGORY_OPTIONS = [
 ];
 const DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'enterprise';
 const DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'limira';
+const IFRAME_PREVIEW_TIMEOUT_MS = 2800;
+const DIRECT_EXTERNAL_EVIDENCE_HOSTS = [
+	'americancompass.org',
+	'afsc.org',
+	'bloomberg.com',
+	'cfr.org',
+	'chinasurvey.csis.org',
+	'cnas.org',
+	'crisisgroup.org',
+	'csis.org',
+	'facebook.com',
+	'ft.com',
+	'globalaffairs.org',
+	'instagram.com',
+	'linkedin.com',
+	'nytimes.com',
+	'pewresearch.org',
+	'reuters.com',
+	'theharrispoll.com',
+	'twitter.com',
+	'washingtonpost.com',
+	'wsj.com',
+	'x.com',
+	'yougov.com'
+];
 
 const state = {
 	authScope: 'personal',
@@ -93,6 +118,12 @@ const state = {
 	uploadResults: [],
 	taskHistory: [],
 	archivedTaskHistory: [],
+	sandboxPreviewId: 0,
+	sandboxPreviewLoaded: false,
+	sandboxPreviewTimer: null,
+	sandboxPreviewUrl: '',
+	sandboxPreviewTitle: '',
+	sandboxPreviewSummary: '',
 	eventSource: null
 };
 
@@ -316,19 +347,40 @@ function bindEvents() {
 			const url = link.href;
 			const title = link.getAttribute('data-title') || '网页预览';
 			const summary = link.getAttribute('data-summary') || '';
-
-			dom.sandboxIframe.removeAttribute('src');
-			dom.sandboxIframe.srcdoc = evidencePreviewHtml({ title, url, summary });
-			dom.sandboxTitle.textContent = title;
-			dom.sandboxExternalLink.href = url;
-			dom.sandboxModal.classList.remove('hidden');
+			openEvidenceSource({ url, title, summary });
 		}
 	});
 
+	dom.sandboxIframe.addEventListener('load', () => {
+		if (!state.sandboxPreviewUrl) {
+			return;
+		}
+		let loadedLocation = '';
+		try {
+			loadedLocation = dom.sandboxIframe.contentWindow?.location?.href || '';
+		} catch {
+			loadedLocation = 'cross-origin';
+		}
+		if (loadedLocation === 'about:blank') {
+			redirectBlockedEvidenceSource({
+				url: state.sandboxPreviewUrl,
+				title: state.sandboxPreviewTitle,
+				summary: state.sandboxPreviewSummary
+			});
+			return;
+		}
+		state.sandboxPreviewLoaded = true;
+		clearSandboxPreviewTimer();
+	});
+	dom.sandboxIframe.addEventListener('error', () => {
+		redirectBlockedEvidenceSource({
+			url: state.sandboxPreviewUrl,
+			title: state.sandboxPreviewTitle,
+			summary: state.sandboxPreviewSummary
+		});
+	});
 	dom.sandboxCloseButton.addEventListener('click', () => {
-		dom.sandboxModal.classList.add('hidden');
-		dom.sandboxIframe.removeAttribute('src');
-		dom.sandboxIframe.srcdoc = '';
+		closeSandboxPreview();
 	});
 }
 
@@ -2027,11 +2079,147 @@ function evidenceCard(item, index) {
 	</article>`;
 }
 
-function evidencePreviewHtml({ title, url, summary }) {
+function openEvidenceSource({ url, title, summary }) {
+	const safeUrl = safeExternalUrl(url);
+	if (!safeUrl) {
+		return;
+	}
+	if (evidencePreviewMode(safeUrl) === 'external') {
+		openExternalEvidenceUrl(safeUrl);
+		return;
+	}
+	showEvidenceIframePreview({ url: safeUrl, title, summary });
+}
+
+function evidencePreviewMode(url) {
+	const safeUrl = safeExternalUrl(url);
+	if (!safeUrl) {
+		return 'external';
+	}
+	const parsed = new URL(safeUrl);
+	if (isLikelyIframeDocument(parsed)) {
+		return 'iframe';
+	}
+	return isDirectExternalEvidenceHost(parsed.hostname) ? 'external' : 'iframe';
+}
+
+function isLikelyIframeDocument(url) {
+	return /\.(?:pdf|txt|csv|png|jpe?g|gif|webp)$/i.test(url.pathname);
+}
+
+function isDirectExternalEvidenceHost(hostname) {
+	const normalizedHost = String(hostname || '').toLowerCase().replace(/^www\./, '');
+	return DIRECT_EXTERNAL_EVIDENCE_HOSTS.some(
+		(blockedHost) =>
+			normalizedHost === blockedHost || normalizedHost.endsWith(`.${blockedHost}`)
+	);
+}
+
+function showEvidenceIframePreview({ url, title, summary }) {
+	state.sandboxPreviewId += 1;
+	const previewId = state.sandboxPreviewId;
+	state.sandboxPreviewLoaded = false;
+	state.sandboxPreviewUrl = url;
+	state.sandboxPreviewTitle = title || '网页预览';
+	state.sandboxPreviewSummary = summary || '';
+	clearSandboxPreviewTimer();
+
+	dom.sandboxTitle.textContent = state.sandboxPreviewTitle;
+	dom.sandboxExternalLink.href = url;
+	dom.sandboxIframe.removeAttribute('srcdoc');
+	dom.sandboxIframe.removeAttribute('src');
+	dom.sandboxIframe.src = url;
+	dom.sandboxModal.classList.remove('hidden');
+
+	state.sandboxPreviewTimer = window.setTimeout(() => {
+		if (state.sandboxPreviewId !== previewId || state.sandboxPreviewLoaded) {
+			return;
+		}
+		redirectBlockedEvidenceSource({
+			url,
+			title: state.sandboxPreviewTitle,
+			summary: state.sandboxPreviewSummary
+		});
+	}, IFRAME_PREVIEW_TIMEOUT_MS);
+}
+
+function redirectBlockedEvidenceSource({ url, title, summary }) {
+	const safeUrl = safeExternalUrl(url);
+	if (!safeUrl) {
+		return;
+	}
+	clearSandboxPreviewTimer();
+	state.sandboxPreviewId += 1;
+	openExternalEvidenceUrl(safeUrl);
+	showEvidenceSummaryFallback({
+		url: safeUrl,
+		title,
+		summary,
+		notice: '该来源可能禁止嵌入预览，已自动尝试在新标签页打开。这里保留 Limira 已保存的来源摘要。'
+	});
+}
+
+function showEvidenceSummaryFallback({ url, title, summary, notice }) {
+	state.sandboxPreviewUrl = safeExternalUrl(url);
+	state.sandboxPreviewTitle = title || '网页预览';
+	state.sandboxPreviewSummary = summary || '';
+	state.sandboxPreviewLoaded = false;
+	dom.sandboxTitle.textContent = state.sandboxPreviewTitle;
+	dom.sandboxExternalLink.href = state.sandboxPreviewUrl;
+	dom.sandboxIframe.removeAttribute('src');
+	dom.sandboxIframe.srcdoc = evidencePreviewHtml({
+		title: state.sandboxPreviewTitle,
+		url: state.sandboxPreviewUrl,
+		summary: state.sandboxPreviewSummary,
+		notice
+	});
+	dom.sandboxModal.classList.remove('hidden');
+}
+
+function clearSandboxPreviewTimer() {
+	if (!state.sandboxPreviewTimer) {
+		return;
+	}
+	window.clearTimeout(state.sandboxPreviewTimer);
+	state.sandboxPreviewTimer = null;
+}
+
+function closeSandboxPreview() {
+	clearSandboxPreviewTimer();
+	state.sandboxPreviewId += 1;
+	state.sandboxPreviewLoaded = false;
+	state.sandboxPreviewUrl = '';
+	state.sandboxPreviewTitle = '';
+	state.sandboxPreviewSummary = '';
+	dom.sandboxModal.classList.add('hidden');
+	dom.sandboxIframe.removeAttribute('src');
+	dom.sandboxIframe.srcdoc = '';
+}
+
+function openExternalEvidenceUrl(url) {
+	const safeUrl = safeExternalUrl(url);
+	if (!safeUrl) {
+		return;
+	}
+	const link = document.createElement('a');
+	link.href = safeUrl;
+	link.target = '_blank';
+	link.rel = 'noopener noreferrer';
+	link.referrerPolicy = 'no-referrer';
+	link.style.display = 'none';
+	document.body.appendChild(link);
+	link.click();
+	link.remove();
+}
+
+function evidencePreviewHtml({ title, url, summary, notice }) {
 	const safeTitle = escapeHtml(title || '网页预览');
 	const safeUrl = escapeAttr(url || '');
 	const safeDisplayUrl = escapeHtml(url || '');
 	const safeSummary = renderMarkdown(summary || '该来源没有可用的本地摘要。');
+	const safeNotice = escapeHtml(
+		notice || '部分网站禁止被第三方页面嵌入预览。这里显示 Limira 已保存的来源摘要；需要查看原网页时，请使用右上角外部打开按钮。'
+	);
 	return `<!doctype html>
 <html lang="zh-CN">
 	<head>
@@ -2055,7 +2243,7 @@ function evidencePreviewHtml({ title, url, summary }) {
 	<body>
 		<h1>${safeTitle}</h1>
 		<p><a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeDisplayUrl}</a></p>
-		<p class="notice">部分网站禁止被第三方页面嵌入预览。这里显示 Limira 已保存的来源摘要；需要查看原网页时，请使用右上角外部打开按钮。</p>
+		<p class="notice">${safeNotice}</p>
 		<div class="summary">${safeSummary}</div>
 	</body>
 </html>`;
