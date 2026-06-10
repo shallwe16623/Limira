@@ -692,6 +692,10 @@ def _normalize_artifact_buckets(value: Mapping[str, Any]) -> dict[str, list[dict
     return buckets
 
 
+def _history_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def _task_from_row(row: dict[str, Any]) -> LimiraTask:
     return LimiraTask(
         task_id=str(row["task_id"]),
@@ -705,6 +709,8 @@ def _task_from_row(row: dict[str, Any]) -> LimiraTask:
         scenario=_optional_string(row.get("scenario")),
         error=_optional_string(row.get("error")),
         model_summary=_json_loads(row.get("model_summary")) or {},
+        archived_at=_optional_string(row.get("archived_at")),
+        deleted_at=_optional_string(row.get("deleted_at")),
     )
 
 

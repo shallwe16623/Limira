@@ -81,7 +81,10 @@
 						</button>
 					</div>
 					<div class="sidebar-body">
-						<div class="sidebar-section-title">历史记录</div>
+						<div class="sidebar-section-row">
+							<div class="sidebar-section-title">历史记录</div>
+							<button id="historyArchiveToggleButton" class="history-toggle-button" type="button">已归档</button>
+						</div>
 						<div id="historyMessage" class="inline-message"></div>
 						<div id="historyList" class="history-list"></div>
 					</div>
@@ -135,7 +138,6 @@
 						<div class="header-actions">
 							<!-- Grouped Downloads -->
 							<div class="download-group">
-								<button id="exportPdfButton" class="ghost-button compact" type="button" title="导出并下载 PDF" aria-label="导出并下载 PDF" disabled>↓ PDF</button>
 								<button id="downloadArchiveButton" class="ghost-button compact" type="button" disabled>↓ 归档</button>
 							</div>
 						</div>

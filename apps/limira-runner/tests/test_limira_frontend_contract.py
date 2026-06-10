@@ -249,10 +249,9 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/enterprise/signin" in app
     assert "/api/limira/enterprise/members" in app
     assert "/api/limira/enterprise/usage" in app
-    assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}/reports" in app
-    assert "report_pdf_generated" in app
     assert "archive_generated" in app
     assert "completion_asset_warning" in app
+    assert 'id="historyArchiveToggleButton"' in index
     assert 'id="personalScopeButton"' in index
     assert 'id="enterpriseScopeButton"' in index
     assert 'id="organizationCategorySelect"' in index
@@ -352,31 +351,34 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function loadTaskHistory()" in app
     assert "function selectHistoryTask(taskId)" in app
     assert "function startNewChat()" in app
-    assert "`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}`" in app
+    assert "`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=${archived}`" in app
+    assert 'id="historyArchiveToggleButton"' in index
+    assert "function archiveHistoryTask(taskId)" in app
+    assert "function restoreHistoryTask(taskId)" in app
+    assert "function deleteHistoryTask(taskId)" in app
+    assert "/history/archive" in app
+    assert "/history/restore" in app
+    assert "method: 'DELETE'" in app
     assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}" in app
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
     assert LEGACY_AUTH_PREFIX not in app
 
 
-def test_limira_standalone_frontend_keeps_pdf_download_bound_to_current_report():
+def test_limira_standalone_frontend_uses_archive_only_export_surface():
     app = _read(LIMIRA_STANDALONE_APP)
     index = _read(LIMIRA_STANDALONE_INDEX)
 
-    assert "const markdown = reportMarkdown().trim();" in app
-    assert "if (!state.taskId || !markdown || state.isExporting)" in app
-    assert "latestReportMatchesCurrentMarkdown()" in app
-    assert "state.latestReportMarkdown = markdown;" in app
-    assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}/reports/pdf" in app
-    assert "/api/limira/tasks/${encodeURIComponent(normalized.task_id)}/reports/${encodeURIComponent(" in app
-    assert "normalized.report_id" in app
-    assert "async function downloadGeneratedPdf(url, filename)" in app
-    assert "accept: 'application/pdf'" in app
-    assert "URL.createObjectURL(blob)" in app
-    assert "state.latestReport = null;" in app
-    assert "请重新导出 PDF" in app
+    assert "exportPdfButton" not in app
+    assert "exportPdfButton" not in index
+    assert "reports/pdf" not in app
+    assert "report_pdf_generated" not in app
+    assert "async function downloadGeneratedPdf" not in app
+    assert "accept: 'application/pdf'" not in app
+    assert "导出并下载 PDF" not in index
+    assert 'id="downloadArchiveButton"' in index
+    assert "async function downloadArchive()" in app
     assert "downloadPdfButton" not in app
     assert "downloadPdfButton" not in index
-    assert "导出并下载 PDF" in index
 
 
 def test_limira_standalone_report_sections_take_precedence_over_cached_final_text():

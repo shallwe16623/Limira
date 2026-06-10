@@ -571,6 +571,8 @@ class FakeLimiraPostgresEngine:
                 "scenario": params["scenario"],
                 "error": None,
                 "model_summary": {},
+                "archived_at": None,
+                "deleted_at": None,
             }
             self.tasks[params["task_id"]] = row
             return FakeLimiraPostgresResult([row])
@@ -585,8 +587,20 @@ class FakeLimiraPostgresEngine:
             row = self.tasks.get(params["task_id"])
             if not row:
                 return FakeLimiraPostgresResult([])
+            if "history_archived_at" in sql:
+                row["archived_at"] = (
+                    json.loads(params["archived_at_json"])
+                    if "archived_at_json" in params
+                    else None
+                )
+            if "history_deleted_at" in sql:
+                row["deleted_at"] = (
+                    json.loads(params["deleted_at_json"])
+                    if "deleted_at_json" in params
+                    else None
+                )
             for key, value in params.items():
-                if key != "task_id":
+                if key not in {"task_id", "archived_at_json", "deleted_at_json"}:
                     row[key] = value
             return FakeLimiraPostgresResult([row])
 
@@ -595,12 +609,19 @@ class FakeLimiraPostgresEngine:
                 row
                 for row in reversed(list(self.tasks.values()))
                 if row["owner_user_id"] == params["owner_user_id"]
+                and row.get("deleted_at") is None
             ]
+            if "history_archived_at' is not null" in sql:
+                rows = [row for row in rows if row.get("archived_at") is not None]
+            elif "history_archived_at' is null" in sql:
+                rows = [row for row in rows if row.get("archived_at") is None]
             return FakeLimiraPostgresResult(rows[: params["limit"]])
 
         if "from limira_research_tasks" in sql:
             row = self.tasks.get(params["task_id"])
             if row and params.get("owner_user_id") and row["owner_user_id"] != params["owner_user_id"]:
+                row = None
+            if row and "history_deleted_at" in sql and row.get("deleted_at") is not None:
                 row = None
             return FakeLimiraPostgresResult([row] if row else [])
 

@@ -35,6 +35,8 @@ except Exception:  # pragma: no cover - depends on optional runtime package
 
 
 ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
+ARCHIVE_OPTIONAL_MEMBER_ORDER = ("report.pdf",)
+ARCHIVE_BINARY_MEMBERS = {"report.pdf"}
 ARCHIVE_SNAPSHOT_DIR = "evidence_snapshots"
 ARCHIVE_SNAPSHOT_MANIFEST = f"{ARCHIVE_SNAPSHOT_DIR}/manifest.json"
 ARCHIVE_SNAPSHOT_MEMBER_PATTERN = re.compile(
@@ -493,6 +495,8 @@ class LimiraTask:
     scenario: str | None = None
     error: str | None = None
     model_summary: dict[str, Any] | None = None
+    archived_at: str | None = None
+    deleted_at: str | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -500,6 +504,7 @@ class LimiraTask:
             "query": self.query,
             "status": self.status,
             "archive_status": self.archive_status,
+            "history_archived": self.archived_at is not None,
             "scenario": self.scenario,
             "error": _public_error_text(self.error, fallback="limira_task_failed"),
             "model_summary": _public_model_summary(self.model_summary or {}),
@@ -629,7 +634,13 @@ class LimiraTaskRepository(Protocol):
 
     def get_user_task(self, task_id: str, owner_user_id: str) -> LimiraTask | None: ...
 
-    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimiraTask]: ...
+    def list_user_tasks(
+        self,
+        *,
+        owner_user_id: str,
+        limit: int,
+        archived: bool = False,
+    ) -> list[LimiraTask]: ...
 
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask: ...
 
@@ -874,15 +885,23 @@ class InMemoryLimiraTaskRepository:
 
     def get_user_task(self, task_id: str, owner_user_id: str) -> LimiraTask | None:
         task = self.get_task(task_id)
-        if not task or task.owner_user_id != owner_user_id:
+        if not task or task.owner_user_id != owner_user_id or task.deleted_at is not None:
             return None
         return task
 
-    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimiraTask]:
+    def list_user_tasks(
+        self,
+        *,
+        owner_user_id: str,
+        limit: int,
+        archived: bool = False,
+    ) -> list[LimiraTask]:
         tasks = [
             task
             for task in reversed(list(self.tasks.values()))
             if task.owner_user_id == owner_user_id
+            and task.deleted_at is None
+            and ((task.archived_at is not None) if archived else (task.archived_at is None))
         ]
         return tasks[:limit]
 

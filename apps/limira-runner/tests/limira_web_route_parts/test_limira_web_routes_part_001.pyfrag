@@ -1148,6 +1148,73 @@ async def test_postgres_task_history_route_is_owner_scoped_and_public_serialized
 
 
 @pytest.mark.asyncio
+async def test_task_history_archive_restore_and_delete_are_owner_scoped():
+    app, repo, _storage = _limira_asgi_app()
+    user = limira.LimiraUser("user-a")
+    repo.create_task(
+        task_id="task-history-active",
+        owner_user_id=user.id,
+        query="active task",
+        scenario=None,
+        runner_task_id="runner-active",
+    )
+    repo.create_task(
+        task_id="task-history-archived",
+        owner_user_id=user.id,
+        query="archived task",
+        scenario=None,
+        runner_task_id="runner-archived",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        archive_response = await client.post(
+            "/api/limira/tasks/task-history-archived/history/archive"
+        )
+        active_response = await client.get("/api/limira/tasks", params={"limit": 10})
+        archived_response = await client.get(
+            "/api/limira/tasks",
+            params={"limit": 10, "archived": "true"},
+        )
+        restore_response = await client.post(
+            "/api/limira/tasks/task-history-archived/history/restore"
+        )
+        restored_response = await client.get("/api/limira/tasks", params={"limit": 10})
+        delete_response = await client.delete(
+            "/api/limira/tasks/task-history-active/history"
+        )
+        after_delete_active = await client.get("/api/limira/tasks", params={"limit": 10})
+        deleted_detail = await client.get("/api/limira/tasks/task-history-active")
+
+    assert archive_response.status_code == 200
+    assert archive_response.json()["history_archived"] is True
+    assert active_response.status_code == 200
+    assert [task["task_id"] for task in active_response.json()["tasks"]] == [
+        "task-history-active"
+    ]
+    assert archived_response.status_code == 200
+    assert archived_response.json()["archived"] is True
+    assert [task["task_id"] for task in archived_response.json()["tasks"]] == [
+        "task-history-archived"
+    ]
+    assert restore_response.status_code == 200
+    assert restore_response.json()["history_archived"] is False
+    assert [task["task_id"] for task in restored_response.json()["tasks"]] == [
+        "task-history-archived",
+        "task-history-active",
+    ]
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"deleted": True, "task_id": "task-history-active"}
+    assert [task["task_id"] for task in after_delete_active.json()["tasks"]] == [
+        "task-history-archived"
+    ]
+    assert deleted_detail.status_code == 404
+    _assert_no_browser_leak(after_delete_active.json())
+
+
+@pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

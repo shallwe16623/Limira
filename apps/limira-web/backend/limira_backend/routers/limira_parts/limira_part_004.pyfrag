@@ -170,6 +170,7 @@ def _build_persisted_archive_zip(
     repo: LimiraTaskRepository,
     *,
     page_snapshots: Mapping[str, EvidencePageSnapshot] | None = None,
+    report_pdf_bytes: bytes | None = None,
 ) -> bytes:
     artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
     artifact_events = _normalize_report_section_trace_events(
@@ -234,6 +235,8 @@ def _build_persisted_archive_zip(
         "report.md": str(scrub_limira_secrets(report_markdown)),
         "trace.json": _archive_json_text(trace, member_name="trace.json"),
     }
+    if report_pdf_bytes:
+        members["report.pdf"] = report_pdf_bytes
     members.update(snapshot_members)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -955,6 +958,8 @@ def validate_archive_zip(archive_bytes: bytes) -> None:
             if any(not _is_allowed_archive_member_name(name) for name in names):
                 raise HTTPException(status_code=502, detail="invalid_archive_members")
             for member_name in names:
+                if _is_archive_binary_member(member_name):
+                    continue
                 text = _decode_archive_text_member(archive.read(member_name))
                 if _is_archive_json_member(member_name):
                     _parse_archive_json_member(text)
@@ -964,6 +969,7 @@ def validate_archive_zip(archive_bytes: bytes) -> None:
 
 def _archive_member_write_order(members: Mapping[str, Any]) -> list[str]:
     core = [name for name in ARCHIVE_MEMBER_ORDER if name in members]
+    optional = [name for name in ARCHIVE_OPTIONAL_MEMBER_ORDER if name in members]
     snapshot_manifest = (
         [ARCHIVE_SNAPSHOT_MANIFEST] if ARCHIVE_SNAPSHOT_MANIFEST in members else []
     )
@@ -972,7 +978,7 @@ def _archive_member_write_order(members: Mapping[str, Any]) -> list[str]:
         for name in members
         if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name)
     )
-    return [*core, *snapshot_manifest, *snapshot_members]
+    return [*core, *optional, *snapshot_manifest, *snapshot_members]
 
 
 def _archive_member_order_is_valid(names: list[str]) -> bool:
@@ -980,6 +986,11 @@ def _archive_member_order_is_valid(names: list[str]) -> bool:
     if names[: len(core)] != core:
         return False
     extra = names[len(core):]
+    optional = [
+        name for name in ARCHIVE_OPTIONAL_MEMBER_ORDER if extra and extra[0] == name
+    ]
+    if optional:
+        extra = extra[len(optional):]
     if not extra:
         return True
     snapshot_members = [
@@ -993,9 +1004,14 @@ def _archive_member_order_is_valid(names: list[str]) -> bool:
 def _is_allowed_archive_member_name(name: str) -> bool:
     return (
         name in ARCHIVE_MEMBER_ORDER
+        or name in ARCHIVE_OPTIONAL_MEMBER_ORDER
         or name == ARCHIVE_SNAPSHOT_MANIFEST
         or bool(ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name))
     )
+
+
+def _is_archive_binary_member(member_name: str) -> bool:
+    return member_name in ARCHIVE_BINARY_MEMBERS
 
 
 def _is_archive_json_member(member_name: str) -> bool:
@@ -1022,6 +1038,9 @@ def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
                 for member_name in names:
                     raw_member = raw_members[member_name]
                     try:
+                        if _is_archive_binary_member(member_name):
+                            _write_archive_member(target, member_name, raw_member)
+                            continue
                         if member_name == "report.md":
                             scrubbed = report_markdown
                         elif member_name == "report.html":
@@ -1217,21 +1236,13 @@ async def _completed_task_asset_events(
 
     events: list[dict[str, Any]] = []
     try:
-        report = await _ensure_completed_task_report_pdf(
+        await _ensure_completed_task_report_pdf(
             task=current,
             user=user,
             repo=repo,
             object_storage=object_storage,
             pdf_exporter=pdf_exporter,
         )
-        if report:
-            events.append(
-                {
-                    "task_id": current.task_id,
-                    "type": "report_pdf_generated",
-                    "payload": report.public_dict(),
-                }
-            )
     except Exception:
         log.exception(
             "Limira completed-task PDF generation failed for task_id=%s",

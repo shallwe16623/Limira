@@ -68,6 +68,7 @@ const state = {
 	userSettingsOpen: false,
 	uploadMenuOpen: false,
 	historyFilesOpen: false,
+	showArchivedHistory: false,
 	savedUserId: '',
 	query: '',
 	taskId: '',
@@ -79,12 +80,9 @@ const state = {
 	isUploading: false,
 	currentUpload: null,
 	isSearching: false,
-	isExporting: false,
 	isLoadingHistory: false,
 	restoreBlocked: false,
 	workspaceGeneration: 0,
-	latestReport: null,
-	latestReportMarkdown: '',
 	finalReportText: '',
 	messages: initialMessages(),
 	artifacts: emptyArtifacts(),
@@ -230,6 +228,11 @@ function bindEvents() {
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
+	dom.historyArchiveToggleButton.addEventListener('click', () => {
+		state.showArchivedHistory = !state.showArchivedHistory;
+		void loadTaskHistory();
+		renderHistory();
+	});
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
 	dom.researchForm.addEventListener('submit', (event) => {
 		event.preventDefault();
@@ -252,7 +255,6 @@ function bindEvents() {
 			void searchUploads();
 		}
 	});
-	dom.exportPdfButton.addEventListener('click', () => void exportPdf());
 	dom.refreshEnterpriseAdminButton.addEventListener('click', () => void loadEnterpriseAdmin());
 	dom.enterpriseMemberForm.addEventListener('submit', (event) => {
 		event.preventDefault();
@@ -799,13 +801,16 @@ async function loadTaskHistory() {
 		dom.historyMessage.textContent = '正在加载历史...';
 	}
 	try {
-		const data = await api(`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}`);
+		const archived = state.showArchivedHistory ? 'true' : 'false';
+		const data = await api(`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=${archived}`);
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
 		state.taskHistory = Array.isArray(data.tasks) ? data.tasks : [];
 		if (dom.historyMessage) {
-			dom.historyMessage.textContent = state.taskHistory.length ? '' : '暂无历史聊天。';
+			dom.historyMessage.textContent = state.taskHistory.length
+				? ''
+				: state.showArchivedHistory ? '暂无已归档历史。' : '暂无历史聊天。';
 		}
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
@@ -828,27 +833,111 @@ function renderHistory() {
 	}
 	dom.refreshHistoryButton.disabled = !state.user || state.isLoadingHistory;
 	dom.newChatButton.disabled = !state.user;
+	dom.historyArchiveToggleButton.disabled = !state.user || state.isLoadingHistory;
+	dom.historyArchiveToggleButton.textContent = state.showArchivedHistory ? '返回历史' : '已归档';
+	dom.historyArchiveToggleButton.classList.toggle('active', state.showArchivedHistory);
 	if (!state.user) {
 		dom.historyList.innerHTML = '';
 		dom.historyMessage.textContent = '';
 		return;
 	}
 	if (!state.taskHistory.length) {
-		dom.historyList.innerHTML = '<div class="empty-state compact-empty">暂无历史聊天。</div>';
+		dom.historyList.innerHTML = state.showArchivedHistory
+			? '<div class="empty-state compact-empty">暂无已归档历史。</div>'
+			: '<div class="empty-state compact-empty">暂无历史聊天。</div>';
 		return;
 	}
 	dom.historyList.innerHTML = state.taskHistory
 		.map((task) => {
 			const taskId = String(task.task_id || '');
 			const active = taskId && taskId === state.taskId;
-			return `<button type="button" class="history-item${active ? ' active' : ''}" data-task-id="${escapeAttr(taskId)}">
-				<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
-				<span class="history-meta">${escapeHtml(taskHistoryMeta(task))}</span>
-			</button>`;
+			const archived = Boolean(task.history_archived || state.showArchivedHistory);
+			return `<article class="history-entry${active ? ' active' : ''}">
+				<button type="button" class="history-item" data-task-id="${escapeAttr(taskId)}">
+					<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
+					<span class="history-meta">${escapeHtml(taskHistoryMeta(task))}</span>
+				</button>
+				<div class="history-actions">
+					<button type="button" class="history-action" data-history-${archived ? 'restore' : 'archive'}-id="${escapeAttr(taskId)}">${archived ? '恢复' : '归档'}</button>
+					<button type="button" class="history-action danger" data-history-delete-id="${escapeAttr(taskId)}">删除</button>
+				</div>
+			</article>`;
 		})
 		.join('');
 	for (const button of dom.historyList.querySelectorAll('.history-item')) {
 		button.addEventListener('click', () => void selectHistoryTask(button.dataset.taskId || ''));
+	}
+	for (const button of dom.historyList.querySelectorAll('[data-history-archive-id]')) {
+		button.addEventListener('click', () => void archiveHistoryTask(button.dataset.historyArchiveId || ''));
+	}
+	for (const button of dom.historyList.querySelectorAll('[data-history-restore-id]')) {
+		button.addEventListener('click', () => void restoreHistoryTask(button.dataset.historyRestoreId || ''));
+	}
+	for (const button of dom.historyList.querySelectorAll('[data-history-delete-id]')) {
+		button.addEventListener('click', () => void deleteHistoryTask(button.dataset.historyDeleteId || ''));
+	}
+}
+
+async function archiveHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || state.isLoadingHistory) {
+		return;
+	}
+	try {
+		await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/history/archive`, {
+			method: 'POST'
+		});
+		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
+		renderHistory();
+		await loadTaskHistory();
+	} catch (error) {
+		dom.historyMessage.textContent = `归档失败：${errorMessage(error)}`;
+	}
+}
+
+async function restoreHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || state.isLoadingHistory) {
+		return;
+	}
+	try {
+		await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/history/restore`, {
+			method: 'POST'
+		});
+		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
+		renderHistory();
+		await loadTaskHistory();
+	} catch (error) {
+		dom.historyMessage.textContent = `恢复失败：${errorMessage(error)}`;
+	}
+}
+
+async function deleteHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || state.isLoadingHistory) {
+		return;
+	}
+	if (!window.confirm('删除后此聊天不会再出现在历史记录中，是否继续？')) {
+		return;
+	}
+	try {
+		await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/history`, {
+			method: 'DELETE'
+		});
+		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
+		if (state.taskId === normalizedTaskId) {
+			resetCurrentTaskView();
+			dom.queryInput.value = '';
+			saveWorkspace();
+			renderStatus();
+			renderMessages();
+			renderTabs();
+			renderReportControls();
+		}
+		renderHistory();
+		await loadTaskHistory();
+	} catch (error) {
+		dom.historyMessage.textContent = `删除失败：${errorMessage(error)}`;
 	}
 }
 
@@ -920,8 +1009,6 @@ function resetCurrentTaskView() {
 	state.isSubmitting = false;
 	state.isSearching = false;
 	state.activeTab = '证据';
-	state.latestReport = null;
-	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.messages = initialMessages();
 	state.artifacts = emptyArtifacts();
@@ -937,6 +1024,11 @@ function mergeTaskHistory(task) {
 		return;
 	}
 	const taskId = String(task.task_id);
+	if (Boolean(task.history_archived) !== state.showArchivedHistory) {
+		state.taskHistory = state.taskHistory.filter((item) => item.task_id !== taskId);
+		renderHistory();
+		return;
+	}
 	const next = [task, ...state.taskHistory.filter((item) => item.task_id !== taskId)];
 	state.taskHistory = next.slice(0, MAX_HISTORY_TASKS);
 	renderHistory();
@@ -949,6 +1041,9 @@ function taskHistoryTitle(task) {
 
 function taskHistoryMeta(task) {
 	const parts = [statusLabel(task.status), `归档${archiveStatusLabel(task.archive_status)}`];
+	if (task.history_archived || state.showArchivedHistory) {
+		parts.push('已归档');
+	}
 	return parts.filter(Boolean).join(' · ');
 }
 
@@ -990,9 +1085,6 @@ function restoreWorkspace() {
 	state.activeTab = tabs.includes(saved.activeTab)
 		? saved.activeTab
 		: LEGACY_TAB_LABELS[saved.activeTab] || '证据';
-	state.latestReport = normalizeGeneratedReport(saved.latestReport);
-	state.latestReportMarkdown =
-		typeof saved.latestReportMarkdown === 'string' ? saved.latestReportMarkdown : '';
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
@@ -1000,10 +1092,6 @@ function restoreWorkspace() {
 		: emptyArtifacts();
 	state.uploads = Array.isArray(saved.uploads) ? saved.uploads : [];
 	state.uploadResults = [];
-	if (!latestReportMatchesCurrentMarkdown()) {
-		state.latestReport = null;
-		state.latestReportMarkdown = '';
-	}
 }
 
 function saveWorkspace() {
@@ -1014,8 +1102,6 @@ function saveWorkspace() {
 		archiveStatus: state.archiveStatus,
 		archiveDownloadUrl: state.archiveDownloadUrl,
 		activeTab: state.activeTab,
-		latestReport: state.latestReport,
-		latestReportMarkdown: state.latestReportMarkdown,
 		finalReportText: state.finalReportText,
 		messages: state.messages.slice(-MAX_STORED_MESSAGES),
 		artifacts: state.artifacts,
@@ -1055,11 +1141,8 @@ function resetWorkspaceState() {
 	state.isUploading = false;
 	state.currentUpload = null;
 	state.isSearching = false;
-	state.isExporting = false;
 	state.isLoadingHistory = false;
 	state.activeTab = '证据';
-	state.latestReport = null;
-	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.messages = initialMessages();
 	state.artifacts = emptyArtifacts();
@@ -1109,8 +1192,6 @@ async function submitResearch() {
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
 	state.restoreBlocked = false;
-	state.latestReport = null;
-	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
 	state.uploadResults = [];
@@ -1216,15 +1297,6 @@ function handleStreamEvent(payload) {
 	} else if (eventType === 'error') {
 		state.status = 'failed';
 		addMessage('error', errorMessage(eventData.error || data.error || payload));
-	} else if (eventType === 'report_pdf_generated') {
-		const report = normalizeGeneratedReport(eventData);
-		if (report) {
-			state.latestReport = report;
-			state.latestReportMarkdown = reportMarkdown().trim();
-			addMessage('assistant', '报告 PDF 已生成并保存到云盘。');
-			void loadUploads();
-			renderReportControls();
-		}
 	} else if (eventType === 'archive_generated') {
 		state.archiveStatus = 'ready';
 		state.archiveDownloadUrl = safeArchiveDownloadUrl(eventData.archive_url, state.taskId);
@@ -1309,7 +1381,6 @@ async function loadArtifacts() {
 			return;
 		}
 		state.artifacts = normalizeArtifacts(data);
-		await loadTaskReports(context);
 		saveWorkspace();
 		renderTabs();
 		renderReportControls();
@@ -1319,45 +1390,6 @@ async function loadArtifacts() {
 		}
 		addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
 	}
-}
-
-async function loadTaskReports(context = captureAsyncContext()) {
-	if (!state.taskId) {
-		state.latestReport = null;
-		state.latestReportMarkdown = '';
-		return;
-	}
-	try {
-		const data = await api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/reports`);
-		if (!isCurrentAsyncContext(context)) {
-			return;
-		}
-		applyLatestReportFromReports(Array.isArray(data.reports) ? data.reports : []);
-	} catch {
-		if (!latestReportMatchesCurrentMarkdown()) {
-			state.latestReport = null;
-			state.latestReportMarkdown = '';
-		}
-	}
-}
-
-function applyLatestReportFromReports(reports) {
-	const normalizedReports = (Array.isArray(reports) ? reports : [])
-		.map((report) => normalizeGeneratedReport(report))
-		.filter(Boolean);
-	const report =
-		normalizedReports.find(
-			(candidate) => candidate.report_type === 'final' && reportPdfUrl(candidate)
-		) || normalizedReports.find((candidate) => reportPdfUrl(candidate));
-	if (!report) {
-		if (!latestReportMatchesCurrentMarkdown()) {
-			state.latestReport = null;
-			state.latestReportMarkdown = '';
-		}
-		return;
-	}
-	state.latestReport = report;
-	state.latestReportMarkdown = reportMarkdown().trim();
 }
 
 async function loadUploads() {
@@ -1659,114 +1691,6 @@ async function createEnterpriseMember() {
 	} finally {
 		dom.createEnterpriseMemberButton.disabled = false;
 	}
-}
-
-async function exportPdf() {
-	const markdown = reportMarkdown().trim();
-	if (state.restoreBlocked) {
-		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再导出 PDF。';
-		return;
-	}
-	if (!state.taskId || !markdown || state.isExporting) {
-		return;
-	}
-	if (latestReportPdfUrl()) {
-		await downloadPdf();
-		return;
-	}
-	state.isExporting = true;
-	dom.reportMessage.textContent = '正在导出...';
-	const context = captureAsyncContext();
-	try {
-		const report = await api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/reports/pdf`, {
-			method: 'POST',
-			body: {
-				report_id: `standalone-${Date.now()}`,
-				report_type: 'final',
-				markdown,
-				evidence_refs: reportEvidenceRefs()
-			}
-		});
-		if (!isCurrentAsyncContext(context)) {
-			return;
-		}
-		state.latestReport = normalizeGeneratedReport(report);
-		state.latestReportMarkdown = markdown;
-		const pdfUrl = latestReportPdfUrl();
-		dom.reportMessage.textContent = pdfUrl ? 'PDF 已生成，正在下载。' : 'PDF 已生成。';
-		saveWorkspace();
-		renderReportControls();
-		if (pdfUrl) {
-			await downloadPdf();
-		}
-		await loadUploads();
-	} catch (error) {
-		if (!isCurrentAsyncContext(context)) {
-			return;
-		}
-		dom.reportMessage.textContent = `PDF 导出失败：${errorMessage(error)}`;
-	} finally {
-		if (isCurrentAsyncContext(context)) {
-			state.isExporting = false;
-			renderReportControls();
-		}
-	}
-}
-
-async function downloadPdf() {
-	if (state.restoreBlocked) {
-		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再下载 PDF。';
-		return;
-	}
-	if (!state.taskId || !state.latestReport?.report_id) {
-		return;
-	}
-	const url = latestReportPdfUrl();
-	if (!url) {
-		state.latestReport = null;
-		state.latestReportMarkdown = '';
-		saveWorkspace();
-		renderReportControls();
-		dom.reportMessage.textContent = '报告内容已更新，请重新导出 PDF。';
-		return;
-	}
-	try {
-		await downloadGeneratedPdf(url, `${state.latestReport.report_id}.pdf`);
-		dom.reportMessage.textContent = 'PDF 已下载。';
-	} catch (error) {
-		state.latestReport = null;
-		state.latestReportMarkdown = '';
-		saveWorkspace();
-		renderReportControls();
-		dom.reportMessage.textContent = `PDF 下载失败：${errorMessage(error)}。请重新导出 PDF。`;
-	}
-}
-
-async function downloadGeneratedPdf(url, filename) {
-	const headers = new Headers({ accept: 'application/pdf' });
-	if (state.token) {
-		headers.set('authorization', `Bearer ${state.token}`);
-	}
-	const response = await fetch(url, {
-		method: 'GET',
-		headers,
-		credentials: 'include'
-	});
-	if (!response.ok) {
-		throw new Error(await responseDetail(response));
-	}
-	const blob = await response.blob();
-	if (!blob.size) {
-		throw new Error('empty_pdf_download');
-	}
-	const objectUrl = URL.createObjectURL(blob);
-	const link = document.createElement('a');
-	link.href = objectUrl;
-	link.download = filename;
-	document.body.appendChild(link);
-	link.click();
-	link.remove();
-	window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
 async function downloadArchive() {
@@ -2368,10 +2292,9 @@ function mergeUploadedDocument(documents, uploaded) {
 }
 
 function renderReportControls() {
-	const hasMarkdown = Boolean(reportMarkdown().trim());
-	const hasPdf = Boolean(latestReportPdfUrl());
-	dom.exportPdfButton.disabled =
-		state.restoreBlocked || !state.taskId || state.isExporting || (!hasMarkdown && !hasPdf);
+	if (dom.reportMessage) {
+		dom.reportMessage.classList.toggle('hidden', !dom.reportMessage.textContent.trim());
+	}
 }
 
 function renderEnterpriseAdmin() {
@@ -2499,8 +2422,6 @@ function clearRestoredTaskState() {
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
-	state.latestReport = null;
-	state.latestReportMarkdown = '';
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
 }
@@ -2534,53 +2455,6 @@ function defaultArchiveDownloadUrl(taskId) {
 function safeArchiveDownloadUrl(value, taskId) {
 	const expected = defaultArchiveDownloadUrl(taskId);
 	return String(value || '').trim() === expected ? expected : '';
-}
-
-function normalizeGeneratedReport(report) {
-	if (!report || typeof report !== 'object' || !state.taskId) {
-		return null;
-	}
-	const reportId = String(report.report_id || '').trim();
-	const taskId = String(report.task_id || '').trim();
-	if (!reportId || taskId !== state.taskId) {
-		return null;
-	}
-	return {
-		...report,
-		task_id: taskId,
-		report_id: reportId,
-		pdf_url: safeReportPdfUrl(report.pdf_url, taskId, reportId)
-	};
-}
-
-function reportPdfUrl(report) {
-	const normalized = normalizeGeneratedReport(report);
-	if (!normalized) {
-		return '';
-	}
-	return (
-		normalized.pdf_url ||
-		`/api/limira/tasks/${encodeURIComponent(normalized.task_id)}/reports/${encodeURIComponent(
-			normalized.report_id
-		)}/pdf`
-	);
-}
-
-function safeReportPdfUrl(value, taskId, reportId) {
-	const expected = `/api/limira/tasks/${encodeURIComponent(taskId)}/reports/${encodeURIComponent(reportId)}/pdf`;
-	return String(value || '').trim() === expected ? expected : '';
-}
-
-function latestReportMatchesCurrentMarkdown() {
-	if (!reportPdfUrl(state.latestReport)) {
-		return false;
-	}
-	const currentMarkdown = reportMarkdown().trim();
-	return Boolean(currentMarkdown && state.latestReportMarkdown === currentMarkdown);
-}
-
-function latestReportPdfUrl() {
-	return latestReportMatchesCurrentMarkdown() ? reportPdfUrl(state.latestReport) : '';
 }
 
 function addMessage(role, content) {

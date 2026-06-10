@@ -400,7 +400,9 @@ class PostgresLimiraTaskRepository:
         archive_zip_sha256,
         scenario,
         error,
-        model_summary
+        model_summary,
+        metadata ->> 'history_archived_at' AS archived_at,
+        metadata ->> 'history_deleted_at' AS deleted_at
     """
     DOCUMENT_COLUMNS = """
         document_id,
@@ -462,13 +464,7 @@ class PostgresLimiraTaskRepository:
         FROM limira_research_tasks
         WHERE task_id = :task_id
           AND owner_user_id = :owner_user_id
-    """
-    SELECT_USER_TASKS_SQL = f"""
-        SELECT {TASK_COLUMNS}
-        FROM limira_research_tasks
-        WHERE owner_user_id = :owner_user_id
-        ORDER BY created_at DESC, task_id DESC
-        LIMIT :limit
+          AND metadata ->> 'history_deleted_at' IS NULL
     """
     INSERT_ARTIFACT_EVENT_SQL = """
         INSERT INTO limira_artifact_events (
@@ -941,9 +937,29 @@ class PostgresLimiraTaskRepository:
         )
         return _task_from_row(row) if row else None
 
-    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimiraTask]:
+    def list_user_tasks(
+        self,
+        *,
+        owner_user_id: str,
+        limit: int,
+        archived: bool = False,
+    ) -> list[LimiraTask]:
+        archive_filter = (
+            "metadata ->> 'history_archived_at' IS NOT NULL"
+            if archived
+            else "metadata ->> 'history_archived_at' IS NULL"
+        )
+        sql = f"""
+            SELECT {self.TASK_COLUMNS}
+            FROM limira_research_tasks
+            WHERE owner_user_id = :owner_user_id
+              AND metadata ->> 'history_deleted_at' IS NULL
+              AND {archive_filter}
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT :limit
+        """
         rows = self._fetch_all(
-            self.SELECT_USER_TASKS_SQL,
+            sql,
             {"owner_user_id": owner_user_id, "limit": limit},
         )
         return [_task_from_row(row) for row in rows]
@@ -958,6 +974,8 @@ class PostgresLimiraTaskRepository:
             "scenario",
             "error",
             "model_summary",
+            "archived_at",
+            "deleted_at",
         }
         values = {key: value for key, value in updates.items() if key in allowed}
         if not values:
@@ -972,6 +990,24 @@ class PostgresLimiraTaskRepository:
             if key == "model_summary":
                 assignments.append(f"{key} = CAST(:{key} AS jsonb)")
                 params[key] = _json_dumps(value or {})
+            elif key == "archived_at":
+                if value is None:
+                    assignments.append("metadata = COALESCE(metadata, '{}'::jsonb) - 'history_archived_at'")
+                else:
+                    assignments.append(
+                        "metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
+                        "'{history_archived_at}', CAST(:archived_at_json AS jsonb), true)"
+                    )
+                    params["archived_at_json"] = _json_dumps(str(value))
+            elif key == "deleted_at":
+                if value is None:
+                    assignments.append("metadata = COALESCE(metadata, '{}'::jsonb) - 'history_deleted_at'")
+                else:
+                    assignments.append(
+                        "metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
+                        "'{history_deleted_at}', CAST(:deleted_at_json AS jsonb), true)"
+                    )
+                    params["deleted_at_json"] = _json_dumps(str(value))
             else:
                 assignments.append(f"{key} = :{key}")
                 params[key] = value

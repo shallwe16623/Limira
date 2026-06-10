@@ -168,10 +168,48 @@ label {
 	padding-left: 0.25rem;
 }
 
+.sidebar-section-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem;
+}
+
+.sidebar-section-row .sidebar-section-title {
+	margin-bottom: 0.35rem;
+}
+
+.history-toggle-button {
+	flex: 0 0 auto;
+	padding: 0.25rem 0.4rem;
+	border-radius: var(--radius-sm);
+	color: var(--muted);
+	font-size: 0.72rem;
+}
+
+.history-toggle-button:hover,
+.history-toggle-button.active {
+	background: var(--surface-hover);
+	color: var(--text);
+}
+
 .history-list {
 	display: flex;
 	flex-direction: column;
 	gap: 0.15rem;
+}
+
+.history-entry {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 0.25rem;
+	border-radius: var(--radius-sm);
+}
+
+.history-entry:hover,
+.history-entry.active {
+	background: var(--surface-hover);
 }
 
 .history-item {
@@ -182,11 +220,39 @@ label {
 	border-radius: var(--radius-sm);
 	color: var(--text);
 	text-align: left;
+	min-width: 0;
 }
-.history-item:hover { background: var(--surface-hover); }
-.history-item.active { background: var(--surface-hover); font-weight: 500; }
+.history-entry.active .history-title { font-weight: 500; }
 .history-title { font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .history-meta { font-size: 0.7rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-actions {
+	display: flex;
+	align-items: center;
+	gap: 0.15rem;
+	padding-right: 0.25rem;
+	opacity: 0;
+	pointer-events: none;
+}
+.history-entry:hover .history-actions,
+.history-entry.active .history-actions,
+.history-actions:focus-within {
+	opacity: 1;
+	pointer-events: auto;
+}
+.history-action {
+	padding: 0.25rem 0.35rem;
+	border-radius: var(--radius-sm);
+	color: var(--muted);
+	font-size: 0.72rem;
+}
+.history-action:hover {
+	background: var(--surface);
+	color: var(--text);
+}
+.history-action.danger:hover {
+	color: var(--danger);
+	background: var(--danger-bg);
+}
 
 .sidebar-footer {
 	position: relative;

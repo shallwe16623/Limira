@@ -853,11 +853,16 @@ async def create_research_task(
 @router.get("/tasks")
 async def list_tasks(
     limit: int = Query(default=30, ge=1, le=100),
+    archived: bool = Query(default=False),
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, Any]:
-    tasks = repo.list_user_tasks(owner_user_id=user.id, limit=limit)
-    payload = {"tasks": [task.public_dict() for task in tasks], "count": len(tasks)}
+    tasks = repo.list_user_tasks(owner_user_id=user.id, limit=limit, archived=archived)
+    payload = {
+        "tasks": [task.public_dict() for task in tasks],
+        "count": len(tasks),
+        "archived": archived,
+    }
     return _assert_browser_safe(payload)
 
 
@@ -869,6 +874,44 @@ async def get_task(
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
     return _assert_browser_safe(task.public_dict())
+
+
+@router.post("/tasks/{task_id}/history/archive")
+async def archive_task_history(
+    task_id: str,
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    task = _get_owned_task(repo, task_id, user)
+    archived = repo.update_task(
+        task.task_id,
+        archived_at=_history_timestamp(),
+    )
+    return _assert_browser_safe(archived.public_dict())
+
+
+@router.post("/tasks/{task_id}/history/restore")
+async def restore_task_history(
+    task_id: str,
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    task = _get_owned_task(repo, task_id, user)
+    restored = repo.update_task(task.task_id, archived_at=None)
+    return _assert_browser_safe(restored.public_dict())
+
+
+@router.delete("/tasks/{task_id}/history")
+async def delete_task_history(
+    task_id: str,
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    task = _get_owned_task(repo, task_id, user)
+    if task.archived_at is not None:
+        repo.update_task(task.task_id, archived_at=None)
+    repo.update_task(task.task_id, deleted_at=_history_timestamp())
+    return _assert_browser_safe({"deleted": True, "task_id": task.task_id})
 
 
 @router.get("/tasks/{task_id}/events")
@@ -1615,6 +1658,7 @@ async def _store_task_report_pdf(
     markdown: str,
     evidence_refs: list[str],
     metadata: Mapping[str, Any] | None = None,
+    record_cloud_document: bool = True,
 ) -> LimiraGeneratedReport:
     report_html = _render_report_html(
         markdown=markdown,
@@ -1676,19 +1720,20 @@ async def _store_task_report_pdf(
         creator_user_id=user.id,
         metadata=report_metadata,
     )
-    _try_record_generated_cloud_document(
-        repo,
-        user,
-        task=task,
-        stored=stored,
-        filename=_report_filename_from_markdown(markdown, fallback=report_id),
-        extracted_text=markdown,
-        metadata={
-            "generated_asset_type": "report_pdf",
-            "report_id": report_id,
-            "report_type": report_type,
-        },
-    )
+    if record_cloud_document:
+        _try_record_generated_cloud_document(
+            repo,
+            user,
+            task=task,
+            stored=stored,
+            filename=_report_filename_from_markdown(markdown, fallback=report_id),
+            extracted_text=markdown,
+            metadata={
+                "generated_asset_type": "report_pdf",
+                "report_id": report_id,
+                "report_type": report_type,
+            },
+        )
     return report
 
 
@@ -1720,6 +1765,7 @@ async def _ensure_completed_task_report_pdf(
         markdown=markdown,
         evidence_refs=evidence_refs,
         metadata={"source_event_type": "auto_task_completion"},
+        record_cloud_document=False,
     )
 
 
@@ -1903,10 +1949,16 @@ async def _load_or_create_persisted_archive(
 
     archive_artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
     page_snapshots = await _fetch_evidence_page_snapshots(archive_artifacts)
+    report_pdf_bytes = await _archive_report_pdf_bytes(
+        task,
+        repo=repo,
+        object_storage=object_storage,
+    )
     archive_bytes = _build_persisted_archive_zip(
         task,
         repo,
         page_snapshots=page_snapshots,
+        report_pdf_bytes=report_pdf_bytes,
     )
     validate_archive_zip(archive_bytes)
     archive_bytes = _scrub_archive_zip(archive_bytes)
@@ -1927,6 +1979,35 @@ async def _load_or_create_persisted_archive(
         archive_bytes=archive_bytes,
     )
     return archive_bytes
+
+
+async def _archive_report_pdf_bytes(
+    task: LimiraTask,
+    *,
+    repo: LimiraTaskRepository,
+    object_storage: LimiraObjectStorage,
+) -> bytes | None:
+    report = _select_archive_report(repo.list_task_reports(task_id=task.task_id))
+    if not report or not report.pdf_object_key:
+        return None
+    try:
+        data = await object_storage.get_object(object_key=report.pdf_object_key)
+    except (FileNotFoundError, ValueError):
+        _clear_report_pdf_metadata(report, repo=repo)
+        return None
+    reuse_failure = _persisted_report_pdf_reuse_failure_reason(data, report=report)
+    if reuse_failure is not None:
+        log.warning(
+            "Persisted limira report PDF object failed validation; excluding from archive",
+            extra={
+                "task_id": report.task_id,
+                "report_id": report.report_id,
+                "reason": reuse_failure,
+            },
+        )
+        _clear_report_pdf_metadata(report, repo=repo)
+        return None
+    return data
 
 
 async def _store_persisted_archive_bytes(
