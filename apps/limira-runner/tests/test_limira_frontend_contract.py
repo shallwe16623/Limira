@@ -358,6 +358,7 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
 def test_limira_standalone_frontend_exposes_native_task_history_controls():
     app = _read(LIMIRA_STANDALONE_APP)
     index = _read(LIMIRA_STANDALONE_INDEX)
+    styles = _read(LIMIRA_STANDALONE_STYLES)
 
     assert 'id="historyList"' in index
     assert 'id="historyMessage"' in index
@@ -373,6 +374,11 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert index.index('id="historySearchButton"') < index.index('id="historySearchModal"')
     assert index.index('id="historySearchModal"') < index.index('id="historySearchInput"')
     assert 'id="sidebarCollapseButton"' in index
+    assert 'id="mainSidebarOpenButton"' in index
+    assert "dom.mainSidebarOpenButton.addEventListener('click', () => {\n\t\tsetSidebarCollapsed(false);" in app
+    assert "dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed);" in app
+    assert ".workspace.sidebar-collapsed .main-sidebar-open-button" in styles
+    assert ".workspace.sidebar-collapsed .sidebar {\n\t\tdisplay: none;" in styles
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app
     assert "dom.workspace.classList.toggle('sidebar-collapsed'" in app

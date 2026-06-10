@@ -574,10 +574,31 @@ label {
 	display: flex;
 	align-items: center;
 	justify-content: flex-start;
+	gap: 0.75rem;
 	min-height: 56px;
 	padding: 0.75rem 1.5rem;
 	flex-shrink: 0;
 	border-bottom: 1px solid var(--border-light);
+}
+
+.main-sidebar-open-button {
+	display: none;
+	align-items: center;
+	justify-content: center;
+	width: 34px;
+	height: 34px;
+	flex: 0 0 auto;
+	border-radius: var(--radius-sm);
+	color: var(--text-secondary);
+}
+
+.main-sidebar-open-button:hover {
+	background: var(--surface-hover);
+	color: var(--text);
+}
+
+.workspace.sidebar-collapsed .main-sidebar-open-button {
+	display: inline-flex;
 }
 
 .brand {
@@ -1645,11 +1666,17 @@ label {
 @media (max-width: 768px) {
 	.app-shell { height: 100dvh; }
 	.workspace { flex-direction: column; }
-	.sidebar { display: none; /* In a real app, you'd toggle this. For now we hide it on mobile to focus on chat */ }
-
-	/* Or stack it */
-	.sidebar { width: 100%; height: auto; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--border); }
-	.workspace { flex-direction: column; }
+	.sidebar {
+		display: flex;
+		width: 100%;
+		height: auto;
+		max-height: 40vh;
+		border-right: none;
+		border-bottom: 1px solid var(--border);
+	}
+	.workspace.sidebar-collapsed .sidebar {
+		display: none;
+	}
 	.main-content { padding-bottom: 0; }
 }
 

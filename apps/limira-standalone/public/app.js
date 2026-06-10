@@ -301,6 +301,9 @@ function bindEvents() {
 	dom.sidebarCollapseButton.addEventListener('click', () => {
 		setSidebarCollapsed(!state.sidebarCollapsed);
 	});
+	dom.mainSidebarOpenButton.addEventListener('click', () => {
+		setSidebarCollapsed(false);
+	});
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.archivedHistoryManageButton.addEventListener('click', (event) => {
 		event.preventDefault();
@@ -540,6 +543,8 @@ function renderSidebar() {
 	dom.sidebarCollapseButton.setAttribute('aria-expanded', state.sidebarCollapsed ? 'false' : 'true');
 	dom.sidebarCollapseButton.title = state.sidebarCollapsed ? '展开边栏' : '折叠边栏';
 	dom.sidebarCollapseButton.setAttribute('aria-label', state.sidebarCollapsed ? '展开边栏' : '折叠边栏');
+	dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed);
+	dom.mainSidebarOpenButton?.setAttribute('aria-expanded', state.sidebarCollapsed ? 'false' : 'true');
 }
 
 function setSidebarCollapsed(collapsed) {
