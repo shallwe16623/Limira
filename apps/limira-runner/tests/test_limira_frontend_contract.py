@@ -429,6 +429,9 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function renderHistorySearchModal()" in app
     assert "function searchTaskHistory()" in app
     assert "function loadTaskHistory()" in app
+    assert "async function loadTaskProgressRecords()" in app
+    assert "function rebuildThinkingFromProgressRecords(records)" in app
+    assert "function appendProgressRecordThinkingStep(record)" in app
     assert "function selectHistoryTask(taskId)" in app
     assert "function startNewChat()" in app
     assert "function switchToWorkspaceRoute()" in app
@@ -437,6 +440,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     start_new_chat_block = app[app.index("function startNewChat()") : app.index("function resetCurrentTaskView()")]
     assert "switchToWorkspaceRoute();" in select_history_block
     assert "renderShell();" in select_history_block
+    assert "await loadTaskProgressRecords();" in select_history_block
     assert "switchToWorkspaceRoute();" in start_new_chat_block
     assert "renderShell();" in start_new_chat_block
     assert "const params = new URLSearchParams({" in app
@@ -460,7 +464,10 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "/history/restore" in app
     assert "method: 'DELETE'" in app
     assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}" in app
+    assert "api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/event-logs`)" in app
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
+    assert "message.kind === 'report' && String(message.taskId || '') === taskId" in app
+    assert "taskId" in app[app.index("function upsertReportMessage(content)") : app.index("function appendThinkingStep")]
     assert LEGACY_AUTH_PREFIX not in app
 
 

@@ -947,6 +947,31 @@ async def get_task_events(
     )
 
 
+@router.get("/tasks/{task_id}/event-logs")
+async def get_task_event_logs(
+    task_id: str,
+    limit: int = Query(default=500, ge=1, le=2000),
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    task = _get_owned_task(repo, task_id, user)
+    events = [
+        _public_admin_event_log(
+            event,
+            owner_user_id=task.owner_user_id,
+            admin_user_id="",
+        )
+        for event in repo.list_task_event_logs(task.task_id, limit=limit)
+    ]
+    return _assert_browser_safe(
+        {
+            "task_id": task.task_id,
+            "count": len(events),
+            "events": events,
+        }
+    )
+
+
 @router.get("/tasks/{task_id}/artifacts")
 async def get_task_artifacts(
     task_id: str,

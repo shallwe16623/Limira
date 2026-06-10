@@ -803,6 +803,80 @@ async def test_admin_task_event_logs_are_persisted_for_operations_only():
 
 
 @pytest.mark.asyncio
+async def test_task_event_logs_are_available_to_owner_for_history_replay():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-history-event-log",
+        owner_user_id=user.id,
+        query="history replay",
+        scenario=None,
+        runner_task_id="runner-history-event-log",
+    )
+    repo.record_task_event_log(
+        task.task_id,
+        {
+            "type": "tool_call",
+            "payload": {
+                "tool_name": "show_text",
+                "tool_input": {"text": "# Final answer\n\nHistory replay works."},
+                "owner_user_id": user.id,
+                "runner_task_id": "runner-history-event-log",
+                "object_key": "limira/users/user-a/tasks/task-history-event-log/raw.json",
+                "internal_runner_path": "/limira-runner/tasks/runner-history-event-log/events",
+            },
+        },
+    )
+
+    payload = await limira.get_task_event_logs(
+        task.task_id,
+        limit=500,
+        user=user,
+        repo=repo,
+    )
+
+    assert payload["task_id"] == task.task_id
+    assert payload["count"] == 1
+    event = payload["events"][0]
+    assert event["event_type"] == "tool_call"
+    assert event["payload"]["tool_name"] == "show_text"
+    assert event["payload"]["tool_input"]["text"].startswith("# Final answer")
+    assert "created_at" in event
+    _assert_admin_browser_payload_hides_raw_identities(
+        payload,
+        owner_user_id=user.id,
+        admin_user_id="admin-not-present",
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_event_logs_reject_cross_user_history_replay():
+    repo = limira.InMemoryLimiraTaskRepository()
+    owner = limira.LimiraUser("user-a")
+    other = limira.LimiraUser("user-b")
+    task = repo.create_task(
+        task_id="task-history-event-log-cross-user",
+        owner_user_id=owner.id,
+        query="history replay isolation",
+        scenario=None,
+        runner_task_id="runner-history-event-log-cross-user",
+    )
+    repo.record_task_event_log(
+        task.task_id,
+        {"type": "status", "payload": {"status": "completed"}},
+    )
+
+    with pytest.raises(HTTPException) as forbidden:
+        await limira.get_task_event_logs(
+            task.task_id,
+            limit=500,
+            user=other,
+            repo=repo,
+        )
+    assert forbidden.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_admin_task_event_logs_shape_identity_bearing_payloads():
     repo = limira.InMemoryLimiraTaskRepository()
     research = FakeResearchClient()

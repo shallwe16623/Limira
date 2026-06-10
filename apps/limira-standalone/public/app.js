@@ -1002,6 +1002,7 @@ async function resumeWorkspace() {
 	}
 	try {
 		await refreshTask();
+		await loadTaskProgressRecords();
 		await loadArtifacts();
 		await loadUploads();
 		await loadTaskHistory();
@@ -1496,6 +1497,7 @@ async function selectHistoryTask(taskId) {
 	state.archiveStatus = cached.archive_status || 'pending';
 	updateArchiveState(cached);
 	state.savedUserId = state.user?.id || state.savedUserId;
+	state.query = cached.query || '';
 	state.messages = historyMessages(cached);
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = historyThinkingSteps(cached);
@@ -1504,6 +1506,7 @@ async function selectHistoryTask(taskId) {
 	renderShell();
 	try {
 		await refreshTask();
+		await loadTaskProgressRecords();
 		await loadArtifacts();
 		await loadUploads();
 		if (!terminalStatuses.has(state.status)) {
@@ -1534,6 +1537,7 @@ function startNewChat() {
 function resetCurrentTaskView() {
 	state.savedUserId = state.user?.id || state.savedUserId || '';
 	state.taskId = '';
+	state.query = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
@@ -1583,12 +1587,14 @@ function taskHistoryMeta(task) {
 
 function historyMessages(task) {
 	const query = String(task.query || '').trim();
+	const taskId = String(task.task_id || state.taskId || '');
 	return [
-		query ? { role: 'user', content: query, time: now() } : null,
+		query ? { role: 'user', content: query, time: now(), taskId } : null,
 		{
 			role: 'assistant',
 			content: `已载入历史任务：${statusLabel(task.status || state.status)}。`,
-			time: now()
+			time: now(),
+			taskId
 		}
 	].filter(Boolean);
 }
@@ -1635,6 +1641,10 @@ function restoreWorkspace() {
 	}
 	state.savedUserId = typeof saved.userId === 'string' ? saved.userId : '';
 	state.taskId = typeof saved.taskId === 'string' ? saved.taskId : '';
+	state.query = typeof saved.query === 'string' ? saved.query : '';
+	if (state.query && dom.queryInput) {
+		dom.queryInput.value = state.query;
+	}
 	state.status = typeof saved.status === 'string' ? saved.status : 'ready';
 	state.archiveStatus = typeof saved.archiveStatus === 'string' ? saved.archiveStatus : 'pending';
 	state.archiveDownloadUrl = safeArchiveDownloadUrl(saved.archiveDownloadUrl, state.taskId);
@@ -1658,6 +1668,7 @@ function saveWorkspace() {
 	const payload = {
 		userId: state.user?.id || state.savedUserId || '',
 		taskId: state.taskId,
+		query: state.query,
 		status: state.status,
 		archiveStatus: state.archiveStatus,
 		archiveDownloadUrl: state.archiveDownloadUrl,
@@ -1750,6 +1761,7 @@ async function submitResearch() {
 	const documentIds = isEnterpriseAccount() ? selectedUploadDocumentIds() : [];
 
 	state.isSubmitting = true;
+	state.query = query;
 	bumpWorkspaceGeneration();
 	const context = captureAsyncContext({ includeTask: false });
 	state.status = 'starting';
@@ -1862,7 +1874,7 @@ function connectStream() {
 	};
 }
 
-function handleStreamEvent(payload) {
+function normalizeStreamPayload(payload) {
 	payload = payload && typeof payload === 'object' ? payload : { message: String(payload || '') };
 	const eventType = String(payload.event || payload.type || payload.data?.event || 'task_update');
 	const data =
@@ -1874,7 +1886,12 @@ function handleStreamEvent(payload) {
 	const nested = data.data && typeof data.data === 'object' ? data.data : {};
 	const eventData = data.event === eventType && Object.keys(nested).length > 0 ? nested : data;
 	const status = payload.status || data.status || nested.status || eventData.status;
-	updateArchiveState(payload);
+	return { payload, eventType, data, nested, eventData, status };
+}
+
+function handleStreamEvent(payload) {
+	const { payload: normalizedPayload, eventType, data, nested, eventData, status } = normalizeStreamPayload(payload);
+	updateArchiveState(normalizedPayload);
 	updateArchiveState(data);
 	updateArchiveState(nested);
 	updateArchiveState(eventData);
@@ -1935,7 +1952,7 @@ function handleStreamEvent(payload) {
 		addThinkingStep(thinkingStepForArtifactEvent(eventType, eventData));
 		void loadArtifacts();
 	} else {
-		const summary = eventData.message || eventData.summary || data.message || data.summary || payload.message || eventType;
+		const summary = eventData.message || eventData.summary || data.message || data.summary || normalizedPayload.message || eventType;
 		addThinkingStep({
 			kind: 'status',
 			title: eventLabel(eventType),
@@ -1995,6 +2012,178 @@ function handleToolCall(data) {
 		detail: toolThinkingDetail(toolName, input),
 		status: 'active'
 	});
+}
+
+function rebuildThinkingFromProgressRecords(records) {
+	const events = Array.isArray(records) ? records : [];
+	if (!events.length) {
+		return false;
+	}
+	state.thinkingSteps = [];
+	const query = currentTaskQuery();
+	if (query) {
+		appendThinkingStep({
+			kind: 'planning',
+			title: '研究问题',
+			detail: query,
+			status: 'done',
+			time: progressRecordDisplayTime(events[0]?.created_at)
+		});
+	}
+	for (const record of events) {
+		appendProgressRecordThinkingStep(record);
+	}
+	return state.thinkingSteps.length > 0;
+}
+
+function currentTaskQuery() {
+	const historyTask = state.taskHistory.find((task) => task.task_id === state.taskId)
+		|| state.archivedTaskHistory.find((task) => task.task_id === state.taskId)
+		|| {};
+	return String(state.query || dom.queryInput?.value || historyTask.query || '').trim();
+}
+
+function progressRecordDisplayTime(value) {
+	if (typeof value === 'number' && Number.isFinite(value)) {
+		const milliseconds = value < 1000000000000 ? value * 1000 : value;
+		return new Date(milliseconds).toLocaleTimeString();
+	}
+	const numeric = Number(value);
+	if (Number.isFinite(numeric) && numeric > 0) {
+		const milliseconds = numeric < 1000000000000 ? numeric * 1000 : numeric;
+		return new Date(milliseconds).toLocaleTimeString();
+	}
+	if (typeof value === 'string' && value.trim()) {
+		const parsed = new Date(value);
+		if (!Number.isNaN(parsed.getTime())) {
+			return parsed.toLocaleTimeString();
+		}
+	}
+	return now();
+}
+
+function appendProgressRecordThinkingStep(record) {
+	const logged = record && typeof record === 'object' ? record : {};
+	const loggedPayload = logged.payload && typeof logged.payload === 'object' ? logged.payload : {};
+	const streamPayload = {
+		task_id: logged.task_id || state.taskId,
+		type: loggedPayload.event || loggedPayload.type || logged.event_type || logged.type || 'task_update',
+		payload: loggedPayload
+	};
+	const { payload, eventType, data, nested, eventData, status } = normalizeStreamPayload(streamPayload);
+	const time = progressRecordDisplayTime(logged.created_at);
+	updateArchiveState(payload);
+	updateArchiveState(data);
+	updateArchiveState(nested);
+	updateArchiveState(eventData);
+	if (status) {
+		state.status = String(status);
+	}
+	if (eventType === 'heartbeat') {
+		return;
+	}
+	if (eventType === 'tool_call') {
+		appendThinkingStep(thinkingStepForLoggedToolCall(eventData, time));
+		return;
+	}
+	if (eventType === 'error') {
+		state.status = 'failed';
+		completeActiveThinkingSteps();
+		appendThinkingStep({
+			kind: 'error',
+			title: '任务执行失败',
+			detail: errorMessage(eventData.error || data.error || payload),
+			status: 'error',
+			time
+		});
+		return;
+	}
+	if (eventType === 'archive_generated') {
+		state.archiveStatus = 'ready';
+		state.archiveDownloadUrl = safeArchiveDownloadUrl(eventData.archive_url, state.taskId);
+		appendThinkingStep({
+			kind: 'archive',
+			title: '任务归档已生成',
+			detail: '报告、证据和运行材料已打包并保存到云盘，可在底部“归档”入口下载。',
+			status: 'done',
+			time
+		});
+		return;
+	}
+	if (eventType === 'completion_asset_warning') {
+		appendThinkingStep({
+			kind: 'warning',
+			title: '部分导出材料生成失败',
+			detail: '任务主体已完成，但部分归档材料需要稍后重试或检查运行配置。',
+			status: 'warning',
+			time
+		});
+		return;
+	}
+	if (eventType === 'end_of_workflow') {
+		state.status = 'completed';
+		completeActiveThinkingSteps();
+		appendThinkingStep({
+			kind: 'done',
+			title: '工作流已完成',
+			detail: artifactThinkingSummary(),
+			status: 'done',
+			time
+		});
+		return;
+	}
+	if (eventType.startsWith('start_of_')) {
+		appendThinkingStep({ ...thinkingStepForStartEvent(eventType, eventData), time });
+		return;
+	}
+	if (artifactEvents.has(eventType)) {
+		appendThinkingStep({ ...thinkingStepForArtifactEvent(eventType, eventData), time });
+		return;
+	}
+	const summary = eventData.message || eventData.summary || data.message || data.summary || payload.message || eventType;
+	appendThinkingStep({
+		kind: 'status',
+		title: eventLabel(eventType),
+		detail: truncateText(stringifyCompact(summary), 260),
+		status: terminalStatuses.has(String(status || state.status)) ? 'done' : 'active',
+		time
+	});
+}
+
+function thinkingStepForLoggedToolCall(data, time) {
+	const toolName = data.tool_name || data.name || 'tool';
+	const input = data.tool_input && typeof data.tool_input === 'object' ? data.tool_input : {};
+	if (toolName === 'show_text' && typeof input.text === 'string') {
+		state.finalReportText = reportTextFromValue(input.text) || input.text;
+		upsertReportMessage(state.finalReportText);
+		state.activeTab = CONVERSATION_VIEW;
+		return {
+			kind: 'report',
+			title: '最终报告已生成',
+			detail: '报告内容已直接写入对话，后续归档会一并打包保存。',
+			status: 'done',
+			time
+		};
+	}
+	if (typeof input.result === 'string') {
+		const parsed = parseJson(input.result);
+		if (parsed && typeof parsed === 'object' && parsed.success) {
+			return {
+				kind: 'tool',
+				title: toolThinkingTitle(toolName, input),
+				detail: toolThinkingDetail(toolName, input, parsed),
+				status: 'done',
+				time
+			};
+		}
+	}
+	return {
+		kind: 'tool',
+		title: toolThinkingTitle(toolName, input),
+		detail: toolThinkingDetail(toolName, input),
+		status: 'active',
+		time
+	};
 }
 
 function compactStartMessage(eventType, data) {
@@ -2141,6 +2330,32 @@ async function loadArtifacts() {
 			return;
 		}
 		addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
+	}
+}
+
+async function loadTaskProgressRecords() {
+	if (!state.taskId) {
+		return false;
+	}
+	const context = captureAsyncContext();
+	try {
+		const data = await api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/event-logs`);
+		if (!isCurrentAsyncContext(context)) {
+			return false;
+		}
+		const events = Array.isArray(data.events) ? data.events : [];
+		if (!events.length || !rebuildThinkingFromProgressRecords(events)) {
+			return false;
+		}
+		saveWorkspace();
+		renderMessages();
+		renderThinking();
+		renderStatus();
+		renderTabs();
+		renderReportControls();
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -3829,6 +4044,7 @@ function safeArchiveDownloadUrl(value, taskId) {
 }
 
 function addMessage(role, content, options = {}) {
+	const taskId = typeof options.taskId === 'string' ? options.taskId : state.taskId || '';
 	state.messages = [
 		...state.messages,
 		{
@@ -3836,7 +4052,8 @@ function addMessage(role, content, options = {}) {
 			content: String(content),
 			time: now(),
 			format: options.format || '',
-			kind: options.kind || ''
+			kind: options.kind || '',
+			taskId
 		}
 	];
 	saveWorkspace();
@@ -3848,13 +4065,17 @@ function upsertReportMessage(content) {
 	if (!text) {
 		return false;
 	}
-	const index = state.messages.findIndex((message) => message.kind === 'report');
+	const taskId = state.taskId || '';
+	const index = state.messages.findIndex((message) => (
+		message.kind === 'report' && String(message.taskId || '') === taskId
+	));
 	const message = {
 		role: 'assistant',
 		content: text,
 		time: index >= 0 ? state.messages[index].time || now() : now(),
 		format: 'markdown',
-		kind: 'report'
+		kind: 'report',
+		taskId
 	};
 	if (
 		index >= 0 &&
@@ -3869,10 +4090,10 @@ function upsertReportMessage(content) {
 	return true;
 }
 
-function addThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '' }) {
+function appendThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '', time = '' }) {
 	const normalizedTitle = String(title || '').trim();
 	if (!normalizedTitle) {
-		return;
+		return false;
 	}
 	const step = {
 		kind,
@@ -3880,10 +4101,17 @@ function addThinkingStep({ kind = 'task', title, detail = '', status = 'active',
 		detail: String(detail || '').trim(),
 		status,
 		meta: String(meta || '').trim(),
-		time: now()
+		time: time || now()
 	};
 	const next = state.thinkingSteps.filter((item) => item.kind !== 'ready');
 	state.thinkingSteps = [...next, step].slice(-MAX_THINKING_STEPS);
+	return true;
+}
+
+function addThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '' }) {
+	if (!appendThinkingStep({ kind, title, detail, status, meta })) {
+		return;
+	}
 	saveWorkspace();
 	renderThinking();
 }
