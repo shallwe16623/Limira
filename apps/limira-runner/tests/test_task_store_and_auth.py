@@ -160,6 +160,37 @@ def test_task_store_rejects_invalid_status_updates(tmp_path):
         store.update_task("task-a", archive_status="missing")
 
 
+def test_task_store_preserves_terminal_status_from_late_updates(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-a",
+        user_id="user-a",
+        query="terminal protection",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    failed = store.update_task(
+        "task-a",
+        status="failed",
+        archive_status="failed",
+        completed_at="2026-06-06T12:02:00+00:00",
+        error="pipeline failed",
+    )
+
+    late_completed = store.update_task(
+        "task-a",
+        status="completed",
+        archive_status="ready",
+        completed_at="2026-06-06T12:03:00+00:00",
+        error=None,
+    )
+
+    assert failed.status == "failed"
+    assert late_completed.status == "failed"
+    assert late_completed.archive_status == "failed"
+    assert late_completed.completed_at == "2026-06-06T12:02:00+00:00"
+    assert late_completed.error == "pipeline failed"
+
+
 def test_runner_task_store_factory_requires_explicit_sqlite_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("RUNNER_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -311,6 +342,18 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert cancelled.archive_status == "failed"
     assert cancelled.error == "cancelled"
 
+    late_failed = store.update_task(
+        "task-a",
+        status="failed",
+        archive_status="failed",
+        completed_at="2026-06-06T12:13:00+00:00",
+        error="late failure",
+    )
+    assert late_failed.status == "completed"
+    assert late_failed.archive_status == "ready"
+    assert late_failed.completed_at == "2026-06-06T12:10:00+00:00"
+    assert late_failed.error is None
+
 
 def test_auth_adapter_accepts_trusted_headers_only():
     auth = authenticate_headers(
@@ -454,9 +497,17 @@ class FakeRunnerPostgresConnection:
             return FakeRunnerPostgresCursor([row])
 
         if "update limira_research_tasks" in lowered:
-            task_id = params[-1]
+            has_terminal_guard = "status not in ('completed', 'failed', 'cancelled')" in lowered
+            task_id = params[-2] if has_terminal_guard else params[-1]
+            incoming_status = params[-1] if has_terminal_guard else None
             row = self.database.rows.get(task_id)
             if not row:
+                return FakeRunnerPostgresCursor([])
+            if (
+                has_terminal_guard
+                and row["status"] in {"completed", "failed", "cancelled"}
+                and row["status"] != incoming_status
+            ):
                 return FakeRunnerPostgresCursor([])
             value_index = 0
             for field in (

@@ -7,6 +7,7 @@ from typing import Any
 
 
 TASK_STATUSES = {"queued", "running", "completed", "failed", "cancelled"}
+FINAL_TASK_STATUSES = ("completed", "failed", "cancelled")
 ARCHIVE_STATUSES = {"pending", "ready", "failed"}
 RUNNER_TASK_STORE_BACKEND_ENV = "RUNNER_TASK_STORE_BACKEND"
 RUNNER_DATABASE_URL_ENV = "RUNNER_DATABASE_URL"
@@ -126,6 +127,7 @@ class TaskStore:
                 raise KeyError(task_id)
             return record
 
+        incoming_status = updates.get("status")
         assignments = ", ".join(f"{field} = ?" for field in updates)
         values = [
             self._serialize_value(value)
@@ -133,13 +135,26 @@ class TaskStore:
             else value
             for field, value in updates.items()
         ]
+        where_clause = "WHERE task_id = ?"
         values.append(task_id)
+        if incoming_status is not None:
+            placeholders = ", ".join("?" for _status in FINAL_TASK_STATUSES)
+            where_clause += f" AND (status NOT IN ({placeholders}) OR status = ?)"
+            values.extend([*FINAL_TASK_STATUSES, incoming_status])
         with self._connect() as conn:
             cursor = conn.execute(
-                f"UPDATE limira_runner_research_tasks SET {assignments} WHERE task_id = ?",
+                f"UPDATE limira_runner_research_tasks SET {assignments} {where_clause}",
                 values,
             )
             if cursor.rowcount == 0:
+                current = self.get_task(task_id)
+                if (
+                    current
+                    and incoming_status is not None
+                    and current.status in FINAL_TASK_STATUSES
+                    and current.status != incoming_status
+                ):
+                    return current
                 raise KeyError(task_id)
         record = self.get_task(task_id)
         if not record:
@@ -428,14 +443,32 @@ class PostgresTaskStore:
             assignments.append("metadata = metadata || CAST(%s AS jsonb)")
             values.append(_serialize_json(metadata_updates))
 
+        incoming_status = updates.get("status")
+        where_clause = "task_id = %s"
+        if incoming_status is not None:
+            where_clause += (
+                " AND (status NOT IN ('completed', 'failed', 'cancelled') OR status = %s)"
+            )
+            where_params = (task_id, incoming_status)
+        else:
+            where_params = (task_id,)
+
         sql = f"""
             UPDATE limira_research_tasks
             SET {", ".join(assignments)}
-            WHERE task_id = %s
+            WHERE {where_clause}
             RETURNING {self.TASK_COLUMNS}
         """
-        row = self._fetch_one(sql, (*values, task_id))
+        row = self._fetch_one(sql, (*values, *where_params))
         if not row:
+            current = self.get_task(task_id)
+            if (
+                current
+                and incoming_status is not None
+                and current.status in FINAL_TASK_STATUSES
+                and current.status != incoming_status
+            ):
+                return current
             raise KeyError(task_id)
         return self._row_to_record(row)
 
