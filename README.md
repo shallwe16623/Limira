@@ -71,6 +71,30 @@ docker-compose.limira.yml
 cp .env.example .env
 ```
 
+本地启动脚本会按下面顺序读取环境变量文件；每个 worktree 都有自己独立的一组文件，不会自动共享其它 worktree 的配置：
+
+```text
+<worktree>/.env
+  本地服务端口、RUNNER_SERVICE_TOKEN、LIMIRA_AUTH_SECRET、CORS 等整套服务通用配置。
+
+<worktree>/apps/limira-agent/.env
+  agent 工具配置：SERPER_API_KEY、JINA_API_KEY、E2B_API_KEY、SUMMARY_LLM_* 等。
+
+<worktree>/apps/limira-runner/.env
+  runner 模型配置：DEFAULT_LLM_PROVIDER、DEFAULT_MODEL_NAME、BASE_URL、API_KEY 等。
+```
+
+当前服务器上常用的四个 worktree 对应路径是：
+
+```text
+/home/limira/MiroLimira/MiroThinker-limra-aggressive/
+/home/limira/MiroLimira/dev/
+/home/limira/MiroLimira/ios/
+/home/limira/MiroLimira/android/
+```
+
+如果要让某个 worktree 跑真实研究任务，至少要确保这个 worktree 下的 `apps/limira-agent/.env` 和 `apps/limira-runner/.env` 已存在并包含有效密钥。`.env` 文件属于本机密钥配置，已被 git 忽略，不要提交到仓库。
+
 至少需要填写：
 
 ```bash
