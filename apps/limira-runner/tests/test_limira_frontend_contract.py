@@ -385,6 +385,14 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function loadTaskHistory()" in app
     assert "function selectHistoryTask(taskId)" in app
     assert "function startNewChat()" in app
+    assert "function switchToWorkspaceRoute()" in app
+    assert "window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);" in app
+    select_history_block = app[app.index("async function selectHistoryTask(taskId)") : app.index("function startNewChat()")]
+    start_new_chat_block = app[app.index("function startNewChat()") : app.index("function resetCurrentTaskView()")]
+    assert "switchToWorkspaceRoute();" in select_history_block
+    assert "renderShell();" in select_history_block
+    assert "switchToWorkspaceRoute();" in start_new_chat_block
+    assert "renderShell();" in start_new_chat_block
     assert "const params = new URLSearchParams({" in app
     assert "api(`/api/limira/tasks?${activeParams.toString()}`)" in app
     assert "api(`/api/limira/tasks?${archivedParams.toString()}`)" in app

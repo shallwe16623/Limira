@@ -556,6 +556,14 @@ function syncRouteFromHash() {
 	state.route = routeFromHash();
 }
 
+function switchToWorkspaceRoute() {
+	state.route = 'workspace';
+	state.userSettingsOpen = false;
+	if (window.location.hash) {
+		window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+	}
+}
+
 function routeFromHash() {
 	if (window.location.hash === '#cloud-drive') {
 		return 'cloud-drive';
@@ -1449,6 +1457,7 @@ async function selectHistoryTask(taskId) {
 	if (!normalizedTaskId || state.isSubmitting) {
 		return;
 	}
+	switchToWorkspaceRoute();
 	state.eventSource?.close();
 	state.eventSource = null;
 	bumpWorkspaceGeneration();
@@ -1464,11 +1473,7 @@ async function selectHistoryTask(taskId) {
 	state.thinkingSteps = historyThinkingSteps(cached);
 	dom.queryInput.value = cached.query || '';
 	saveWorkspace();
-	renderStatus();
-	renderHistory();
-	renderMessages();
-	renderTabs();
-	renderReportControls();
+	renderShell();
 	try {
 		await refreshTask();
 		await loadArtifacts();
@@ -1480,27 +1485,21 @@ async function selectHistoryTask(taskId) {
 		if (isAuthoritativeRestoreRejection(error)) {
 			clearRestoredTaskState();
 			saveWorkspace();
-			renderStatus();
-			renderHistory();
-			renderTabs();
-			renderReportControls();
+			renderShell();
 		}
 		addMessage('error', `无法加载历史任务：${errorMessage(error)}`);
 	}
 }
 
 function startNewChat() {
+	switchToWorkspaceRoute();
 	state.eventSource?.close();
 	state.eventSource = null;
 	bumpWorkspaceGeneration();
 	resetCurrentTaskView();
 	dom.queryInput.value = '';
 	saveWorkspace();
-	renderStatus();
-	renderHistory();
-	renderMessages();
-	renderTabs();
-	renderReportControls();
+	renderShell();
 	void loadUploads();
 }
 
