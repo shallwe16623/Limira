@@ -588,7 +588,6 @@ def _task_response(record: TaskRecord) -> dict[str, Any]:
     return {
         "task_id": record.task_id,
         "query": record.query,
-        "user_id": record.user_id,
         "status": record.status,
         "archive_status": record.archive_status,
         "download_url": f"/limira-runner/tasks/{record.task_id}/archive.zip"

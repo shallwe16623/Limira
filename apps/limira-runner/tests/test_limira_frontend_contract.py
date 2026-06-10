@@ -46,9 +46,10 @@ def _free_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _read_url(url: str) -> tuple[int, str]:
+def _read_url(url: str, *, headers: dict[str, str] | None = None) -> tuple[int, str]:
+    request = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8")
@@ -56,12 +57,16 @@ def _read_url(url: str) -> tuple[int, str]:
 
 class _RecordingBackendHandler(BaseHTTPRequestHandler):
     requests: list[str] = []
+    headers_seen: list[dict[str, str]] = []
 
     def log_message(self, *_args):
         return
 
     def do_GET(self):
         self.__class__.requests.append(self.path)
+        self.__class__.headers_seen.append(
+            {str(key).lower(): str(value) for key, value in self.headers.items()}
+        )
         self.send_response(200)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.end_headers()
@@ -132,6 +137,7 @@ def test_limira_standalone_proxy_only_forwards_limira_api_namespace():
     backend_port = _free_local_port()
     proxy_port = _free_local_port()
     _RecordingBackendHandler.requests = []
+    _RecordingBackendHandler.headers_seen = []
     backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _RecordingBackendHandler)
     backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
     backend_thread.start()
@@ -170,6 +176,28 @@ def test_limira_standalone_proxy_only_forwards_limira_api_namespace():
         assert auth_status == 200
         assert json.loads(auth_body)["proxied_path"] == "/api/limira/auth/session"
 
+        spoof_status, spoof_body = _read_url(
+            f"{base_url}/api/limira/scenarios",
+            headers={
+                "Authorization": "Bearer browser-session-token",
+                "Cookie": "limira_session=user-cookie",
+                "X-Limira-User-Id": "attacker",
+                "X-Limira-User-Role": "admin",
+                "X-Limira-Runner-Service-Token": "browser-forged-service-token",
+            },
+        )
+        assert spoof_status == 200
+        assert json.loads(spoof_body)["proxied_path"] == "/api/limira/scenarios"
+        proxied_headers = _RecordingBackendHandler.headers_seen[-1]
+        assert proxied_headers["authorization"] == "Bearer browser-session-token"
+        assert proxied_headers["cookie"] == "limira_session=user-cookie"
+        for private_header in (
+            "x-limira-user-id",
+            "x-limira-user-role",
+            "x-limira-runner-service-token",
+        ):
+            assert private_header not in proxied_headers
+
         for blocked_path in [
             f"{LEGACY_AUTH_PREFIX}/",
             f"{LEGACY_AUTH_PREFIX}/update/timezone",
@@ -183,6 +211,7 @@ def test_limira_standalone_proxy_only_forwards_limira_api_namespace():
         assert _RecordingBackendHandler.requests == [
             "/api/limira/scenarios",
             "/api/limira/auth/session",
+            "/api/limira/scenarios",
         ]
     finally:
         process.terminate()

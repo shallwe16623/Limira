@@ -11,6 +11,11 @@ const indexPath = join(publicRoot, 'index.html');
 const host = process.env.LIMIRA_STANDALONE_HOST || '0.0.0.0';
 const port = Number(process.env.LIMIRA_STANDALONE_PORT || 5173);
 const backendUrl = (process.env.LIMIRA_BACKEND_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
+const privateProxyHeaders = new Set([
+	'x-limira-user-id',
+	'x-limira-user-role',
+	'x-limira-runner-service-token'
+]);
 
 const mimeTypes = new Map([
 	['.html', 'text/html; charset=utf-8'],
@@ -72,6 +77,9 @@ async function proxyApi(req, res, requestUrl) {
 	delete headers.host;
 	delete headers.connection;
 	delete headers['content-length'];
+	for (const header of privateProxyHeaders) {
+		delete headers[header];
+	}
 
 	const body = await requestBody(req);
 	const proxyResponse = await fetch(target, {

@@ -219,6 +219,36 @@ def parse_sse(body):
     ]
 
 
+def assert_public_task_response_hides_internal_identifiers(payload):
+    serialized = json.dumps(payload, ensure_ascii=False)
+    forbidden_fields = (
+        "user_id",
+        "owner_user_id",
+        "object_key",
+        "objectKey",
+        "archive_object_key",
+        "archiveObjectKey",
+        "pdf_object_key",
+        "pdfObjectKey",
+    )
+    for field in forbidden_fields:
+        assert field not in payload
+        assert field not in serialized
+
+    for marker in (
+        "limira/users/",
+        "X-Limira-Runner-Service-Token",
+        "x-limira-runner-service-token",
+        "shared",
+        "Authorization",
+        "authorization",
+        "Cookie",
+        "cookie",
+        "Set-Cookie",
+    ):
+        assert marker not in serialized
+
+
 def test_create_app_preserves_partial_helper_overrides(tmp_path, monkeypatch):
     async def custom_stream():
         yield {}
@@ -346,6 +376,7 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
             status_payload["download_url"]
             == f"/limira-runner/tasks/{task_id}/archive.zip"
         )
+        assert_public_task_response_hides_internal_identifiers(status_payload)
 
         record = store.get_task(task_id)
         assert record.archive_dir is not None
@@ -748,7 +779,8 @@ async def test_runner_api_admin_allowed_for_status(tmp_path):
         )
         assert response.status == 200
         payload = await response.json()
-        assert payload["user_id"] == "user-a"
+        assert payload["status"] == "queued"
+        assert_public_task_response_hides_internal_identifiers(payload)
     finally:
         await client.close()
 
@@ -798,6 +830,8 @@ async def test_runner_api_admin_allowed_for_cancel(tmp_path):
         payload = await response.json()
         assert payload["status"] == "cancelled"
         assert payload["archive_status"] == "ready"
+        assert payload["cancel_requested"] is True
+        assert_public_task_response_hides_internal_identifiers(payload)
         record = store.get_task(start_payload["task_id"])
         assert record.status == "cancelled"
     finally:
@@ -840,6 +874,7 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
         status_payload = await status_response.json()
         assert status_payload["status"] == "cancelled"
         assert status_payload["archive_status"] == "ready"
+        assert_public_task_response_hides_internal_identifiers(status_payload)
 
         record = store.get_task(task_id)
         archive_dir = Path(record.archive_dir)
@@ -879,6 +914,7 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
         assert cancel_payload["download_url"] == (
             f"/limira-runner/tasks/{task_id}/archive.zip"
         )
+        assert_public_task_response_hides_internal_identifiers(cancel_payload)
         assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
         assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
 
@@ -922,6 +958,7 @@ async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
         assert cancel_payload["cancel_requested"] is True
         assert cancel_payload["status"] == "cancelled"
         assert cancel_payload["archive_status"] == "ready"
+        assert_public_task_response_hides_internal_identifiers(cancel_payload)
         assert task_id not in client.server.app[CANCELLED_TASKS_KEY]
 
         record = store.get_task(task_id)
@@ -1027,6 +1064,7 @@ async def test_runner_api_queued_cancel_keeps_signal_when_stream_claim_wins(tmp_
         assert cancel_payload["cancel_requested"] is True
         assert cancel_payload["status"] == "running"
         assert cancel_payload["archive_status"] == "pending"
+        assert_public_task_response_hides_internal_identifiers(cancel_payload)
         assert task_id in client.server.app[CANCELLED_TASKS_KEY]
 
         record = store.get_task(task_id)
@@ -1145,6 +1183,7 @@ async def test_runner_api_cancel_endpoint_enforces_owner_and_admin(tmp_path):
         assert admin_payload["status"] == "cancelled"
         assert admin_payload["archive_status"] == "ready"
         assert admin_payload["cancel_requested"] is True
+        assert_public_task_response_hides_internal_identifiers(admin_payload)
 
         record = store.get_task(admin_task["task_id"])
         assert record.status == "cancelled"
