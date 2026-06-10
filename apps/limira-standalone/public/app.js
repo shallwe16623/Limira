@@ -278,6 +278,7 @@ function renderAuthMode() {
 	dom.signupModeButton.classList.toggle('active', state.authMode === 'signup');
 	dom.organizationCategoryLabel.classList.toggle('hidden', personalScope);
 	dom.organizationLabel.classList.toggle('hidden', personalScope);
+	dom.enterpriseContactPrompt.classList.toggle('hidden', personalScope);
 	dom.enterpriseContactActions.classList.toggle('hidden', personalScope);
 	renderOrganizationCategoryOptions();
 	selectDefaultOrganizationForCategory();

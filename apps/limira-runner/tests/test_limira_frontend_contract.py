@@ -245,9 +245,13 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="enterpriseScopeButton"' in index
     assert 'id="organizationCategorySelect"' in index
     assert 'id="organizationSelect"' in index
+    assert "此页面直接连接 limira 后端" not in index
+    assert 'id="enterpriseContactPrompt"' in index
+    assert "如需开通单位账号，请通过以下方式联系团队。" in index
     assert 'id="enterpriseContactActions"' in index
     assert 'href="tel:+8617267052536"' in index
     assert 'href="mailto:admin@limira-inc.com"' in index
+    assert "dom.enterpriseContactPrompt.classList.toggle('hidden', personalScope)" in app
     assert "dom.enterpriseContactActions.classList.toggle('hidden', personalScope)" in app
     assert "DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'public_institution'" in app
     assert "DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'ndrc-international-cooperation-center'" in app
