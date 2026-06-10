@@ -590,8 +590,8 @@ label {
 }
 
 .conversation-panel.compact .message-list-bottom {
-	max-height: 104px;
-	overflow: hidden;
+	max-height: none;
+	overflow: visible;
 }
 
 .conversation-panel.compact .message-list-bottom .message {

@@ -2344,7 +2344,8 @@ function renderTabs() {
 			renderThinking();
 			renderTabs();
 			if (isArtifactView()) {
-				dom.workspaceContent.scrollTo({ top: 0, behavior: 'smooth' });
+				const top = Math.max(0, dom.conversationPanel.offsetTop - 16);
+				dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });
 			}
 		});
 	}

@@ -428,7 +428,10 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "bottom: 7.15rem;" not in styles
     assert ".scrollable-canvas.conversation-mode .input-container" in styles
     assert ".scrollable-canvas.artifact-mode .input-container" in styles
-    assert "dom.workspaceContent.scrollTo({ top: 0, behavior: 'smooth' });" in app
+    assert "const top = Math.max(0, dom.conversationPanel.offsetTop - 16);" in app
+    assert "dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });" in app
+    assert ".conversation-panel.compact .message-list-bottom {\n\tmax-height: none;" in styles
+    assert "max-height: 104px;" not in styles
     assert "async function downloadArchive()" in app
     assert "downloadPdfButton" not in app
     assert "downloadPdfButton" not in index
