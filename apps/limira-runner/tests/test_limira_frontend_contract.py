@@ -473,6 +473,13 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "taskId" in app[app.index("function upsertReportMessage(content)") : app.index("function appendThinkingStep")]
     render_messages_block = app[app.index("function renderMessages()") : app.index("function latestUserMessageIndex()")]
     assert "function messageBelongsToCurrentTask(message)" in app
+    assert "function renderReportTaskControls(message)" in app
+    assert "data-report-task-id" in app
+    assert "data-report-tab" in app
+    assert "data-report-archive" in app
+    assert "function currentArtifactTaskId()" in app
+    assert "function archiveStatusForTask(taskId)" in app
+    assert "state.artifactTaskId" in app
     assert "item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message)" in render_messages_block
     assert "item.message.kind === 'report' && messageBelongsToCurrentTask(item.message)" in render_messages_block
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]
@@ -542,6 +549,7 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert index.index('id="workspaceContent"') < index.index('id="inputContainer"')
     assert index.index('id="artifactContent"') < index.index('id="inputContainer"')
     assert ".tabs {\n\tz-index: 8;" in styles
+    assert ".report-artifact-controls {" in styles
     assert "bottom: 7.15rem;" not in styles
     assert ".input-container {\n\tposition: absolute;" in styles
     assert ".input-container .tabs" not in styles
@@ -551,7 +559,7 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });" in app
     assert ".conversation-panel.compact .message-list-bottom {\n\tmax-height: none;" in styles
     assert "max-height: 104px;" not in styles
-    assert "async function downloadArchive()" in app
+    assert "async function downloadArchive(taskId = currentArtifactTaskId())" in app
     assert "downloadPdfButton" not in app
     assert "downloadPdfButton" not in index
 
@@ -569,14 +577,16 @@ def test_limira_standalone_archive_download_uses_authenticated_fetch():
     app = _read(LIMIRA_STANDALONE_APP)
 
     assert "dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');" in app
-    assert "dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive());" in app
-    assert "async function downloadArchive()" in app
+    assert "dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive(dom.downloadArchiveButton.dataset.archiveDownload || ''));" in app
+    assert "async function downloadArchive(taskId = currentArtifactTaskId())" in app
+    assert "void downloadArchive(button.dataset.reportTaskId || '');" in app
+    assert "void openReportArtifacts(button.dataset.reportTaskId || '', button.dataset.reportTab || '');" in app
     assert "async function downloadGeneratedArchive(url, filename)" in app
     assert "accept: 'application/zip'" in app
     assert "headers.set('authorization', `Bearer ${state.token}`);" in app
     assert "credentials: 'include'" in app
     assert "empty_archive_download" in app
-    assert "dom.downloadArchiveButton.disabled = state.restoreBlocked || !state.taskId;" in app
+    assert "dom.downloadArchiveButton.disabled = (state.restoreBlocked && archiveTaskId === state.taskId) || !archiveTaskId;" in app
 
 
 def test_limira_standalone_evidence_preview_uses_local_srcdoc_fallback():

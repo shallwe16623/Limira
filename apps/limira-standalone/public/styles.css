@@ -918,6 +918,38 @@ label {
 	box-shadow: none;
 }
 
+.report-artifact-controls {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.35rem;
+	padding: 0.35rem;
+	border: 1px solid var(--border-light);
+	border-radius: var(--radius);
+	background: var(--surface);
+}
+
+.report-artifact-controls button {
+	flex: 0 0 auto;
+	min-height: 34px;
+	padding: 0.42rem 0.65rem;
+	border-radius: var(--radius-sm);
+	color: var(--muted);
+	font-size: 0.88rem;
+	white-space: nowrap;
+}
+
+.report-artifact-controls button:hover:not(:disabled),
+.report-artifact-controls button:focus-visible {
+	background: var(--surface-muted);
+	color: var(--text-secondary);
+}
+
+.report-artifact-controls .archive-tab {
+	border-left: 1px solid var(--border-light);
+	color: var(--text-secondary);
+}
+
 .conversation-panel.compact {
 	padding-bottom: 0.4rem;
 	border-bottom: 1px solid var(--border-light);

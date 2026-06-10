@@ -113,6 +113,7 @@ const state = {
 	status: 'ready',
 	archiveStatus: 'pending',
 	archiveDownloadUrl: '',
+	artifactTaskId: '',
 	activeTab: CONVERSATION_VIEW,
 	isSubmitting: false,
 	isUploading: false,
@@ -1493,6 +1494,7 @@ async function selectHistoryTask(taskId) {
 	const cached = state.taskHistory.find((task) => task.task_id === normalizedTaskId) || {};
 	resetCurrentTaskView();
 	state.taskId = normalizedTaskId;
+	state.artifactTaskId = normalizedTaskId;
 	state.status = cached.status || 'queued';
 	state.archiveStatus = cached.archive_status || 'pending';
 	updateArchiveState(cached);
@@ -1537,6 +1539,7 @@ function startNewChat() {
 function resetCurrentTaskView() {
 	state.savedUserId = state.user?.id || state.savedUserId || '';
 	state.taskId = '';
+	state.artifactTaskId = '';
 	state.query = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
@@ -1641,6 +1644,7 @@ function restoreWorkspace() {
 	}
 	state.savedUserId = typeof saved.userId === 'string' ? saved.userId : '';
 	state.taskId = typeof saved.taskId === 'string' ? saved.taskId : '';
+	state.artifactTaskId = typeof saved.artifactTaskId === 'string' ? saved.artifactTaskId : state.taskId;
 	state.query = typeof saved.query === 'string' ? saved.query : '';
 	state.status = typeof saved.status === 'string' ? saved.status : 'ready';
 	state.archiveStatus = typeof saved.archiveStatus === 'string' ? saved.archiveStatus : 'pending';
@@ -1665,6 +1669,7 @@ function saveWorkspace() {
 	const payload = {
 		userId: state.user?.id || state.savedUserId || '',
 		taskId: state.taskId,
+		artifactTaskId: state.artifactTaskId,
 		query: state.query,
 		status: state.status,
 		archiveStatus: state.archiveStatus,
@@ -1703,6 +1708,7 @@ function resetWorkspaceState() {
 	bumpWorkspaceGeneration();
 	state.savedUserId = state.user?.id || '';
 	state.taskId = '';
+	state.artifactTaskId = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
@@ -1763,6 +1769,7 @@ async function submitResearch() {
 	const context = captureAsyncContext({ includeTask: false });
 	state.status = 'starting';
 	state.taskId = '';
+	state.artifactTaskId = '';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
 	state.restoreBlocked = false;
@@ -1803,6 +1810,7 @@ async function submitResearch() {
 			return;
 		}
 		state.taskId = task.task_id || '';
+		state.artifactTaskId = state.taskId;
 		state.status = task.status || 'queued';
 		updateArchiveState(task);
 		mergeTaskHistory(task);
@@ -2304,19 +2312,24 @@ function artifactThinkingSummary() {
 	return parts.length ? `当前成果：${parts.join(' · ')}。` : '当前成果正在整理中。';
 }
 
-async function loadArtifacts() {
-	if (!state.taskId) {
+async function loadArtifacts(taskId = state.taskId, options = {}) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
 		return;
 	}
-	const context = captureAsyncContext();
+	const activeTaskLoad = normalizedTaskId === state.taskId;
+	const context = captureAsyncContext({ includeTask: activeTaskLoad });
 	try {
-		const data = await api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/artifacts`);
+		const data = await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/artifacts`);
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
 		state.artifacts = normalizeArtifacts(data);
-		upsertReportMessage(reportMarkdown());
-		upsertArtifactThinkingStep();
+		state.artifactTaskId = normalizedTaskId;
+		if (activeTaskLoad && options.updateReport !== false) {
+			upsertReportMessage(reportMarkdown());
+			upsertArtifactThinkingStep();
+		}
 		saveWorkspace();
 		renderMessages();
 		renderThinking();
@@ -2326,7 +2339,9 @@ async function loadArtifacts() {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
-		addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
+		if (options.silent !== true) {
+			addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
+		}
 	}
 }
 
@@ -2652,20 +2667,39 @@ async function createEnterpriseMember() {
 	}
 }
 
-async function downloadArchive() {
-	if (state.restoreBlocked) {
+async function openReportArtifacts(taskId, tab) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
+		return;
+	}
+	state.activeTab = tabs.includes(tab) ? tab : CONVERSATION_VIEW;
+	await loadArtifacts(normalizedTaskId, { updateReport: false });
+	if (isArtifactView() && dom.workspaceContent) {
+		const top = Math.max(0, dom.conversationPanel.offsetTop - 16);
+		dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });
+	}
+}
+
+async function downloadArchive(taskId = currentArtifactTaskId()) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (state.restoreBlocked && normalizedTaskId === state.taskId) {
 		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再下载归档。';
 		return;
 	}
-	if (!state.taskId) {
+	if (!normalizedTaskId) {
 		return;
 	}
-	const url = state.archiveDownloadUrl || defaultArchiveDownloadUrl(state.taskId);
+	const url = normalizedTaskId === state.taskId
+		? state.archiveDownloadUrl || defaultArchiveDownloadUrl(normalizedTaskId)
+		: defaultArchiveDownloadUrl(normalizedTaskId);
 	try {
 		await downloadGeneratedArchive(url, 'archive.zip');
-		state.archiveStatus = 'ready';
-		state.archiveDownloadUrl = url;
+		if (normalizedTaskId === state.taskId) {
+			state.archiveStatus = 'ready';
+			state.archiveDownloadUrl = url;
+		}
 		saveWorkspace();
+		renderMessages();
 		renderStatus();
 		dom.reportMessage.textContent = '归档已下载。';
 		await loadUploads();
@@ -2705,6 +2739,7 @@ function hasResearchSurface() {
 	const counts = artifactCounts();
 	return Boolean(
 		state.taskId ||
+		state.artifactTaskId ||
 		state.isSubmitting ||
 		state.finalReportText ||
 		Object.values(counts).some((count) => Number(count || 0) > 0)
@@ -2737,8 +2772,9 @@ function renderStatus() {
 		: '暂无任务';
 	dom.submitResearchButton.disabled = state.isSubmitting;
 	if (dom.downloadArchiveButton) {
-		dom.downloadArchiveButton.disabled = state.restoreBlocked || !state.taskId;
-		dom.downloadArchiveButton.textContent = `归档 ${archiveStatusLabel(state.archiveStatus)}`;
+		const archiveTaskId = currentArtifactTaskId();
+		dom.downloadArchiveButton.disabled = (state.restoreBlocked && archiveTaskId === state.taskId) || !archiveTaskId;
+		dom.downloadArchiveButton.textContent = `归档 ${archiveStatusLabel(archiveStatusForTask(archiveTaskId))}`;
 	}
 }
 
@@ -2759,12 +2795,13 @@ function renderMessages() {
 	const latestUserIndex = latestUserMessageIndex();
 	dom.messageList.innerHTML = messages
 		.map(
-			({ message, index }) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
-				<div class="message-bubble">
-					<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
-				</div>
-				${renderMessageActions(message, index, latestUserIndex)}
-			</article>`
+				({ message, index }) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
+					<div class="message-bubble">
+						<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
+					</div>
+					${message.kind === 'report' ? renderReportTaskControls(message) : ''}
+					${renderMessageActions(message, index, latestUserIndex)}
+				</article>`
 		)
 		.join('');
 	if (dom.reportList) {
@@ -2774,6 +2811,7 @@ function renderMessages() {
 					<div class="message-bubble">
 						<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
 					</div>
+					${renderReportTaskControls(message)}
 					${renderMessageActions(message, index, latestUserIndex)}
 				</article>`
 			)
@@ -2787,6 +2825,45 @@ function renderMessages() {
 function messageBelongsToCurrentTask(message) {
 	const taskId = state.taskId || '';
 	return Boolean(taskId) && String(message?.taskId || '') === taskId;
+}
+
+function renderReportTaskControls(message) {
+	const taskId = String(message?.taskId || '').trim();
+	if (!taskId) {
+		return '';
+	}
+	const counts = reportArtifactCounts(taskId);
+	const archiveStatus = archiveStatusForTask(taskId);
+	return `<div class="report-artifact-controls" data-report-task-id="${escapeAttr(taskId)}" aria-label="本次输出成果">
+		${tabs
+			.map((tab) => `<button type="button" data-report-tab="${escapeAttr(tab)}" data-report-task-id="${escapeAttr(taskId)}">${escapeHtml(tab)} ${counts[tab] || ''}</button>`)
+			.join('')}
+		<button type="button" class="archive-tab" data-report-archive data-report-task-id="${escapeAttr(taskId)}">归档 ${escapeHtml(archiveStatusLabel(archiveStatus))}</button>
+	</div>`;
+}
+
+function reportArtifactCounts(taskId) {
+	return taskId && taskId === currentArtifactTaskId() ? artifactCounts() : {};
+}
+
+function currentArtifactTaskId() {
+	return state.artifactTaskId || state.taskId || '';
+}
+
+function taskHistoryRecord(taskId) {
+	return state.taskHistory.find((task) => task.task_id === taskId)
+		|| state.archivedTaskHistory.find((task) => task.task_id === taskId)
+		|| null;
+}
+
+function archiveStatusForTask(taskId) {
+	if (!taskId) {
+		return 'pending';
+	}
+	if (taskId === state.taskId) {
+		return state.archiveStatus;
+	}
+	return taskHistoryRecord(taskId)?.archive_status || 'pending';
 }
 
 function latestUserMessageIndex() {
@@ -2814,6 +2891,18 @@ function renderMessageActions(message, index, latestUserIndex) {
 
 function bindMessageActions() {
 	for (const root of [dom.messageList, dom.reportList].filter(Boolean)) {
+		for (const button of root.querySelectorAll('[data-report-tab]')) {
+			button.addEventListener('click', (event) => {
+				event.stopPropagation();
+				void openReportArtifacts(button.dataset.reportTaskId || '', button.dataset.reportTab || '');
+			});
+		}
+		for (const button of root.querySelectorAll('[data-report-archive]')) {
+			button.addEventListener('click', (event) => {
+				event.stopPropagation();
+				void downloadArchive(button.dataset.reportTaskId || '');
+			});
+		}
 		for (const button of root.querySelectorAll('[data-message-action]')) {
 			button.addEventListener('click', (event) => {
 				const index = Number(button.dataset.messageIndex);
@@ -2933,6 +3022,7 @@ function scrollThinkingToLatest() {
 function renderTabs() {
 	const surfaceVisible = hasResearchSurface();
 	const conversationView = isConversationView();
+	const archiveTaskId = currentArtifactTaskId();
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
 	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');
@@ -2947,7 +3037,7 @@ function renderTabs() {
 		return;
 	}
 	const counts = artifactCounts();
-	const archiveDisabled = state.restoreBlocked || !state.taskId;
+	const archiveDisabled = (state.restoreBlocked && archiveTaskId === state.taskId) || !archiveTaskId;
 	dom.artifactTabs.innerHTML = [
 		isArtifactView()
 			? `<button type="button" class="back-tab" data-tab="${CONVERSATION_VIEW}">${BACK_TO_CHAT_LABEL}</button>`
@@ -2957,7 +3047,7 @@ function renderTabs() {
 			(tab) =>
 				`<button type="button" class="${tab === state.activeTab ? 'active' : ''}" data-tab="${tab}">${tab} ${counts[tab] || ''}</button>`
 		),
-		`<button id="downloadArchiveButton" type="button" class="archive-tab" data-archive-download ${archiveDisabled ? 'disabled' : ''}>归档 ${archiveStatusLabel(state.archiveStatus)}</button>`
+		`<button id="downloadArchiveButton" type="button" class="archive-tab" data-archive-download="${escapeAttr(archiveTaskId)}" ${archiveDisabled ? 'disabled' : ''}>归档 ${archiveStatusLabel(archiveStatusForTask(archiveTaskId))}</button>`
 	].join('');
 	for (const button of dom.artifactTabs.querySelectorAll('[data-tab]')) {
 		button.addEventListener('click', () => {
@@ -2973,7 +3063,7 @@ function renderTabs() {
 		});
 	}
 	dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');
-	dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive());
+	dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive(dom.downloadArchiveButton.dataset.archiveDownload || ''));
 	renderArtifactContent();
 	renderStatus();
 }
@@ -4027,6 +4117,7 @@ function isCurrentAsyncContext(context) {
 function clearRestoredTaskState() {
 	state.restoreBlocked = false;
 	state.taskId = '';
+	state.artifactTaskId = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
