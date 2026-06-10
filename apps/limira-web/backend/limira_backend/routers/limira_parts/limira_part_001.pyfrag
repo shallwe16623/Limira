@@ -943,25 +943,39 @@ class PostgresLimiraTaskRepository:
         owner_user_id: str,
         limit: int,
         archived: bool = False,
+        query: str | None = None,
     ) -> list[LimiraTask]:
         archive_filter = (
             "metadata ->> 'history_archived_at' IS NOT NULL"
             if archived
             else "metadata ->> 'history_archived_at' IS NULL"
         )
+        params: dict[str, Any] = {"owner_user_id": owner_user_id, "limit": limit}
+        search_filter = ""
+        trimmed_query = str(query or "").strip()
+        if trimmed_query:
+            params["search_query"] = f"%{trimmed_query.casefold()}%"
+            search_filter = """
+              AND (
+                LOWER(task_id) LIKE :search_query
+                OR LOWER(query) LIKE :search_query
+                OR LOWER(COALESCE(status, '')) LIKE :search_query
+                OR LOWER(COALESCE(archive_status, '')) LIKE :search_query
+                OR LOWER(COALESCE(scenario, '')) LIKE :search_query
+                OR LOWER(COALESCE(model_summary::text, '')) LIKE :search_query
+              )
+            """
         sql = f"""
             SELECT {self.TASK_COLUMNS}
             FROM limira_research_tasks
             WHERE owner_user_id = :owner_user_id
               AND metadata ->> 'history_deleted_at' IS NULL
               AND {archive_filter}
+              {search_filter}
             ORDER BY created_at DESC, task_id DESC
             LIMIT :limit
         """
-        rows = self._fetch_all(
-            sql,
-            {"owner_user_id": owner_user_id, "limit": limit},
-        )
+        rows = self._fetch_all(sql, params)
         return [_task_from_row(row) for row in rows]
 
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask:

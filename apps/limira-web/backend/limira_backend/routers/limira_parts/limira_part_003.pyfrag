@@ -854,14 +854,22 @@ async def create_research_task(
 async def list_tasks(
     limit: int = Query(default=30, ge=1, le=100),
     archived: bool = Query(default=False),
+    query: str | None = Query(default=None, max_length=200),
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, Any]:
-    tasks = repo.list_user_tasks(owner_user_id=user.id, limit=limit, archived=archived)
+    trimmed_query = str(query or "").strip() or None
+    tasks = repo.list_user_tasks(
+        owner_user_id=user.id,
+        limit=limit,
+        archived=archived,
+        query=trimmed_query,
+    )
     payload = {
         "tasks": [task.public_dict() for task in tasks],
         "count": len(tasks),
         "archived": archived,
+        "query": trimmed_query,
     }
     return _assert_browser_safe(payload)
 
@@ -1342,6 +1350,43 @@ def _attach_documents_to_task(
             )
         )
     return attached
+
+
+@router.post("/speech/transcribe")
+async def transcribe_speech_audio(
+    file: UploadFile,
+    language: str | None = Form(default=None),
+    user: LimiraUser = Depends(get_current_limira_user),
+) -> dict[str, Any]:
+    filename = _safe_original_filename(file.filename or "voice.webm")
+    content_type = _speech_audio_content_type(file.content_type, filename)
+    try:
+        await file.seek(0)
+    except Exception:
+        pass
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty_audio_upload")
+    max_bytes = _speech_max_audio_bytes()
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail="speech_audio_too_large")
+    result = await asyncio.to_thread(
+        _transcribe_speech_audio,
+        data,
+        filename=filename,
+        content_type=content_type,
+        language=language,
+    )
+    return _assert_browser_safe(
+        {
+            "text": result["text"],
+            "language": result.get("language"),
+            "duration_seconds": result.get("duration_seconds"),
+            "content_type": content_type,
+            "filename": filename,
+            "user_authenticated": bool(user.id),
+        }
+    )
 
 
 @router.get("/uploads")

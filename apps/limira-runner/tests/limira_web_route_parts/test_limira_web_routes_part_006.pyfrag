@@ -615,6 +615,23 @@ class FakeLimiraPostgresEngine:
                 rows = [row for row in rows if row.get("archived_at") is not None]
             elif "history_archived_at' is null" in sql:
                 rows = [row for row in rows if row.get("archived_at") is None]
+            if params.get("search_query"):
+                needle = str(params["search_query"]).strip("%").casefold()
+                rows = [
+                    row
+                    for row in rows
+                    if needle
+                    in "\n".join(
+                        [
+                            str(row.get("task_id") or ""),
+                            str(row.get("query") or ""),
+                            str(row.get("status") or ""),
+                            str(row.get("archive_status") or ""),
+                            str(row.get("scenario") or ""),
+                            json.dumps(row.get("model_summary") or {}, ensure_ascii=False),
+                        ]
+                    ).casefold()
+                ]
             return FakeLimiraPostgresResult(rows[: params["limit"]])
 
         if "from limira_research_tasks" in sql:

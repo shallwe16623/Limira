@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import smtplib
+import tempfile
 import time
 import uuid
 import zipfile
@@ -174,6 +175,41 @@ OBJECT_KEY_ALLOWED_EXTENSIONS = {
     ".txt",
     ".zip",
 }
+SPEECH_WHISPER_MODEL_ENV = "LIMIRA_SPEECH_WHISPER_MODEL"
+SPEECH_WHISPER_DEVICE_ENV = "LIMIRA_SPEECH_WHISPER_DEVICE"
+SPEECH_WHISPER_COMPUTE_TYPE_ENV = "LIMIRA_SPEECH_WHISPER_COMPUTE_TYPE"
+SPEECH_MAX_AUDIO_BYTES_ENV = "LIMIRA_SPEECH_MAX_AUDIO_BYTES"
+SPEECH_DEFAULT_MAX_AUDIO_BYTES = 25 * 1024 * 1024
+SPEECH_ALLOWED_CONTENT_TYPES = {
+    "audio/aac",
+    "audio/flac",
+    "audio/m4a",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+    "audio/x-m4a",
+    "audio/x-wav",
+}
+SPEECH_GENERIC_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+}
+SPEECH_EXTENSION_CONTENT_TYPES = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".oga": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+_SPEECH_WHISPER_MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 REPORT_BLOCKED_HTML_TAGS = (
     "base",
     "button",
@@ -516,6 +552,23 @@ class LimiraTask:
         }
 
 
+def _task_matches_history_search(task: LimiraTask, query: str | None) -> bool:
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return True
+    haystack = "\n".join(
+        [
+            task.task_id,
+            task.query,
+            task.status,
+            task.archive_status,
+            task.scenario or "",
+            _json_dumps(_public_model_summary(task.model_summary or {})),
+        ]
+    ).casefold()
+    return needle in haystack
+
+
 @dataclass
 class LimiraUploadedDocument:
     document_id: str
@@ -640,6 +693,7 @@ class LimiraTaskRepository(Protocol):
         owner_user_id: str,
         limit: int,
         archived: bool = False,
+        query: str | None = None,
     ) -> list[LimiraTask]: ...
 
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask: ...
@@ -895,6 +949,7 @@ class InMemoryLimiraTaskRepository:
         owner_user_id: str,
         limit: int,
         archived: bool = False,
+        query: str | None = None,
     ) -> list[LimiraTask]:
         tasks = [
             task
@@ -902,6 +957,7 @@ class InMemoryLimiraTaskRepository:
             if task.owner_user_id == owner_user_id
             and task.deleted_at is None
             and ((task.archived_at is not None) if archived else (task.archived_at is None))
+            and _task_matches_history_search(task, query)
         ]
         return tasks[:limit]
 

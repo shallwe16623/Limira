@@ -363,10 +363,18 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert 'id="historyMessage"' in index
     assert 'id="newChatButton"' in index
     assert 'id="refreshHistoryButton"' in index
+    assert 'id="historySearchInput"' in index
+    assert 'id="clearHistorySearchButton"' in index
+    assert 'id="sidebarCollapseButton"' in index
+    assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
+    assert "function setSidebarCollapsed(collapsed)" in app
+    assert "dom.workspace.classList.toggle('sidebar-collapsed'" in app
     assert "function loadTaskHistory()" in app
     assert "function selectHistoryTask(taskId)" in app
     assert "function startNewChat()" in app
-    assert "`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=${archived}`" in app
+    assert "const params = new URLSearchParams({" in app
+    assert "params.set('query', historyQuery);" in app
+    assert "`/api/limira/tasks?${params.toString()}`" in app
     assert 'id="historyArchiveToggleButton"' in index
     assert 'id="archivedHistoryManageButton"' in index
     assert "window.location.hash = 'archived-chats';" in app
@@ -386,6 +394,27 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}" in app
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
     assert LEGACY_AUTH_PREFIX not in app
+
+
+def test_limira_standalone_frontend_exposes_real_voice_input_paths():
+    app = _read(LIMIRA_STANDALONE_APP)
+    index = _read(LIMIRA_STANDALONE_INDEX)
+    styles = _read(LIMIRA_STANDALONE_STYLES)
+
+    assert 'id="voiceInputButton"' in index
+    assert 'id="voiceAudioInput"' in index
+    assert 'id="voiceInputMessage"' in index
+    assert "function toggleVoiceInput()" in app
+    assert "function browserLiveVoiceAllowed()" in app
+    assert "window.SpeechRecognition || window.webkitSpeechRecognition" in app
+    assert "navigator.mediaDevices?.getUserMedia && window.MediaRecorder" in app
+    assert "new MediaRecorder(stream" in app
+    assert "api('/api/limira/speech/transcribe'" in app
+    assert "form.append('file', blob" in app
+    assert "function transcribeVoiceBlob(blob, filename)" in app
+    assert ".voice-input-button.recording" in styles
+    assert "unsupported_audio_upload" in app
+    assert "speech_transcription_unavailable" in app
 
 
 def test_limira_standalone_frontend_uses_archive_only_export_surface():

@@ -15,6 +15,7 @@ const artifactEvents = new Set([
 
 const STORAGE_KEY = 'limiraStandaloneWorkspace:v2';
 const LEGACY_STORAGE_KEYS = ['limiraStandaloneWorkspace:v1'];
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'limiraSidebarCollapsed:v1';
 const MAX_STORED_MESSAGES = 100;
 const MAX_THINKING_STEPS = 120;
 const MAX_HISTORY_TASKS = 30;
@@ -94,9 +95,12 @@ const state = {
 	route: routeFromHash(),
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
+	sidebarCollapsed: localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
 	uploadMenuOpen: false,
 	historyFilesOpen: false,
 	showArchivedHistory: false,
+	historySearchQuery: '',
+	historySearchTimer: null,
 	savedUserId: '',
 	query: '',
 	taskId: '',
@@ -123,6 +127,14 @@ const state = {
 	uploadResults: [],
 	taskHistory: [],
 	archivedTaskHistory: [],
+	isVoiceRecording: false,
+	isVoiceTranscribing: false,
+	voiceRecognition: null,
+	voiceMediaRecorder: null,
+	voiceMediaStream: null,
+	voiceChunks: [],
+	voiceBaseText: '',
+	voiceFinalTranscript: '',
 	sandboxPreviewId: 0,
 	sandboxPreviewLoaded: false,
 	sandboxPreviewTimer: null,
@@ -273,8 +285,14 @@ function bindEvents() {
 			setUploadMenuOpen(false);
 			setHistoryFilesOpen(false);
 		}
+		if (event.key === 'Escape' && state.isVoiceRecording) {
+			stopVoiceInput();
+		}
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
+	dom.sidebarCollapseButton.addEventListener('click', () => {
+		setSidebarCollapsed(!state.sidebarCollapsed);
+	});
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.archivedHistoryManageButton.addEventListener('click', (event) => {
 		event.preventDefault();
@@ -317,11 +335,26 @@ function bindEvents() {
 		void loadTaskHistory();
 		renderHistory();
 	});
+	dom.historySearchInput.addEventListener('input', () => {
+		state.historySearchQuery = dom.historySearchInput.value.trim();
+		renderHistorySearchControls();
+		window.clearTimeout(state.historySearchTimer);
+		state.historySearchTimer = window.setTimeout(() => void loadTaskHistory(), 250);
+	});
+	dom.clearHistorySearchButton.addEventListener('click', () => {
+		state.historySearchQuery = '';
+		dom.historySearchInput.value = '';
+		window.clearTimeout(state.historySearchTimer);
+		void loadTaskHistory();
+		renderHistorySearchControls();
+	});
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
 	dom.researchForm.addEventListener('submit', (event) => {
 		event.preventDefault();
 		void submitResearch();
 	});
+	dom.voiceInputButton.addEventListener('click', () => void toggleVoiceInput());
+	dom.voiceAudioInput.addEventListener('change', () => void transcribeSelectedVoiceAudio());
 	dom.refreshArtifactsButton.addEventListener('click', () => void loadArtifacts());
 	dom.thinkingToggleButton.addEventListener('click', () => {
 		state.thinkingCollapsed = !state.thinkingCollapsed;
@@ -446,9 +479,11 @@ function renderShell() {
 		setHistoryFilesOpen(false);
 	}
 	dom.userSettingsPanel.classList.toggle('hidden', !signedIn || !state.userSettingsOpen);
+	renderSidebar();
 	renderUploadMenu();
 	renderHistoryFiles();
 	renderFileControls();
+	renderVoiceInput();
 	renderCloudStorage();
 	renderArchivedHistory();
 	const displayName = state.user?.name || state.user?.username || state.user?.email || '已登录';
@@ -465,6 +500,26 @@ function renderShell() {
 	renderReportControls();
 	renderEnterpriseAdmin();
 	renderCloudDrive();
+}
+
+function renderSidebar() {
+	if (!dom.workspace || !dom.sidebarCollapseButton) {
+		return;
+	}
+	dom.workspace.classList.toggle('sidebar-collapsed', Boolean(state.sidebarCollapsed));
+	dom.sidebarCollapseButton.setAttribute('aria-expanded', state.sidebarCollapsed ? 'false' : 'true');
+	dom.sidebarCollapseButton.title = state.sidebarCollapsed ? '展开边栏' : '折叠边栏';
+	dom.sidebarCollapseButton.setAttribute('aria-label', state.sidebarCollapsed ? '展开边栏' : '折叠边栏');
+}
+
+function setSidebarCollapsed(collapsed) {
+	state.sidebarCollapsed = Boolean(collapsed);
+	try {
+		localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, state.sidebarCollapsed ? 'true' : 'false');
+	} catch {
+		// Sidebar preference is non-critical.
+	}
+	renderShell();
 }
 
 function syncRouteFromHash() {
@@ -935,7 +990,15 @@ async function loadTaskHistory() {
 	}
 	try {
 		const archived = state.showArchivedHistory ? 'true' : 'false';
-		const data = await api(`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=${archived}`);
+		const params = new URLSearchParams({
+			limit: String(MAX_HISTORY_TASKS),
+			archived
+		});
+		const historyQuery = state.historySearchQuery.trim();
+		if (historyQuery) {
+			params.set('query', historyQuery);
+		}
+		const data = await api(`/api/limira/tasks?${params.toString()}`);
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
@@ -943,7 +1006,7 @@ async function loadTaskHistory() {
 		if (dom.historyMessage) {
 			dom.historyMessage.textContent = state.taskHistory.length
 				? ''
-				: state.showArchivedHistory ? '暂无已归档历史。' : '暂无历史聊天。';
+				: historyQuery ? '没有找到相关历史。' : state.showArchivedHistory ? '暂无已归档历史。' : '暂无历史聊天。';
 		}
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
@@ -1031,6 +1094,7 @@ function renderHistory() {
 	if (!dom.historyList) {
 		return;
 	}
+	renderHistorySearchControls();
 	dom.refreshHistoryButton.disabled = !state.user || state.isLoadingHistory;
 	dom.newChatButton.disabled = !state.user;
 	dom.historyArchiveToggleButton.disabled = !state.user || state.isLoadingHistory;
@@ -1042,7 +1106,9 @@ function renderHistory() {
 		return;
 	}
 	if (!state.taskHistory.length) {
-		dom.historyList.innerHTML = state.showArchivedHistory
+		dom.historyList.innerHTML = state.historySearchQuery
+			? '<div class="empty-state compact-empty">没有找到相关历史。</div>'
+			: state.showArchivedHistory
 			? '<div class="empty-state compact-empty">暂无已归档历史。</div>'
 			: '<div class="empty-state compact-empty">暂无历史聊天。</div>';
 		return;
@@ -1076,6 +1142,19 @@ function renderHistory() {
 	for (const button of dom.historyList.querySelectorAll('[data-history-delete-id]')) {
 		button.addEventListener('click', () => void deleteHistoryTask(button.dataset.historyDeleteId || ''));
 	}
+}
+
+function renderHistorySearchControls() {
+	if (!dom.historySearchInput || !dom.clearHistorySearchButton) {
+		return;
+	}
+	if (dom.historySearchInput.value.trim() !== state.historySearchQuery) {
+		dom.historySearchInput.value = state.historySearchQuery;
+	}
+	dom.historySearchInput.placeholder = state.showArchivedHistory ? '搜索已归档历史' : '搜索对话历史';
+	dom.historySearchInput.disabled = !state.user || state.isLoadingHistory;
+	dom.clearHistorySearchButton.classList.toggle('hidden', !state.historySearchQuery);
+	dom.clearHistorySearchButton.disabled = !state.user || state.isLoadingHistory;
 }
 
 async function archiveHistoryTask(taskId) {
@@ -3123,6 +3202,278 @@ function enterpriseMemberResearchCount(member) {
 	return Number(usage?.totals?.research_task || 0);
 }
 
+async function toggleVoiceInput() {
+	if (state.isVoiceTranscribing) {
+		return;
+	}
+	if (state.isVoiceRecording) {
+		stopVoiceInput();
+		return;
+	}
+	if (browserLiveVoiceAllowed() && speechRecognitionSupported()) {
+		startSpeechRecognition();
+		return;
+	}
+	if (browserLiveVoiceAllowed() && mediaRecorderSupported()) {
+		await startBackendVoiceRecording();
+		return;
+	}
+	openVoiceAudioFallback();
+}
+
+function browserLiveVoiceAllowed() {
+	const host = window.location.hostname;
+	return Boolean(window.isSecureContext || host === 'localhost' || host === '127.0.0.1' || host === '::1');
+}
+
+function speechRecognitionSupported() {
+	return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+function mediaRecorderSupported() {
+	return Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
+}
+
+function startSpeechRecognition() {
+	const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+	if (!Recognition) {
+		openVoiceAudioFallback();
+		return;
+	}
+	stopVoiceInput({ silent: true });
+	const recognition = new Recognition();
+	state.voiceRecognition = recognition;
+	state.voiceBaseText = dom.queryInput.value.trim();
+	state.voiceFinalTranscript = '';
+	recognition.lang = preferredSpeechLanguage();
+	recognition.continuous = true;
+	recognition.interimResults = true;
+	recognition.onstart = () => {
+		state.isVoiceRecording = true;
+		setVoiceMessage('正在听写，点击麦克风结束。');
+		renderVoiceInput();
+	};
+	recognition.onresult = (event) => {
+		let interimTranscript = '';
+		for (let index = event.resultIndex; index < event.results.length; index += 1) {
+			const result = event.results[index];
+			const transcript = String(result?.[0]?.transcript || '').trim();
+			if (!transcript) {
+				continue;
+			}
+			if (result.isFinal) {
+				state.voiceFinalTranscript = joinVoiceText(state.voiceFinalTranscript, transcript);
+			} else {
+				interimTranscript = joinVoiceText(interimTranscript, transcript);
+			}
+		}
+		setQueryInputValue(
+			joinVoiceText(state.voiceBaseText, joinVoiceText(state.voiceFinalTranscript, interimTranscript))
+		);
+	};
+	recognition.onerror = () => {
+		state.isVoiceRecording = false;
+		renderVoiceInput();
+		openVoiceAudioFallback('浏览器实时听写不可用，请选择或录制音频转写。');
+	};
+	recognition.onend = () => {
+		state.isVoiceRecording = false;
+		state.voiceRecognition = null;
+		if (state.voiceFinalTranscript) {
+			setVoiceMessage('语音已写入输入框。');
+		}
+		renderVoiceInput();
+	};
+	try {
+		recognition.start();
+	} catch {
+		openVoiceAudioFallback('浏览器实时听写启动失败，请选择或录制音频转写。');
+	}
+}
+
+async function startBackendVoiceRecording() {
+	stopVoiceInput({ silent: true });
+	try {
+		const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		const mimeType = preferredAudioMimeType();
+		const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+		state.voiceMediaStream = stream;
+		state.voiceMediaRecorder = recorder;
+		state.voiceChunks = [];
+		recorder.addEventListener('dataavailable', (event) => {
+			if (event.data && event.data.size > 0) {
+				state.voiceChunks.push(event.data);
+			}
+		});
+		recorder.addEventListener('stop', () => {
+			const chunks = state.voiceChunks.slice();
+			const recordedType = recorder.mimeType || mimeType || 'audio/webm';
+			cleanupVoiceRecorder();
+			if (!chunks.length) {
+				setVoiceMessage('没有录到音频，请重试。');
+				renderVoiceInput();
+				return;
+			}
+			const blob = new Blob(chunks, { type: recordedType });
+			void transcribeVoiceBlob(blob, voiceFilenameForMime(recordedType));
+		});
+		recorder.start();
+		state.isVoiceRecording = true;
+		setVoiceMessage('正在录音，点击麦克风结束并转写。');
+		renderVoiceInput();
+	} catch {
+		cleanupVoiceRecorder();
+		openVoiceAudioFallback('当前访问环境不允许直接录音，请选择或录制音频转写。');
+	}
+}
+
+function stopVoiceInput(options = {}) {
+	if (state.voiceRecognition) {
+		try {
+			state.voiceRecognition.stop();
+		} catch {
+			// Recognition may already be stopped by the browser.
+		}
+		state.voiceRecognition = null;
+	}
+	if (state.voiceMediaRecorder && state.voiceMediaRecorder.state !== 'inactive') {
+		state.voiceMediaRecorder.stop();
+	} else {
+		cleanupVoiceRecorder();
+	}
+	state.isVoiceRecording = false;
+	if (!options.silent) {
+		renderVoiceInput();
+	}
+}
+
+function cleanupVoiceRecorder() {
+	if (state.voiceMediaStream) {
+		for (const track of state.voiceMediaStream.getTracks()) {
+			track.stop();
+		}
+	}
+	state.voiceMediaStream = null;
+	state.voiceMediaRecorder = null;
+}
+
+function openVoiceAudioFallback(message = '请选择或录制一段音频，Limira 会在后端转写成文字。') {
+	setVoiceMessage(message);
+	renderVoiceInput();
+	dom.voiceAudioInput.value = '';
+	dom.voiceAudioInput.click();
+}
+
+async function transcribeSelectedVoiceAudio() {
+	const file = dom.voiceAudioInput.files?.[0];
+	if (!file) {
+		return;
+	}
+	await transcribeVoiceBlob(file, file.name || voiceFilenameForMime(file.type || 'audio/webm'));
+	dom.voiceAudioInput.value = '';
+}
+
+async function transcribeVoiceBlob(blob, filename) {
+	if (!blob || !blob.size) {
+		setVoiceMessage('没有录到音频，请重试。');
+		return;
+	}
+	state.isVoiceTranscribing = true;
+	state.isVoiceRecording = false;
+	setVoiceMessage('正在转写语音...');
+	renderVoiceInput();
+	try {
+		const form = new FormData();
+		form.append('file', blob, filename || 'voice.webm');
+		const language = preferredSpeechLanguage();
+		if (language) {
+			form.append('language', language);
+		}
+		const data = await api('/api/limira/speech/transcribe', {
+			method: 'POST',
+			body: form
+		});
+		const text = String(data?.text || '').trim();
+		if (!text) {
+			setVoiceMessage('没有识别到可用文字。');
+			return;
+		}
+		appendVoiceTranscript(text);
+		setVoiceMessage('语音已写入输入框。');
+	} catch (error) {
+		setVoiceMessage(`语音转写失败：${errorMessage(error)}`);
+	} finally {
+		state.isVoiceTranscribing = false;
+		renderVoiceInput();
+	}
+}
+
+function renderVoiceInput() {
+	if (!dom.voiceInputButton || !dom.voiceInputMessage) {
+		return;
+	}
+	const busy = state.isVoiceRecording || state.isVoiceTranscribing;
+	dom.voiceInputButton.classList.toggle('recording', state.isVoiceRecording);
+	dom.voiceInputButton.setAttribute('aria-pressed', state.isVoiceRecording ? 'true' : 'false');
+	dom.voiceInputButton.disabled = state.isSubmitting || state.isVoiceTranscribing || state.route !== 'workspace';
+	dom.voiceInputButton.title = state.isVoiceRecording ? '结束语音输入' : '语音输入';
+	dom.voiceInputMessage.classList.toggle('hidden', !dom.voiceInputMessage.textContent.trim() && !busy);
+}
+
+function setVoiceMessage(message) {
+	if (dom.voiceInputMessage) {
+		dom.voiceInputMessage.textContent = message || '';
+		dom.voiceInputMessage.classList.toggle('hidden', !message);
+	}
+}
+
+function appendVoiceTranscript(text) {
+	const current = dom.queryInput.value.trim();
+	setQueryInputValue(joinVoiceText(current, text));
+	dom.queryInput.focus();
+}
+
+function setQueryInputValue(value) {
+	dom.queryInput.value = value;
+	state.query = value;
+}
+
+function joinVoiceText(left, right) {
+	const first = String(left || '').trim();
+	const second = String(right || '').trim();
+	if (!first) {
+		return second;
+	}
+	if (!second) {
+		return first;
+	}
+	return `${first} ${second}`;
+}
+
+function preferredSpeechLanguage() {
+	const language = navigator.language || navigator.userLanguage || 'zh-CN';
+	return String(language || 'zh-CN');
+}
+
+function preferredAudioMimeType() {
+	const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+	return types.find((type) => window.MediaRecorder?.isTypeSupported?.(type)) || '';
+}
+
+function voiceFilenameForMime(mimeType) {
+	const normalized = String(mimeType || '').toLowerCase();
+	if (normalized.includes('mp4')) {
+		return 'voice.m4a';
+	}
+	if (normalized.includes('ogg')) {
+		return 'voice.ogg';
+	}
+	if (normalized.includes('wav')) {
+		return 'voice.wav';
+	}
+	return 'voice.webm';
+}
+
 function bumpWorkspaceGeneration() {
 	state.workspaceGeneration += 1;
 	return state.workspaceGeneration;
@@ -3361,6 +3712,11 @@ function localizedErrorDetail(detail) {
 		enterprise_cloud_storage_required: '云文件仅支持单位账号。',
 		enterprise_cloud_storage_quota_exceeded: '云空间已满，请清理文件或联系管理员扩容。',
 		document_not_found: '没有找到这个历史文件。',
+		empty_audio_upload: '没有收到音频文件。',
+		unsupported_audio_upload: '暂不支持这个音频格式。',
+		speech_audio_too_large: '音频文件太大。',
+		speech_transcription_empty: '没有识别到可用文字。',
+		speech_transcription_unavailable: '语音识别服务暂不可用，请检查 Whisper 依赖或模型配置。',
 		runner_task_failed: '研究任务失败，请检查运行配置或稍后重试。',
 		personal_daily_quota_exceeded: '个人方式登录每天只能创建一次研究任务。',
 		invalid_organization_role: '单位角色无效。',

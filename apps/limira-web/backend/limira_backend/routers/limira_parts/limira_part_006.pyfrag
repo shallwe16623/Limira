@@ -263,6 +263,111 @@ def _uploaded_content_type(content_type: str | None, filename: str) -> str:
     raise HTTPException(status_code=415, detail="unsupported_upload_type")
 
 
+def _speech_audio_content_type(content_type: str | None, filename: str) -> str:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized in SPEECH_ALLOWED_CONTENT_TYPES:
+        return normalized
+    suffix = os.path.splitext(filename or "")[1].lower()
+    inferred = SPEECH_EXTENSION_CONTENT_TYPES.get(suffix)
+    if normalized in SPEECH_GENERIC_CONTENT_TYPES and inferred:
+        return inferred
+    raise HTTPException(status_code=415, detail="unsupported_audio_upload")
+
+
+def _speech_max_audio_bytes(env: Any = os.environ) -> int:
+    raw_value = str(env.get(SPEECH_MAX_AUDIO_BYTES_ENV) or "").strip()
+    if not raw_value:
+        return SPEECH_DEFAULT_MAX_AUDIO_BYTES
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return SPEECH_DEFAULT_MAX_AUDIO_BYTES
+
+
+def _speech_whisper_model(env: Any = os.environ) -> Any:
+    model_name = str(env.get(SPEECH_WHISPER_MODEL_ENV) or "tiny").strip() or "tiny"
+    device = str(env.get(SPEECH_WHISPER_DEVICE_ENV) or "cpu").strip() or "cpu"
+    compute_type = (
+        str(env.get(SPEECH_WHISPER_COMPUTE_TYPE_ENV) or "int8").strip() or "int8"
+    )
+    cache_key = (model_name, device, compute_type)
+    if cache_key in _SPEECH_WHISPER_MODEL_CACHE:
+        return _SPEECH_WHISPER_MODEL_CACHE[cache_key]
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as exc:  # pragma: no cover - depends on runtime image
+        raise HTTPException(
+            status_code=503,
+            detail="speech_transcription_unavailable",
+        ) from exc
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    except Exception as exc:  # pragma: no cover - model download/runtime dependent
+        raise HTTPException(
+            status_code=503,
+            detail="speech_transcription_unavailable",
+        ) from exc
+    _SPEECH_WHISPER_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _speech_audio_suffix(filename: str, content_type: str) -> str:
+    suffix = os.path.splitext(filename or "")[1].lower()
+    if suffix in SPEECH_EXTENSION_CONTENT_TYPES:
+        return suffix
+    for extension, mapped_type in SPEECH_EXTENSION_CONTENT_TYPES.items():
+        if mapped_type == content_type:
+            return extension
+    return ".webm"
+
+
+def _speech_language_code(language: str | None) -> str | None:
+    normalized = str(language or "").strip().lower().replace("_", "-")
+    if not normalized:
+        return None
+    return normalized.split("-", 1)[0] or None
+
+
+def _transcribe_speech_audio(
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+    language: str | None = None,
+) -> dict[str, Any]:
+    model = _speech_whisper_model()
+    suffix = _speech_audio_suffix(filename, content_type)
+    language_code = _speech_language_code(language)
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(data)
+            temp_path = temp_file.name
+        segments, info = model.transcribe(
+            temp_path,
+            language=language_code,
+            vad_filter=True,
+        )
+        text = " ".join(
+            str(getattr(segment, "text", "") or "").strip()
+            for segment in segments
+            if str(getattr(segment, "text", "") or "").strip()
+        ).strip()
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+    if not text:
+        raise HTTPException(status_code=422, detail="speech_transcription_empty")
+    return {
+        "text": text,
+        "language": getattr(info, "language", None),
+        "duration_seconds": getattr(info, "duration", None),
+    }
+
+
 def _extract_uploaded_document_text(
     data: bytes,
     *,

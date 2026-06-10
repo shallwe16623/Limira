@@ -1195,6 +1195,10 @@ async def test_postgres_task_history_route_is_owner_scoped_and_public_serialized
     ) as client:
         response = await client.get("/api/limira/tasks", params={"limit": 10})
         limited_response = await client.get("/api/limira/tasks", params={"limit": 1})
+        search_response = await client.get(
+            "/api/limira/tasks",
+            params={"limit": 10, "query": "older"},
+        )
 
     assert response.status_code == 200
     payload = response.json()
@@ -1229,6 +1233,11 @@ async def test_postgres_task_history_route_is_owner_scoped_and_public_serialized
     assert limited_response.status_code == 200
     assert limited_response.json()["count"] == 1
     assert limited_response.json()["tasks"][0]["task_id"] == "task-history-latest"
+    assert search_response.status_code == 200
+    assert search_response.json()["query"] == "older"
+    assert [task["task_id"] for task in search_response.json()["tasks"]] == [
+        "task-history-older"
+    ]
 
 
 @pytest.mark.asyncio

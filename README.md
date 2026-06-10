@@ -23,8 +23,7 @@ Browser
 - 历史聊天列表和任务恢复
 - 上传本地资料，并在研究时检索上传内容
 - 查看结构化研究成果、报告片段和证据成果
-- 一键导出并下载 PDF
-- 下载完整归档 zip
+- 下载完整归档 zip，归档内包含报告 PDF
 - 后端保留事件日志，普通用户前端不展示底层事件字符串
 - 管理接口可按任务查看后台事件日志
 - 下载、归档、PDF、上传文件和任务详情都按用户归属做边界检查
@@ -70,7 +69,7 @@ docker-compose.limira.yml
 
 ### 2. 安装项目依赖
 
-本地开发和服务启动使用 `apps/limira-runner` 的 Python 环境。它的 `pyproject.toml` 会把 runner、agent、tools 三部分依赖一次装齐，包括 FastAPI/aiohttp、LLM SDK、MCP/FastMCP、PDF/Office 文档解析、PDF 导出、对象存储、Postgres 驱动、测试工具，以及 PDF 上传抽文本需要的 `pypdf`。
+本地开发和服务启动使用 `apps/limira-runner` 的 Python 环境。它的 `pyproject.toml` 会把 runner、agent、tools 三部分依赖一次装齐，包括 FastAPI/aiohttp、LLM SDK、MCP/FastMCP、PDF/Office 文档解析、PDF 导出、对象存储、Postgres 驱动、测试工具、PDF 上传抽文本需要的 `pypdf`，以及语音输入后端转写使用的开源 `faster-whisper`。
 
 在每个 worktree 里执行：
 
@@ -165,6 +164,17 @@ SERPER_API_KEY=
 JINA_API_KEY=
 E2B_API_KEY=
 ```
+
+语音输入的后端转写接口 `/api/limira/speech/transcribe` 使用 `faster-whisper` 按需加载模型。默认使用 CPU 上的 `tiny` 模型；如需调整模型或使用 GPU，可在当前 worktree 的 `.env` 中配置：
+
+```bash
+LIMIRA_SPEECH_WHISPER_MODEL=tiny
+LIMIRA_SPEECH_WHISPER_DEVICE=cpu
+LIMIRA_SPEECH_WHISPER_COMPUTE_TYPE=int8
+LIMIRA_SPEECH_MAX_AUDIO_BYTES=26214400
+```
+
+浏览器支持 Web Speech API 时会优先直接听写；不支持或当前访问环境禁止直接录音时，前端会选择/录制音频并上传给后端 Whisper 转写。
 
 ### 4. 一键启动本地开发服务
 

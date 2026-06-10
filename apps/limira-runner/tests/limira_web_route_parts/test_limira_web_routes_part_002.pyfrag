@@ -512,6 +512,79 @@ def test_pdf_text_extractor_accepts_valid_pdf_bytes():
 
 
 @pytest.mark.asyncio
+async def test_speech_transcribe_route_uses_backend_whisper_transcriber(monkeypatch):
+    app, _repo, _storage = _limira_asgi_app()
+    calls = []
+
+    def fake_transcribe(data, *, filename, content_type, language=None):
+        calls.append(
+            {
+                "data": data,
+                "filename": filename,
+                "content_type": content_type,
+                "language": language,
+            }
+        )
+        return {
+            "text": "这是转写后的研究问题",
+            "language": "zh",
+            "duration_seconds": 1.25,
+        }
+
+    monkeypatch.setattr(limira, "_transcribe_speech_audio", fake_transcribe)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/speech/transcribe",
+            data={"language": "zh-CN"},
+            files={"file": ("voice.webm", b"webm audio bytes", "audio/webm")},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "text": "这是转写后的研究问题",
+        "language": "zh",
+        "duration_seconds": 1.25,
+        "content_type": "audio/webm",
+        "filename": "voice.webm",
+        "user_authenticated": True,
+    }
+    assert calls == [
+        {
+            "data": b"webm audio bytes",
+            "filename": "voice.webm",
+            "content_type": "audio/webm",
+            "language": "zh-CN",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_speech_transcribe_route_rejects_non_audio_upload(monkeypatch):
+    app, _repo, _storage = _limira_asgi_app()
+    monkeypatch.setattr(
+        limira,
+        "_transcribe_speech_audio",
+        lambda *_args, **_kwargs: {"text": "should not run"},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/speech/transcribe",
+            files={"file": ("not-audio.txt", b"text", "text/plain")},
+        )
+
+    assert response.status_code == 415
+    assert response.json()["detail"] == "unsupported_audio_upload"
+
+
+@pytest.mark.asyncio
 async def test_upload_route_stores_pdf_when_text_extraction_fails(monkeypatch):
     app, repo, storage = _limira_asgi_app()
     pdf_bytes = b"%PDF-1.7\nbinary pdf body\n%%EOF"

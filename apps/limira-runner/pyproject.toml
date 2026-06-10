@@ -8,6 +8,7 @@ dependencies = [
     "beautifulsoup4>=4.14.3",
     "boto3>=1.42.62",
     "fastapi>=0.135.1",
+    "faster-whisper>=1.2.1",
     "fpdf2>=2.8.7",
     "pydantic>=2.10.0",
     "python-dotenv>=1.0.0",

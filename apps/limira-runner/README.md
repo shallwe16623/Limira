@@ -30,7 +30,7 @@ libs/limira-tools/pyproject.toml
 
 Do not install individual missing packages with ad hoc `pip install`; update the relevant `pyproject.toml`, regenerate `apps/limira-runner/uv.lock`, and rerun `uv sync --locked` in every worktree that needs to run the service.
 
-The runner environment includes the PDF upload parser dependency `pypdf`. PDF export also needs Playwright's Chromium browser binary:
+The runner environment includes the PDF upload parser dependency `pypdf` and the backend speech transcription dependency `faster-whisper`. PDF export also needs Playwright's Chromium browser binary:
 
 ```bash
 uv run playwright install chromium
@@ -53,6 +53,15 @@ uv run runner_api.py
 ```
 
 The service exposes the internal runner API under `/limira-runner/*`. Browser traffic should not call these routes directly; the standalone frontend only proxies `/api/limira/*` to the Limira backend.
+
+The Limira backend speech endpoint `/api/limira/speech/transcribe` loads Whisper lazily through `faster-whisper`. Default local settings use the CPU `tiny` model. Override these in the worktree `.env` when needed:
+
+```bash
+LIMIRA_SPEECH_WHISPER_MODEL=tiny
+LIMIRA_SPEECH_WHISPER_DEVICE=cpu
+LIMIRA_SPEECH_WHISPER_COMPUTE_TYPE=int8
+LIMIRA_SPEECH_MAX_AUDIO_BYTES=26214400
+```
 
 ## Environment Files
 
