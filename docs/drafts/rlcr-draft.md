@@ -9,10 +9,10 @@ Web/Runner/Artifact/History 壳子不错
 
 **主要问题**
 
-[P1] Harness 不是 durable long-running job harness。  
+[P1] Harness 不是 durable long-running job harness。
 Runner 现在用进程内 dict 保存 worker、事件 log、subscriber，并通过 `asyncio.create_task` 启动后台任务，见 [runner_api.py](/Users/shallwe/Documents/Limira-dev/apps/limira-runner/runner_api.py:49)、[runner_api.py](/Users/shallwe/Documents/Limira-dev/apps/limira-runner/runner_api.py:119)、[runner_api.py](/Users/shallwe/Documents/Limira-dev/apps/limira-runner/runner_api.py:446)。这对普通 demo 可以，但 deep research 往往是长任务：进程重启、部署滚动、worker 崩溃后，内存里的 event replay / worker ownership 会丢。建议加持久化 lease、heartbeat、startup reconciliation、checkpoint，最少也要让 task 能从 DB 状态恢复。
 
-[P1] research graph 还没真正执行。  
+[P1] research graph 还没真正执行。
 [research_graph.py](/Users/shallwe/Documents/Limira-dev/apps/limira-agent/src/core/research_graph.py:1) 自己说明 executor 仍是 compatibility single-agent loop；[pipeline.py](/Users/shallwe/Documents/Limira-dev/apps/limira-agent/src/core/pipeline.py:101) 创建 graph 后，[pipeline.py](/Users/shallwe/Documents/Limira-dev/apps/limira-agent/src/core/pipeline.py:131) 还是把 graph prompt 丢给 orchestrator。也就是说现在是：
 
 ```text
@@ -34,16 +34,16 @@ planner node
 
 这里确实适合引入 LangGraph：先 feature flag 一个 `StateGraph`，保留 legacy fallback。
 
-[P1] Web -> Runner -> Agent 的上下文合同断了。  
+[P1] Web -> Runner -> Agent 的上下文合同断了。
 Web request 已经有 `scenario`、`document_ids`、`conversation_id`，见 [limira_part_003.pyfrag](/Users/shallwe/Documents/Limira-dev/apps/limira-web/backend/limira_backend/routers/limira_parts/limira_part_003.pyfrag:769)，但传给 runner 后，runner task store 只保存 `query`，见 [task_store.py](/Users/shallwe/Documents/Limira-dev/apps/limira-runner/task_store.py:18)。真正执行时还把第三个 context 参数传成 `None`，见 [runner_api.py](/Users/shallwe/Documents/Limira-dev/apps/limira-runner/runner_api.py:289)，而 [pipeline_helpers.py](/Users/shallwe/Documents/Limira-dev/apps/limira-runner/pipeline_helpers.py:295) 也忽略这个参数。结果是 scenario 和上传资料只停在 Web 层，没有成为 agent 的研究策略输入。
 
-[P1] evidence 闭环仍不稳。  
+[P1] evidence 闭环仍不稳。
 搜索结果会被直接记录成 evidence，见 [limira_evidence.py](/Users/shallwe/Documents/Limira-dev/libs/limira-tools/src/limira_tools/limira_evidence.py:93)；工具生成的是 hash 型 `EVID-xxxxxxxxxxxx`，见 [limira_evidence.py](/Users/shallwe/Documents/Limira-dev/libs/limira-tools/src/limira_tools/limira_evidence.py:255)；但后端 Markdown 抽取只认数字型 `EVID-001`，见 [limira_part_005.pyfrag](/Users/shallwe/Documents/Limira-dev/apps/limira-web/backend/limira_backend/routers/limira_parts/limira_part_005.pyfrag:616)。这会导致报告引用、证据账本、归档审计对不上。
 
-[P2] 上传文档还不是 agent source。  
+[P2] 上传文档还不是 agent source。
 Web 后端有 attach/search upload 的能力，见 [limira_part_003.pyfrag](/Users/shallwe/Documents/Limira-dev/apps/limira-web/backend/limira_backend/routers/limira_parts/limira_part_003.pyfrag:1316)，但 agent 默认工具只有 web search、Jina、artifact recorder、Python，见 [default.yaml](/Users/shallwe/Documents/Limira-dev/apps/limira-agent/conf/agent/default.yaml:1) 和 [settings.py](/Users/shallwe/Documents/Limira-dev/apps/limira-agent/src/config/settings.py:40)。所以“上传资料参与研究”现在不是自动闭环。
 
-[P2] 后端 artifact/report 归档过度依赖事件流消费。  
+[P2] 后端 artifact/report 归档过度依赖事件流消费。
 后端是在 stream 事件时记录 artifact/report，见 [limira_part_005.pyfrag](/Users/shallwe/Documents/Limira-dev/apps/limira-web/backend/limira_backend/routers/limira_parts/limira_part_005.pyfrag:235)。如果前端或后端没有稳定消费 runner stream，Web 侧归档可能滞后。Runner 自己有 archive，但 Web artifact repo 和 UI history 的一致性需要一个 server-side ingestion worker，而不是只靠浏览器打开 SSE。
 
 **修改建议**
