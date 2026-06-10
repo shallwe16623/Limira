@@ -293,9 +293,15 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "enterpriseMemberResearchCount(member)" in app
     for category_label in ("企业", "事业单位", "高校", "智库", "国家部委", "地方政府"):
         assert category_label in app
-    assert 'id="enterpriseAdminPanel"' in index
+    assert 'id="enterpriseAdminManageButton"' in index
+    assert 'id="enterpriseAdminPage"' in index
+    assert 'id="enterpriseAdminBackButton"' in index
     assert 'id="enterpriseMemberForm"' in index
     assert '<option value="admin">管理员</option>' not in index
+    assert "window.location.hash = 'enterprise-admin';" in app
+    assert "state.route === 'enterprise-admin'" in app
+    assert "dom.enterpriseAdminManageButton.classList.toggle('hidden', !admin)" in app
+    assert "dom.enterpriseAdminManageButton.classList.toggle('active', pageVisible)" in app
     assert 'id="scenarioSelect"' not in index
     assert 'id="useScenarioButton"' not in index
     assert "填入模板" not in index

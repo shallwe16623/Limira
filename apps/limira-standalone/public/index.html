@@ -108,24 +108,7 @@
 							</div>
 							<button id="cloudDriveManageButton" class="settings-menu-item hidden" type="button">管理云盘</button>
 							<button id="archivedHistoryManageButton" class="settings-menu-item" type="button">已归档对话</button>
-							<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
-								<div class="enterprise-admin-header">
-									<div class="sidebar-section-title">单位管理</div>
-									<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
-								</div>
-								<div id="enterpriseUsageSummary" class="inline-message"></div>
-								<form id="enterpriseMemberForm" class="compact-form">
-									<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
-									<input id="enterpriseMemberUsernameInput" placeholder="用户名" autocomplete="username" />
-									<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
-									<select id="enterpriseMemberRoleSelect">
-										<option value="member">成员</option>
-									</select>
-									<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加成员账号</button>
-								</form>
-								<div id="enterpriseMemberMessage" class="inline-message"></div>
-								<div id="enterpriseMemberList" class="compact-list"></div>
-							</div>
+							<button id="enterpriseAdminManageButton" class="settings-menu-item hidden" type="button">单位管理</button>
 							<button id="signOutButton" class="settings-menu-item danger" type="button">退出登录</button>
 						</div>
 					</div>
@@ -188,6 +171,28 @@
 						</div>
 						<div id="archivedHistoryMessage" class="inline-message"></div>
 						<div id="archivedHistoryList" class="archived-history-list"></div>
+					</section>
+					<section id="enterpriseAdminPage" class="enterprise-admin-page hidden" aria-label="单位管理">
+						<div class="enterprise-admin-page-header">
+							<button id="enterpriseAdminBackButton" class="ghost-button compact" type="button">返回工作台</button>
+							<div>
+								<h2>单位管理</h2>
+								<p>管理单位成员账号，查看成员研究任务计数和账单用量。</p>
+							</div>
+							<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
+						</div>
+						<div id="enterpriseUsageSummary" class="enterprise-usage-summary"></div>
+						<form id="enterpriseMemberForm" class="enterprise-member-form">
+							<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
+							<input id="enterpriseMemberUsernameInput" placeholder="用户名" autocomplete="username" />
+							<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
+							<select id="enterpriseMemberRoleSelect">
+								<option value="member">成员</option>
+							</select>
+							<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加成员账号</button>
+						</form>
+						<div id="enterpriseMemberMessage" class="inline-message"></div>
+						<div id="enterpriseMemberList" class="enterprise-member-list"></div>
 					</section>
 
 					<!-- Bottom Input Area (ChatGPT Style) -->

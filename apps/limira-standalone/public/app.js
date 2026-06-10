@@ -149,6 +149,8 @@ function bindEvents() {
 			void loadUploads();
 		} else if (state.route === 'archived-chats') {
 			void loadArchivedTaskHistory();
+		} else if (state.route === 'enterprise-admin') {
+			void loadEnterpriseAdmin();
 		}
 	});
 	dom.cloudDriveManageButton.addEventListener('click', (event) => {
@@ -246,7 +248,21 @@ function bindEvents() {
 		renderShell();
 		void loadArchivedTaskHistory();
 	});
+	dom.enterpriseAdminManageButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		state.userSettingsOpen = false;
+		window.location.hash = 'enterprise-admin';
+		syncRouteFromHash();
+		renderShell();
+		void loadEnterpriseAdmin();
+	});
 	dom.refreshArchivedHistoryButton.addEventListener('click', () => void loadArchivedTaskHistory());
+	dom.enterpriseAdminBackButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		window.location.hash = '';
+		syncRouteFromHash();
+		renderShell();
+	});
 	dom.archivedHistoryList.addEventListener('click', (event) => {
 		const restoreButton = event.target.closest('[data-archived-restore-id]');
 		if (restoreButton) {
@@ -347,18 +363,22 @@ function renderShell() {
 	const enterpriseAdmin = signedIn && isEnterpriseAdmin();
 	const cloudDriveVisible = signedIn && state.route === 'cloud-drive';
 	const archivedHistoryVisible = signedIn && state.route === 'archived-chats';
-	const utilityPageVisible = cloudDriveVisible || archivedHistoryVisible;
+	const enterpriseAdminVisible = enterpriseAdmin && state.route === 'enterprise-admin';
+	const utilityPageVisible = cloudDriveVisible || archivedHistoryVisible || enterpriseAdminVisible;
 	dom.authPanel.classList.toggle('hidden', signedIn);
 	dom.workspace.classList.toggle('hidden', !signedIn);
 	dom.workspaceContent.classList.toggle('hidden', utilityPageVisible);
 	dom.inputContainer.classList.toggle('hidden', utilityPageVisible);
 	dom.cloudDrivePage.classList.toggle('hidden', !cloudDriveVisible);
 	dom.archivedHistoryPage.classList.toggle('hidden', !archivedHistoryVisible);
+	dom.enterpriseAdminPage.classList.toggle('hidden', !enterpriseAdminVisible);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
 	dom.userSettingsButton.classList.toggle('hidden', !signedIn);
 	if (!signedIn) {
 		state.userSettingsOpen = false;
 		state.archivedTaskHistory = [];
+		state.enterpriseMembers = [];
+		state.enterpriseUsage = null;
 		state.route = 'workspace';
 		setUploadMenuOpen(false);
 		setHistoryFilesOpen(false);
@@ -394,6 +414,9 @@ function routeFromHash() {
 	}
 	if (window.location.hash === '#archived-chats') {
 		return 'archived-chats';
+	}
+	if (window.location.hash === '#enterprise-admin') {
+		return 'enterprise-admin';
 	}
 	return 'workspace';
 }
@@ -2478,12 +2501,17 @@ function renderReportControls() {
 }
 
 function renderEnterpriseAdmin() {
-	if (!dom.enterpriseAdminPanel) {
+	if (!dom.enterpriseAdminPage) {
 		return;
 	}
-	const visible = Boolean(state.user) && isEnterpriseAdmin();
-	dom.enterpriseAdminPanel.classList.toggle('hidden', !visible);
-	if (!visible) {
+	const admin = Boolean(state.user) && isEnterpriseAdmin();
+	const pageVisible = admin && state.route === 'enterprise-admin';
+	dom.enterpriseAdminManageButton.classList.toggle('hidden', !admin);
+	dom.enterpriseAdminManageButton.classList.toggle('active', pageVisible);
+	if (!admin) {
+		dom.enterpriseMemberList.innerHTML = '';
+		dom.enterpriseUsageSummary.textContent = '';
+		dom.enterpriseMemberMessage.textContent = '';
 		return;
 	}
 	dom.refreshEnterpriseAdminButton.disabled = state.isLoadingEnterpriseAdmin;
