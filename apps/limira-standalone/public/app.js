@@ -110,6 +110,8 @@ const state = {
 	savedUserId: '',
 	query: '',
 	taskId: '',
+	conversationRootTaskId: '',
+	conversationTaskIds: [],
 	status: 'ready',
 	archiveStatus: 'pending',
 	archiveDownloadUrl: '',
@@ -1042,7 +1044,10 @@ async function refreshTask() {
 	state.restoreBlocked = false;
 	state.status = task.status || state.status;
 	updateArchiveState(task);
-	mergeTaskHistory(task);
+	mergeTaskHistory(task, {
+		suppressIfCurrentConversation: isCurrentConversationTaskId(task.task_id)
+			&& task.task_id !== state.conversationRootTaskId
+	});
 	saveWorkspace();
 	renderStatus();
 }
@@ -1067,7 +1072,7 @@ async function loadTaskHistory() {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
-		state.taskHistory = Array.isArray(data.tasks) ? data.tasks : [];
+		state.taskHistory = collapseCurrentConversationHistory(Array.isArray(data.tasks) ? data.tasks : []);
 		if (dom.historyMessage) {
 			dom.historyMessage.textContent = state.taskHistory.length
 				? ''
@@ -1185,7 +1190,7 @@ function renderHistory() {
 	dom.historyList.innerHTML = state.taskHistory
 		.map((task) => {
 			const taskId = String(task.task_id || '');
-			const active = taskId && taskId === state.taskId;
+			const active = taskId && isActiveHistoryTask(taskId);
 			const archived = Boolean(task.history_archived || state.showArchivedHistory);
 			return `<article class="history-entry${active ? ' active' : ''}">
 				<button type="button" class="history-item" data-task-id="${escapeAttr(taskId)}">
@@ -1340,7 +1345,7 @@ async function searchTaskHistory() {
 				byId.set(taskId, task);
 			}
 		}
-		state.historySearchResults = [...byId.values()];
+		state.historySearchResults = collapseCurrentConversationHistory([...byId.values()]);
 	} catch (error) {
 		if (isCurrentAsyncContext(context)) {
 			state.historySearchError = `搜索失败：${errorMessage(error)}`;
@@ -1495,6 +1500,8 @@ async function selectHistoryTask(taskId) {
 	const cached = state.taskHistory.find((task) => task.task_id === normalizedTaskId) || {};
 	resetCurrentTaskView();
 	state.taskId = normalizedTaskId;
+	state.conversationRootTaskId = normalizedTaskId;
+	state.conversationTaskIds = uniqueTaskIds([normalizedTaskId]);
 	state.artifactTaskId = normalizedTaskId;
 	state.status = cached.status || 'queued';
 	state.archiveStatus = cached.archive_status || 'pending';
@@ -1540,6 +1547,8 @@ function startNewChat() {
 function resetCurrentTaskView() {
 	state.savedUserId = state.user?.id || state.savedUserId || '';
 	state.taskId = '';
+	state.conversationRootTaskId = '';
+	state.conversationTaskIds = [];
 	state.artifactTaskId = '';
 	state.query = '';
 	state.status = 'ready';
@@ -1562,19 +1571,95 @@ function resetCurrentTaskView() {
 	state.historyFilesOpen = false;
 }
 
-function mergeTaskHistory(task) {
+function mergeTaskHistory(task, options = {}) {
 	if (!task || typeof task !== 'object' || !task.task_id) {
 		return;
 	}
 	const taskId = String(task.task_id);
+	if (options.suppressIfCurrentConversation && isCurrentConversationTaskId(taskId) && taskId !== state.conversationRootTaskId) {
+		state.taskHistory = collapseCurrentConversationHistory(state.taskHistory);
+		renderHistory();
+		return;
+	}
 	if (Boolean(task.history_archived) !== state.showArchivedHistory) {
 		state.taskHistory = state.taskHistory.filter((item) => item.task_id !== taskId);
 		renderHistory();
 		return;
 	}
 	const next = [task, ...state.taskHistory.filter((item) => item.task_id !== taskId)];
-	state.taskHistory = next.slice(0, MAX_HISTORY_TASKS);
+	state.taskHistory = collapseCurrentConversationHistory(next.slice(0, MAX_HISTORY_TASKS));
 	renderHistory();
+}
+
+function uniqueTaskIds(values) {
+	const ids = [];
+	for (const value of values || []) {
+		const id = String(value || '').trim();
+		if (id && !ids.includes(id)) {
+			ids.push(id);
+		}
+	}
+	return ids;
+}
+
+function taskIdsFromMessages(messages) {
+	return uniqueTaskIds((Array.isArray(messages) ? messages : []).map((message) => message?.taskId));
+}
+
+function rememberCurrentConversationTask(taskId, rootTaskId = '') {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
+		return;
+	}
+	const normalizedRootTaskId = String(rootTaskId || state.conversationRootTaskId || state.conversationTaskIds[0] || normalizedTaskId).trim();
+	state.conversationRootTaskId = normalizedRootTaskId;
+	state.conversationTaskIds = uniqueTaskIds([
+		normalizedRootTaskId,
+		...state.conversationTaskIds,
+		normalizedTaskId
+	]);
+}
+
+function isCurrentConversationTaskId(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	return Boolean(normalizedTaskId) && state.conversationTaskIds.includes(normalizedTaskId);
+}
+
+function isActiveHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	return Boolean(normalizedTaskId) && (
+		normalizedTaskId === state.taskId ||
+		(normalizedTaskId === state.conversationRootTaskId && isCurrentConversationTaskId(state.taskId))
+	);
+}
+
+function collapseCurrentConversationHistory(tasks) {
+	const items = Array.isArray(tasks) ? tasks : [];
+	const rootTaskId = String(state.conversationRootTaskId || state.conversationTaskIds[0] || '').trim();
+	const conversationIds = new Set(uniqueTaskIds([
+		rootTaskId,
+		...state.conversationTaskIds,
+		state.taskId
+	]));
+	if (!rootTaskId || conversationIds.size <= 1) {
+		return items;
+	}
+	const representative = items.find((task) => String(task?.task_id || '') === rootTaskId)
+		|| state.taskHistory.find((task) => String(task?.task_id || '') === rootTaskId)
+		|| null;
+	let insertedConversation = false;
+	return items.reduce((next, task) => {
+		const taskId = String(task?.task_id || '').trim();
+		if (!conversationIds.has(taskId)) {
+			next.push(task);
+			return next;
+		}
+		if (!insertedConversation) {
+			next.push(representative || task);
+			insertedConversation = true;
+		}
+		return next;
+	}, []);
 }
 
 function taskHistoryTitle(task) {
@@ -1646,6 +1731,15 @@ function restoreWorkspace() {
 	}
 	state.savedUserId = typeof saved.userId === 'string' ? saved.userId : '';
 	state.taskId = typeof saved.taskId === 'string' ? saved.taskId : '';
+	const savedConversationRootTaskId = typeof saved.conversationRootTaskId === 'string'
+		? saved.conversationRootTaskId
+		: '';
+	state.conversationRootTaskId = savedConversationRootTaskId || state.taskId;
+	state.conversationTaskIds = uniqueTaskIds(
+		Array.isArray(saved.conversationTaskIds)
+			? saved.conversationTaskIds
+			: [state.conversationRootTaskId || state.taskId]
+	);
 	state.artifactTaskId = typeof saved.artifactTaskId === 'string' ? saved.artifactTaskId : state.taskId;
 	state.query = typeof saved.query === 'string' ? saved.query : '';
 	state.status = typeof saved.status === 'string' ? saved.status : 'ready';
@@ -1656,6 +1750,16 @@ function restoreWorkspace() {
 		: saved.activeTab === '报告' ? CONVERSATION_VIEW : LEGACY_TAB_LABELS[saved.activeTab] || CONVERSATION_VIEW;
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
+	const restoredMessageTaskIds = taskIdsFromMessages(state.messages);
+	if (!savedConversationRootTaskId && restoredMessageTaskIds.length) {
+		state.conversationRootTaskId = restoredMessageTaskIds[0];
+	}
+	state.conversationTaskIds = uniqueTaskIds([
+		state.conversationRootTaskId,
+		...state.conversationTaskIds,
+		...restoredMessageTaskIds,
+		state.taskId
+	]);
 	state.thinkingCollapsed = Boolean(saved.thinkingCollapsed);
 	state.thinkingSteps = Array.isArray(saved.thinkingSteps) && saved.thinkingSteps.length
 		? saved.thinkingSteps.slice(-MAX_THINKING_STEPS)
@@ -1672,6 +1776,8 @@ function saveWorkspace() {
 	const payload = {
 		userId: state.user?.id || state.savedUserId || '',
 		taskId: state.taskId,
+		conversationRootTaskId: state.conversationRootTaskId,
+		conversationTaskIds: state.conversationTaskIds,
 		artifactTaskId: state.artifactTaskId,
 		query: state.query,
 		status: state.status,
@@ -1711,6 +1817,8 @@ function resetWorkspaceState() {
 	bumpWorkspaceGeneration();
 	state.savedUserId = state.user?.id || '';
 	state.taskId = '';
+	state.conversationRootTaskId = '';
+	state.conversationTaskIds = [];
 	state.artifactTaskId = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
@@ -1766,9 +1874,23 @@ async function submitResearch() {
 		return;
 	}
 	const documentIds = isEnterpriseAccount() ? selectedUploadDocumentIds() : [];
+	const previousTaskId = state.taskId;
+	const previousConversationRootTaskId = state.conversationRootTaskId || state.conversationTaskIds[0] || previousTaskId;
+	const wasContinuingConversation = hasConversationActivity() && Boolean(previousConversationRootTaskId);
 
 	state.isSubmitting = true;
 	state.query = query;
+	if (wasContinuingConversation) {
+		state.conversationRootTaskId = previousConversationRootTaskId;
+		state.conversationTaskIds = uniqueTaskIds([
+			previousConversationRootTaskId,
+			...state.conversationTaskIds,
+			previousTaskId
+		]);
+	} else {
+		state.conversationRootTaskId = '';
+		state.conversationTaskIds = [];
+	}
 	bumpWorkspaceGeneration();
 	const context = captureAsyncContext({ includeTask: false });
 	state.status = 'starting';
@@ -1815,10 +1937,15 @@ async function submitResearch() {
 			return;
 		}
 		state.taskId = task.task_id || '';
+		rememberCurrentConversationTask(
+			state.taskId,
+			wasContinuingConversation ? previousConversationRootTaskId : state.taskId
+		);
 		state.artifactTaskId = state.taskId;
 		state.status = task.status || 'queued';
 		updateArchiveState(task);
-		mergeTaskHistory(task);
+		assignLatestUserMessageTaskId(state.taskId);
+		mergeTaskHistory(task, { suppressIfCurrentConversation: wasContinuingConversation });
 		state.savedUserId = state.user?.id || state.savedUserId;
 		dom.queryInput.value = '';
 		state.uploads = [];
@@ -4145,6 +4272,8 @@ function isCurrentAsyncContext(context) {
 function clearRestoredTaskState() {
 	state.restoreBlocked = false;
 	state.taskId = '';
+	state.conversationRootTaskId = '';
+	state.conversationTaskIds = [];
 	state.artifactTaskId = '';
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
@@ -4201,6 +4330,20 @@ function addMessage(role, content, options = {}) {
 	];
 	saveWorkspace();
 	renderMessages();
+}
+
+function assignLatestUserMessageTaskId(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
+		return;
+	}
+	for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+		const message = state.messages[index];
+		if (message?.role === 'user' && !message.taskId) {
+			state.messages[index] = { ...message, taskId: normalizedTaskId };
+			return;
+		}
+	}
 }
 
 function upsertReportMessage(content) {

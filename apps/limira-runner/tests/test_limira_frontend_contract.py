@@ -430,6 +430,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function renderHistorySearchModal()" in app
     assert "function searchTaskHistory()" in app
     assert "function loadTaskHistory()" in app
+    assert "state.taskHistory = collapseCurrentConversationHistory(Array.isArray(data.tasks) ? data.tasks : []);" in app
     assert "async function loadTaskProgressRecords()" in app
     assert "function rebuildThinkingFromProgressRecords(records)" in app
     assert "function appendProgressRecordThinkingStep(record)" in app
@@ -443,6 +444,8 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "renderShell();" in select_history_block
     assert "await loadTaskProgressRecords();" in select_history_block
     assert "dom.queryInput.value = '';" in select_history_block
+    assert "state.conversationRootTaskId = normalizedTaskId;" in select_history_block
+    assert "state.conversationTaskIds = uniqueTaskIds([normalizedTaskId]);" in select_history_block
     assert "dom.queryInput.value = cached.query" not in select_history_block
     assert "switchToWorkspaceRoute();" in start_new_chat_block
     assert "renderShell();" in start_new_chat_block
@@ -478,6 +481,16 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "data-report-tab" in app
     assert "data-report-archive" in app
     assert "function currentArtifactTaskId()" in app
+    assert "conversationRootTaskId: ''" in app
+    assert "conversationTaskIds: []" in app
+    assert "const wasContinuingConversation = hasConversationActivity() && Boolean(previousConversationRootTaskId);" in app
+    assert "const restoredMessageTaskIds = taskIdsFromMessages(state.messages);" in app
+    assert "state.conversationRootTaskId = restoredMessageTaskIds[0];" in app
+    assert "function taskIdsFromMessages(messages)" in app
+    assert "function collapseCurrentConversationHistory(tasks)" in app
+    assert "function rememberCurrentConversationTask(taskId, rootTaskId = '')" in app
+    assert "mergeTaskHistory(task, { suppressIfCurrentConversation: wasContinuingConversation });" in app
+    assert "state.historySearchResults = collapseCurrentConversationHistory([...byId.values()]);" in app
     assert "function artifactsForTask(taskId)" in app
     assert "function archiveStatusForTask(taskId)" in app
     assert "state.artifactTaskId" in app
