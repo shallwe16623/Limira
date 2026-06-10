@@ -1986,7 +1986,7 @@ function renderReport() {
 	const cards = sections
 		.map((section, index) => reportCard(reportTitle(section, index), reportText(section), section.evidence_refs))
 		.join('');
-	const finalCard = state.finalReportText
+	const finalCard = !cards && state.finalReportText
 		? reportCard('最终回答', reportTextFromValue(state.finalReportText), reportEvidenceRefs())
 		: '';
 	dom.artifactContent.innerHTML =
@@ -2623,7 +2623,10 @@ function reportMarkdown() {
 	const sectionText = state.artifacts.report_sections
 		.map((section, index) => `## ${reportTitle(section, index)}\n\n${reportText(section)}`)
 		.join('\n\n');
-	return [reportTextFromValue(state.finalReportText), sectionText].filter(Boolean).join('\n\n');
+	if (sectionText) {
+		return sectionText;
+	}
+	return reportTextFromValue(state.finalReportText);
 }
 
 function reportEvidenceRefs() {

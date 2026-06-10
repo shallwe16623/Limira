@@ -372,6 +372,15 @@ def test_limira_standalone_frontend_keeps_pdf_download_bound_to_current_report()
     assert "导出并下载 PDF" in index
 
 
+def test_limira_standalone_report_sections_take_precedence_over_cached_final_text():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    assert "const finalCard = !cards && state.finalReportText" in app
+    assert "if (sectionText) {" in app
+    assert "return sectionText;" in app
+    assert "return reportTextFromValue(state.finalReportText);" in app
+
+
 def test_limira_standalone_archive_download_uses_authenticated_fetch():
     app = _read(LIMIRA_STANDALONE_APP)
 
