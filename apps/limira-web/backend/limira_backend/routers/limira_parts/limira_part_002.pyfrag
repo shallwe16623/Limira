@@ -647,6 +647,15 @@ def _limira_auth_insert_user(
     )
     if normalized_account_type == "enterprise" and not normalized_organization_id:
         raise HTTPException(status_code=400, detail="organization_required")
+    if (
+        normalized_account_type == "enterprise"
+        and normalized_organization_role == "admin"
+        and _limira_auth_enterprise_admin_exists(
+            organization_id=str(normalized_organization_id),
+            env=env,
+        )
+    ):
+        raise HTTPException(status_code=409, detail="enterprise_admin_already_exists")
     normalized_username = _normalize_auth_username(
         username or _limira_auth_username_from_email(str(email or ""))
     )
@@ -728,6 +737,27 @@ def _normalize_organization_role(
     if normalized not in {"admin", "member"}:
         raise HTTPException(status_code=400, detail="invalid_organization_role")
     return normalized
+
+
+def _limira_auth_enterprise_admin_exists(
+    *,
+    organization_id: str,
+    env: Any = os.environ,
+) -> bool:
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM limira_auth_users
+            WHERE account_type = 'enterprise'
+                AND organization_id = ?
+                AND organization_role = 'admin'
+                AND active = 1
+            LIMIT 1
+            """,
+            (str(organization_id),),
+        ).fetchone()
+    return row is not None
 
 
 def _normalize_auth_email(email: str) -> str:
@@ -1749,6 +1779,28 @@ def _limira_auth_usage_summary(
             """,
             (str(organization_id), cutoff_date),
         ).fetchall()
+        member_rows = connection.execute(
+            """
+            SELECT
+                users.username AS username,
+                users.name AS name,
+                users.email AS email,
+                users.organization_role AS organization_role,
+                COALESCE(SUM(events.quantity), 0) AS research_tasks
+            FROM limira_auth_users AS users
+            LEFT JOIN limira_auth_usage_events AS events
+                ON events.user_id = users.id
+                AND events.organization_id = users.organization_id
+                AND events.event_type = 'research_task'
+                AND events.usage_date >= ?
+            WHERE users.account_type = 'enterprise'
+                AND users.organization_id = ?
+                AND users.active = 1
+            GROUP BY users.id, users.username, users.name, users.email, users.organization_role
+            ORDER BY research_tasks DESC, users.name COLLATE NOCASE
+            """,
+            (cutoff_date, str(organization_id)),
+        ).fetchall()
     totals: dict[str, int] = {}
     daily: list[dict[str, Any]] = []
     for row in rows:
@@ -1766,6 +1818,20 @@ def _limira_auth_usage_summary(
         "days": bounded_days,
         "totals": totals,
         "daily": daily,
+        "member_usage": [
+            {
+                "username": str(row["username"] or ""),
+                "name": str(row["name"] or ""),
+                "email": None
+                if _limira_is_enterprise_synthetic_email(row["email"])
+                else str(row["email"] or ""),
+                "organization_role": str(row["organization_role"] or "member"),
+                "totals": {
+                    "research_task": int(row["research_tasks"] or 0),
+                },
+            }
+            for row in member_rows
+        ],
     }
 
 

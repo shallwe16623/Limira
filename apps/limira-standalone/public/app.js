@@ -100,6 +100,7 @@ const state = {
 	enterpriseMembers: [],
 	enterpriseUsage: null,
 	isLoadingEnterpriseAdmin: false,
+	userSettingsOpen: false,
 	scenarios: [],
 	selectedScenario: '',
 	savedUserId: '',
@@ -165,6 +166,21 @@ function bindEvents() {
 	dom.resendVerificationButton.addEventListener('click', () => void resendVerificationEmail());
 	dom.googleSigninButton.addEventListener('click', googleSignIn);
 	dom.wechatSigninButton.addEventListener('click', wechatSignIn);
+	dom.userSettingsButton.addEventListener('click', (event) => {
+		event.stopPropagation();
+		state.userSettingsOpen = !state.userSettingsOpen;
+		renderShell();
+	});
+	document.addEventListener('click', (event) => {
+		if (
+			state.userSettingsOpen &&
+			!dom.userSettingsPanel.contains(event.target) &&
+			!dom.userSettingsButton.contains(event.target)
+		) {
+			state.userSettingsOpen = false;
+			renderShell();
+		}
+	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
@@ -253,12 +269,19 @@ async function boot() {
 
 function renderShell() {
 	const signedIn = Boolean(state.user);
+	const enterpriseAdmin = signedIn && isEnterpriseAdmin();
 	dom.authPanel.classList.toggle('hidden', signedIn);
 	dom.workspace.classList.toggle('hidden', !signedIn);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
-	dom.sessionLabel.textContent = signedIn
-		? `${state.user.name || state.user.username || state.user.email || '已登录'} · ${accountLabel(state.user)}`
-		: '未登录';
+	dom.userSettingsButton.classList.toggle('hidden', !enterpriseAdmin);
+	if (!enterpriseAdmin) {
+		state.userSettingsOpen = false;
+	}
+	dom.userSettingsPanel.classList.toggle('hidden', !enterpriseAdmin || !state.userSettingsOpen);
+	const displayName = state.user?.name || state.user?.username || state.user?.email || '已登录';
+	const fullSessionLabel = signedIn ? `${displayName} · ${accountLabel(state.user)}` : '未登录';
+	dom.sessionLabel.textContent = signedIn ? displayName : '未登录';
+	dom.sessionLabel.title = fullSessionLabel;
 	renderAuthMode();
 	renderStatus();
 	renderHistory();
@@ -939,6 +962,7 @@ function resetWorkspaceState() {
 	state.uploads = [];
 	state.uploadResults = [];
 	state.taskHistory = [];
+	state.userSettingsOpen = false;
 }
 
 async function signOut() {
@@ -955,6 +979,7 @@ async function signOut() {
 	state.enterpriseMembers = [];
 	state.enterpriseUsage = null;
 	state.isLoadingEnterpriseAdmin = false;
+	state.userSettingsOpen = false;
 	resetWorkspaceState();
 	clearWorkspaceStorage();
 	localStorage.removeItem('limiraToken');
@@ -1927,19 +1952,29 @@ function renderEnterpriseAdmin() {
 	dom.refreshEnterpriseAdminButton.disabled = state.isLoadingEnterpriseAdmin;
 	const researchTasks = Number(state.enterpriseUsage?.totals?.research_task || 0);
 	const days = Number(state.enterpriseUsage?.days || 30);
-	dom.enterpriseUsageSummary.textContent = `${days} 天内已计量研究任务 ${researchTasks} 次。`;
+	dom.enterpriseUsageSummary.textContent = `${days} 天内研究任务 ${researchTasks} 次，按成员计入单位账单。`;
 	dom.enterpriseMemberList.innerHTML = state.enterpriseMembers.length
 		? state.enterpriseMembers
 				.map((member) => {
 					const role = member.organization_role === 'admin' ? '管理员' : '成员';
 					const account = member.username || member.email || '';
+					const researchCount = enterpriseMemberResearchCount(member);
 					return `<article class="management-card">
 						<div class="artifact-title">${escapeHtml(member.name || account || '单位账号')}</div>
-						<div class="artifact-meta"><span>${escapeHtml(account)}</span><span>${role}</span></div>
+						<div class="artifact-meta"><span>${escapeHtml(account)}</span><span>${role}</span><span>研究 ${researchCount} 次</span></div>
 					</article>`;
 				})
 				.join('')
 		: '<div class="empty-state compact-empty">暂无单位账号。</div>';
+}
+
+function enterpriseMemberResearchCount(member) {
+	const memberUsage = Array.isArray(state.enterpriseUsage?.member_usage)
+		? state.enterpriseUsage.member_usage
+		: [];
+	const username = String(member.username || '').trim();
+	const usage = memberUsage.find((item) => String(item.username || '').trim() === username);
+	return Number(usage?.totals?.research_task || 0);
 }
 
 function bumpWorkspaceGeneration() {
@@ -2130,6 +2165,7 @@ function localizedErrorDetail(detail) {
 		organization_not_found: '没有找到这个单位。',
 		organization_required: '请选择单位。',
 		enterprise_admin_required: '当前账号没有单位管理权限。',
+		enterprise_admin_already_exists: '每个单位只能保留一个管理员账号。',
 		organization_already_exists: '这个单位已经存在。',
 		personal_daily_quota_exceeded: '个人方式登录每天只能创建一次研究任务。',
 		invalid_organization_role: '单位角色无效。',

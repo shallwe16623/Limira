@@ -249,6 +249,8 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="usernameLabel"' in index
     assert 'id="enterpriseMemberUsernameInput"' in index
     assert 'id="enterpriseMemberEmailInput"' not in index
+    assert 'id="userSettingsButton"' in index
+    assert 'id="userSettingsPanel"' in index
     assert "此页面直接连接 limira 后端" not in index
     assert 'id="enterpriseContactPrompt"' in index
     assert "如需开通单位账号，请通过以下方式联系团队。" in index
@@ -268,10 +270,13 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "dom.emailLabel.classList.toggle('hidden', !emailVisible)" in app
     assert "enterpriseMemberUsernameInput" in app
     assert "enterpriseMemberEmailInput" not in app
+    assert "state.userSettingsOpen = !state.userSettingsOpen" in app
+    assert "enterpriseMemberResearchCount(member)" in app
     for category_label in ("企业", "事业单位", "高校", "智库", "国家部委", "地方政府"):
         assert category_label in app
     assert 'id="enterpriseAdminPanel"' in index
     assert 'id="enterpriseMemberForm"' in index
+    assert '<option value="admin">管理员</option>' not in index
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
     assert "/api/limira/auth/wechat/config" in app

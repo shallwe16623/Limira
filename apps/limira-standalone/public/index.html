@@ -84,25 +84,6 @@
 						<div class="sidebar-section-title">历史记录</div>
 						<div id="historyMessage" class="inline-message"></div>
 						<div id="historyList" class="history-list"></div>
-						<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
-							<div class="enterprise-admin-header">
-								<div class="sidebar-section-title">单位管理</div>
-								<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
-							</div>
-							<div id="enterpriseUsageSummary" class="inline-message"></div>
-							<form id="enterpriseMemberForm" class="compact-form">
-								<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
-								<input id="enterpriseMemberUsernameInput" placeholder="用户名" autocomplete="username" />
-								<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
-								<select id="enterpriseMemberRoleSelect">
-									<option value="member">成员</option>
-									<option value="admin">管理员</option>
-								</select>
-								<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加账号</button>
-							</form>
-							<div id="enterpriseMemberMessage" class="inline-message"></div>
-							<div id="enterpriseMemberList" class="compact-list"></div>
-						</div>
 					</div>
 					<div class="sidebar-footer">
 						<div class="task-status-row">
@@ -111,7 +92,33 @@
 						</div>
 						<div class="user-row">
 							<span id="sessionLabel" class="session-label">正在检查登录状态</span>
-							<button id="signOutButton" class="ghost-button compact" type="button">退出</button>
+							<div class="user-actions">
+								<button id="userSettingsButton" class="icon-button compact-icon hidden" type="button" title="设置" aria-label="设置">
+									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 1 0 12 8.5A3.5 3.5 0 0 0 12 15.5Z" stroke="currentColor" stroke-width="2"/><path d="M19.43 12.98C19.47 12.66 19.5 12.34 19.5 12C19.5 11.66 19.47 11.34 19.43 11.02L21.54 9.37L19.54 5.91L17.05 6.91C16.52 6.5 15.94 6.16 15.3 5.91L14.92 3.25H10.92L10.54 5.91C9.9 6.16 9.32 6.5 8.79 6.91L6.3 5.91L4.3 9.37L6.41 11.02C6.37 11.34 6.34 11.66 6.34 12C6.34 12.34 6.37 12.66 6.41 12.98L4.3 14.63L6.3 18.09L8.79 17.09C9.32 17.5 9.9 17.84 10.54 18.09L10.92 20.75H14.92L15.3 18.09C15.94 17.84 16.52 17.5 17.05 17.09L19.54 18.09L21.54 14.63L19.43 12.98Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+								</button>
+								<button id="signOutButton" class="ghost-button compact" type="button">退出</button>
+							</div>
+						</div>
+						<div id="userSettingsPanel" class="settings-popover hidden">
+							<div class="settings-title">设置</div>
+							<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
+								<div class="enterprise-admin-header">
+									<div class="sidebar-section-title">单位管理</div>
+									<button id="refreshEnterpriseAdminButton" class="ghost-button compact" type="button">刷新</button>
+								</div>
+								<div id="enterpriseUsageSummary" class="inline-message"></div>
+								<form id="enterpriseMemberForm" class="compact-form">
+									<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
+									<input id="enterpriseMemberUsernameInput" placeholder="用户名" autocomplete="username" />
+									<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
+									<select id="enterpriseMemberRoleSelect">
+										<option value="member">成员</option>
+									</select>
+									<button id="createEnterpriseMemberButton" class="secondary-button" type="submit">添加成员账号</button>
+								</form>
+								<div id="enterpriseMemberMessage" class="inline-message"></div>
+								<div id="enterpriseMemberList" class="compact-list"></div>
+							</div>
 						</div>
 					</div>
 				</aside>

@@ -509,6 +509,19 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
         assert created.json()["member"]["organization_id"] == organization.id
         assert created.json()["member"]["organization_role"] == "member"
 
+        second_admin = await client.post(
+            "/api/limira/enterprise/members",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "username": "second-admin",
+                "name": "Second Admin",
+                "password": "admin-password",
+                "organization_role": "admin",
+            },
+        )
+        assert second_admin.status_code == 409
+        assert second_admin.json() == {"detail": "enterprise_admin_already_exists"}
+
         usage = await client.get(
             "/api/limira/enterprise/usage",
             headers={"Authorization": f"Bearer {token}"},
@@ -607,6 +620,16 @@ async def test_enterprise_auth_research_records_metered_usage_without_daily_limi
         slug="metered-unit",
     )
     limira._limira_auth_insert_user(
+        email="metered-admin@example.test",
+        username="metered-admin",
+        password="metered-admin-password",
+        name="Metered Admin",
+        account_type="enterprise",
+        organization_id=organization.id,
+        organization_role="admin",
+        email_verified_at=1,
+    )
+    limira._limira_auth_insert_user(
         email="metered@example.test",
         username="metered-user",
         password="metered-password",
@@ -653,6 +676,37 @@ async def test_enterprise_auth_research_records_metered_usage_without_daily_limi
                 json={"query": query},
             )
             assert response.status_code == 202
+
+        admin_signin = await client.post(
+            "/api/limira/auth/enterprise/signin",
+            json={
+                "organization_id": organization.id,
+                "username": "metered-admin",
+                "password": "metered-admin-password",
+            },
+        )
+        assert admin_signin.status_code == 200
+        usage_response = await client.get(
+            "/api/limira/enterprise/usage",
+            headers={"Authorization": f"Bearer {admin_signin.json()['token']}"},
+        )
+        assert usage_response.status_code == 200
+        usage_payload = usage_response.json()["usage"]
+        assert usage_payload["totals"]["research_task"] == 2
+        assert {
+            "username": "metered-user",
+            "name": "Metered User",
+            "email": "metered@example.test",
+            "organization_role": "member",
+            "totals": {"research_task": 2},
+        } in usage_payload["member_usage"]
+        assert {
+            "username": "metered-admin",
+            "name": "Metered Admin",
+            "email": "metered-admin@example.test",
+            "organization_role": "admin",
+            "totals": {"research_task": 0},
+        } in usage_payload["member_usage"]
 
     assert len(research.create_calls) == 2
     with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
