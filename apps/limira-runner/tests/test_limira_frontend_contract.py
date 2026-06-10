@@ -416,7 +416,8 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "function hasConversationActivity()" in app
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
     assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace' || !conversationView);" in app
-    assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
+    assert index.index('id="conversationPanel"') < index.index('id="artifactTabs"')
+    assert index.index('id="artifactTabs"') < index.index('id="thinkingPanel"')
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
     assert ".tabs {\n\tz-index: 8;" in styles
     assert "bottom: 7.15rem;" not in styles
