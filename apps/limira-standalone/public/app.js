@@ -2454,6 +2454,7 @@ function localizedErrorDetail(detail) {
 		enterprise_cloud_storage_required: '云文件仅支持单位账号。',
 		enterprise_cloud_storage_quota_exceeded: '云空间已满，请清理文件或联系管理员扩容。',
 		document_not_found: '没有找到这个历史文件。',
+		runner_task_failed: '研究任务失败，请检查运行配置或稍后重试。',
 		personal_daily_quota_exceeded: '个人方式登录每天只能创建一次研究任务。',
 		invalid_organization_role: '单位角色无效。',
 		google_auth_failed: 'Google 登录失败，请重试。',
@@ -2736,7 +2737,7 @@ function now() {
 
 function errorMessage(error) {
 	if (error instanceof Error) return error.message;
-	if (typeof error === 'string') return error;
+	if (typeof error === 'string') return localizedErrorDetail(error);
 	return stringifyCompact(error);
 }
 

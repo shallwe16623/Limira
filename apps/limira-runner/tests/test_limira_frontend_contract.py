@@ -379,6 +379,13 @@ def test_limira_standalone_hides_raw_event_log_and_keeps_progress_panel():
     assert 'id="clearStreamButton"' in index
 
 
+def test_limira_standalone_localizes_runner_task_failures():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    assert "runner_task_failed: '研究任务失败，请检查运行配置或稍后重试。'" in app
+    assert "if (typeof error === 'string') return localizedErrorDetail(error);" in app
+
+
 def test_limira_standalone_persists_uploaded_documents_across_workspace_restore():
     app = _read(LIMIRA_STANDALONE_APP)
 
