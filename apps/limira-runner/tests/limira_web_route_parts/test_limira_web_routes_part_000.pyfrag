@@ -168,6 +168,7 @@ async def test_create_research_uses_limira_namespace_and_rejects_body_user_id():
     assert payload["artifacts_url"].startswith("/api/limira/tasks/")
     assert payload["scenario"] == "sanctions"
     assert payload["query"] == "track sanctions"
+    assert payload["conversation_id"] == payload["task_id"]
     assert research.create_calls == [
         {
             "query": "track sanctions",
@@ -188,6 +189,45 @@ async def test_create_research_uses_limira_namespace_and_rejects_body_user_id():
             research_client=research,
         )
     assert rejected.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_task_history_collapses_follow_up_tasks_by_conversation_id():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+
+    first = await limira.create_research_task(
+        {"query": "first message"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    second = await limira.create_research_task(
+        {
+            "query": "follow up message",
+            "conversation_id": first["conversation_id"],
+        },
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+
+    assert second["conversation_id"] == first["conversation_id"]
+    history = await limira.list_tasks(
+        limit=30,
+        archived=False,
+        query=None,
+        user=user,
+        repo=repo,
+    )
+
+    assert history["count"] == 1
+    assert history["tasks"][0]["task_id"] == first["task_id"]
+    assert history["tasks"][0]["query"] == "first message"
+    assert history["tasks"][0]["conversation_id"] == first["conversation_id"]
 
 
 @pytest.mark.asyncio

@@ -818,6 +818,7 @@ def _task_from_row(row: dict[str, Any]) -> LimiraTask:
         model_summary=_json_loads(row.get("model_summary")) or {},
         archived_at=_optional_string(row.get("archived_at")),
         deleted_at=_optional_string(row.get("deleted_at")),
+        conversation_id=_optional_string(row.get("conversation_id")),
     )
 
 

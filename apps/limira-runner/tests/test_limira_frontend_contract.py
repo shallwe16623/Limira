@@ -484,6 +484,8 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "conversationRootTaskId: ''" in app
     assert "conversationTaskIds: []" in app
     assert "const wasContinuingConversation = hasConversationActivity() && Boolean(previousConversationRootTaskId);" in app
+    assert "researchBody.conversation_id = previousConversationRootTaskId;" in app
+    assert "const responseConversationId = String(task.conversation_id || '').trim();" in app
     assert "const restoredMessageTaskIds = taskIdsFromMessages(state.messages);" in app
     assert "state.conversationRootTaskId = restoredMessageTaskIds[0];" in app
     assert "function taskIdsFromMessages(messages)" in app

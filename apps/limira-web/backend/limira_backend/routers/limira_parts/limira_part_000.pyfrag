@@ -416,6 +416,7 @@ LIMIRA_DEMO_SCENARIOS: dict[str, LimiraDemoScenario] = {
 class ResearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
     scenario: str | None = Field(default=None, max_length=120)
+    conversation_id: str | None = Field(default=None, max_length=120)
     document_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
@@ -533,10 +534,12 @@ class LimiraTask:
     model_summary: dict[str, Any] | None = None
     archived_at: str | None = None
     deleted_at: str | None = None
+    conversation_id: str | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
+            "conversation_id": self.conversation_id or self.task_id,
             "query": self.query,
             "status": self.status,
             "archive_status": self.archive_status,
@@ -563,10 +566,32 @@ def _task_matches_history_search(task: LimiraTask, query: str | None) -> bool:
             task.status,
             task.archive_status,
             task.scenario or "",
+            task.conversation_id or "",
             _json_dumps(_public_model_summary(task.model_summary or {})),
         ]
     ).casefold()
     return needle in haystack
+
+
+def _task_conversation_id(task: LimiraTask) -> str:
+    return str(task.conversation_id or task.task_id)
+
+
+def _collapse_history_conversations(tasks: list[LimiraTask]) -> list[LimiraTask]:
+    groups: dict[str, list[LimiraTask]] = {}
+    order: list[str] = []
+    for task in tasks:
+        conversation_id = _task_conversation_id(task)
+        if conversation_id not in groups:
+            groups[conversation_id] = []
+            order.append(conversation_id)
+        groups[conversation_id].append(task)
+    collapsed: list[LimiraTask] = []
+    for conversation_id in order:
+        members = groups[conversation_id]
+        root = next((task for task in members if task.task_id == conversation_id), None)
+        collapsed.append(root or members[0])
+    return collapsed
 
 
 @dataclass
@@ -681,6 +706,7 @@ class LimiraTaskRepository(Protocol):
         query: str,
         scenario: str | None,
         runner_task_id: str | None,
+        conversation_id: str | None = None,
     ) -> LimiraTask: ...
 
     def get_task(self, task_id: str) -> LimiraTask | None: ...
@@ -920,6 +946,7 @@ class InMemoryLimiraTaskRepository:
         query: str,
         scenario: str | None,
         runner_task_id: str | None,
+        conversation_id: str | None = None,
     ) -> LimiraTask:
         task = LimiraTask(
             task_id=task_id,
@@ -927,6 +954,7 @@ class InMemoryLimiraTaskRepository:
             query=query,
             scenario=scenario,
             runner_task_id=runner_task_id,
+            conversation_id=conversation_id or task_id,
         )
         self.tasks[task_id] = task
         self.artifacts[task_id] = _empty_artifact_buckets()
@@ -959,7 +987,7 @@ class InMemoryLimiraTaskRepository:
             and ((task.archived_at is not None) if archived else (task.archived_at is None))
             and _task_matches_history_search(task, query)
         ]
-        return tasks[:limit]
+        return _collapse_history_conversations(tasks)[:limit]
 
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
         task = self.get_task(task_id)
@@ -1289,6 +1317,7 @@ class SQLiteLimiraTaskRepository(InMemoryLimiraTaskRepository):
         query: str,
         scenario: str | None,
         runner_task_id: str | None,
+        conversation_id: str | None = None,
     ) -> LimiraTask:
         task = super().create_task(
             task_id=task_id,
@@ -1296,6 +1325,7 @@ class SQLiteLimiraTaskRepository(InMemoryLimiraTaskRepository):
             query=query,
             scenario=scenario,
             runner_task_id=runner_task_id,
+            conversation_id=conversation_id,
         )
         self._persist_state()
         return task

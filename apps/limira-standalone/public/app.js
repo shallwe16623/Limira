@@ -1926,20 +1926,25 @@ async function submitResearch() {
 	renderReportControls();
 
 	try {
+		const researchBody = {
+			query,
+			document_ids: documentIds
+		};
+		if (wasContinuingConversation && previousConversationRootTaskId) {
+			researchBody.conversation_id = previousConversationRootTaskId;
+		}
 		const task = await api('/api/limira/research', {
 			method: 'POST',
-			body: {
-				query,
-				document_ids: documentIds
-			}
+			body: researchBody
 		});
 		if (!state.isSubmitting || !isCurrentAsyncContext(context)) {
 			return;
 		}
 		state.taskId = task.task_id || '';
+		const responseConversationId = String(task.conversation_id || '').trim();
 		rememberCurrentConversationTask(
 			state.taskId,
-			wasContinuingConversation ? previousConversationRootTaskId : state.taskId
+			responseConversationId || (wasContinuingConversation ? previousConversationRootTaskId : state.taskId)
 		);
 		state.artifactTaskId = state.taskId;
 		state.status = task.status || 'queued';

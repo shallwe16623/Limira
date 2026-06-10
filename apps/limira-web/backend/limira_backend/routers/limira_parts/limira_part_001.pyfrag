@@ -402,7 +402,8 @@ class PostgresLimiraTaskRepository:
         error,
         model_summary,
         metadata ->> 'history_archived_at' AS archived_at,
-        metadata ->> 'history_deleted_at' AS deleted_at
+        metadata ->> 'history_deleted_at' AS deleted_at,
+        metadata ->> 'conversation_id' AS conversation_id
     """
     DOCUMENT_COLUMNS = """
         document_id,
@@ -909,7 +910,9 @@ class PostgresLimiraTaskRepository:
         query: str,
         scenario: str | None,
         runner_task_id: str | None,
+        conversation_id: str | None = None,
     ) -> LimiraTask:
+        normalized_conversation_id = str(conversation_id or task_id)
         row = self._fetch_one(
             self.INSERT_TASK_SQL,
             {
@@ -919,7 +922,10 @@ class PostgresLimiraTaskRepository:
                 "runner_task_id": runner_task_id,
                 "scenario": scenario,
                 "model_summary": _json_dumps({}),
-                "metadata": _json_dumps({"repository": "postgres"}),
+                "metadata": _json_dumps({
+                    "repository": "postgres",
+                    "conversation_id": normalized_conversation_id,
+                }),
             },
         )
         if not row:
@@ -950,7 +956,8 @@ class PostgresLimiraTaskRepository:
             if archived
             else "metadata ->> 'history_archived_at' IS NULL"
         )
-        params: dict[str, Any] = {"owner_user_id": owner_user_id, "limit": limit}
+        row_limit = min(max(limit * 5, limit), 500)
+        params: dict[str, Any] = {"owner_user_id": owner_user_id, "limit": row_limit}
         search_filter = ""
         trimmed_query = str(query or "").strip()
         if trimmed_query:
@@ -962,6 +969,7 @@ class PostgresLimiraTaskRepository:
                 OR LOWER(COALESCE(status, '')) LIKE :search_query
                 OR LOWER(COALESCE(archive_status, '')) LIKE :search_query
                 OR LOWER(COALESCE(scenario, '')) LIKE :search_query
+                OR LOWER(COALESCE(metadata ->> 'conversation_id', '')) LIKE :search_query
                 OR LOWER(COALESCE(model_summary::text, '')) LIKE :search_query
               )
             """
@@ -976,7 +984,7 @@ class PostgresLimiraTaskRepository:
             LIMIT :limit
         """
         rows = self._fetch_all(sql, params)
-        return [_task_from_row(row) for row in rows]
+        return _collapse_history_conversations([_task_from_row(row) for row in rows])[:limit]
 
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
         allowed = {

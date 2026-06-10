@@ -786,6 +786,7 @@ async def create_research_task(
     )
     runner_query = _runner_query_for_scenario(query, scenario)
     task_id = str(uuid.uuid4())
+    conversation_id = str(request_data.conversation_id or "").strip() or task_id
     if request is not None:
         _limira_record_research_usage(user=user, task_id=task_id)
     task = repo.create_task(
@@ -794,6 +795,7 @@ async def create_research_task(
         query=query,
         scenario=scenario,
         runner_task_id=None,
+        conversation_id=conversation_id,
     )
     attached_documents = _attach_documents_to_task(
         repo,
@@ -839,6 +841,7 @@ async def create_research_task(
     return _assert_browser_safe(
         {
             "task_id": task.task_id,
+            "conversation_id": task.conversation_id or task.task_id,
             "status": task.status,
             "scenario": task.scenario,
             "query": task.query,
