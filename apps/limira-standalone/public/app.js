@@ -2228,8 +2228,18 @@ function hasResearchSurface() {
 	const counts = artifactCounts();
 	return Boolean(
 		state.taskId ||
+		state.isSubmitting ||
 		state.finalReportText ||
 		Object.values(counts).some((count) => Number(count || 0) > 0)
+	);
+}
+
+function hasConversationActivity() {
+	return Boolean(
+		state.messages.length ||
+		state.taskId ||
+		state.isSubmitting ||
+		state.thinkingSteps.some((step) => step.kind !== 'ready')
 	);
 }
 
@@ -2258,7 +2268,10 @@ function renderStatus() {
 function renderMessages() {
 	const artifactView = isArtifactView();
 	dom.conversationPanel?.classList.toggle('compact', artifactView);
-	const messages = artifactView ? state.messages.slice(-3) : state.messages.slice(-80);
+	const sourceMessages = artifactView
+		? state.messages.filter((message) => message.kind !== 'report').slice(-2)
+		: state.messages.slice(-80);
+	const messages = sourceMessages;
 	dom.messageList.innerHTML = messages
 		.map(
 			(message) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}">
@@ -2298,7 +2311,7 @@ function renderTabs() {
 	const conversationView = isConversationView();
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
-	dom.thinkingPanel?.classList.toggle('hidden', !conversationView);
+	dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());
 	dom.artifactContent.classList.toggle('hidden', conversationView || !surfaceVisible);
 	dom.artifactTabs.classList.toggle('hidden', !surfaceVisible);
 	if (!surfaceVisible) {
@@ -3308,14 +3321,7 @@ function emptyArtifacts() {
 }
 
 function initialMessages() {
-	return [
-		{
-			role: 'assistant',
-			content:
-				'请输入研究问题。发送后，上方显示对话，中间显示工作过程，功能按钮会在任务开始后出现。',
-			time: now()
-		}
-	];
+	return [];
 }
 
 function initialThinkingSteps() {

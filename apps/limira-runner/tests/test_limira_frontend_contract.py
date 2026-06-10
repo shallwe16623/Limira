@@ -20,6 +20,7 @@ LIMIRA_STANDALONE_ROOT = REPO_ROOT / "apps" / "limira-standalone"
 LIMIRA_STANDALONE_SERVER = LIMIRA_STANDALONE_ROOT / "server.mjs"
 LIMIRA_STANDALONE_INDEX = LIMIRA_STANDALONE_ROOT / "public" / "index.html"
 LIMIRA_STANDALONE_APP = LIMIRA_STANDALONE_ROOT / "public" / "app.js"
+LIMIRA_STANDALONE_STYLES = LIMIRA_STANDALONE_ROOT / "public" / "styles.css"
 LIMIRA_BACKEND_ROOT = LIMIRA_WEB_ROOT / "backend" / "limira_backend"
 LIMIRA_BACKEND_ROUTER = LIMIRA_BACKEND_ROOT / "routers" / "limira.py"
 LIMIRA_BACKEND_ROUTER_PARTS = LIMIRA_BACKEND_ROOT / "routers" / "limira_parts"
@@ -390,6 +391,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
 def test_limira_standalone_frontend_uses_archive_only_export_surface():
     app = _read(LIMIRA_STANDALONE_APP)
     index = _read(LIMIRA_STANDALONE_INDEX)
+    styles = _read(LIMIRA_STANDALONE_STYLES)
 
     assert "exportPdfButton" not in app
     assert "exportPdfButton" not in index
@@ -409,6 +411,12 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "state.activeTab = tabs.includes(button.dataset.tab) ? button.dataset.tab : CONVERSATION_VIEW;" in app
     assert "addMessage('assistant', state.finalReportText, { format: 'markdown', kind: 'report' });" in app
     assert "state.activeTab = '报告'" not in app
+    assert "function initialMessages()" in app
+    assert "return [];" in app
+    assert "function hasConversationActivity()" in app
+    assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
+    assert ".tabs {\n\tposition: absolute;" in styles
+    assert "bottom: 7.15rem;" in styles
     assert "async function downloadArchive()" in app
     assert "downloadPdfButton" not in app
     assert "downloadPdfButton" not in index
