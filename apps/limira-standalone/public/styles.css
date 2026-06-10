@@ -385,13 +385,6 @@ label {
 	border-color: var(--muted);
 }
 
-.chat-input-top-bar {
-	display: flex;
-	align-items: center;
-	gap: 0.5rem;
-	padding: 0 0.25rem;
-}
-
 .icon-button {
 	display: inline-flex;
 	align-items: center;
@@ -407,7 +400,48 @@ label {
 	background: var(--border);
 	color: var(--text);
 }
-.upload-trigger { cursor: pointer; }
+
+.upload-menu-wrapper {
+	position: relative;
+	flex-shrink: 0;
+	margin-bottom: 0.25rem;
+}
+.upload-menu-button {
+	border: 1px solid var(--border);
+	border-radius: var(--radius-full);
+	background: var(--surface);
+}
+.upload-menu {
+	position: absolute;
+	left: 0;
+	bottom: calc(100% + 0.5rem);
+	width: 168px;
+	padding: 0.35rem;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+	background: var(--surface);
+	box-shadow: var(--shadow-md);
+	z-index: 30;
+}
+.upload-menu-item {
+	display: flex;
+	align-items: center;
+	gap: 0.55rem;
+	width: 100%;
+	min-height: 38px;
+	padding: 0.5rem 0.6rem;
+	border-radius: var(--radius-sm);
+	color: var(--text);
+	font-size: 0.9rem;
+	text-align: left;
+}
+.upload-menu-item:hover {
+	background: var(--surface-muted);
+}
+.upload-menu-item svg {
+	color: var(--text-secondary);
+	flex-shrink: 0;
+}
 
 .chat-input-wrapper {
 	display: flex;

@@ -163,16 +163,19 @@
 						<div id="messageList" class="message-list-bottom" aria-label="实时进展"></div>
 
 						<form id="researchForm" class="chat-input-box">
-							<div class="chat-input-top-bar">
-								<!-- Upload Integration -->
-								<label class="icon-button upload-trigger" title="上传知识库资料">
-										<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M9 7C9 4.23858 11.2386 2 14 2C16.7614 2 19 4.23858 19 7V15C19 18.866 16.7614 22 14 22C11.2386 22 9 18.866 9 15V9C9 8.44772 9.44772 8 10 8C10.5523 8 11 8.44772 11 9V15C11 16.6569 12.3431 18 14 18C15.6569 18 17 16.6569 17 15V7C17 5.34315 15.6569 4 14 4C12.3431 4 11 5.34315 11 7V15C11 15.5523 11.4477 16 12 16C12.5523 16 13 15.5523 13 15V9C13 8.44772 13.4477 8 14 8C14.5523 8 15 8.44772 15 9V15C15 16.6569 13.6569 18 12 18C10.3431 18 9 16.6569 9 15V7Z" fill="currentColor"/></svg>
-										<input id="uploadInput" type="file" class="hidden" />
-									</label>
-
-							</div>
-
 							<div class="chat-input-wrapper">
+								<div class="upload-menu-wrapper">
+									<button id="uploadMenuButton" class="icon-button upload-menu-button" type="button" title="添加" aria-haspopup="menu" aria-expanded="false">
+										<svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M12 5V19M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+									</button>
+									<div id="uploadMenu" class="upload-menu hidden" role="menu" aria-label="添加内容">
+										<button id="uploadFileButton" class="upload-menu-item" type="button" role="menuitem">
+											<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M14 3H7C5.89543 3 5 3.89543 5 5V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V8M14 3L19 8M14 3V8H19" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+											<span>上传文件</span>
+										</button>
+									</div>
+									<input id="uploadInput" type="file" class="hidden" />
+								</div>
 								<textarea id="queryInput" rows="1" placeholder="发送消息以开始 OSINT 研究..." required></textarea>
 								<button id="submitResearchButton" class="send-button" type="submit" title="发送">
 									<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 11L12 6L17 11M12 18V7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>

@@ -283,6 +283,11 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "填入模板" not in index
     assert "关键矿产竞争" not in app
     assert "scenario: state.selectedScenario" not in app
+    assert 'id="uploadMenuButton"' in index
+    assert 'id="uploadFileButton"' in index
+    assert "上传文件" in index
+    assert "upload-trigger" not in index
+    assert "dom.uploadFileButton.addEventListener" in app
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
     assert "/api/limira/auth/wechat/config" in app

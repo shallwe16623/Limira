@@ -65,6 +65,7 @@ const state = {
 	enterpriseUsage: null,
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
+	uploadMenuOpen: false,
 	savedUserId: '',
 	query: '',
 	taskId: '',
@@ -133,6 +134,15 @@ function bindEvents() {
 		state.userSettingsOpen = !state.userSettingsOpen;
 		renderShell();
 	});
+	dom.uploadMenuButton.addEventListener('click', (event) => {
+		event.stopPropagation();
+		setUploadMenuOpen(!state.uploadMenuOpen);
+	});
+	dom.uploadFileButton.addEventListener('click', (event) => {
+		event.stopPropagation();
+		setUploadMenuOpen(false);
+		dom.uploadInput.click();
+	});
 	document.addEventListener('click', (event) => {
 		if (
 			state.userSettingsOpen &&
@@ -141,6 +151,18 @@ function bindEvents() {
 		) {
 			state.userSettingsOpen = false;
 			renderShell();
+		}
+		if (
+			state.uploadMenuOpen &&
+			!dom.uploadMenu.contains(event.target) &&
+			!dom.uploadMenuButton.contains(event.target)
+		) {
+			setUploadMenuOpen(false);
+		}
+	});
+	document.addEventListener('keydown', (event) => {
+		if (event.key === 'Escape' && state.uploadMenuOpen) {
+			setUploadMenuOpen(false);
 		}
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
@@ -230,8 +252,10 @@ function renderShell() {
 	dom.userSettingsButton.classList.toggle('hidden', !signedIn);
 	if (!signedIn) {
 		state.userSettingsOpen = false;
+		setUploadMenuOpen(false);
 	}
 	dom.userSettingsPanel.classList.toggle('hidden', !signedIn || !state.userSettingsOpen);
+	renderUploadMenu();
 	const displayName = state.user?.name || state.user?.username || state.user?.email || '已登录';
 	const fullSessionLabel = signedIn ? `${displayName} · ${accountLabel(state.user)}` : '未登录';
 	dom.sessionLabel.textContent = signedIn ? displayName : '未登录';
@@ -244,6 +268,19 @@ function renderShell() {
 	renderUploads();
 	renderReportControls();
 	renderEnterpriseAdmin();
+}
+
+function setUploadMenuOpen(open) {
+	state.uploadMenuOpen = Boolean(open);
+	renderUploadMenu();
+}
+
+function renderUploadMenu() {
+	if (!dom.uploadMenu || !dom.uploadMenuButton) {
+		return;
+	}
+	dom.uploadMenu.classList.toggle('hidden', !state.uploadMenuOpen);
+	dom.uploadMenuButton.setAttribute('aria-expanded', state.uploadMenuOpen ? 'true' : 'false');
 }
 
 function renderAuthMode() {
