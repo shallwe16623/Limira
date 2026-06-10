@@ -1232,6 +1232,77 @@ async def test_artifacts_api_unwraps_legacy_json_wrapped_report_section_text():
     assert '"content"' not in members["trace.json"]
 
 
+def test_show_text_markdown_formats_structured_report_json():
+    structured_report = json.dumps(
+        {
+            "title": "2026年6月8日美国国防部1260H清单新增中国企业全面报告",
+            "sections": [
+                {
+                    "heading": "事件背景",
+                    "content": "美国国防部依据NDAA第1260H条更新中国军事企业名单。",
+                },
+                {
+                    "heading": "新增企业",
+                    "content": "除比亚迪外，还包括阿里巴巴、百度、宇树科技等。",
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    markdown = limira._show_text_markdown({"text": f"草稿标题\n{structured_report}"})
+
+    assert markdown.startswith("# 2026年6月8日美国国防部1260H清单新增中国企业全面报告")
+    assert "## 事件背景" in markdown
+    assert "美国国防部依据NDAA第1260H条更新中国军事企业名单。" in markdown
+    assert "## 新增企业" in markdown
+    assert '{"title"' not in markdown
+    assert '"sections"' not in markdown
+
+
+@pytest.mark.asyncio
+async def test_artifacts_api_formats_structured_json_report_sections():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-structured-json-report",
+        owner_user_id=user.id,
+        query="1260H新增企业",
+        scenario=None,
+        runner_task_id="runner-structured-json-report",
+    )
+    structured_report = json.dumps(
+        {
+            "title": "1260H新增企业报告",
+            "sections": [
+                {"heading": "互联网与AI", "content": "阿里巴巴、百度、商汤集团等。"},
+                {"heading": "新能源与汽车", "content": "比亚迪、蔚来、中创新航等。"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-STRUCTURED",
+            "markdown": structured_report,
+            "source_event_type": "record_research_artifact",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    artifacts = await limira.get_task_artifacts(task.task_id, user=user, repo=repo)
+
+    section = artifacts["report_sections"][0]
+    assert section["title"] == "1260H新增企业报告"
+    assert "## 互联网与AI" in section["markdown"]
+    assert "阿里巴巴、百度、商汤集团等。" in section["markdown"]
+    assert "## 新能源与汽车" in section["markdown"]
+    assert '{"title"' not in json.dumps(artifacts, ensure_ascii=False)
+    assert '"sections"' not in json.dumps(artifacts, ensure_ascii=False)
+
+
 @pytest.mark.asyncio
 async def test_archive_download_unwraps_json_wrapped_report_members_from_persisted_archive():
     repo = limira.InMemoryLimiraTaskRepository()

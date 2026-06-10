@@ -1982,7 +1982,7 @@ function handleToolCall(data) {
 	const toolName = data.tool_name || data.name || 'tool';
 	const input = data.tool_input && typeof data.tool_input === 'object' ? data.tool_input : {};
 	if (toolName === 'show_text' && typeof input.text === 'string') {
-		state.finalReportText = reportTextFromValue(input.text) || input.text;
+		state.finalReportText = reportTextFromValue(input.text, { includeTitle: true }) || input.text;
 		addThinkingStep({
 			kind: 'report',
 			title: '最终报告已生成',
@@ -2159,7 +2159,7 @@ function thinkingStepForLoggedToolCall(data, time) {
 	const toolName = data.tool_name || data.name || 'tool';
 	const input = data.tool_input && typeof data.tool_input === 'object' ? data.tool_input : {};
 	if (toolName === 'show_text' && typeof input.text === 'string') {
-		state.finalReportText = reportTextFromValue(input.text) || input.text;
+		state.finalReportText = reportTextFromValue(input.text, { includeTitle: true }) || input.text;
 		upsertReportMessage(state.finalReportText);
 		state.activeTab = CONVERSATION_VIEW;
 		return {
@@ -4175,7 +4175,7 @@ function addMessage(role, content, options = {}) {
 }
 
 function upsertReportMessage(content) {
-	const text = reportTextFromValue(content);
+	const text = reportTextFromValue(content, { includeTitle: true });
 	if (!text) {
 		return false;
 	}
@@ -4463,7 +4463,7 @@ function reportMarkdown() {
 	if (sectionText) {
 		return sectionText;
 	}
-	return reportTextFromValue(state.finalReportText);
+	return reportTextFromValue(state.finalReportText, { includeTitle: true });
 }
 
 function reportEvidenceRefs() {
@@ -4491,13 +4491,15 @@ function reportTitle(section, index) {
 
 function reportText(section) {
 	return (
-		reportTextFromValue(section.markdown || section.content || section.text || section.summary || section) ||
+		reportTextFromValue(section.markdown || section.content || section.text || section.summary || section, { includeTitle: false }) ||
 		stringifyCompact(section)
 	);
 }
 
 const REPORT_TEXT_FIELDS = ['markdown', 'content', 'text', 'summary'];
 const REPORT_TITLE_FIELDS = ['title', 'report_title', 'name'];
+const REPORT_SECTION_FIELDS = ['sections', 'report_sections'];
+const REPORT_SECTION_TITLE_FIELDS = ['heading', ...REPORT_TITLE_FIELDS];
 
 function reportWrapper(value) {
 	if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -4505,9 +4507,46 @@ function reportWrapper(value) {
 	}
 	if (typeof value !== 'string') return null;
 	const trimmed = value.trim();
-	if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
-	const parsed = parseJson(trimmed);
+	const jsonText = trimmed.startsWith('{') && trimmed.endsWith('}')
+		? trimmed
+		: embeddedJsonObjectText(trimmed);
+	if (!jsonText) return null;
+	const parsed = parseJson(jsonText);
 	return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+}
+
+function embeddedJsonObjectText(text) {
+	const first = text.indexOf('{');
+	const last = text.lastIndexOf('}');
+	if (first < 0 || last <= first) {
+		return '';
+	}
+	const candidate = text.slice(first, last + 1).trim();
+	const parsed = parseJson(candidate);
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		return '';
+	}
+	const keys = new Set([
+		...REPORT_TEXT_FIELDS,
+		...REPORT_TITLE_FIELDS,
+		...REPORT_SECTION_FIELDS,
+		'payload',
+		'result'
+	]);
+	return Object.keys(parsed).some((key) => keys.has(key)) ? candidate : '';
+}
+
+function directReportField(value, fields) {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return '';
+	}
+	for (const field of fields) {
+		const raw = value[field];
+		if (raw === undefined || raw === null || typeof raw === 'object') continue;
+		const text = String(raw).trim();
+		if (text) return text;
+	}
+	return '';
 }
 
 function reportFieldFromValue(value, fields) {
@@ -4528,16 +4567,49 @@ function reportFieldFromValue(value, fields) {
 	return null;
 }
 
-function reportTextFromValue(value) {
+function structuredReportMarkdown(wrapped, options = {}) {
+	const sections = REPORT_SECTION_FIELDS.flatMap((field) => asArray(wrapped[field]));
+	if (!sections.length) {
+		return '';
+	}
+	const parts = [];
+	const title = directReportField(wrapped, REPORT_TITLE_FIELDS);
+	if (options.includeTitle !== false && title) {
+		parts.push(`# ${title}`);
+	}
+	for (const section of sections) {
+		const heading = directReportField(section, REPORT_SECTION_TITLE_FIELDS);
+		const text = reportTextFromValue(
+			section?.markdown || section?.content || section?.text || section?.summary || section,
+			{ includeTitle: false }
+		);
+		if (heading && text) {
+			parts.push(`## ${heading}\n\n${text}`);
+		} else if (heading) {
+			parts.push(`## ${heading}`);
+		} else if (text) {
+			parts.push(text);
+		}
+	}
+	return parts.join('\n\n').trim();
+}
+
+function reportTextFromValue(value, options = {}) {
 	const wrapped = reportWrapper(value);
 	if (wrapped) {
+		const structured = structuredReportMarkdown(wrapped, options);
+		if (structured) return structured;
 		for (const field of REPORT_TEXT_FIELDS) {
 			if (!(field in wrapped)) continue;
-			const text = reportTextFromValue(wrapped[field]);
+			const text = reportTextFromValue(wrapped[field], options);
 			if (text) return text;
 		}
 		if ('payload' in wrapped) {
-			const text = reportTextFromValue(wrapped.payload);
+			const text = reportTextFromValue(wrapped.payload, options);
+			if (text) return text;
+		}
+		if ('result' in wrapped) {
+			const text = reportTextFromValue(wrapped.result, options);
 			if (text) return text;
 		}
 		return '';

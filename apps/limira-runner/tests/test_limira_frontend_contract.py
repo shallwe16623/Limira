@@ -570,7 +570,17 @@ def test_limira_standalone_report_sections_take_precedence_over_cached_final_tex
     assert "const finalCard = !cards && state.finalReportText" in app
     assert "if (sectionText) {" in app
     assert "return sectionText;" in app
-    assert "return reportTextFromValue(state.finalReportText);" in app
+    assert "return reportTextFromValue(state.finalReportText, { includeTitle: true });" in app
+    assert "const REPORT_SECTION_FIELDS = ['sections', 'report_sections'];" in app
+    assert "function embeddedJsonObjectText(text)" in app
+    assert "function structuredReportMarkdown(wrapped, options = {})" in app
+    assert "parts.push(`# ${title}`);" in app
+    assert "parts.push(`## ${heading}\\n\\n${text}`);" in app
+    assert "reportTextFromValue(input.text, { includeTitle: true })" in app
+    assert (
+        "reportTextFromValue(section.markdown || section.content || "
+        "section.text || section.summary || section, { includeTitle: false })"
+    ) in app
 
 
 def test_limira_standalone_archive_download_uses_authenticated_fetch():
