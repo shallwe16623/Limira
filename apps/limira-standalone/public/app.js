@@ -431,7 +431,6 @@ function renderShell() {
 	dom.authPanel.classList.toggle('hidden', signedIn);
 	dom.workspace.classList.toggle('hidden', !signedIn);
 	dom.workspaceContent.classList.toggle('hidden', utilityPageVisible);
-	dom.inputContainer.classList.toggle('hidden', utilityPageVisible);
 	dom.cloudDrivePage.classList.toggle('hidden', !cloudDriveVisible);
 	dom.archivedHistoryPage.classList.toggle('hidden', !archivedHistoryVisible);
 	dom.enterpriseAdminPage.classList.toggle('hidden', !enterpriseAdminVisible);
@@ -1536,6 +1535,8 @@ async function submitResearch() {
 		mergeTaskHistory(task);
 		state.savedUserId = state.user?.id || state.savedUserId;
 		dom.queryInput.value = '';
+		state.uploads = [];
+		state.uploadResults = [];
 		completeActiveThinkingSteps();
 		addThinkingStep({
 			kind: 'status',
@@ -1546,6 +1547,7 @@ async function submitResearch() {
 		addMessage('assistant', `研究任务 ${state.taskId || '已创建'}：${statusLabel(state.status)}。`);
 		saveWorkspace();
 		renderTabs();
+		renderUploads();
 		connectStream();
 		await loadArtifacts();
 		await loadUploads();
@@ -1899,12 +1901,7 @@ async function loadUploads() {
 		state.cloudFiles = Array.isArray(historyData.documents) ? historyData.documents : [];
 		state.cloudStorage = historyData.storage || null;
 		if (state.taskId) {
-			const taskData = await api(`/api/limira/uploads?task_id=${encodeURIComponent(state.taskId)}`);
-			if (!isCurrentAsyncContext(context)) {
-				return;
-			}
-			state.uploads = Array.isArray(taskData.documents) ? taskData.documents : [];
-			state.cloudStorage = taskData.storage || state.cloudStorage;
+			state.uploads = [];
 		} else {
 			state.uploads = reconcileSelectedUploads(state.uploads, state.cloudFiles);
 		}
@@ -2311,6 +2308,7 @@ function renderTabs() {
 	const conversationView = isConversationView();
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
+	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace' || !conversationView);
 	dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());
 	dom.artifactContent.classList.toggle('hidden', conversationView || !surfaceVisible);
 	dom.artifactTabs.classList.toggle('hidden', !surfaceVisible);

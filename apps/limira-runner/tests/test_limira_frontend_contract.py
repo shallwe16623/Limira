@@ -415,6 +415,7 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "return [];" in app
     assert "function hasConversationActivity()" in app
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
+    assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace' || !conversationView);" in app
     assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
     assert ".tabs {\n\tz-index: 8;" in styles
@@ -506,7 +507,8 @@ def test_limira_standalone_persists_uploaded_documents_across_workspace_restore(
     assert "state.uploads = mergeUploadedDocument(state.uploads, uploaded);" in app
     assert "function mergeUploadedDocument(documents, uploaded)" in app
     assert "state.cloudFiles = Array.isArray(historyData.documents) ? historyData.documents : [];" in app
-    assert "state.uploads = Array.isArray(taskData.documents) ? taskData.documents : [];" in app
+    assert "state.uploads = Array.isArray(taskData.documents) ? taskData.documents : [];" not in app
+    assert "state.uploads = [];" in app
     assert "state.uploads = reconcileSelectedUploads(state.uploads, state.cloudFiles);" in app
     assert "function reconcileSelectedUploads(selectedUploads, cloudFiles)" in app
 
