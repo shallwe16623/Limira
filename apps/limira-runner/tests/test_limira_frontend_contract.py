@@ -398,7 +398,10 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "async function downloadGeneratedPdf" not in app
     assert "accept: 'application/pdf'" not in app
     assert "导出并下载 PDF" not in index
-    assert 'id="downloadArchiveButton"' in index
+    assert 'class="header-actions"' not in index
+    assert 'id="downloadArchiveButton"' not in index
+    assert 'id="downloadArchiveButton"' in app
+    assert "data-archive-download" in app
     assert "async function downloadArchive()" in app
     assert "downloadPdfButton" not in app
     assert "downloadPdfButton" not in index
@@ -416,7 +419,8 @@ def test_limira_standalone_report_sections_take_precedence_over_cached_final_tex
 def test_limira_standalone_archive_download_uses_authenticated_fetch():
     app = _read(LIMIRA_STANDALONE_APP)
 
-    assert "dom.downloadArchiveButton.addEventListener('click', () => void downloadArchive());" in app
+    assert "dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');" in app
+    assert "dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive());" in app
     assert "async function downloadArchive()" in app
     assert "async function downloadGeneratedArchive(url, filename)" in app
     assert "accept: 'application/zip'" in app
@@ -456,9 +460,16 @@ def test_limira_standalone_hides_raw_event_log_and_keeps_progress_panel():
     assert "state.events" not in app
     assert "recordEvent(" not in app
     assert "renderEvents(" not in app
-    assert "实时进展" in index
+    assert 'id="conversationPanel"' in index
+    assert 'id="thinkingPanel"' in index
+    assert 'id="thinkingToggleButton"' in index
+    assert 'id="thinkingList"' in index
+    assert 'aria-label="工作过程"' in index
     assert 'id="messageList"' in index
     assert 'id="clearStreamButton"' in index
+    assert "function renderThinking()" in app
+    assert "function addThinkingStep" in app
+    assert "state.thinkingCollapsed = false;" in app
 
 
 def test_limira_standalone_localizes_runner_task_failures():
@@ -498,7 +509,7 @@ def test_limira_standalone_stream_handler_unwraps_nested_runner_events():
     assert "const nested = data.data && typeof data.data === 'object' ? data.data : {};" in app
     assert "const eventData = data.event === eventType" in app
     assert "handleToolCall(eventData);" in app
-    assert "compactStartMessage(eventType, eventData)" in app
+    assert "thinkingStepForStartEvent(eventType, eventData)" in app
 
 
 def test_limira_standalone_graph_and_map_render_without_external_frontend_stack():

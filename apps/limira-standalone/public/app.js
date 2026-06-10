@@ -14,6 +14,7 @@ const artifactEvents = new Set([
 const STORAGE_KEY = 'limiraStandaloneWorkspace:v2';
 const LEGACY_STORAGE_KEYS = ['limiraStandaloneWorkspace:v1'];
 const MAX_STORED_MESSAGES = 100;
+const MAX_THINKING_STEPS = 120;
 const MAX_HISTORY_TASKS = 30;
 const STATUS_LABELS = {
 	ready: '就绪',
@@ -111,6 +112,8 @@ const state = {
 	workspaceGeneration: 0,
 	finalReportText: '',
 	messages: initialMessages(),
+	thinkingCollapsed: false,
+	thinkingSteps: initialThinkingSteps(),
 	artifacts: emptyArtifacts(),
 	uploads: [],
 	cloudFiles: [],
@@ -318,11 +321,17 @@ function bindEvents() {
 		void submitResearch();
 	});
 	dom.refreshArtifactsButton.addEventListener('click', () => void loadArtifacts());
-	dom.downloadArchiveButton.addEventListener('click', () => void downloadArchive());
+	dom.thinkingToggleButton.addEventListener('click', () => {
+		state.thinkingCollapsed = !state.thinkingCollapsed;
+		saveWorkspace();
+		renderThinking();
+	});
 	dom.clearStreamButton.addEventListener('click', () => {
 		state.messages = [];
+		state.thinkingSteps = initialThinkingSteps();
 		saveWorkspace();
 		renderMessages();
+		renderThinking();
 	});
 	dom.refreshUploadsButton.addEventListener('click', () => void loadUploads());
 	dom.uploadButton.addEventListener('click', () => void uploadDocument());
@@ -449,6 +458,7 @@ function renderShell() {
 	renderStatus();
 	renderHistory();
 	renderMessages();
+	renderThinking();
 	renderTabs();
 	renderUploads();
 	renderReportControls();
@@ -1212,6 +1222,8 @@ async function selectHistoryTask(taskId) {
 	updateArchiveState(cached);
 	state.savedUserId = state.user?.id || state.savedUserId;
 	state.messages = historyMessages(cached);
+	state.thinkingCollapsed = false;
+	state.thinkingSteps = historyThinkingSteps(cached);
 	dom.queryInput.value = cached.query || '';
 	saveWorkspace();
 	renderStatus();
@@ -1266,6 +1278,8 @@ function resetCurrentTaskView() {
 	state.activeTab = '证据';
 	state.finalReportText = '';
 	state.messages = initialMessages();
+	state.thinkingCollapsed = false;
+	state.thinkingSteps = initialThinkingSteps();
 	state.artifacts = emptyArtifacts();
 	state.uploads = [];
 	state.uploadResults = [];
@@ -1314,6 +1328,28 @@ function historyMessages(task) {
 	].filter(Boolean);
 }
 
+function historyThinkingSteps(task) {
+	const query = String(task.query || '').trim();
+	const steps = [];
+	if (query) {
+		steps.push({
+			kind: 'planning',
+			title: '研究问题',
+			detail: query,
+			time: now(),
+			status: 'done'
+		});
+	}
+	steps.push({
+		kind: 'status',
+		title: `任务${statusLabel(task.status || state.status)}`,
+		detail: `历史任务已载入。归档状态：${archiveStatusLabel(task.archive_status || state.archiveStatus)}。`,
+		time: now(),
+		status: terminalStatuses.has(String(task.status || state.status)) ? 'done' : 'active'
+	});
+	return steps.length ? steps : initialThinkingSteps();
+}
+
 function clearLegacyWorkspaceStorage() {
 	for (const key of LEGACY_STORAGE_KEYS) {
 		if (key !== STORAGE_KEY) {
@@ -1342,6 +1378,10 @@ function restoreWorkspace() {
 		: LEGACY_TAB_LABELS[saved.activeTab] || '证据';
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
+	state.thinkingCollapsed = Boolean(saved.thinkingCollapsed);
+	state.thinkingSteps = Array.isArray(saved.thinkingSteps) && saved.thinkingSteps.length
+		? saved.thinkingSteps.slice(-MAX_THINKING_STEPS)
+		: state.thinkingSteps;
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
 		: emptyArtifacts();
@@ -1359,6 +1399,8 @@ function saveWorkspace() {
 		activeTab: state.activeTab,
 		finalReportText: state.finalReportText,
 		messages: state.messages.slice(-MAX_STORED_MESSAGES),
+		thinkingCollapsed: state.thinkingCollapsed,
+		thinkingSteps: state.thinkingSteps.slice(-MAX_THINKING_STEPS),
 		artifacts: state.artifacts,
 		uploads: state.uploads
 	};
@@ -1400,6 +1442,8 @@ function resetWorkspaceState() {
 	state.activeTab = '证据';
 	state.finalReportText = '';
 	state.messages = initialMessages();
+	state.thinkingCollapsed = false;
+	state.thinkingSteps = initialThinkingSteps();
 	state.artifacts = emptyArtifacts();
 	state.uploads = [];
 	state.cloudFiles = [];
@@ -1438,6 +1482,7 @@ async function submitResearch() {
 	if (!query || state.isSubmitting) {
 		return;
 	}
+	const documentIds = isEnterpriseAccount() ? selectedUploadDocumentIds() : [];
 
 	state.isSubmitting = true;
 	bumpWorkspaceGeneration();
@@ -1451,14 +1496,28 @@ async function submitResearch() {
 	state.artifacts = emptyArtifacts();
 	state.uploadResults = [];
 	state.isSearching = false;
+	state.thinkingCollapsed = false;
+	state.thinkingSteps = [];
 	saveWorkspace();
 	addMessage('user', query);
+	addThinkingStep({
+		kind: 'planning',
+		title: '拆解研究任务',
+		detail: `围绕“${truncateText(query, 140)}”识别核心问题、证据需求和最终报告结构。`,
+		status: 'active',
+		meta: documentIds.length ? `已附加 ${documentIds.length} 个文件` : ''
+	});
+	addThinkingStep({
+		kind: 'planning',
+		title: '制定信息路线',
+		detail: '优先查找权威机构、公开数据、研究报告和可核验网页，再进行交叉验证、实体抽取、时间线整理和报告归纳。',
+		status: 'active'
+	});
 	renderStatus();
 	renderTabs();
 	renderReportControls();
 
 	try {
-		const documentIds = isEnterpriseAccount() ? selectedUploadDocumentIds() : [];
 		const task = await api('/api/limira/research', {
 			method: 'POST',
 			body: {
@@ -1475,6 +1534,13 @@ async function submitResearch() {
 		mergeTaskHistory(task);
 		state.savedUserId = state.user?.id || state.savedUserId;
 		dom.queryInput.value = '';
+		completeActiveThinkingSteps();
+		addThinkingStep({
+			kind: 'status',
+			title: '研究任务已创建',
+			detail: `任务 ${state.taskId || '已创建'} 已进入${statusLabel(state.status)}状态，正在连接实时进度并沉淀结构化成果。`,
+			status: 'active'
+		});
 		addMessage('assistant', `研究任务 ${state.taskId || '已创建'}：${statusLabel(state.status)}。`);
 		saveWorkspace();
 		connectStream();
@@ -1486,6 +1552,13 @@ async function submitResearch() {
 			return;
 		}
 		state.status = 'failed';
+		completeActiveThinkingSteps();
+		addThinkingStep({
+			kind: 'error',
+			title: '任务启动失败',
+			detail: errorMessage(error),
+			status: 'error'
+		});
 		addMessage('error', errorMessage(error));
 	} finally {
 		if (isCurrentAsyncContext(context)) {
@@ -1551,25 +1624,55 @@ function handleStreamEvent(payload) {
 		handleToolCall(eventData);
 	} else if (eventType === 'error') {
 		state.status = 'failed';
+		completeActiveThinkingSteps();
+		addThinkingStep({
+			kind: 'error',
+			title: '任务执行失败',
+			detail: errorMessage(eventData.error || data.error || payload),
+			status: 'error'
+		});
 		addMessage('error', errorMessage(eventData.error || data.error || payload));
 	} else if (eventType === 'archive_generated') {
 		state.archiveStatus = 'ready';
 		state.archiveDownloadUrl = safeArchiveDownloadUrl(eventData.archive_url, state.taskId);
-		addMessage('assistant', '任务归档已生成并保存到云盘。');
+		addThinkingStep({
+			kind: 'archive',
+			title: '任务归档已生成',
+			detail: '报告、证据和运行材料已打包并保存到云盘，可在底部“归档”入口下载。',
+			status: 'done'
+		});
 		void loadUploads();
 	} else if (eventType === 'completion_asset_warning') {
+		addThinkingStep({
+			kind: 'warning',
+			title: '部分导出材料生成失败',
+			detail: '任务主体已完成，但部分归档材料需要稍后重试或检查运行配置。',
+			status: 'warning'
+		});
 		addMessage('error', '任务已完成，但部分导出文件生成失败，请稍后重试下载。');
 	} else if (eventType === 'end_of_workflow') {
 		state.status = 'completed';
+		completeActiveThinkingSteps();
+		addThinkingStep({
+			kind: 'done',
+			title: '工作流已完成',
+			detail: artifactThinkingSummary(),
+			status: 'done'
+		});
 		addMessage('assistant', '工作流已完成。');
 	} else if (eventType.startsWith('start_of_')) {
-		addMessage('assistant', compactStartMessage(eventType, eventData));
+		addThinkingStep(thinkingStepForStartEvent(eventType, eventData));
 	} else if (artifactEvents.has(eventType)) {
-		addMessage('assistant', `${eventLabel(eventType)}：研究成果已更新。`);
+		addThinkingStep(thinkingStepForArtifactEvent(eventType, eventData));
 		void loadArtifacts();
 	} else {
 		const summary = eventData.message || eventData.summary || data.message || data.summary || payload.message || eventType;
-		addMessage('assistant', `${eventLabel(eventType)}：${stringifyCompact(summary)}`);
+		addThinkingStep({
+			kind: 'status',
+			title: eventLabel(eventType),
+			detail: truncateText(stringifyCompact(summary), 260),
+			status: terminalStatuses.has(String(status || state.status)) ? 'done' : 'active'
+		});
 	}
 
 	if (terminalStatuses.has(state.status)) {
@@ -1589,6 +1692,12 @@ function handleToolCall(data) {
 	const input = data.tool_input && typeof data.tool_input === 'object' ? data.tool_input : {};
 	if (toolName === 'show_text' && typeof input.text === 'string') {
 		state.finalReportText = reportTextFromValue(input.text) || input.text;
+		addThinkingStep({
+			kind: 'report',
+			title: '最终报告已生成',
+			detail: '报告内容已进入底部“报告”标签页，后续归档会一并打包保存。',
+			status: 'done'
+		});
 		addMessage('assistant', '已收到最终报告，请在“报告”标签页查看。');
 		state.activeTab = '报告';
 		saveWorkspace();
@@ -1600,16 +1709,22 @@ function handleToolCall(data) {
 	if (typeof input.result === 'string') {
 		const parsed = parseJson(input.result);
 		if (parsed && typeof parsed === 'object' && parsed.success) {
-			addMessage(
-				'assistant',
-				`工具已完成：${toolName}${parsed.url ? ` · ${parsed.url}` : ''}`
-			);
+			addThinkingStep({
+				kind: 'tool',
+				title: toolThinkingTitle(toolName, input),
+				detail: toolThinkingDetail(toolName, input, parsed),
+				status: 'done'
+			});
 			return;
 		}
 	}
 
-	const target = input.url ? ` · ${input.url}` : '';
-	addMessage('assistant', `调用工具：${toolName}${target}`);
+	addThinkingStep({
+		kind: 'tool',
+		title: toolThinkingTitle(toolName, input),
+		detail: toolThinkingDetail(toolName, input),
+		status: 'active'
+	});
 }
 
 function compactStartMessage(eventType, data) {
@@ -1623,6 +1738,114 @@ function compactStartMessage(eventType, data) {
 		return `模型步骤已启动：${data.agent_name || 'agent'}。`;
 	}
 	return eventLabel(eventType);
+}
+
+function thinkingStepForStartEvent(eventType, data) {
+	if (eventType === 'start_of_workflow') {
+		return {
+			kind: 'workflow',
+			title: '启动研究工作流',
+			detail: '开始组织检索、阅读、抽取、核验和报告生成步骤。',
+			status: 'active'
+		};
+	}
+	if (eventType === 'start_of_agent') {
+		const name = data.agent_name || data.display_name || '研究智能体';
+		return {
+			kind: 'agent',
+			title: `调度${name}`,
+			detail: '分配当前研究阶段，准备调用检索、阅读或结构化整理能力。',
+			status: 'active'
+		};
+	}
+	if (eventType === 'start_of_llm') {
+		return {
+			kind: 'reasoning',
+			title: '整理阶段性判断',
+			detail: '模型正在阅读已有材料、规划下一步检索方向，并把信息转成可验证的研究结论。',
+			status: 'active',
+			meta: data.agent_name || ''
+		};
+	}
+	return {
+		kind: 'status',
+		title: eventLabel(eventType),
+		detail: eventThinkingDetail(data),
+		status: 'active'
+	};
+}
+
+function thinkingStepForArtifactEvent(eventType, data) {
+	const labels = {
+		evidence_collected: ['evidence', '新增证据', '有新的来源或摘录进入证据池，正在用于后续交叉验证。'],
+		entity_extracted: ['entity', '识别关键实体', '从材料中抽取机构、人物、地点、政策或产业对象。'],
+		relation_extracted: ['graph', '更新关系图谱', '识别实体之间的政策、贸易、投资或影响关系。'],
+		timeline_event_added: ['timeline', '补充时间线', '把关键事件按时间顺序沉淀到时间线。'],
+		map_feature_added: ['map', '补充地理线索', '把可定位的国家、地区、机构或项目沉淀到地图。'],
+		verification_result: ['verification', '完成一轮核验', '对来源可信度、事实一致性或引用链进行检查。'],
+		report_section_generated: ['report', '生成报告章节', '阶段性研究结论已写入报告结构。'],
+		record_research_artifact: ['artifact', '沉淀研究成果', '新的结构化成果已保存到工作区。']
+	};
+	const [kind, title, fallback] = labels[eventType] || ['artifact', eventLabel(eventType), '研究成果已更新。'];
+	return {
+		kind,
+		title,
+		detail: eventThinkingDetail(data) || fallback,
+		status: 'done',
+		meta: artifactThinkingSummary()
+	};
+}
+
+function toolThinkingTitle(toolName, input) {
+	const normalized = String(toolName || '').replace(/[_-]+/g, ' ').trim();
+	if (input.query) {
+		return `检索：${truncateText(input.query, 72)}`;
+	}
+	if (input.url) {
+		return `阅读来源：${truncateText(input.url, 72)}`;
+	}
+	return normalized ? `调用工具：${normalized}` : '调用研究工具';
+}
+
+function toolThinkingDetail(toolName, input, result = null) {
+	if (result?.url) {
+		return `已完成来源处理：${truncateText(result.url, 180)}。`;
+	}
+	if (result?.message || result?.summary) {
+		return truncateText(String(result.message || result.summary), 260);
+	}
+	if (input.query) {
+		return `围绕检索式收集公开资料，并筛选可进入证据池的来源。`;
+	}
+	if (input.url) {
+		return '正在读取网页内容、提取可引用段落，并判断能否作为证据使用。';
+	}
+	const compact = stringifyCompact(input, 260);
+	return compact && compact !== '{}' ? compact : `执行 ${toolName || 'tool'} 步骤。`;
+}
+
+function eventThinkingDetail(data) {
+	if (!data || typeof data !== 'object') {
+		return '';
+	}
+	const value =
+		data.message ||
+		data.summary ||
+		data.title ||
+		data.query ||
+		data.url ||
+		data.error ||
+		data.reason ||
+		'';
+	return truncateText(typeof value === 'string' ? value : stringifyCompact(value), 280);
+}
+
+function artifactThinkingSummary() {
+	const counts = artifactCounts();
+	const parts = tabs
+		.map((tab) => `${tab} ${counts[tab] || 0}`)
+		.filter(Boolean);
+	return parts.length ? `当前成果：${parts.join(' · ')}。` : '当前成果正在整理中。';
 }
 
 async function loadArtifacts() {
@@ -2005,7 +2228,10 @@ function renderStatus() {
 			}`
 		: '暂无任务';
 	dom.submitResearchButton.disabled = state.isSubmitting;
-	dom.downloadArchiveButton.disabled = state.restoreBlocked || !state.taskId;
+	if (dom.downloadArchiveButton) {
+		dom.downloadArchiveButton.disabled = state.restoreBlocked || !state.taskId;
+		dom.downloadArchiveButton.textContent = `归档 ${archiveStatusLabel(state.archiveStatus)}`;
+	}
 }
 
 function renderMessages() {
@@ -2021,22 +2247,51 @@ function renderMessages() {
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 }
 
+function renderThinking() {
+	if (!dom.thinkingPanel) {
+		return;
+	}
+	const steps = state.thinkingSteps.length ? state.thinkingSteps : initialThinkingSteps();
+	dom.thinkingPanel.classList.toggle('collapsed', state.thinkingCollapsed);
+	dom.thinkingToggleButton.setAttribute('aria-expanded', state.thinkingCollapsed ? 'false' : 'true');
+	dom.thinkingToggleLabel.textContent = state.thinkingCollapsed ? '展开思考过程' : '隐藏思考过程';
+	dom.thinkingStepCount.textContent = `${steps.length}`;
+	dom.thinkingList.innerHTML = state.thinkingCollapsed
+		? ''
+		: steps
+				.map((step) => `<article class="thinking-step ${escapeAttr(step.kind || 'task')} ${escapeAttr(step.status || 'active')}">
+					<div class="thinking-step-dot" aria-hidden="true"></div>
+					<div class="thinking-step-content">
+						<div class="thinking-step-title">${escapeHtml(step.title)}</div>
+						${step.detail ? `<div class="thinking-step-detail">${escapeHtml(step.detail)}</div>` : ''}
+						<div class="thinking-step-meta">${[step.meta, step.time].filter(Boolean).map(escapeHtml).join(' · ')}</div>
+					</div>
+				</article>`)
+				.join('');
+}
+
 function renderTabs() {
 	const counts = artifactCounts();
-	dom.artifactTabs.innerHTML = tabs
+	const archiveDisabled = state.restoreBlocked || !state.taskId;
+	dom.artifactTabs.innerHTML = [
+		...tabs
 		.map(
 			(tab) =>
 				`<button type="button" class="${tab === state.activeTab ? 'active' : ''}" data-tab="${tab}">${tab} ${counts[tab] || ''}</button>`
-		)
-		.join('');
-	for (const button of dom.artifactTabs.querySelectorAll('button')) {
+		),
+		`<button id="downloadArchiveButton" type="button" class="archive-tab" data-archive-download ${archiveDisabled ? 'disabled' : ''}>归档 ${archiveStatusLabel(state.archiveStatus)}</button>`
+	].join('');
+	for (const button of dom.artifactTabs.querySelectorAll('[data-tab]')) {
 		button.addEventListener('click', () => {
 			state.activeTab = button.dataset.tab;
 			saveWorkspace();
 			renderTabs();
 		});
 	}
+	dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');
+	dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive());
 	renderArtifactContent();
+	renderStatus();
 }
 
 function renderArtifactContent() {
@@ -2864,6 +3119,31 @@ function addMessage(role, content) {
 	renderMessages();
 }
 
+function addThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '' }) {
+	const normalizedTitle = String(title || '').trim();
+	if (!normalizedTitle) {
+		return;
+	}
+	const step = {
+		kind,
+		title: normalizedTitle,
+		detail: String(detail || '').trim(),
+		status,
+		meta: String(meta || '').trim(),
+		time: now()
+	};
+	const next = state.thinkingSteps.filter((item) => item.kind !== 'ready');
+	state.thinkingSteps = [...next, step].slice(-MAX_THINKING_STEPS);
+	saveWorkspace();
+	renderThinking();
+}
+
+function completeActiveThinkingSteps() {
+	state.thinkingSteps = state.thinkingSteps.map((step) => (
+		step.status === 'active' ? { ...step, status: 'done' } : step
+	));
+}
+
 async function api(path, options = {}) {
 	const headers = new Headers(options.headers || {});
 	const isForm = options.body instanceof FormData;
@@ -2978,8 +3258,20 @@ function initialMessages() {
 		{
 			role: 'assistant',
 			content:
-				'请输入研究问题。系统会在这里流式显示进展，并把结构化成果填入右侧工作区。',
+				'请输入研究问题。发送后，上方显示对话，中间显示工作过程，底部沉淀证据、图谱、报告和归档。',
 			time: now()
+		}
+	];
+}
+
+function initialThinkingSteps() {
+	return [
+		{
+			kind: 'ready',
+			title: '等待研究问题',
+			detail: '发送消息后，Limira 会在这里展示任务规划、检索、证据筛选、信息整合和报告生成进展。',
+			time: now(),
+			status: 'pending'
 		}
 	];
 }
@@ -3148,6 +3440,11 @@ function parseJson(value) {
 function stringifyCompact(value, limit = 1200) {
 	const text = typeof value === 'string' ? value : JSON.stringify(value);
 	return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function truncateText(value, limit = 160) {
+	const text = String(value || '').replace(/\s+/g, ' ').trim();
+	return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
 }
 
 function emptyState(text) {

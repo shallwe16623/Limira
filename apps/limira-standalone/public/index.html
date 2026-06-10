@@ -119,20 +119,22 @@
 					<!-- Topbar integrated into main content area -->
 					<header class="main-header">
 						<div class="brand">limira OSINT</div>
-						<div class="header-actions">
-							<!-- Grouped Downloads -->
-							<div class="download-group">
-								<button id="downloadArchiveButton" class="ghost-button compact" type="button" disabled>↓ 归档</button>
-							</div>
-						</div>
 					</header>
 
 					<!-- Content Area -->
 					<div id="workspaceContent" class="scrollable-canvas">
-						<!-- Tabs centered at top -->
-						<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
-
+						<section id="conversationPanel" class="conversation-panel" aria-label="对话消息">
+							<div id="messageList" class="message-list-bottom" aria-label="对话消息"></div>
+						</section>
+						<section id="thinkingPanel" class="thinking-panel" aria-label="工作过程">
+							<button id="thinkingToggleButton" class="thinking-toggle" type="button" aria-expanded="true">
+								<span id="thinkingToggleLabel">隐藏思考过程</span>
+								<span id="thinkingStepCount" class="thinking-step-count">0</span>
+							</button>
+							<div id="thinkingList" class="thinking-list"></div>
+						</section>
 						<section id="artifactContent" class="artifact-content"></section>
+						<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
 
 						<!-- Hidden elements to preserve JS bindings -->
 						<div class="hidden">
@@ -197,9 +199,6 @@
 
 					<!-- Bottom Input Area (ChatGPT Style) -->
 					<div id="inputContainer" class="input-container">
-						<!-- Realtime Progress just above the input box -->
-						<div id="messageList" class="message-list-bottom" aria-label="实时进展"></div>
-
 						<form id="researchForm" class="chat-input-box">
 							<div id="uploadMessage" class="upload-message" aria-live="polite"></div>
 							<div id="uploadList" class="attachment-list" aria-label="上传文件列表"></div>
