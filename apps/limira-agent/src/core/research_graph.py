@@ -353,15 +353,16 @@ def _constraints(upload_document_ids: list[str]) -> list[str]:
 def _source_policy_from_context(source_policy: dict[str, Any] | None) -> SourcePolicy:
     if not isinstance(source_policy, dict):
         return SourcePolicy()
-    candidate: dict[str, Any] = {}
-    if "min_sources" in source_policy:
-        candidate["min_sources"] = source_policy["min_sources"]
-    if "prefer_primary_sources" in source_policy:
-        candidate["prefer_primary_sources"] = source_policy["prefer_primary_sources"]
-    if "allow_secondary_sources" in source_policy:
-        candidate["allow_secondary_sources"] = source_policy["allow_secondary_sources"]
-    if "require_retrieved_at" in source_policy:
-        candidate["require_retrieved_at"] = source_policy["require_retrieved_at"]
+    candidate = {
+        key: source_policy[key]
+        for key in (
+            "min_sources",
+            "prefer_primary_sources",
+            "allow_secondary_sources",
+            "require_retrieved_at",
+        )
+        if key in source_policy
+    }
     try:
         return SourcePolicy.model_validate(candidate)
     except Exception:
