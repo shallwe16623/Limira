@@ -445,6 +445,12 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
             "billing_mode": "metered",
         } in listed_organizations
         listed_names = {listed["name"] for listed in listed_organizations}
+        limira_organization = next(
+            listed for listed in listed_organizations if listed["slug"] == "limira"
+        )
+        assert limira_organization["name"] == "Limira"
+        assert limira_organization["category"] == "enterprise"
+        assert limira_organization["category_label"] == "企业"
         assert "国家发展改革委办公厅" in listed_names
         assert "国家发展改革委国际合作中心" in listed_names
         assert "中国社会科学院经济研究所" in listed_names

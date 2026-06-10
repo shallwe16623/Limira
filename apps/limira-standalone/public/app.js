@@ -76,14 +76,15 @@ const SCENARIO_TEXT = {
 };
 
 const ORGANIZATION_CATEGORY_OPTIONS = [
+	{ value: 'enterprise', label: '企业' },
 	{ value: 'public_institution', label: '事业单位' },
 	{ value: 'university', label: '高校' },
 	{ value: 'think_tank', label: '智库' },
 	{ value: 'ministry', label: '国家部委' },
 	{ value: 'local_government', label: '地方政府' }
 ];
-const DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'public_institution';
-const DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'ndrc-international-cooperation-center';
+const DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'enterprise';
+const DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'limira';
 
 const state = {
 	authScope: 'personal',

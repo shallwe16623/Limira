@@ -12,6 +12,7 @@ def _limira_wechat_oauth_userinfo_url(env: Any = os.environ) -> str:
 
 
 DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS: tuple[tuple[str, str, str], ...] = (
+    ("builtin-limira", "Limira", "limira"),
     ("builtin-ministry-national-development-reform-commission", "国家发展和改革委员会", "ministry-national-development-reform-commission"),
     ("builtin-ndrc-general-office", "国家发展改革委办公厅", "ndrc-general-office"),
     ("builtin-ndrc-policy-research-office", "国家发展改革委政策研究室", "ndrc-policy-research-office"),
@@ -100,6 +101,7 @@ DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS: tuple[tuple[str, str, str], ...] = (
 
 
 LIMIRA_ORGANIZATION_CATEGORIES = {
+    "enterprise": "企业",
     "ministry": "国家部委",
     "public_institution": "事业单位",
     "think_tank": "智库",
@@ -110,6 +112,7 @@ LIMIRA_ORGANIZATION_CATEGORIES = {
 LIMIRA_ORGANIZATION_DEFAULT_CATEGORY = "public_institution"
 
 LIMIRA_ORGANIZATION_CATEGORY_BY_ID = {
+    "builtin-limira": "enterprise",
     "builtin-ministry-national-development-reform-commission": "ministry",
     "builtin-ministry-finance": "ministry",
     "builtin-peoples-bank-china": "ministry",

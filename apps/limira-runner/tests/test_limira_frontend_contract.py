@@ -257,8 +257,8 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'href="mailto:admin@limira-inc.com"' in index
     assert "dom.enterpriseContactPrompt.classList.toggle('hidden', personalScope)" in app
     assert "dom.enterpriseContactActions.classList.toggle('hidden', personalScope)" in app
-    assert "DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'public_institution'" in app
-    assert "DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'ndrc-international-cooperation-center'" in app
+    assert "DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'enterprise'" in app
+    assert "DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'limira'" in app
     assert "renderOrganizationCategoryOptions()" in app
     assert "organizationsForSelectedCategory()" in app
     assert "const username = dom.usernameInput.value.trim();" in app
@@ -268,7 +268,7 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "dom.emailLabel.classList.toggle('hidden', !emailVisible)" in app
     assert "enterpriseMemberUsernameInput" in app
     assert "enterpriseMemberEmailInput" not in app
-    for category_label in ("事业单位", "高校", "智库", "国家部委", "地方政府"):
+    for category_label in ("企业", "事业单位", "高校", "智库", "国家部委", "地方政府"):
         assert category_label in app
     assert 'id="enterpriseAdminPanel"' in index
     assert 'id="enterpriseMemberForm"' in index
