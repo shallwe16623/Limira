@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -139,6 +140,26 @@ class CancellationProbe:
                 self.stopped.set()
                 return
             await asyncio.sleep(0.01)
+
+
+class BackgroundExecutionProbe:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, task_id, query, _unused, disconnect_check=None):
+        assert disconnect_check is not None
+        self.started.set()
+        yield {
+            "event": "message",
+            "data": {"delta": {"content": "partial"}},
+        }
+        await self.release.wait()
+        assert await disconnect_check() is False
+        yield {
+            "event": "message",
+            "data": {"delta": {"content": " final"}},
+        }
 
 
 class ZipFailWriter(ResearchArchiveWriter):
@@ -298,6 +319,16 @@ async def start_task(client, headers=USER_A_HEADERS, query="test query"):
     return await response.json()
 
 
+def seed_queued_task(store, user_id="user-a", query="test query"):
+    return store.create_task(
+        task_id=str(uuid.uuid4()),
+        user_id=user_id,
+        query=query,
+        created_at="2026-06-06T11:59:59+00:00",
+        model_summary={},
+    )
+
+
 async def complete_task(client, headers=USER_A_HEADERS):
     start_payload = await start_task(client, headers=headers)
     task_id = start_payload["task_id"]
@@ -308,6 +339,18 @@ async def complete_task(client, headers=USER_A_HEADERS):
     assert events_response.status == 200
     await events_response.text()
     return task_id
+
+
+async def wait_for_task_status(store, task_id, status, timeout=1.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        record = store.get_task(task_id)
+        if record and record.status == status:
+            return record
+        await asyncio.sleep(0.01)
+    record = store.get_task(task_id)
+    actual = record.status if record else None
+    raise AssertionError(f"task {task_id} status is {actual!r}, expected {status!r}")
 
 
 def archive_dir_for(store, task_id):
@@ -395,6 +438,42 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         assert download_response.status == 200
         with zipfile.ZipFile(io.BytesIO(await download_response.read())) as archive:
             assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_task_continues_after_event_client_disconnect(tmp_path):
+    probe = BackgroundExecutionProbe()
+    client, store = await make_client(tmp_path, stream_events=probe.stream)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
+        running = await wait_for_task_status(store, task_id, "running")
+        assert running.archive_status == "pending"
+
+        events_response = await client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        first_line = await asyncio.wait_for(events_response.content.readline(), timeout=1)
+        assert b"partial" in first_line
+        events_response.release()
+
+        probe.release.set()
+        completed = await wait_for_task_status(store, task_id, "completed")
+        assert completed.archive_status == "ready"
+
+        replay_response = await client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert replay_response.status == 200
+        replay_events = parse_sse(await replay_response.text())
+        assert [event["type"] for event in replay_events] == ["message", "message"]
+        assert store.get_task(task_id).status == "completed"
     finally:
         await client.close()
 
@@ -507,13 +586,15 @@ async def test_runner_api_stream_setup_failure_finalizes_claimed_task(tmp_path):
     try:
         start_payload = await start_task(client)
         task_id = start_payload["task_id"]
+        await wait_for_task_status(store, task_id, "failed")
 
         events_response = await client.get(
             f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert events_response.status == 500
-        assert await events_response.json() == {"error": "stream_setup_failed"}
+        assert events_response.status == 200
+        setup_events = parse_sse(await events_response.text())
+        assert setup_events[-1]["type"] == "error"
 
         status_response = await client.get(
             f"/limira-runner/tasks/{task_id}",
@@ -539,8 +620,7 @@ async def test_runner_api_stream_setup_failure_finalizes_claimed_task(tmp_path):
             f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert retry_response.status == 409
-        assert await retry_response.json() == {"error": "task_already_finished"}
+        assert retry_response.status == 200
     finally:
         await client.close()
 
@@ -553,13 +633,7 @@ async def test_runner_api_archive_finalization_failure_finalizes_claimed_task(
     try:
         start_payload = await start_task(client)
         task_id = start_payload["task_id"]
-
-        events_response = await client.get(
-            f"/limira-runner/tasks/{task_id}/events",
-            headers=USER_A_HEADERS,
-        )
-        assert events_response.status == 200
-        await events_response.text()
+        await wait_for_task_status(store, task_id, "completed")
 
         status_response = await client.get(
             f"/limira-runner/tasks/{task_id}",
@@ -591,8 +665,7 @@ async def test_runner_api_archive_finalization_failure_finalizes_claimed_task(
             f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert retry_response.status == 409
-        assert await retry_response.json() == {"error": "task_already_finished"}
+        assert retry_response.status == 200
     finally:
         await client.close()
 
@@ -606,13 +679,7 @@ async def test_runner_api_renderer_failure_finalizes_claimed_task(tmp_path):
     try:
         start_payload = await start_task(client)
         task_id = start_payload["task_id"]
-
-        events_response = await client.get(
-            f"/limira-runner/tasks/{task_id}/events",
-            headers=USER_A_HEADERS,
-        )
-        assert events_response.status == 200
-        await events_response.text()
+        await wait_for_task_status(store, task_id, "completed")
 
         status_response = await client.get(
             f"/limira-runner/tasks/{task_id}",
@@ -643,18 +710,19 @@ async def test_runner_api_renderer_failure_finalizes_claimed_task(tmp_path):
             f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert retry_response.status == 409
-        assert await retry_response.json() == {"error": "task_already_finished"}
+        assert retry_response.status == 200
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
 async def test_runner_api_rejects_foreign_user_and_not_ready_download(tmp_path):
-    client, _store = await make_client(tmp_path)
+    probe = BackgroundExecutionProbe()
+    client, _store = await make_client(tmp_path, stream_events=probe.stream)
     try:
         start_payload = await start_task(client)
         task_id = start_payload["task_id"]
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
 
         foreign_status = await client.get(
             f"/limira-runner/tasks/{task_id}",
@@ -674,6 +742,7 @@ async def test_runner_api_rejects_foreign_user_and_not_ready_download(tmp_path):
         )
         assert not_ready_download.status == 409
         assert (await not_ready_download.json())["error"] == "archive_not_ready"
+        probe.release.set()
     finally:
         await client.close()
 
@@ -779,7 +848,7 @@ async def test_runner_api_admin_allowed_for_status(tmp_path):
         )
         assert response.status == 200
         payload = await response.json()
-        assert payload["status"] == "queued"
+        assert payload["status"] in {"queued", "running", "completed"}
         assert_public_task_response_hides_internal_identifiers(payload)
     finally:
         await client.close()
@@ -819,11 +888,33 @@ async def test_runner_api_admin_allowed_for_archive_download(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_api_admin_allowed_for_cancel(tmp_path):
-    client, store = await make_client(tmp_path)
+    probe = CancellationProbe()
+    client, store = await make_client(tmp_path, stream_events=probe.stream)
     try:
         start_payload = await start_task(client)
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
         response = await client.post(
             f"/limira-runner/tasks/{start_payload['task_id']}/cancel",
+            headers=ADMIN_HEADERS,
+        )
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["status"] == "running"
+        assert payload["archive_status"] == "pending"
+        assert payload["cancel_requested"] is True
+        assert_public_task_response_hides_internal_identifiers(payload)
+        await wait_for_task_status(store, start_payload["task_id"], "cancelled")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_admin_allowed_for_queued_cancel(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        record = seed_queued_task(store)
+        response = await client.post(
+            f"/limira-runner/tasks/{record.task_id}/cancel",
             headers=ADMIN_HEADERS,
         )
         assert response.status == 200
@@ -832,7 +923,7 @@ async def test_runner_api_admin_allowed_for_cancel(tmp_path):
         assert payload["archive_status"] == "ready"
         assert payload["cancel_requested"] is True
         assert_public_task_response_hides_internal_identifiers(payload)
-        record = store.get_task(start_payload["task_id"])
+        record = store.get_task(record.task_id)
         assert record.status == "cancelled"
     finally:
         await client.close()
@@ -892,8 +983,8 @@ async def test_runner_api_cancel_endpoint_stops_active_stream_and_archives(tmp_p
 async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tmp_path):
     client, store = await make_client(tmp_path)
     try:
-        start_payload = await start_task(client)
-        task_id = start_payload["task_id"]
+        seeded = seed_queued_task(store)
+        task_id = seeded.task_id
         claimed = store.claim_queued_task(
             task_id,
             started_at="2026-06-06T12:30:00+00:00",
@@ -936,8 +1027,7 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
             f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert retry_response.status == 409
-        assert await retry_response.json() == {"error": "task_already_finished"}
+        assert retry_response.status == 200
     finally:
         await client.close()
 
@@ -946,8 +1036,7 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
 async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
     client, store = await make_client(tmp_path)
     try:
-        start_payload = await start_task(client)
-        task_id = start_payload["task_id"]
+        task_id = seed_queued_task(store).task_id
 
         cancel_response = await client.post(
             f"/limira-runner/tasks/{task_id}/cancel",
@@ -977,8 +1066,7 @@ async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
 async def test_runner_api_queued_cancel_start_failure_sets_archive_failed(tmp_path):
     client, store = await make_client(tmp_path, writer_cls=StartFailWriter)
     try:
-        start_payload = await start_task(client)
-        task_id = start_payload["task_id"]
+        task_id = seed_queued_task(store).task_id
 
         cancel_response = await client.post(
             f"/limira-runner/tasks/{task_id}/cancel",
@@ -1013,8 +1101,7 @@ async def test_runner_api_queued_cancel_start_failure_sets_archive_failed(tmp_pa
 async def test_runner_api_queued_cancel_complete_failure_sets_archive_failed(tmp_path):
     client, store = await make_client(tmp_path, writer_cls=CompleteFailWriter)
     try:
-        start_payload = await start_task(client)
-        task_id = start_payload["task_id"]
+        task_id = seed_queued_task(store).task_id
 
         cancel_response = await client.post(
             f"/limira-runner/tasks/{task_id}/cancel",
@@ -1050,8 +1137,7 @@ async def test_runner_api_queued_cancel_keeps_signal_when_stream_claim_wins(tmp_
     store = StreamClaimRaceStore(tmp_path / "tasks.sqlite3")
     client, _store = await make_client(tmp_path, task_store=store)
     try:
-        start_payload = await start_task(client)
-        task_id = start_payload["task_id"]
+        task_id = seed_queued_task(store).task_id
 
         cancel_response = await client.post(
             f"/limira-runner/tasks/{task_id}/cancel",
@@ -1077,7 +1163,7 @@ async def test_runner_api_queued_cancel_keeps_signal_when_stream_claim_wins(tmp_
 
 
 @pytest.mark.asyncio
-async def test_runner_api_rejects_duplicate_running_event_stream(tmp_path):
+async def test_runner_api_allows_duplicate_running_event_stream_subscription(tmp_path):
     probe = CancellationProbe()
     client, _store = await make_client(tmp_path, stream_events=probe.stream)
     try:
@@ -1095,8 +1181,7 @@ async def test_runner_api_rejects_duplicate_running_event_stream(tmp_path):
             f"/limira-runner/tasks/{task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert duplicate_response.status == 409
-        assert await duplicate_response.json() == {"error": "task_already_running"}
+        assert duplicate_response.status == 200
         assert probe.stream_count == 1
 
         cancel_response = await client.post(
@@ -1107,12 +1192,13 @@ async def test_runner_api_rejects_duplicate_running_event_stream(tmp_path):
         events_response = await asyncio.wait_for(events_task, timeout=1)
         assert events_response.status == 200
         await asyncio.wait_for(events_response.text(), timeout=1)
+        await asyncio.wait_for(duplicate_response.text(), timeout=1)
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_runner_api_transport_close_stops_active_stream(tmp_path):
+async def test_runner_api_transport_close_does_not_cancel_background_task(tmp_path):
     probe = CancellationProbe()
     transport_closed = False
 
@@ -1143,6 +1229,14 @@ async def test_runner_api_transport_close_stops_active_stream(tmp_path):
         await asyncio.wait_for(probe.started.wait(), timeout=1)
 
         transport_closed = True
+        await asyncio.sleep(0.05)
+        assert not probe.stopped.is_set()
+
+        cancel_response = await client.post(
+            f"/limira-runner/tasks/{task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        assert cancel_response.status == 200
         await asyncio.wait_for(probe.stopped.wait(), timeout=1)
         await asyncio.wait_for(events_response.text(), timeout=1)
 
@@ -1166,16 +1260,16 @@ async def test_runner_api_transport_close_stops_active_stream(tmp_path):
 async def test_runner_api_cancel_endpoint_enforces_owner_and_admin(tmp_path):
     client, store = await make_client(tmp_path)
     try:
-        foreign_task = await start_task(client)
+        foreign_task = seed_queued_task(store)
         foreign_cancel = await client.post(
-            f"/limira-runner/tasks/{foreign_task['task_id']}/cancel",
+            f"/limira-runner/tasks/{foreign_task.task_id}/cancel",
             headers=USER_B_HEADERS,
         )
         assert foreign_cancel.status == 404
 
-        admin_task = await start_task(client)
+        admin_task = seed_queued_task(store)
         admin_cancel = await client.post(
-            f"/limira-runner/tasks/{admin_task['task_id']}/cancel",
+            f"/limira-runner/tasks/{admin_task.task_id}/cancel",
             headers=ADMIN_HEADERS,
         )
         assert admin_cancel.status == 200
@@ -1185,15 +1279,15 @@ async def test_runner_api_cancel_endpoint_enforces_owner_and_admin(tmp_path):
         assert admin_payload["cancel_requested"] is True
         assert_public_task_response_hides_internal_identifiers(admin_payload)
 
-        record = store.get_task(admin_task["task_id"])
+        record = store.get_task(admin_task.task_id)
         assert record.status == "cancelled"
         assert record.archive_zip_path is not None
 
         completed_events = await client.get(
-            f"/limira-runner/tasks/{admin_task['task_id']}/events",
+            f"/limira-runner/tasks/{admin_task.task_id}/events",
             headers=USER_A_HEADERS,
         )
-        assert completed_events.status == 409
+        assert completed_events.status == 200
     finally:
         await client.close()
 

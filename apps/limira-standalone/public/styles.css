@@ -115,6 +115,7 @@ label {
 	min-height: 0;
 	width: 100%;
 	overflow: hidden;
+	position: relative;
 }
 
 /* Desktop Sidebar */
@@ -171,7 +172,7 @@ label {
 }
 
 .workspace.sidebar-collapsed .sidebar {
-	width: 56px;
+	display: none;
 }
 
 .workspace.sidebar-collapsed .sidebar-header {
@@ -194,6 +195,49 @@ label {
 
 .workspace.sidebar-collapsed .sidebar-collapse-button svg {
 	transform: rotate(180deg);
+}
+
+.sidebar-overlay-backdrop {
+	position: absolute;
+	inset: 0;
+	z-index: 24;
+	background: linear-gradient(90deg, rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0));
+}
+
+.workspace.sidebar-overlay-open .sidebar {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	z-index: 25;
+	display: flex;
+	width: min(320px, calc(100vw - 32px));
+	height: 100%;
+	border-right: 1px solid var(--border);
+	box-shadow: 20px 0 48px rgba(0, 0, 0, 0.12);
+}
+
+.workspace.sidebar-overlay-open .sidebar-header {
+	flex-direction: row;
+	padding: 1rem;
+}
+
+.workspace.sidebar-overlay-open .new-chat-btn {
+	justify-content: flex-start;
+	width: 100%;
+	height: auto;
+	padding: 0.6rem 0.75rem;
+}
+
+.workspace.sidebar-overlay-open .new-chat-btn span,
+.workspace.sidebar-overlay-open .sidebar-body,
+.workspace.sidebar-overlay-open .sidebar-footer {
+	display: flex;
+}
+
+.workspace.sidebar-overlay-open .sidebar-body,
+.workspace.sidebar-overlay-open .sidebar-footer {
+	flex-direction: column;
 }
 
 .sidebar-body {
@@ -886,6 +930,9 @@ label {
 .thinking-list {
 	display: grid;
 	gap: 0.85rem;
+	max-height: min(44vh, 440px);
+	overflow-y: auto;
+	overscroll-behavior: contain;
 	padding: 1rem;
 }
 
@@ -1676,6 +1723,19 @@ label {
 	}
 	.workspace.sidebar-collapsed .sidebar {
 		display: none;
+	}
+	.workspace.sidebar-overlay-open .sidebar {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: 0;
+		z-index: 25;
+		display: flex;
+		width: min(320px, calc(100vw - 32px));
+		height: 100%;
+		max-height: none;
+		border-right: 1px solid var(--border);
+		border-bottom: none;
 	}
 	.main-content { padding-bottom: 0; }
 }

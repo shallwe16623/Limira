@@ -96,6 +96,7 @@ const state = {
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
 	sidebarCollapsed: localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
+	sidebarOverlayOpen: false,
 	uploadMenuOpen: false,
 	historyFilesOpen: false,
 	showArchivedHistory: false,
@@ -299,10 +300,17 @@ function bindEvents() {
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.sidebarCollapseButton.addEventListener('click', () => {
+		if (state.sidebarOverlayOpen) {
+			setSidebarOverlayOpen(false);
+			return;
+		}
 		setSidebarCollapsed(!state.sidebarCollapsed);
 	});
 	dom.mainSidebarOpenButton.addEventListener('click', () => {
-		setSidebarCollapsed(false);
+		setSidebarOverlayOpen(true);
+	});
+	dom.sidebarOverlayBackdrop.addEventListener('click', () => {
+		setSidebarOverlayOpen(false);
 	});
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.archivedHistoryManageButton.addEventListener('click', (event) => {
@@ -540,19 +548,33 @@ function renderSidebar() {
 		return;
 	}
 	dom.workspace.classList.toggle('sidebar-collapsed', Boolean(state.sidebarCollapsed));
-	dom.sidebarCollapseButton.setAttribute('aria-expanded', state.sidebarCollapsed ? 'false' : 'true');
-	dom.sidebarCollapseButton.title = state.sidebarCollapsed ? '展开边栏' : '折叠边栏';
-	dom.sidebarCollapseButton.setAttribute('aria-label', state.sidebarCollapsed ? '展开边栏' : '折叠边栏');
-	dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed);
-	dom.mainSidebarOpenButton?.setAttribute('aria-expanded', state.sidebarCollapsed ? 'false' : 'true');
+	dom.workspace.classList.toggle('sidebar-overlay-open', Boolean(state.sidebarOverlayOpen));
+	dom.sidebarOverlayBackdrop?.classList.toggle('hidden', !state.sidebarOverlayOpen);
+	const sidebarExpanded = !state.sidebarCollapsed || state.sidebarOverlayOpen;
+	dom.sidebarCollapseButton.setAttribute('aria-expanded', sidebarExpanded ? 'true' : 'false');
+	dom.sidebarCollapseButton.title = state.sidebarOverlayOpen
+		? '关闭边栏'
+		: state.sidebarCollapsed ? '展开边栏' : '折叠边栏';
+	dom.sidebarCollapseButton.setAttribute('aria-label', dom.sidebarCollapseButton.title);
+	dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed || state.sidebarOverlayOpen);
+	dom.mainSidebarOpenButton?.setAttribute('aria-expanded', sidebarExpanded ? 'true' : 'false');
 }
 
 function setSidebarCollapsed(collapsed) {
 	state.sidebarCollapsed = Boolean(collapsed);
+	state.sidebarOverlayOpen = false;
 	try {
 		localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, state.sidebarCollapsed ? 'true' : 'false');
 	} catch {
 		// Sidebar preference is non-critical.
+	}
+	renderShell();
+}
+
+function setSidebarOverlayOpen(open) {
+	state.sidebarOverlayOpen = Boolean(open);
+	if (state.sidebarOverlayOpen) {
+		state.sidebarCollapsed = true;
 	}
 	renderShell();
 }
@@ -564,6 +586,7 @@ function syncRouteFromHash() {
 function switchToWorkspaceRoute() {
 	state.route = 'workspace';
 	state.userSettingsOpen = false;
+	state.sidebarOverlayOpen = false;
 	if (window.location.hash) {
 		window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
 	}
@@ -2559,6 +2582,18 @@ function renderThinking() {
 					</div>
 				</article>`)
 				.join('');
+	if (!state.thinkingCollapsed) {
+		scrollThinkingToLatest();
+	}
+}
+
+function scrollThinkingToLatest() {
+	if (!dom.thinkingList) {
+		return;
+	}
+	window.requestAnimationFrame(() => {
+		dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;
+	});
 }
 
 function renderTabs() {

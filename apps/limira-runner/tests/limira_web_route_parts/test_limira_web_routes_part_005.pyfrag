@@ -660,11 +660,14 @@ async def test_event_proxy_cancellation_closes_matching_runtime_stream():
 
     runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
     assert events == []
-    assert json.loads(runtime_hash["status"]) == "cancelled"
-    assert json.loads(runtime_hash["archive_status"]) == "failed"
-    assert json.loads(runtime_hash["terminal"]) is True
+    assert repo.get_task(task_id).status == "running"
+    assert repo.get_task(task_id).archive_status == "pending"
+    assert repo.get_task(task_id).error is None
+    assert json.loads(runtime_hash["status"]) == "running"
+    assert json.loads(runtime_hash["archive_status"]) == "pending"
+    assert json.loads(runtime_hash["terminal"]) is False
     assert json.loads(runtime_hash["stream_state"]) == "closed"
-    assert json.loads(runtime_hash["stream_close_reason"]) == "event_stream_cancelled"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "client_disconnected"
 
 
 @pytest.mark.asyncio
@@ -1023,17 +1026,17 @@ async def test_postgres_event_proxy_preserves_recorded_report_section_after_late
     last_event = json.loads(runtime_hash["last_event"])
 
     assert [event["type"] for event in events] == ["record_research_artifact"]
-    assert task_payload["status"] == "cancelled"
-    assert task_payload["archive_status"] == "failed"
-    assert task_payload["error"] == "event_stream_cancelled"
-    assert repo.get_task(task_id).status == "cancelled"
-    assert repo.get_task(task_id).error == "event_stream_cancelled"
-    assert json.loads(runtime_hash["status"]) == "cancelled"
-    assert json.loads(runtime_hash["archive_status"]) == "failed"
-    assert json.loads(runtime_hash["terminal"]) is True
-    assert json.loads(runtime_hash["error"]) == "event_stream_cancelled"
+    assert task_payload["status"] == "running"
+    assert task_payload["archive_status"] == "pending"
+    assert task_payload["error"] is None
+    assert repo.get_task(task_id).status == "running"
+    assert repo.get_task(task_id).error is None
+    assert json.loads(runtime_hash["status"]) == "running"
+    assert json.loads(runtime_hash["archive_status"]) == "pending"
+    assert json.loads(runtime_hash["terminal"]) is False
+    assert "error" not in runtime_hash
     assert json.loads(runtime_hash["stream_state"]) == "closed"
-    assert json.loads(runtime_hash["stream_close_reason"]) == "event_stream_cancelled"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "client_disconnected"
     assert last_event["type"] == "record_research_artifact"
 
     assert len(artifacts["report_sections"]) == 1
@@ -1512,9 +1515,9 @@ async def test_event_proxy_cancellation_does_not_mark_task_completed():
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
     assert events == []
-    assert repo.get_task(task_id).status == "cancelled"
-    assert repo.get_task(task_id).archive_status == "failed"
-    assert repo.get_task(task_id).error == "event_stream_cancelled"
+    assert repo.get_task(task_id).status == "running"
+    assert repo.get_task(task_id).archive_status == "pending"
+    assert repo.get_task(task_id).error is None
 
 
 @pytest.mark.asyncio

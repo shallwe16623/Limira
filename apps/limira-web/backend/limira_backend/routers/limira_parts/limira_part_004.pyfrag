@@ -1486,20 +1486,14 @@ async def _limira_event_stream(
                 },
             )
             return
-        stream_close_reason = "event_stream_cancelled"
-        repo.update_task(
-            task.task_id,
-            status="cancelled",
-            archive_status="failed",
-            error="event_stream_cancelled",
-        )
+        stream_close_reason = "client_disconnected"
         await runtime_state.update_task_runtime(
             task.task_id,
             {
-                "status": "cancelled",
-                "archive_status": "failed",
-                "terminal": True,
-                "error": "event_stream_cancelled",
+                "status": current.status if current else task.status,
+                "archive_status": current.archive_status if current else task.archive_status,
+                "terminal": False,
+                "error": current.error if current else task.error,
             },
         )
         return

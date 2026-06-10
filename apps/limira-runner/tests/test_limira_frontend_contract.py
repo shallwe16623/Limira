@@ -374,11 +374,22 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert index.index('id="historySearchButton"') < index.index('id="historySearchModal"')
     assert index.index('id="historySearchModal"') < index.index('id="historySearchInput"')
     assert 'id="sidebarCollapseButton"' in index
+    assert 'id="sidebarOverlayBackdrop"' in index
     assert 'id="mainSidebarOpenButton"' in index
-    assert "dom.mainSidebarOpenButton.addEventListener('click', () => {\n\t\tsetSidebarCollapsed(false);" in app
-    assert "dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed);" in app
+    assert "sidebarOverlayOpen: false" in app
+    assert "dom.mainSidebarOpenButton.addEventListener('click', () => {\n\t\tsetSidebarOverlayOpen(true);" in app
+    assert "dom.sidebarOverlayBackdrop.addEventListener('click', () => {\n\t\tsetSidebarOverlayOpen(false);" in app
+    assert "function setSidebarOverlayOpen(open)" in app
+    assert "dom.workspace.classList.toggle('sidebar-overlay-open', Boolean(state.sidebarOverlayOpen));" in app
+    assert "dom.sidebarOverlayBackdrop?.classList.toggle('hidden', !state.sidebarOverlayOpen);" in app
+    assert "dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed || state.sidebarOverlayOpen);" in app
     assert ".workspace.sidebar-collapsed .main-sidebar-open-button" in styles
-    assert ".workspace.sidebar-collapsed .sidebar {\n\t\tdisplay: none;" in styles
+    assert ".workspace.sidebar-collapsed .sidebar {\n\tdisplay: none;" in styles
+    assert ".workspace.sidebar-overlay-open .sidebar" in styles
+    assert ".sidebar-overlay-backdrop" in styles
+    assert "function scrollThinkingToLatest()" in app
+    assert "scrollThinkingToLatest();" in app
+    assert "overflow-y: auto;" in styles
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app
     assert "dom.workspace.classList.toggle('sidebar-collapsed'" in app

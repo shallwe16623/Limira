@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -45,10 +46,18 @@ RENDER_MARKDOWN_KEY = web.AppKey("render_markdown", object)
 TRANSPORT_CLOSING_KEY = web.AppKey("transport_closing", object)
 CANCELLED_TASKS_KEY = web.AppKey("cancelled_tasks", set[str])
 ACTIVE_TASKS_KEY = web.AppKey("active_tasks", set[str])
+TASK_WORKERS_KEY = web.AppKey("task_workers", dict[str, asyncio.Task])
+TASK_EVENT_LOG_KEY = web.AppKey("task_event_log", dict[str, list[dict[str, Any]]])
+TASK_SUBSCRIBERS_KEY = web.AppKey(
+    "task_subscribers",
+    dict[str, set[asyncio.Queue[dict[str, Any] | None]]],
+)
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 DEFAULT_LLM_PROVIDER = "openai"
 DEFAULT_MODEL_NAME = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
+MAX_REPLAY_EVENTS = 1000
+log = logging.getLogger(__name__)
 
 
 def _env_or_default(name: str, default: str) -> str:
@@ -107,6 +116,9 @@ def create_app(
     app[TRANSPORT_CLOSING_KEY] = transport_closing or _transport_closing
     app[CANCELLED_TASKS_KEY] = set()
     app[ACTIVE_TASKS_KEY] = set()
+    app[TASK_WORKERS_KEY] = {}
+    app[TASK_EVENT_LOG_KEY] = {}
+    app[TASK_SUBSCRIBERS_KEY] = {}
 
     app.router.add_post("/limira-runner/research", start_research)
     app.router.add_get("/limira-runner/tasks/{task_id}", get_task_status)
@@ -144,17 +156,18 @@ async def start_research(request: web.Request) -> web.Response:
     task_id = str(uuid.uuid4())
     model_summary = _model_summary_from_env()
     store: TaskStore = request.app[TASK_STORE_KEY]
-    store.create_task(
+    record = store.create_task(
         task_id=task_id,
         user_id=auth.user_id,
         query=query,
         created_at=request.app[CLOCK_KEY](),
         model_summary=model_summary,
     )
+    _ensure_task_worker(request.app, record.task_id)
     return web.json_response(
         {
             "task_id": task_id,
-            "status": "queued",
+            "status": record.status,
             "stream_url": f"/limira-runner/tasks/{task_id}/events",
             "task_url": f"/limira-runner/tasks/{task_id}",
         },
@@ -196,44 +209,6 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
     record = _get_authorized_task(request, auth)
     if not record:
         raise web.HTTPNotFound(text=json.dumps({"error": "not_found"}))
-    if record.status in FINAL_TASK_STATUSES:
-        raise web.HTTPConflict(
-            text=json.dumps({"error": "task_already_finished"}),
-            content_type="application/json",
-        )
-    if record.status == "running":
-        raise web.HTTPConflict(
-            text=json.dumps({"error": "task_already_running"}),
-            content_type="application/json",
-        )
-
-    store: TaskStore = request.app[TASK_STORE_KEY]
-    clock: Callable[[], str] = request.app[CLOCK_KEY]
-    started_at = clock()
-    claimed_record = store.claim_queued_task(record.task_id, started_at=started_at)
-    if not claimed_record:
-        current_record = store.get_task(record.task_id)
-        if not current_record:
-            raise web.HTTPNotFound(text=json.dumps({"error": "not_found"}))
-        if current_record.status in FINAL_TASK_STATUSES:
-            raise web.HTTPConflict(
-                text=json.dumps({"error": "task_already_finished"}),
-                content_type="application/json",
-            )
-        raise web.HTTPConflict(
-            text=json.dumps({"error": "task_already_running"}),
-            content_type="application/json",
-        )
-    record = claimed_record
-    _register_active_task(request.app, record.task_id)
-
-    writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
-    status = "completed"
-    error = None
-    state: dict[str, Any] = {}
-    writer_started = False
-    response_prepared = False
-    setup_failed_before_response = False
 
     response = web.StreamResponse(
         status=200,
@@ -243,6 +218,59 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             "Connection": "keep-alive",
         },
     )
+    queue = _subscribe_task_events(request.app, record.task_id)
+    response_prepared = False
+    try:
+        await response.prepare(request)
+        response_prepared = True
+        if record.status == "queued":
+            _ensure_task_worker(request.app, record.task_id)
+        for event in _task_event_snapshot(request.app, record.task_id):
+            await _write_sse(response, event)
+        current = _task_store(request.app).get_task(record.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            return response
+        while True:
+            event = await queue.get()
+            if event is None:
+                return response
+            await _write_sse(response, event)
+    except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+        return response
+    finally:
+        _unsubscribe_task_events(request.app, record.task_id, queue)
+        if response_prepared:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+
+    return response
+
+
+async def _run_task_worker(app: web.Application, task_id: str) -> None:
+    store = _task_store(app)
+    record = store.get_task(task_id)
+    if not record or record.status in FINAL_TASK_STATUSES:
+        _notify_task_finished(app, task_id)
+        return
+
+    clock: Callable[[], str] = app[CLOCK_KEY]
+    started_at = clock()
+    claimed_record = store.claim_queued_task(record.task_id, started_at=started_at)
+    if not claimed_record:
+        current_record = store.get_task(record.task_id)
+        if current_record and current_record.status in FINAL_TASK_STATUSES:
+            _notify_task_finished(app, task_id)
+        return
+
+    record = claimed_record
+    _register_active_task(app, record.task_id)
+    writer = app[ARCHIVE_WRITER_KEY](app[ARCHIVE_ROOT_KEY], clock=clock)
+    status = "completed"
+    error = None
+    state: dict[str, Any] = {}
+    writer_started = False
 
     try:
         writer.start(
@@ -253,54 +281,44 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
             start_time=started_at,
         )
         writer_started = True
-        state = request.app[INIT_RENDER_STATE_KEY]()
-        await response.prepare(request)
-        response_prepared = True
+        state = app[INIT_RENDER_STATE_KEY]()
 
-        async def disconnect_check() -> bool:
-            return _task_cancel_requested(request.app, record.task_id) or request.app[
-                TRANSPORT_CLOSING_KEY
-            ](request)
+        async def cancel_check() -> bool:
+            return _task_cancel_requested(app, record.task_id)
 
-        async for message in request.app[STREAM_EVENTS_KEY](
+        async for message in app[STREAM_EVENTS_KEY](
             record.task_id,
             record.query,
             None,
-            disconnect_check,
+            cancel_check,
         ):
             normalized = normalize_stream_event(record.task_id, message, clock())
             if normalized["type"] != "heartbeat":
                 writer.record_event(normalized)
-                state = request.app[UPDATE_STATE_KEY](state, scrub_secrets(message))
+                state = app[UPDATE_STATE_KEY](state, scrub_secrets(message))
                 if normalized["type"] == "error":
                     status = "failed"
                     error = _event_error(normalized)
-            await _write_sse(response, normalized)
-        if await disconnect_check():
+            _append_task_event(app, record.task_id, normalized)
+        if await cancel_check():
             status = "cancelled"
             error = "task cancelled"
-    except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError) as exc:
-        _request_task_cancel(request.app, record.task_id)
+    except asyncio.CancelledError as exc:
         status = "cancelled"
-        error = str(exc) or "client disconnected"
-        setup_failed_before_response = not response_prepared
+        error = str(exc) or "task cancelled"
     except Exception as exc:
         status = "failed"
         error = str(exc)
-        setup_failed_before_response = not response_prepared
-        if response_prepared:
-            try:
-                await _write_sse(
-                    response,
-                    {
-                        "task_id": record.task_id,
-                        "type": "error",
-                        "timestamp": clock(),
-                        "payload": {"error": scrub_secrets(error)},
-                    },
-                )
-            except Exception:
-                pass
+        _append_task_event(
+            app,
+            record.task_id,
+            {
+                "task_id": record.task_id,
+                "type": "error",
+                "timestamp": clock(),
+                "payload": {"error": scrub_secrets(error)},
+            },
+        )
     finally:
         end_time = clock()
         try:
@@ -309,16 +327,14 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                 render_error = None
                 try:
                     if status == "completed":
-                        report_markdown = request.app[RENDER_MARKDOWN_KEY](state)
+                        report_markdown = app[RENDER_MARKDOWN_KEY](state)
                 except Exception as exc:
                     render_error = exc
 
                 if render_error:
                     archive_updates = {
                         "archive_status": "failed",
-                        "archive_dir": str(writer.archive_dir)
-                        if writer.archive_dir
-                        else None,
+                        "archive_dir": str(writer.archive_dir) if writer.archive_dir else None,
                         "archive_zip_path": None,
                         "warnings": [
                             scrub_secrets(f"report rendering failed: {render_error}")
@@ -364,21 +380,9 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                     warnings=["stream setup failed before archive writer started"],
                 )
         finally:
-            _clear_active_task(request.app, record.task_id)
-            _clear_task_cancel(request.app, record.task_id)
-            if response_prepared:
-                try:
-                    await response.write_eof()
-                except Exception:
-                    pass
-
-    if setup_failed_before_response:
-        raise web.HTTPInternalServerError(
-            text=json.dumps({"error": "stream_setup_failed"}),
-            content_type="application/json",
-        )
-
-    return response
+            _clear_active_task(app, record.task_id)
+            _clear_task_cancel(app, record.task_id)
+            _notify_task_finished(app, record.task_id)
 
 
 async def download_archive(request: web.Request) -> web.StreamResponse:
@@ -433,6 +437,81 @@ def _get_authorized_task(
     if not auth.is_admin and record.user_id != auth.user_id:
         return None
     return record
+
+
+def _task_store(app: web.Application) -> TaskStore:
+    return app[TASK_STORE_KEY]
+
+
+def _ensure_task_worker(app: web.Application, task_id: str) -> None:
+    workers = app[TASK_WORKERS_KEY]
+    worker = workers.get(task_id)
+    if worker and not worker.done():
+        return
+    record = _task_store(app).get_task(task_id)
+    if not record or record.status in FINAL_TASK_STATUSES:
+        return
+    worker = asyncio.create_task(_run_task_worker(app, task_id))
+    workers[task_id] = worker
+
+    def _forget_worker(done: asyncio.Task) -> None:
+        if workers.get(task_id) is done:
+            workers.pop(task_id, None)
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("limira runner background task failed: task_id=%s", task_id)
+
+    worker.add_done_callback(_forget_worker)
+
+
+def _task_event_snapshot(
+    app: web.Application,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    return list(app[TASK_EVENT_LOG_KEY].get(task_id, []))
+
+
+def _subscribe_task_events(
+    app: web.Application,
+    task_id: str,
+) -> asyncio.Queue[dict[str, Any] | None]:
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    app[TASK_SUBSCRIBERS_KEY].setdefault(task_id, set()).add(queue)
+    return queue
+
+
+def _unsubscribe_task_events(
+    app: web.Application,
+    task_id: str,
+    queue: asyncio.Queue[dict[str, Any] | None],
+) -> None:
+    subscribers = app[TASK_SUBSCRIBERS_KEY].get(task_id)
+    if not subscribers:
+        return
+    subscribers.discard(queue)
+    if not subscribers:
+        app[TASK_SUBSCRIBERS_KEY].pop(task_id, None)
+
+
+def _append_task_event(
+    app: web.Application,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    events = app[TASK_EVENT_LOG_KEY].setdefault(task_id, [])
+    events.append(event)
+    if len(events) > MAX_REPLAY_EVENTS:
+        del events[:-MAX_REPLAY_EVENTS]
+    for queue in list(app[TASK_SUBSCRIBERS_KEY].get(task_id, ())):
+        queue.put_nowait(event)
+
+
+def _notify_task_finished(app: web.Application, task_id: str) -> None:
+    for queue in list(app[TASK_SUBSCRIBERS_KEY].get(task_id, ())):
+        queue.put_nowait(None)
 
 
 def _request_task_cancel(app: web.Application, task_id: str) -> None:
