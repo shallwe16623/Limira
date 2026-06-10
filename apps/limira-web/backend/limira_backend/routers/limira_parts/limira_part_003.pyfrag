@@ -1264,11 +1264,25 @@ async def upload_document(
         pass
     data = await file.read()
     _ensure_enterprise_storage_capacity(repo, user, incoming_bytes=len(data))
-    extracted_text = _extract_uploaded_document_text(
-        data,
-        filename=filename,
-        content_type=content_type,
-    )
+    extraction_metadata: dict[str, Any] = {}
+    try:
+        extracted_text = _extract_uploaded_document_text(
+            data,
+            filename=filename,
+            content_type=content_type,
+        )
+    except HTTPException as exc:
+        if content_type != "application/pdf" or exc.detail != "invalid_pdf_upload":
+            raise
+        log.warning(
+            "Limira PDF upload text extraction failed; storing original PDF",
+            extra={"original_filename": filename, "owner_user_id": user.id},
+        )
+        extracted_text = ""
+        extraction_metadata["text_extraction"] = {
+            "status": "failed",
+            "detail": "invalid_pdf_upload",
+        }
     embedding, embedding_metadata = await _uploaded_document_embedding(
         extracted_text,
         config=embedding_config,
@@ -1308,6 +1322,7 @@ async def upload_document(
         metadata={
             "sha256": stored.sha256,
             "upload_source": "api",
+            **extraction_metadata,
             **embedding_metadata,
         },
         embedding=embedding,

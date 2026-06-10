@@ -501,6 +501,41 @@ async def test_upload_route_stores_pdf_with_extracted_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_upload_route_stores_pdf_when_text_extraction_fails(monkeypatch):
+    app, repo, storage = _limira_asgi_app()
+    pdf_bytes = b"%PDF-1.7\nbinary pdf body\n%%EOF"
+
+    def fail_pdf_extraction(data):
+        raise limira.HTTPException(status_code=400, detail="invalid_pdf_upload")
+
+    monkeypatch.setattr(limira, "_extract_pdf_text", fail_pdf_extraction)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/uploads",
+            files={"file": ("scanned.pdf", pdf_bytes, "application/pdf")},
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["filename"] == "scanned.pdf"
+    assert payload["content_type"] == "application/pdf"
+    assert payload["extracted_text_chars"] == 0
+    document = repo.get_user_document(payload["document_id"], "user-a")
+    assert document is not None
+    assert document.extracted_text == ""
+    assert document.metadata["text_extraction"] == {
+        "status": "failed",
+        "detail": "invalid_pdf_upload",
+    }
+    assert document.object_key.endswith(f"/uploads/{document.document_id}.pdf")
+    assert storage.objects[document.object_key]["data"] == pdf_bytes
+
+
+@pytest.mark.asyncio
 async def test_upload_document_list_read_and_download_are_owner_scoped():
     app, repo, storage = _limira_asgi_app()
     repo.create_task(
