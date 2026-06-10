@@ -205,11 +205,13 @@ def graph_task_description(
     unit_lines = []
     for unit in state.plan.research_units:
         queries = "; ".join(unit.search_queries)
+        source_policy = _source_policy_text(unit.source_policy)
         unit_lines.append(
             f"- {unit.id}: {unit.question}\n"
             f"  Search queries: {queries}\n"
             f"  Source target: at least {unit.source_policy.min_sources}, "
-            f"max {unit.max_sources} sources"
+            f"max {unit.max_sources} sources\n"
+            f"  Source policy: {source_policy}"
         )
     success_criteria = "\n".join(f"- {item}" for item in state.brief.success_criteria)
     required_sources = "\n".join(f"- {item}" for item in state.brief.required_sources)
@@ -242,6 +244,14 @@ def graph_task_description(
 def evidence_id_for_source(*, task_id: str, source: str, index: int = 0) -> str:
     digest = hashlib.sha256(f"{task_id}:{source}:{index}".encode("utf-8")).hexdigest()
     return f"EVID-{digest[:12]}"
+
+
+def _source_policy_text(source_policy: SourcePolicy) -> str:
+    return (
+        f"prefer_primary_sources={source_policy.prefer_primary_sources}; "
+        f"allow_secondary_sources={source_policy.allow_secondary_sources}; "
+        f"require_retrieved_at={source_policy.require_retrieved_at}"
+    )
 
 
 def _normalize_query(query: str) -> str:

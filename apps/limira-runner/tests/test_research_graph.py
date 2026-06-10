@@ -131,6 +131,29 @@ def test_graph_task_description_includes_plan_for_compatibility_executor():
     assert "### Report Contract" in task_description
 
 
+def test_graph_task_description_surfaces_source_policy_flags():
+    state = build_initial_research_graph(
+        task_id="task-graph-policy",
+        query="Verify a claim with constrained sources",
+        source_policy={
+            "min_sources": 4,
+            "prefer_primary_sources": False,
+            "allow_secondary_sources": False,
+            "require_retrieved_at": False,
+        },
+    )
+
+    task_description = graph_task_description(
+        state,
+        "Verify a claim with constrained sources",
+    )
+
+    assert "Source target: at least 4" in task_description
+    assert "prefer_primary_sources=False" in task_description
+    assert "allow_secondary_sources=False" in task_description
+    assert "require_retrieved_at=False" in task_description
+
+
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():
     first = evidence_id_for_source(task_id="task-a", source="https://example.test", index=0)
     second = evidence_id_for_source(task_id="task-a", source="https://example.test", index=0)
