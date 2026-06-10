@@ -30,6 +30,37 @@ PLAN_NAMED_OBJECT_KEY_ALIASES = (
 )
 
 
+def test_limira_enterprise_auth_seeds_economic_unit_login_list(tmp_path, monkeypatch):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+
+    organizations = limira._limira_auth_list_organizations()
+    names = {organization.name for organization in organizations}
+    by_slug = {organization.slug: organization.name for organization in organizations}
+
+    assert {
+        "国家发展改革委办公厅",
+        "国家发展改革委国民经济综合司",
+        "国家发展改革委经济运行调节局",
+        "国家发展改革委财政金融和信用建设司",
+        "国家发展改革委价格司",
+        "中国宏观经济研究院（国家发展改革委宏观经济研究院）",
+        "国家信息中心",
+        "国家发展改革委价格监测中心",
+        "中国国际经济交流中心",
+        "国务院发展研究中心",
+        "中国社会科学院经济研究所",
+        "国家统计局",
+        "财政部",
+        "商务部",
+        "中国人民银行",
+    } <= names
+    assert by_slug["ndrc-general-office"] == "国家发展改革委办公厅"
+    assert by_slug["ndrc-price-monitoring-center"] == "国家发展改革委价格监测中心"
+    assert by_slug["cass-economics-institute"] == "中国社会科学院经济研究所"
+    assert len(organizations) >= len(limira.DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS)
+
+
 def _latest_auth_link_token(outbox_path: Path, query_key: str) -> str:
     records = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
     for record in reversed(records):
@@ -376,14 +407,16 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
     ) as client:
         organizations = await client.get("/api/limira/auth/organizations")
         assert organizations.status_code == 200
-        assert organizations.json()["organizations"] == [
-            {
-                "id": organization.id,
-                "name": "Example Intelligence Unit",
-                "slug": "example-unit",
-                "billing_mode": "metered",
-            }
-        ]
+        listed_organizations = organizations.json()["organizations"]
+        assert {
+            "id": organization.id,
+            "name": "Example Intelligence Unit",
+            "slug": "example-unit",
+            "billing_mode": "metered",
+        } in listed_organizations
+        listed_names = {listed["name"] for listed in listed_organizations}
+        assert "国家发展改革委办公厅" in listed_names
+        assert "中国社会科学院经济研究所" in listed_names
 
         personal_signin = await client.post(
             "/api/limira/auth/signin",

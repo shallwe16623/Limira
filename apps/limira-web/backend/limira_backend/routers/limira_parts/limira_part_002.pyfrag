@@ -11,6 +11,77 @@ def _limira_wechat_oauth_userinfo_url(env: Any = os.environ) -> str:
     ).strip()
 
 
+DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS: tuple[tuple[str, str, str], ...] = (
+    ("builtin-ndrc-general-office", "国家发展改革委办公厅", "ndrc-general-office"),
+    ("builtin-ndrc-policy-research-office", "国家发展改革委政策研究室", "ndrc-policy-research-office"),
+    ("builtin-ndrc-development-planning", "国家发展改革委发展战略和规划司", "ndrc-development-planning"),
+    ("builtin-ndrc-national-economy", "国家发展改革委国民经济综合司", "ndrc-national-economy"),
+    ("builtin-ndrc-economic-operation", "国家发展改革委经济运行调节局", "ndrc-economic-operation"),
+    ("builtin-ndrc-reform", "国家发展改革委体制改革综合司", "ndrc-reform"),
+    ("builtin-ndrc-fixed-asset-investment", "国家发展改革委固定资产投资司", "ndrc-fixed-asset-investment"),
+    ("builtin-ndrc-foreign-investment", "国家发展改革委利用外资和境外投资司（港澳台办公室）", "ndrc-foreign-investment"),
+    ("builtin-ndrc-regional-economy", "国家发展改革委地区经济司（京津冀协同发展领导小组办公室）", "ndrc-regional-economy"),
+    ("builtin-ndrc-regional-revitalization", "国家发展改革委地区振兴司", "ndrc-regional-revitalization"),
+    ("builtin-ndrc-regional-opening", "国家发展改革委区域开放司（推进“一带一路”建设工作领导小组办公室）", "ndrc-regional-opening"),
+    ("builtin-ndrc-rural-economy", "国家发展改革委农村经济司", "ndrc-rural-economy"),
+    ("builtin-ndrc-infrastructure", "国家发展改革委基础设施发展司（推动长江经济带发展领导小组办公室）", "ndrc-infrastructure"),
+    ("builtin-ndrc-industrial-development", "国家发展改革委产业发展司", "ndrc-industrial-development"),
+    ("builtin-ndrc-innovation-high-tech", "国家发展改革委创新和高技术发展司", "ndrc-innovation-high-tech"),
+    ("builtin-ndrc-resource-conservation", "国家发展改革委资源节约和环境保护司", "ndrc-resource-conservation"),
+    ("builtin-ndrc-social-development", "国家发展改革委社会发展司", "ndrc-social-development"),
+    ("builtin-ndrc-employment-income-consumption", "国家发展改革委就业收入分配和消费司", "ndrc-employment-income-consumption"),
+    ("builtin-ndrc-economic-trade", "国家发展改革委经济贸易司", "ndrc-economic-trade"),
+    ("builtin-ndrc-fiscal-finance-credit", "国家发展改革委财政金融和信用建设司", "ndrc-fiscal-finance-credit"),
+    ("builtin-ndrc-price", "国家发展改革委价格司", "ndrc-price"),
+    ("builtin-ndrc-laws-regulations", "国家发展改革委法规司", "ndrc-laws-regulations"),
+    ("builtin-ndrc-international-cooperation", "国家发展改革委国际合作司", "ndrc-international-cooperation"),
+    ("builtin-ndrc-personnel", "国家发展改革委人事司", "ndrc-personnel"),
+    ("builtin-ndrc-economic-defense", "国家发展改革委经济与国防协调发展司", "ndrc-economic-defense"),
+    ("builtin-ndrc-evaluation-supervision", "国家发展改革委评估督导司", "ndrc-evaluation-supervision"),
+    ("builtin-ndrc-party-committee", "国家发展改革委机关党委", "ndrc-party-committee"),
+    ("builtin-ndrc-retired-cadres", "国家发展改革委离退休干部局", "ndrc-retired-cadres"),
+    ("builtin-ndrc-macroeconomic-research-academy", "中国宏观经济研究院（国家发展改革委宏观经济研究院）", "ndrc-macroeconomic-research-academy"),
+    ("builtin-ndrc-state-information-center", "国家信息中心", "ndrc-state-information-center"),
+    ("builtin-ndrc-xi-economic-thought-center", "习近平经济思想研究中心", "ndrc-xi-economic-thought-center"),
+    ("builtin-ndrc-agency-service-center", "国家发展改革委机关服务中心", "ndrc-agency-service-center"),
+    ("builtin-ndrc-infrastructure-property-center", "国家发展改革委基建物业管理中心", "ndrc-infrastructure-property-center"),
+    ("builtin-ndrc-training-publicity-center", "国家发展改革委培训中心（宣传中心）", "ndrc-training-publicity-center"),
+    ("builtin-ndrc-price-cost-certification-center", "国家发展改革委价格成本和认证中心", "ndrc-price-cost-certification-center"),
+    ("builtin-ndrc-economic-defense-research-center", "国家发展改革委经济与国防协调发展研究中心", "ndrc-economic-defense-research-center"),
+    ("builtin-ndrc-investment-project-review-center", "国家投资项目评审中心", "ndrc-investment-project-review-center"),
+    ("builtin-ndrc-price-monitoring-center", "国家发展改革委价格监测中心", "ndrc-price-monitoring-center"),
+    ("builtin-ndrc-international-cooperation-center", "国家发展改革委国际合作中心", "ndrc-international-cooperation-center"),
+    ("builtin-ndrc-urban-small-town-center", "国家发展改革委城市和小城镇改革发展中心", "ndrc-urban-small-town-center"),
+    ("builtin-ndrc-energy-conservation-center", "国家节能中心", "ndrc-energy-conservation-center"),
+    ("builtin-ndrc-credit-geospatial-center", "国家公共信用和地理空间信息中心", "ndrc-credit-geospatial-center"),
+    ("builtin-ndrc-belt-road-center", "一带一路建设促进中心", "ndrc-belt-road-center"),
+    ("builtin-ndrc-innovation-driven-center", "国家发展改革委创新驱动发展中心", "ndrc-innovation-driven-center"),
+    ("builtin-ndrc-china-economic-herald", "中国经济导报社", "ndrc-china-economic-herald"),
+    ("builtin-ndrc-china-reform-news", "中国改革报社", "ndrc-china-reform-news"),
+    ("builtin-ndrc-business-environment-center", "营商环境发展促进中心", "ndrc-business-environment-center"),
+    ("builtin-ndrc-china-planning-press", "中国计划出版社", "ndrc-china-planning-press"),
+    ("builtin-ndrc-china-market-press", "中国市场出版社", "ndrc-china-market-press"),
+    ("builtin-cciee", "中国国际经济交流中心", "cciee"),
+    ("builtin-ndrc-economic-system-management-institute", "经济体制与管理研究所", "ndrc-economic-system-management-institute"),
+    ("builtin-ndrc-macroeconomic-management-journal", "宏观经济杂志社", "ndrc-macroeconomic-management-journal"),
+    ("builtin-drc-state-council", "国务院发展研究中心", "drc-state-council"),
+    ("builtin-cass-economics-institute", "中国社会科学院经济研究所", "cass-economics-institute"),
+    ("builtin-cass-industrial-economics-institute", "中国社会科学院工业经济研究所", "cass-industrial-economics-institute"),
+    ("builtin-cass-rural-development-institute", "中国社会科学院农村发展研究所", "cass-rural-development-institute"),
+    ("builtin-cass-naes", "中国社会科学院财经战略研究院", "cass-naes"),
+    ("builtin-cass-finance-institute", "中国社会科学院金融研究所", "cass-finance-institute"),
+    ("builtin-cass-quantitative-technical-economics-institute", "中国社会科学院数量经济与技术经济研究所", "cass-quantitative-technical-economics-institute"),
+    ("builtin-cass-population-labor-economics-institute", "中国社会科学院人口与劳动经济研究所", "cass-population-labor-economics-institute"),
+    ("builtin-cass-ecological-civilization-institute", "中国社会科学院生态文明研究所", "cass-ecological-civilization-institute"),
+    ("builtin-national-bureau-statistics", "国家统计局", "national-bureau-statistics"),
+    ("builtin-ministry-finance", "财政部", "ministry-finance"),
+    ("builtin-ministry-commerce", "商务部", "ministry-commerce"),
+    ("builtin-ministry-industry-information-technology", "工业和信息化部", "ministry-industry-information-technology"),
+    ("builtin-peoples-bank-china", "中国人民银行", "peoples-bank-china"),
+    ("builtin-national-data-administration", "国家数据局", "national-data-administration"),
+)
+
+
 def _limira_auth_connect(env: Any = os.environ) -> sqlite3.Connection:
     database_path = _limira_auth_sqlite_path(env)
     os.makedirs(os.path.dirname(database_path), exist_ok=True)
@@ -86,6 +157,7 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
         ON limira_auth_organizations(active, name)
         """
     )
+    _ensure_limira_default_organizations(connection)
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS limira_auth_usage_events (
@@ -163,6 +235,21 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
         """
     )
     connection.commit()
+
+
+def _ensure_limira_default_organizations(connection: sqlite3.Connection) -> None:
+    timestamp = int(time.time())
+    connection.executemany(
+        """
+        INSERT OR IGNORE INTO limira_auth_organizations (
+            id, name, slug, active, billing_mode, created_at, updated_at
+        ) VALUES (?, ?, ?, 1, 'metered', ?, ?)
+        """,
+        [
+            (organization_id, name, slug, timestamp, timestamp)
+            for organization_id, name, slug in DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS
+        ],
+    )
 
 
 def _migrate_legacy_auth_if_needed(connection: sqlite3.Connection, env: Any = os.environ) -> None:
