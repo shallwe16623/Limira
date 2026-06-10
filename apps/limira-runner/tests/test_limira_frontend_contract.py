@@ -402,7 +402,7 @@ def test_limira_standalone_frontend_exposes_real_voice_input_paths():
     styles = _read(LIMIRA_STANDALONE_STYLES)
 
     assert 'id="voiceInputButton"' in index
-    assert 'id="voiceAudioInput"' in index
+    assert 'id="voiceAudioInput"' not in index
     assert 'id="voiceInputMessage"' in index
     assert "function toggleVoiceInput()" in app
     assert "function browserLiveVoiceAllowed()" in app
@@ -412,6 +412,8 @@ def test_limira_standalone_frontend_exposes_real_voice_input_paths():
     assert "api('/api/limira/speech/transcribe'" in app
     assert "form.append('file', blob" in app
     assert "function transcribeVoiceBlob(blob, filename)" in app
+    assert "function transcribeSelectedVoiceAudio()" not in app
+    assert ".click();" not in app[app.index("async function toggleVoiceInput()"):app.index("function transcribeVoiceBlob")]
     assert ".voice-input-button.recording" in styles
     assert "unsupported_audio_upload" in app
     assert "speech_transcription_unavailable" in app

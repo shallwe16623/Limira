@@ -354,7 +354,6 @@ function bindEvents() {
 		void submitResearch();
 	});
 	dom.voiceInputButton.addEventListener('click', () => void toggleVoiceInput());
-	dom.voiceAudioInput.addEventListener('change', () => void transcribeSelectedVoiceAudio());
 	dom.refreshArtifactsButton.addEventListener('click', () => void loadArtifacts());
 	dom.thinkingToggleButton.addEventListener('click', () => {
 		state.thinkingCollapsed = !state.thinkingCollapsed;
@@ -3210,15 +3209,21 @@ async function toggleVoiceInput() {
 		stopVoiceInput();
 		return;
 	}
-	if (browserLiveVoiceAllowed() && speechRecognitionSupported()) {
-		startSpeechRecognition();
+	if (!browserLiveVoiceAllowed()) {
+		setVoiceMessage('当前 http/IP 访问环境不能调用麦克风。请使用 HTTPS 域名或 localhost 后再录音。');
+		renderVoiceInput();
 		return;
 	}
-	if (browserLiveVoiceAllowed() && mediaRecorderSupported()) {
+	if (mediaRecorderSupported()) {
 		await startBackendVoiceRecording();
 		return;
 	}
-	openVoiceAudioFallback();
+	if (speechRecognitionSupported()) {
+		startSpeechRecognition();
+		return;
+	}
+	setVoiceMessage('当前浏览器不支持网页录音。请换用支持麦克风权限的现代浏览器。');
+	renderVoiceInput();
 }
 
 function browserLiveVoiceAllowed() {
@@ -3237,7 +3242,8 @@ function mediaRecorderSupported() {
 function startSpeechRecognition() {
 	const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 	if (!Recognition) {
-		openVoiceAudioFallback();
+		setVoiceMessage('当前浏览器不支持实时听写。');
+		renderVoiceInput();
 		return;
 	}
 	stopVoiceInput({ silent: true });
@@ -3274,7 +3280,7 @@ function startSpeechRecognition() {
 	recognition.onerror = () => {
 		state.isVoiceRecording = false;
 		renderVoiceInput();
-		openVoiceAudioFallback('浏览器实时听写不可用，请选择或录制音频转写。');
+		setVoiceMessage('浏览器实时听写不可用。请换用 HTTPS 域名或支持麦克风权限的浏览器。');
 	};
 	recognition.onend = () => {
 		state.isVoiceRecording = false;
@@ -3287,7 +3293,8 @@ function startSpeechRecognition() {
 	try {
 		recognition.start();
 	} catch {
-		openVoiceAudioFallback('浏览器实时听写启动失败，请选择或录制音频转写。');
+		setVoiceMessage('浏览器实时听写启动失败。请换用 HTTPS 域名或支持麦克风权限的浏览器。');
+		renderVoiceInput();
 	}
 }
 
@@ -3323,7 +3330,9 @@ async function startBackendVoiceRecording() {
 		renderVoiceInput();
 	} catch {
 		cleanupVoiceRecorder();
-		openVoiceAudioFallback('当前访问环境不允许直接录音，请选择或录制音频转写。');
+		state.isVoiceRecording = false;
+		setVoiceMessage('当前访问环境不允许直接录音。请使用 HTTPS 域名或 localhost 后再录音。');
+		renderVoiceInput();
 	}
 }
 
@@ -3355,22 +3364,6 @@ function cleanupVoiceRecorder() {
 	}
 	state.voiceMediaStream = null;
 	state.voiceMediaRecorder = null;
-}
-
-function openVoiceAudioFallback(message = '请选择或录制一段音频，Limira 会在后端转写成文字。') {
-	setVoiceMessage(message);
-	renderVoiceInput();
-	dom.voiceAudioInput.value = '';
-	dom.voiceAudioInput.click();
-}
-
-async function transcribeSelectedVoiceAudio() {
-	const file = dom.voiceAudioInput.files?.[0];
-	if (!file) {
-		return;
-	}
-	await transcribeVoiceBlob(file, file.name || voiceFilenameForMime(file.type || 'audio/webm'));
-	dom.voiceAudioInput.value = '';
 }
 
 async function transcribeVoiceBlob(blob, filename) {

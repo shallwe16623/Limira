@@ -174,7 +174,7 @@ LIMIRA_SPEECH_WHISPER_COMPUTE_TYPE=int8
 LIMIRA_SPEECH_MAX_AUDIO_BYTES=26214400
 ```
 
-浏览器支持 Web Speech API 时会优先直接听写；不支持或当前访问环境禁止直接录音时，前端会选择/录制音频并上传给后端 Whisper 转写。
+浏览器允许麦克风权限时，前端会直接录音并上传给后端 Whisper 转写；如果当前是 `http://IP` 这类浏览器禁止麦克风的访问环境，页面只提示切换到 HTTPS 域名或 localhost，不会弹出本地音频文件选择。
 
 ### 4. 一键启动本地开发服务
 
