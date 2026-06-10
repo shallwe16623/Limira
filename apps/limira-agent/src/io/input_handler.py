@@ -28,6 +28,7 @@ import re
 import shutil
 import tempfile
 import traceback
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Tuple, Union
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
@@ -53,6 +54,43 @@ VIDEO_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 # Extensions that should skip MarkItDown fallback processing
 SKIP_MARKITDOWN_EXTENSIONS = MEDIA_EXTENSIONS | {"pdb"}
+
+
+def _safe_zip_member_path(root: Path, member_name: str) -> Path:
+    raw_name = str(member_name or "")
+    normalized_name = raw_name.replace("\\", "/")
+    posix_path = PurePosixPath(normalized_name)
+    windows_path = PureWindowsPath(raw_name)
+    parts = [part for part in posix_path.parts if part not in {"", "."}]
+
+    if (
+        not parts
+        or posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+        or any(part == ".." for part in parts)
+    ):
+        raise ValueError(f"unsafe ZIP member path: {raw_name}")
+
+    target = root.joinpath(*parts).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"unsafe ZIP member path: {raw_name}")
+    return target
+
+
+def _extract_zip_safely(zip_ref, temp_dir: str) -> None:
+    root = Path(temp_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    for member in zip_ref.infolist():
+        target = _safe_zip_member_path(root, member.filename)
+        if member.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zip_ref.open(member) as source, open(target, "wb") as destination:
+            shutil.copyfileobj(source, destination)
 
 
 def _generate_image_caption(image_path: str) -> str:
@@ -1169,7 +1207,7 @@ def ZipConverter(local_path: str, **kwargs):
 
     try:
         with zipfile.ZipFile(local_path, "r") as zip_ref:
-            zip_ref.extractall(temp_dir)
+            _extract_zip_safely(zip_ref, temp_dir)
 
         # Get all extracted files
         extracted_files = []
