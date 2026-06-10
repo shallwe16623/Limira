@@ -107,6 +107,15 @@
 								<div class="cloud-storage-meter" aria-label="云空间用量"><span id="cloudStorageMeter"></span></div>
 							</div>
 							<button id="cloudDriveManageButton" class="settings-menu-item hidden" type="button">管理云盘</button>
+							<button id="archivedHistoryManageButton" class="settings-menu-item" type="button" aria-expanded="false">已归档对话</button>
+							<div id="archivedHistoryPanel" class="archived-history-panel hidden">
+								<div class="archived-history-header">
+									<div class="sidebar-section-title">已归档对话</div>
+									<button id="refreshArchivedHistoryButton" class="ghost-button compact" type="button">刷新</button>
+								</div>
+								<div id="archivedHistoryMessage" class="inline-message"></div>
+								<div id="archivedHistoryList" class="settings-history-list"></div>
+							</div>
 							<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
 								<div class="enterprise-admin-header">
 									<div class="sidebar-section-title">单位管理</div>

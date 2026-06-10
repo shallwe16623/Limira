@@ -844,8 +844,57 @@ label {
 	color: var(--text);
 }
 
+.settings-menu-item.active {
+	background: var(--surface-hover);
+}
+
 .settings-menu-item.danger {
 	color: var(--danger);
+}
+
+.archived-history-panel {
+	display: grid;
+	gap: 0.5rem;
+	padding: 0.65rem 0;
+	border-top: 1px solid var(--border-light);
+}
+
+.archived-history-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem;
+}
+
+.archived-history-header .sidebar-section-title {
+	margin: 0;
+	padding-left: 0;
+}
+
+.settings-history-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.2rem;
+	max-height: 220px;
+	overflow-y: auto;
+}
+
+.settings-history-item {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 0.25rem;
+	border-radius: var(--radius-sm);
+	background: var(--surface-muted);
+}
+
+.settings-history-item .history-item {
+	padding: 0.5rem 0.6rem;
+}
+
+.visible-actions {
+	opacity: 1;
+	pointer-events: auto;
 }
 
 .cloud-storage-panel {

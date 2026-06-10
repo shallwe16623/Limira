@@ -66,6 +66,7 @@ const state = {
 	route: window.location.hash === '#cloud-drive' ? 'cloud-drive' : 'workspace',
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
+	archivedHistoryOpen: false,
 	uploadMenuOpen: false,
 	historyFilesOpen: false,
 	showArchivedHistory: false,
@@ -81,6 +82,7 @@ const state = {
 	currentUpload: null,
 	isSearching: false,
 	isLoadingHistory: false,
+	isLoadingArchivedHistory: false,
 	restoreBlocked: false,
 	workspaceGeneration: 0,
 	finalReportText: '',
@@ -91,6 +93,7 @@ const state = {
 	cloudStorage: null,
 	uploadResults: [],
 	taskHistory: [],
+	archivedTaskHistory: [],
 	eventSource: null
 };
 
@@ -228,6 +231,27 @@ function bindEvents() {
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
+	dom.archivedHistoryManageButton.addEventListener('click', () => {
+		state.archivedHistoryOpen = !state.archivedHistoryOpen;
+		renderArchivedHistory();
+		if (state.archivedHistoryOpen) {
+			void loadArchivedTaskHistory();
+		}
+	});
+	dom.refreshArchivedHistoryButton.addEventListener('click', () => void loadArchivedTaskHistory());
+	dom.archivedHistoryList.addEventListener('click', (event) => {
+		const restoreButton = event.target.closest('[data-archived-restore-id]');
+		if (restoreButton) {
+			event.preventDefault();
+			void restoreArchivedHistoryTask(restoreButton.dataset.archivedRestoreId || '');
+			return;
+		}
+		const deleteButton = event.target.closest('[data-archived-delete-id]');
+		if (deleteButton) {
+			event.preventDefault();
+			void deleteArchivedHistoryTask(deleteButton.dataset.archivedDeleteId || '');
+		}
+	});
 	dom.historyArchiveToggleButton.addEventListener('click', () => {
 		state.showArchivedHistory = !state.showArchivedHistory;
 		void loadTaskHistory();
@@ -323,6 +347,8 @@ function renderShell() {
 	dom.userSettingsButton.classList.toggle('hidden', !signedIn);
 	if (!signedIn) {
 		state.userSettingsOpen = false;
+		state.archivedHistoryOpen = false;
+		state.archivedTaskHistory = [];
 		state.route = 'workspace';
 		setUploadMenuOpen(false);
 		setHistoryFilesOpen(false);
@@ -332,6 +358,7 @@ function renderShell() {
 	renderHistoryFiles();
 	renderFileControls();
 	renderCloudStorage();
+	renderArchivedHistory();
 	const displayName = state.user?.name || state.user?.username || state.user?.email || '已登录';
 	const fullSessionLabel = signedIn ? `${displayName} · ${accountLabel(state.user)}` : '未登录';
 	dom.sessionLabel.textContent = signedIn ? displayName : '未登录';
@@ -827,6 +854,75 @@ async function loadTaskHistory() {
 	}
 }
 
+async function loadArchivedTaskHistory() {
+	if (!state.user || state.isLoadingArchivedHistory) {
+		renderArchivedHistory();
+		return;
+	}
+	state.isLoadingArchivedHistory = true;
+	const context = captureAsyncContext({ includeTask: false });
+	if (dom.archivedHistoryMessage) {
+		dom.archivedHistoryMessage.textContent = '正在加载已归档对话...';
+	}
+	try {
+		const data = await api(`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=true`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		state.archivedTaskHistory = Array.isArray(data.tasks) ? data.tasks : [];
+		if (dom.archivedHistoryMessage) {
+			dom.archivedHistoryMessage.textContent = state.archivedTaskHistory.length
+				? ''
+				: '暂无已归档对话。';
+		}
+	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		if (dom.archivedHistoryMessage) {
+			dom.archivedHistoryMessage.textContent = `归档对话加载失败：${errorMessage(error)}`;
+		}
+	} finally {
+		state.isLoadingArchivedHistory = false;
+		if (isCurrentAsyncContext(context)) {
+			renderArchivedHistory();
+		}
+	}
+}
+
+function renderArchivedHistory() {
+	if (!dom.archivedHistoryPanel) {
+		return;
+	}
+	const visible = Boolean(state.user) && state.archivedHistoryOpen;
+	dom.archivedHistoryPanel.classList.toggle('hidden', !visible);
+	dom.archivedHistoryManageButton.classList.toggle('active', visible);
+	dom.archivedHistoryManageButton.setAttribute('aria-expanded', visible ? 'true' : 'false');
+	dom.refreshArchivedHistoryButton.disabled = !state.user || state.isLoadingArchivedHistory;
+	if (!visible) {
+		return;
+	}
+	if (!state.archivedTaskHistory.length) {
+		dom.archivedHistoryList.innerHTML = '<div class="empty-state compact-empty">暂无已归档对话。</div>';
+		return;
+	}
+	dom.archivedHistoryList.innerHTML = state.archivedTaskHistory
+		.map((task) => {
+			const taskId = String(task.task_id || '');
+			return `<article class="settings-history-item">
+				<div class="history-item">
+					<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
+					<span class="history-meta">${escapeHtml(taskHistoryMeta({ ...task, history_archived: true }))}</span>
+				</div>
+				<div class="history-actions visible-actions">
+					<button type="button" class="history-action" data-archived-restore-id="${escapeAttr(taskId)}">恢复</button>
+					<button type="button" class="history-action danger" data-archived-delete-id="${escapeAttr(taskId)}">删除</button>
+				</div>
+			</article>`;
+		})
+		.join('');
+}
+
 function renderHistory() {
 	if (!dom.historyList) {
 		return;
@@ -889,6 +985,9 @@ async function archiveHistoryTask(taskId) {
 		});
 		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
 		renderHistory();
+		if (state.archivedHistoryOpen) {
+			await loadArchivedTaskHistory();
+		}
 		await loadTaskHistory();
 	} catch (error) {
 		dom.historyMessage.textContent = `归档失败：${errorMessage(error)}`;
@@ -906,6 +1005,9 @@ async function restoreHistoryTask(taskId) {
 		});
 		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
 		renderHistory();
+		if (state.archivedHistoryOpen) {
+			await loadArchivedTaskHistory();
+		}
 		await loadTaskHistory();
 	} catch (error) {
 		dom.historyMessage.textContent = `恢复失败：${errorMessage(error)}`;
@@ -935,11 +1037,71 @@ async function deleteHistoryTask(taskId) {
 			renderReportControls();
 		}
 		renderHistory();
+		if (state.archivedHistoryOpen) {
+			await loadArchivedTaskHistory();
+		}
 		await loadTaskHistory();
 	} catch (error) {
 		dom.historyMessage.textContent = `删除失败：${errorMessage(error)}`;
 	}
 }
+
+async function restoreArchivedHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || state.isLoadingArchivedHistory) {
+		return;
+	}
+	try {
+		await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/history/restore`, {
+			method: 'POST'
+		});
+		state.archivedTaskHistory = state.archivedTaskHistory.filter(
+			(task) => task.task_id !== normalizedTaskId
+		);
+		renderArchivedHistory();
+		await loadArchivedTaskHistory();
+		if (!state.showArchivedHistory) {
+			await loadTaskHistory();
+		}
+	} catch (error) {
+		dom.archivedHistoryMessage.textContent = `恢复失败：${errorMessage(error)}`;
+	}
+}
+
+async function deleteArchivedHistoryTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || state.isLoadingArchivedHistory) {
+		return;
+	}
+	if (!window.confirm('删除后此聊天不会再出现在历史记录中，是否继续？')) {
+		return;
+	}
+	try {
+		await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/history`, {
+			method: 'DELETE'
+		});
+		state.archivedTaskHistory = state.archivedTaskHistory.filter(
+			(task) => task.task_id !== normalizedTaskId
+		);
+		if (state.taskId === normalizedTaskId) {
+			resetCurrentTaskView();
+			dom.queryInput.value = '';
+			saveWorkspace();
+			renderStatus();
+			renderMessages();
+			renderTabs();
+			renderReportControls();
+		}
+		renderArchivedHistory();
+		await loadArchivedTaskHistory();
+		if (state.showArchivedHistory) {
+			await loadTaskHistory();
+		}
+	} catch (error) {
+		dom.archivedHistoryMessage.textContent = `删除失败：${errorMessage(error)}`;
+	}
+}
+
 
 async function selectHistoryTask(taskId) {
 	const normalizedTaskId = String(taskId || '').trim();

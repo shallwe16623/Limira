@@ -265,6 +265,9 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="cloudDrivePage"' in index
     assert 'id="cloudDriveFileList"' in index
     assert 'id="userSettingsPanel"' in index
+    assert 'id="archivedHistoryManageButton"' in index
+    assert 'id="archivedHistoryPanel"' in index
+    assert 'id="archivedHistoryList"' in index
     assert 'class="settings-menu-item danger"' in index
     assert "此页面直接连接 limira 后端" not in index
     assert 'id="enterpriseContactPrompt"' in index
@@ -353,9 +356,15 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function startNewChat()" in app
     assert "`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=${archived}`" in app
     assert 'id="historyArchiveToggleButton"' in index
+    assert 'id="archivedHistoryManageButton"' in index
+    assert "function loadArchivedTaskHistory()" in app
+    assert "function renderArchivedHistory()" in app
     assert "function archiveHistoryTask(taskId)" in app
     assert "function restoreHistoryTask(taskId)" in app
     assert "function deleteHistoryTask(taskId)" in app
+    assert "function restoreArchivedHistoryTask(taskId)" in app
+    assert "function deleteArchivedHistoryTask(taskId)" in app
+    assert "`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=true`" in app
     assert "/history/archive" in app
     assert "/history/restore" in app
     assert "method: 'DELETE'" in app
