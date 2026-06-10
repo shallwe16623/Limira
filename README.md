@@ -63,7 +63,56 @@ docker-compose.limira.yml
 - Python 3.12
 - uv
 - Node.js 18 或更高版本
+- bash、curl，以及可选的 lsof 或 fuser（`scripts/start-local.sh` 用来清理占用端口的旧进程）
 - Docker 和 Docker Compose，推荐用于完整本地部署
+
+前端 `apps/limira-standalone/server.mjs` 只使用 Node.js 内置模块，当前没有 `package.json`，不需要 `npm install`。
+
+### 2. 安装项目依赖
+
+本地开发和服务启动使用 `apps/limira-runner` 的 Python 环境。它的 `pyproject.toml` 会把 runner、agent、tools 三部分依赖一次装齐，包括 FastAPI/aiohttp、LLM SDK、MCP/FastMCP、PDF/Office 文档解析、PDF 导出、对象存储、Postgres 驱动、测试工具，以及 PDF 上传抽文本需要的 `pypdf`。
+
+在每个 worktree 里执行：
+
+```bash
+cd apps/limira-runner
+uv sync --locked
+```
+
+如果只安装生产运行依赖，可以使用：
+
+```bash
+cd apps/limira-runner
+uv sync --locked --no-dev
+```
+
+PDF 导出需要 Playwright 的 Chromium 浏览器二进制。Python 包会由 `uv sync --locked` 安装，但浏览器二进制需要单独安装：
+
+```bash
+cd apps/limira-runner
+uv run playwright install chromium
+```
+
+如果机器缺 Chromium 运行所需的系统库，再执行：
+
+```bash
+cd apps/limira-runner
+uv run playwright install-deps chromium
+```
+
+`install-deps` 可能需要系统包管理权限。服务器上如果已经有可用的 Playwright 运行时，也可以通过 `LIMIRA_PLAYWRIGHT_RUNTIME_PATH` 指向它。
+
+当前 Python 顶层依赖清单由这三个文件维护，不要手工逐个 `pip install`：
+
+```text
+apps/limira-runner/pyproject.toml
+apps/limira-agent/pyproject.toml
+libs/limira-tools/pyproject.toml
+```
+
+只要这些文件或 `apps/limira-runner/uv.lock` 变化，就在对应 worktree 里重新运行 `cd apps/limira-runner && uv sync --locked`。
+
+### 3. 配置环境变量
 
 复制环境变量模板：
 
@@ -117,7 +166,7 @@ JINA_API_KEY=
 E2B_API_KEY=
 ```
 
-### 2. 一键启动本地开发服务
+### 4. 一键启动本地开发服务
 
 本地开发和调试推荐直接运行启动脚本：
 
@@ -154,7 +203,7 @@ limira-runtime/pids/
 
 脚本默认使用 SQLite、本地文件对象存储和内存 runtime state，适合本机开发。模型 API、搜索 API 等真实研究所需变量仍从 `.env`、`apps/limira-agent/.env` 和 `apps/limira-runner/.env` 读取。
 
-### 3. 绑定域名和 HTTPS
+### 5. 绑定域名和 HTTPS
 
 项目提供 Caddy 反向代理脚本：
 
@@ -210,7 +259,7 @@ CADDY_ACME_EMAIL=admin@limira-inc.com
 LIMIRA_FRONTEND_UPSTREAM=127.0.0.1:5173
 ```
 
-### 4. Docker Compose 部署
+### 6. Docker Compose 部署
 
 如果要跑更接近生产的 Postgres、Redis、MinIO 组合，可以用 Docker Compose：
 

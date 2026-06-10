@@ -17,8 +17,32 @@ It is not a browser UI. The user-facing UI lives in `apps/limira-standalone`, an
 Install dependencies from this directory:
 
 ```bash
-uv sync
+uv sync --locked
 ```
+
+This installs the runner plus the editable local `limira-agent` and `limira-tools` packages. The top-level runtime dependencies are declared in:
+
+```text
+apps/limira-runner/pyproject.toml
+apps/limira-agent/pyproject.toml
+libs/limira-tools/pyproject.toml
+```
+
+Do not install individual missing packages with ad hoc `pip install`; update the relevant `pyproject.toml`, regenerate `apps/limira-runner/uv.lock`, and rerun `uv sync --locked` in every worktree that needs to run the service.
+
+The runner environment includes the PDF upload parser dependency `pypdf`. PDF export also needs Playwright's Chromium browser binary:
+
+```bash
+uv run playwright install chromium
+```
+
+If the host is missing Chromium system libraries, install them with:
+
+```bash
+uv run playwright install-deps chromium
+```
+
+`install-deps` may require system package manager privileges. If a prebuilt Playwright runtime is used instead, point `LIMIRA_PLAYWRIGHT_RUNTIME_PATH` at that runtime.
 
 Run the runner API:
 
