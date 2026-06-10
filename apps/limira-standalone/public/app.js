@@ -259,6 +259,7 @@ function renderAuthMode() {
 	dom.signinModeButton.classList.toggle('active', state.authMode === 'signin');
 	dom.signupModeButton.classList.toggle('active', state.authMode === 'signup');
 	dom.organizationLabel.classList.toggle('hidden', personalScope);
+	dom.enterpriseContactActions.classList.toggle('hidden', personalScope);
 	dom.organizationSelect.disabled = personalScope;
 	dom.organizationSelect.required = !personalScope;
 	renderOrganizationOptions();

@@ -244,6 +244,10 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="personalScopeButton"' in index
     assert 'id="enterpriseScopeButton"' in index
     assert 'id="organizationSelect"' in index
+    assert 'id="enterpriseContactActions"' in index
+    assert 'href="tel:+8617267052536"' in index
+    assert 'href="mailto:admin@limira-inc.com"' in index
+    assert "dom.enterpriseContactActions.classList.toggle('hidden', personalScope)" in app
     assert 'id="enterpriseAdminPanel"' in index
     assert 'id="enterpriseMemberForm"' in index
     assert "/api/limira/auth/google/config" in app
