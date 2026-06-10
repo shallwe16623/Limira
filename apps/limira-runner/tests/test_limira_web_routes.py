@@ -22,6 +22,14 @@ sys.path.insert(0, str(LIMIRA_BACKEND))
 from limira_backend.routers import limira  # noqa: E402
 
 
+PLAN_NAMED_OBJECT_KEY_ALIASES = (
+    "archive_object_key",
+    "archiveObjectKey",
+    "pdf_object_key",
+    "pdfObjectKey",
+)
+
+
 def _latest_auth_link_token(outbox_path: Path, query_key: str) -> str:
     records = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
     for record in reversed(records):
@@ -2991,7 +2999,14 @@ async def test_upload_route_rejects_object_key_aliases_on_actual_http_surface():
         transport=httpx.ASGITransport(app=app),
         base_url="http://limira.test",
     ) as client:
-        for alias in sorted(limira.OBJECT_KEY_FORBIDDEN_FIELDS):
+        assert set(PLAN_NAMED_OBJECT_KEY_ALIASES).issubset(
+            limira.OBJECT_KEY_FORBIDDEN_FIELDS
+        )
+        aliases = sorted(
+            set(limira.OBJECT_KEY_FORBIDDEN_FIELDS)
+            | set(PLAN_NAMED_OBJECT_KEY_ALIASES)
+        )
+        for alias in aliases:
             query_response = await client.post(
                 "/api/limira/uploads",
                 params={alias: "users/user-a/uploads/evil.pdf"},
@@ -4165,7 +4180,14 @@ async def test_pdf_route_rejects_object_key_aliases_on_actual_http_surface():
         transport=httpx.ASGITransport(app=app),
         base_url="http://limira.test",
     ) as client:
-        for alias in sorted(limira.OBJECT_KEY_FORBIDDEN_FIELDS):
+        assert set(PLAN_NAMED_OBJECT_KEY_ALIASES).issubset(
+            limira.OBJECT_KEY_FORBIDDEN_FIELDS
+        )
+        aliases = sorted(
+            set(limira.OBJECT_KEY_FORBIDDEN_FIELDS)
+            | set(PLAN_NAMED_OBJECT_KEY_ALIASES)
+        )
+        for alias in aliases:
             query_response = await client.post(
                 "/api/limira/tasks/task-a/reports/pdf",
                 params={alias: "users/user-a/reports/evil.pdf"},

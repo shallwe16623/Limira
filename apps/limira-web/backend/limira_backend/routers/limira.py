@@ -136,8 +136,12 @@ LIMIRA_WECHAT_OAUTH_STATE_TTL_SECONDS = 10 * 60
 LIMIRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 OBJECT_KEY_FORBIDDEN_FIELDS = {
+    "archive_object_key",
+    "archiveObjectKey",
     "object_key",
     "objectKey",
+    "pdf_object_key",
+    "pdfObjectKey",
     "s3_key",
     "s3Key",
     "minio_object_key",
