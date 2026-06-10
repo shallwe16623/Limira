@@ -1,4 +1,6 @@
-const tabs = ['证据', '实体', '图谱', '时间线', '地图', '报告'];
+const CONVERSATION_VIEW = '对话';
+const BACK_TO_CHAT_LABEL = '回到对话';
+const tabs = ['证据', '实体', '图谱', '时间线', '地图'];
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 const artifactEvents = new Set([
 	'evidence_collected',
@@ -38,7 +40,7 @@ const LEGACY_TAB_LABELS = {
 	Graph: '图谱',
 	Timeline: '时间线',
 	Map: '地图',
-	Report: '报告'
+	Report: CONVERSATION_VIEW
 };
 const ORGANIZATION_CATEGORY_OPTIONS = [
 	{ value: 'enterprise', label: '企业' },
@@ -101,7 +103,7 @@ const state = {
 	status: 'ready',
 	archiveStatus: 'pending',
 	archiveDownloadUrl: '',
-	activeTab: '证据',
+	activeTab: CONVERSATION_VIEW,
 	isSubmitting: false,
 	isUploading: false,
 	currentUpload: null,
@@ -1275,7 +1277,7 @@ function resetCurrentTaskView() {
 	state.restoreBlocked = false;
 	state.isSubmitting = false;
 	state.isSearching = false;
-	state.activeTab = '证据';
+	state.activeTab = CONVERSATION_VIEW;
 	state.finalReportText = '';
 	state.messages = initialMessages();
 	state.thinkingCollapsed = false;
@@ -1375,7 +1377,7 @@ function restoreWorkspace() {
 	state.archiveDownloadUrl = safeArchiveDownloadUrl(saved.archiveDownloadUrl, state.taskId);
 	state.activeTab = tabs.includes(saved.activeTab)
 		? saved.activeTab
-		: LEGACY_TAB_LABELS[saved.activeTab] || '证据';
+		: saved.activeTab === '报告' ? CONVERSATION_VIEW : LEGACY_TAB_LABELS[saved.activeTab] || CONVERSATION_VIEW;
 	state.finalReportText = typeof saved.finalReportText === 'string' ? saved.finalReportText : '';
 	state.messages = Array.isArray(saved.messages) && saved.messages.length ? saved.messages : state.messages;
 	state.thinkingCollapsed = Boolean(saved.thinkingCollapsed);
@@ -1439,7 +1441,7 @@ function resetWorkspaceState() {
 	state.currentUpload = null;
 	state.isSearching = false;
 	state.isLoadingHistory = false;
-	state.activeTab = '证据';
+	state.activeTab = CONVERSATION_VIEW;
 	state.finalReportText = '';
 	state.messages = initialMessages();
 	state.thinkingCollapsed = false;
@@ -1543,6 +1545,7 @@ async function submitResearch() {
 		});
 		addMessage('assistant', `研究任务 ${state.taskId || '已创建'}：${statusLabel(state.status)}。`);
 		saveWorkspace();
+		renderTabs();
 		connectStream();
 		await loadArtifacts();
 		await loadUploads();
@@ -1695,12 +1698,13 @@ function handleToolCall(data) {
 		addThinkingStep({
 			kind: 'report',
 			title: '最终报告已生成',
-			detail: '报告内容已进入底部“报告”标签页，后续归档会一并打包保存。',
+			detail: '报告内容已直接写入对话，后续归档会一并打包保存。',
 			status: 'done'
 		});
-		addMessage('assistant', '已收到最终报告，请在“报告”标签页查看。');
-		state.activeTab = '报告';
+		addMessage('assistant', state.finalReportText, { format: 'markdown', kind: 'report' });
+		state.activeTab = CONVERSATION_VIEW;
 		saveWorkspace();
+		renderMessages();
 		renderTabs();
 		renderReportControls();
 		return;
@@ -2220,6 +2224,23 @@ async function downloadGeneratedArchive(url, filename) {
 	window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
+function hasResearchSurface() {
+	const counts = artifactCounts();
+	return Boolean(
+		state.taskId ||
+		state.finalReportText ||
+		Object.values(counts).some((count) => Number(count || 0) > 0)
+	);
+}
+
+function isArtifactView() {
+	return tabs.includes(state.activeTab);
+}
+
+function isConversationView() {
+	return !isArtifactView();
+}
+
 function renderStatus() {
 	dom.statusLabel.textContent = statusLabel(state.status);
 	dom.taskLabel.textContent = state.taskId
@@ -2235,12 +2256,14 @@ function renderStatus() {
 }
 
 function renderMessages() {
-	dom.messageList.innerHTML = state.messages
-		.slice(-80)
+	const artifactView = isArtifactView();
+	dom.conversationPanel?.classList.toggle('compact', artifactView);
+	const messages = artifactView ? state.messages.slice(-3) : state.messages.slice(-80);
+	dom.messageList.innerHTML = messages
 		.map(
-			(message) => `<article class="message ${escapeHtml(message.role)}">
+			(message) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}">
 				<div class="message-meta"><span>${escapeHtml(roleLabel(message.role))}</span><span>${escapeHtml(message.time)}</span></div>
-				<div class="message-body">${escapeHtml(message.content)}</div>
+				<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
 			</article>`
 		)
 		.join('');
@@ -2271,9 +2294,26 @@ function renderThinking() {
 }
 
 function renderTabs() {
+	const surfaceVisible = hasResearchSurface();
+	const conversationView = isConversationView();
+	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
+	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
+	dom.thinkingPanel?.classList.toggle('hidden', !conversationView);
+	dom.artifactContent.classList.toggle('hidden', conversationView || !surfaceVisible);
+	dom.artifactTabs.classList.toggle('hidden', !surfaceVisible);
+	if (!surfaceVisible) {
+		dom.artifactTabs.innerHTML = '';
+		dom.downloadArchiveButton = null;
+		renderArtifactContent();
+		renderStatus();
+		return;
+	}
 	const counts = artifactCounts();
 	const archiveDisabled = state.restoreBlocked || !state.taskId;
 	dom.artifactTabs.innerHTML = [
+		isArtifactView()
+			? `<button type="button" class="back-tab" data-tab="${CONVERSATION_VIEW}">${BACK_TO_CHAT_LABEL}</button>`
+			: '',
 		...tabs
 		.map(
 			(tab) =>
@@ -2283,8 +2323,10 @@ function renderTabs() {
 	].join('');
 	for (const button of dom.artifactTabs.querySelectorAll('[data-tab]')) {
 		button.addEventListener('click', () => {
-			state.activeTab = button.dataset.tab;
+			state.activeTab = tabs.includes(button.dataset.tab) ? button.dataset.tab : CONVERSATION_VIEW;
 			saveWorkspace();
+			renderMessages();
+			renderThinking();
 			renderTabs();
 		});
 	}
@@ -2295,6 +2337,10 @@ function renderTabs() {
 }
 
 function renderArtifactContent() {
+	if (!isArtifactView() || !hasResearchSurface()) {
+		dom.artifactContent.innerHTML = '';
+		return;
+	}
 	if (state.activeTab === '证据') {
 		renderEvidence();
 	} else if (state.activeTab === '实体') {
@@ -2305,8 +2351,6 @@ function renderArtifactContent() {
 		renderTimeline();
 	} else if (state.activeTab === '地图') {
 		renderMap();
-	} else {
-		renderReport();
 	}
 }
 
@@ -3078,6 +3122,7 @@ function clearRestoredTaskState() {
 	state.status = 'ready';
 	state.archiveStatus = 'pending';
 	state.archiveDownloadUrl = '';
+	state.activeTab = CONVERSATION_VIEW;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
 }
@@ -3113,8 +3158,17 @@ function safeArchiveDownloadUrl(value, taskId) {
 	return String(value || '').trim() === expected ? expected : '';
 }
 
-function addMessage(role, content) {
-	state.messages = [...state.messages, { role, content: String(content), time: now() }];
+function addMessage(role, content, options = {}) {
+	state.messages = [
+		...state.messages,
+		{
+			role,
+			content: String(content),
+			time: now(),
+			format: options.format || '',
+			kind: options.kind || ''
+		}
+	];
 	saveWorkspace();
 	renderMessages();
 }
@@ -3258,7 +3312,7 @@ function initialMessages() {
 		{
 			role: 'assistant',
 			content:
-				'请输入研究问题。发送后，上方显示对话，中间显示工作过程，底部沉淀证据、图谱、报告和归档。',
+				'请输入研究问题。发送后，上方显示对话，中间显示工作过程，功能按钮会在任务开始后出现。',
 			time: now()
 		}
 	];
@@ -3282,8 +3336,7 @@ function artifactCounts() {
 		实体: state.artifacts.entities.length,
 		图谱: state.artifacts.entities.length + state.artifacts.relations.length,
 		时间线: state.artifacts.timeline_events.length,
-		地图: mapFeatures().length,
-		报告: state.artifacts.report_sections.length + (state.finalReportText ? 1 : 0)
+		地图: mapFeatures().length
 	};
 }
 

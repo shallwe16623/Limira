@@ -409,6 +409,10 @@ label {
 .tabs .archive-tab {
 	border-left: 1px solid var(--border-light);
 }
+.tabs .back-tab {
+	color: var(--text);
+	font-weight: 500;
+}
 
 /* Artifact Content */
 .artifact-content {
@@ -417,6 +421,18 @@ label {
 	width: 100%;
 	padding: 0 0 1rem;
 	flex: 1;
+}
+
+.scrollable-canvas.conversation-mode .artifact-content {
+	display: none;
+}
+
+.scrollable-canvas.artifact-mode {
+	gap: 0.75rem;
+}
+
+.scrollable-canvas.artifact-mode .artifact-content {
+	padding-top: 0.5rem;
 }
 
 .artifact-grid { display: flex; flex-direction: column; gap: 2rem; }
@@ -532,6 +548,38 @@ label {
 .message-list-bottom .message-body {
 	white-space: pre-wrap;
 	word-break: break-word;
+}
+
+.message-list-bottom .message-body.markdown-body {
+	white-space: normal;
+}
+
+.message-list-bottom .message.report {
+	align-self: stretch;
+	width: 100%;
+	max-width: 100%;
+	background: transparent;
+	border-color: var(--border-light);
+	box-shadow: none;
+}
+
+.conversation-panel.compact {
+	padding-bottom: 0.4rem;
+	border-bottom: 1px solid var(--border-light);
+}
+
+.conversation-panel.compact .message-list-bottom {
+	max-height: 118px;
+	overflow: hidden;
+}
+
+.conversation-panel.compact .message-list-bottom .message {
+	padding: 0.55rem 0.75rem;
+	font-size: 0.9rem;
+}
+
+.conversation-panel.compact .message-list-bottom .message.report {
+	display: none;
 }
 
 .thinking-panel {
