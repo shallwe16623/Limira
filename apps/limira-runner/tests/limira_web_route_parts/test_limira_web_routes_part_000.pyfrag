@@ -228,6 +228,18 @@ async def test_task_history_collapses_follow_up_tasks_by_conversation_id():
     assert history["tasks"][0]["task_id"] == first["task_id"]
     assert history["tasks"][0]["query"] == "first message"
     assert history["tasks"][0]["conversation_id"] == first["conversation_id"]
+    assert history["tasks"][0]["conversation_count"] == 2
+    assert [task["task_id"] for task in history["tasks"][0]["conversation_members"]] == [
+        first["task_id"],
+        second["task_id"],
+    ]
+    assert [task["query"] for task in history["tasks"][0]["conversation_members"]] == [
+        "first message",
+        "follow up message",
+    ]
+    serialized = json.dumps(history, ensure_ascii=False)
+    assert "owner_user_id" not in serialized
+    assert "runner_task_id" not in serialized
 
 
 @pytest.mark.asyncio

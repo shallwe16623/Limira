@@ -19,7 +19,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from email.message import EmailMessage
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -535,9 +535,10 @@ class LimiraTask:
     archived_at: str | None = None
     deleted_at: str | None = None
     conversation_id: str | None = None
+    conversation_members: list[dict[str, Any]] | None = None
 
     def public_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "task_id": self.task_id,
             "conversation_id": self.conversation_id or self.task_id,
             "query": self.query,
@@ -553,6 +554,10 @@ class LimiraTask:
             "events_url": f"/api/limira/tasks/{self.task_id}/events",
             "artifacts_url": f"/api/limira/tasks/{self.task_id}/artifacts",
         }
+        if self.conversation_members is not None:
+            payload["conversation_members"] = self.conversation_members
+            payload["conversation_count"] = len(self.conversation_members)
+        return payload
 
 
 def _task_matches_history_search(task: LimiraTask, query: str | None) -> bool:
@@ -590,7 +595,16 @@ def _collapse_history_conversations(tasks: list[LimiraTask]) -> list[LimiraTask]
     for conversation_id in order:
         members = groups[conversation_id]
         root = next((task for task in members if task.task_id == conversation_id), None)
-        collapsed.append(root or members[0])
+        representative = root or members[-1]
+        ordered_members = [representative] + list(
+            reversed([task for task in members if task.task_id != representative.task_id])
+        )
+        collapsed.append(
+            replace(
+                representative,
+                conversation_members=[task.public_dict() for task in ordered_members],
+            )
+        )
     return collapsed
 
 

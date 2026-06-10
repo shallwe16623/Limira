@@ -1530,25 +1530,33 @@ async function selectHistoryTask(taskId) {
 	state.eventSource?.close();
 	state.eventSource = null;
 	bumpWorkspaceGeneration();
-	const cached = state.taskHistory.find((task) => task.task_id === normalizedTaskId) || {};
+	const cached = historyTaskCandidate(normalizedTaskId) || {};
+	const members = conversationMembersForTask(cached, normalizedTaskId);
+	const rootTask = members[0] || cached;
+	const activeTask = members[members.length - 1] || rootTask || cached;
+	const activeTaskId = String(activeTask.task_id || normalizedTaskId);
+	const rootTaskId = String(rootTask.conversation_id || rootTask.task_id || normalizedTaskId);
 	resetCurrentTaskView();
-	state.taskId = normalizedTaskId;
-	state.conversationRootTaskId = normalizedTaskId;
-	state.conversationTaskIds = uniqueTaskIds([normalizedTaskId]);
-	state.artifactTaskId = normalizedTaskId;
-	state.status = cached.status || 'queued';
-	state.archiveStatus = cached.archive_status || 'pending';
-	updateArchiveState(cached);
+	state.taskId = activeTaskId;
+	state.conversationRootTaskId = rootTaskId;
+	state.conversationTaskIds = uniqueTaskIds(members.map((task) => task.task_id));
+	state.artifactTaskId = activeTaskId;
+	state.status = activeTask.status || cached.status || 'queued';
+	state.archiveStatus = activeTask.archive_status || cached.archive_status || 'pending';
+	updateArchiveState(activeTask);
 	state.savedUserId = state.user?.id || state.savedUserId;
-	state.query = cached.query || '';
-	state.messages = historyMessages(cached);
+	state.query = activeTask.query || cached.query || '';
+	state.messages = conversationHistoryMessages(members);
 	state.thinkingCollapsed = false;
-	state.thinkingSteps = historyThinkingSteps(cached);
-	rememberTaskThinkingSteps(normalizedTaskId, state.thinkingSteps);
+	state.thinkingSteps = historyThinkingSteps(activeTask);
+	for (const member of members) {
+		rememberTaskThinkingSteps(member.task_id, historyThinkingSteps(member));
+	}
 	dom.queryInput.value = '';
 	saveWorkspace();
 	renderShell();
 	try {
+		await hydrateConversationHistory(members);
 		await refreshTask();
 		await loadTaskProgressRecords();
 		await loadArtifacts();
@@ -1564,6 +1572,49 @@ async function selectHistoryTask(taskId) {
 		}
 		addMessage('error', `无法加载历史任务：${errorMessage(error)}`);
 	}
+}
+
+function historyTaskCandidate(taskId) {
+	return state.taskHistory.find((task) => task.task_id === taskId)
+		|| state.historySearchResults.find((task) => task.task_id === taskId)
+		|| state.archivedTaskHistory.find((task) => task.task_id === taskId)
+		|| null;
+}
+
+function conversationMembersForTask(task, fallbackTaskId) {
+	const members = Array.isArray(task?.conversation_members) && task.conversation_members.length
+		? task.conversation_members
+		: [task && Object.keys(task).length ? task : { task_id: fallbackTaskId, query: '' }];
+	return members
+		.map((member) => ({ ...member, task_id: String(member.task_id || '').trim() }))
+		.filter((member) => member.task_id);
+}
+
+function conversationHistoryMessages(members) {
+	return members.flatMap(historyMessages);
+}
+
+async function hydrateConversationHistory(members) {
+	for (const member of members) {
+		const taskId = String(member.task_id || '').trim();
+		if (!taskId) {
+			continue;
+		}
+		await loadTaskThinkingSnapshot(taskId);
+		const artifacts = await loadArtifacts(taskId, {
+			updateReport: false,
+			select: taskId === state.taskId,
+			silent: true
+		});
+		const report = artifacts ? reportMarkdown(artifacts, { includeFinalReport: taskId === state.taskId }) : '';
+		if (report) {
+			upsertReportMessage(report, { taskId });
+		}
+	}
+	saveWorkspace();
+	renderMessages({ preserveScroll: true });
+	renderTabs();
+	renderReportControls();
 }
 
 function startNewChat() {
@@ -2589,6 +2640,7 @@ async function loadArtifacts(taskId = state.taskId, options = {}) {
 		renderThinking();
 		renderTabs();
 		renderReportControls();
+		return artifacts;
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
@@ -2597,6 +2649,7 @@ async function loadArtifacts(taskId = state.taskId, options = {}) {
 			addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
 		}
 	}
+	return null;
 }
 
 async function loadTaskProgressRecords() {
@@ -4925,12 +4978,12 @@ function assignLatestUserMessageTaskId(taskId) {
 	}
 }
 
-function upsertReportMessage(content) {
+function upsertReportMessage(content, options = {}) {
 	const text = reportTextFromValue(content, { includeTitle: true });
 	if (!text) {
 		return false;
 	}
-	const taskId = state.taskId || '';
+	const taskId = String(options.taskId || state.taskId || '').trim();
 	const index = state.messages.findIndex((message) => (
 		message.kind === 'report' && String(message.taskId || '') === taskId
 	));
@@ -5233,12 +5286,15 @@ function collectPairs(value) {
 	return value.flatMap(collectPairs);
 }
 
-function reportMarkdown(artifacts = state.artifacts) {
+function reportMarkdown(artifacts = state.artifacts, options = {}) {
 	const sectionText = artifacts.report_sections
 		.map((section, index) => `## ${reportTitle(section, index)}\n\n${reportText(section)}`)
 		.join('\n\n');
 	if (sectionText) {
 		return sectionText;
+	}
+	if (options.includeFinalReport === false) {
+		return '';
 	}
 	return reportTextFromValue(state.finalReportText, { includeTitle: true });
 }

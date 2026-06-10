@@ -474,8 +474,11 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "renderShell();" in select_history_block
     assert "await loadTaskProgressRecords();" in select_history_block
     assert "dom.queryInput.value = '';" in select_history_block
-    assert "state.conversationRootTaskId = normalizedTaskId;" in select_history_block
-    assert "state.conversationTaskIds = uniqueTaskIds([normalizedTaskId]);" in select_history_block
+    assert "const members = conversationMembersForTask(cached, normalizedTaskId);" in select_history_block
+    assert "state.conversationRootTaskId = rootTaskId;" in select_history_block
+    assert "state.conversationTaskIds = uniqueTaskIds(members.map((task) => task.task_id));" in select_history_block
+    assert "state.messages = conversationHistoryMessages(members);" in select_history_block
+    assert "await hydrateConversationHistory(members);" in select_history_block
     assert "dom.queryInput.value = cached.query" not in select_history_block
     assert "switchToWorkspaceRoute();" in start_new_chat_block
     assert "renderShell();" in start_new_chat_block
@@ -503,7 +506,11 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/event-logs`)" in app
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
     assert "message.kind === 'report' && String(message.taskId || '') === taskId" in app
-    assert "taskId" in app[app.index("function upsertReportMessage(content)") : app.index("function appendThinkingStep")]
+    assert "function conversationMembersForTask(task, fallbackTaskId)" in app
+    assert "function hydrateConversationHistory(members)" in app
+    assert "conversation_members" in app
+    assert "upsertReportMessage(report, { taskId });" in app
+    assert "taskId" in app[app.index("function upsertReportMessage(content, options = {})") : app.index("function appendThinkingStep")]
     render_messages_block = app[app.index("function renderMessages(options = {})") : app.index("function latestUserMessageIndex()")]
     assert "function messageBelongsToCurrentTask(message)" in app
     assert "function renderReportTaskControls(message)" in app
@@ -620,7 +627,7 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "state.activeTab = tabs.includes(button.dataset.tab) ? button.dataset.tab : CONVERSATION_VIEW;" in app
     assert "upsertReportMessage(state.finalReportText);" in app
     assert "upsertReportMessage(reportMarkdown(artifacts));" in app
-    assert "function upsertReportMessage(content)" in app
+    assert "function upsertReportMessage(content, options = {})" in app
     assert "function upsertArtifactThinkingStep(artifacts = state.artifacts)" in app
     assert "kind: 'artifact-summary'" in app
     assert "state.activeTab = '报告'" not in app
