@@ -128,6 +128,7 @@ const state = {
 	thinkingCollapsed: false,
 	thinkingSteps: initialThinkingSteps(),
 	artifacts: emptyArtifacts(),
+	artifactsByTaskId: {},
 	uploads: [],
 	cloudFiles: [],
 	cloudStorage: null,
@@ -1553,6 +1554,7 @@ function resetCurrentTaskView() {
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = initialThinkingSteps();
 	state.artifacts = emptyArtifacts();
+	state.artifactsByTaskId = {};
 	state.uploads = [];
 	state.uploadResults = [];
 	state.currentUpload = null;
@@ -1661,6 +1663,7 @@ function restoreWorkspace() {
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
 		: emptyArtifacts();
+	state.artifactsByTaskId = state.artifactTaskId ? { [state.artifactTaskId]: state.artifacts } : {};
 	state.uploads = Array.isArray(saved.uploads) ? saved.uploads : [];
 	state.uploadResults = [];
 }
@@ -1724,6 +1727,7 @@ function resetWorkspaceState() {
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = initialThinkingSteps();
 	state.artifacts = emptyArtifacts();
+	state.artifactsByTaskId = {};
 	state.uploads = [];
 	state.cloudFiles = [];
 	state.cloudStorage = null;
@@ -1775,6 +1779,7 @@ async function submitResearch() {
 	state.restoreBlocked = false;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
+	state.artifactsByTaskId = {};
 	state.uploadResults = [];
 	state.isSearching = false;
 	state.thinkingCollapsed = false;
@@ -2304,8 +2309,8 @@ function eventThinkingDetail(data) {
 	return truncateText(typeof value === 'string' ? value : stringifyCompact(value), 280);
 }
 
-function artifactThinkingSummary() {
-	const counts = artifactCounts();
+function artifactThinkingSummary(artifacts = state.artifacts) {
+	const counts = artifactCounts(artifacts);
 	const parts = tabs
 		.map((tab) => `${tab} ${counts[tab] || 0}`)
 		.filter(Boolean);
@@ -2324,11 +2329,22 @@ async function loadArtifacts(taskId = state.taskId, options = {}) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
-		state.artifacts = normalizeArtifacts(data);
-		state.artifactTaskId = normalizedTaskId;
+		const artifacts = normalizeArtifacts(data);
+		state.artifactsByTaskId = {
+			...state.artifactsByTaskId,
+			[normalizedTaskId]: artifacts
+		};
+		const shouldSelect =
+			options.select === true ||
+			!state.artifactTaskId ||
+			state.artifactTaskId === normalizedTaskId;
+		if (shouldSelect) {
+			state.artifacts = artifacts;
+			state.artifactTaskId = normalizedTaskId;
+		}
 		if (activeTaskLoad && options.updateReport !== false) {
-			upsertReportMessage(reportMarkdown());
-			upsertArtifactThinkingStep();
+			upsertReportMessage(reportMarkdown(artifacts));
+			upsertArtifactThinkingStep(artifacts);
 		}
 		saveWorkspace();
 		renderMessages();
@@ -2843,11 +2859,23 @@ function renderReportTaskControls(message) {
 }
 
 function reportArtifactCounts(taskId) {
-	return taskId && taskId === currentArtifactTaskId() ? artifactCounts() : {};
+	const artifacts = artifactsForTask(taskId);
+	return artifacts ? artifactCounts(artifacts) : {};
 }
 
 function currentArtifactTaskId() {
 	return state.artifactTaskId || state.taskId || '';
+}
+
+function artifactsForTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
+		return null;
+	}
+	if (normalizedTaskId === state.artifactTaskId) {
+		return state.artifacts;
+	}
+	return state.artifactsByTaskId[normalizedTaskId] || null;
 }
 
 function taskHistoryRecord(taskId) {
@@ -4124,6 +4152,7 @@ function clearRestoredTaskState() {
 	state.activeTab = CONVERSATION_VIEW;
 	state.finalReportText = '';
 	state.artifacts = emptyArtifacts();
+	state.artifactsByTaskId = {};
 }
 
 function isAuthoritativeRestoreRejection(error) {
@@ -4243,17 +4272,17 @@ function completeActiveThinkingSteps() {
 	));
 }
 
-function upsertArtifactThinkingStep() {
-	const reportText = reportMarkdown();
-	const counts = artifactCounts();
+function upsertArtifactThinkingStep(artifacts = state.artifacts) {
+	const reportText = reportMarkdown(artifacts);
+	const counts = artifactCounts(artifacts);
 	const hasArtifacts = Boolean(reportText) || Object.values(counts).some((count) => Number(count || 0) > 0);
 	if (!hasArtifacts) {
 		return false;
 	}
 	const title = reportText ? '已恢复最终报告' : '已恢复研究成果';
 	const detail = reportText
-		? `最终报告已恢复到对话中。${artifactThinkingSummary()}`
-		: artifactThinkingSummary();
+		? `最终报告已恢复到对话中。${artifactThinkingSummary(artifacts)}`
+		: artifactThinkingSummary(artifacts);
 	const step = {
 		kind: 'artifact-summary',
 		title,
@@ -4406,18 +4435,18 @@ function initialThinkingSteps() {
 	];
 }
 
-function artifactCounts() {
+function artifactCounts(artifacts = state.artifacts) {
 	return {
-		证据: state.artifacts.evidence.length,
-		实体: state.artifacts.entities.length,
-		图谱: state.artifacts.entities.length + state.artifacts.relations.length,
-		时间线: state.artifacts.timeline_events.length,
-		地图: mapFeatures().length
+		证据: artifacts.evidence.length,
+		实体: artifacts.entities.length,
+		图谱: artifacts.entities.length + artifacts.relations.length,
+		时间线: artifacts.timeline_events.length,
+		地图: mapFeatures(artifacts).length
 	};
 }
 
-function mapFeatures() {
-	const source = [...state.artifacts.map_features, ...state.artifacts.timeline_events];
+function mapFeatures(artifacts = state.artifacts) {
+	const source = [...artifacts.map_features, ...artifacts.timeline_events];
 	return source
 		.map((item, index) => {
 			const geometry = normalizeGeometry(
@@ -4456,8 +4485,8 @@ function collectPairs(value) {
 	return value.flatMap(collectPairs);
 }
 
-function reportMarkdown() {
-	const sectionText = state.artifacts.report_sections
+function reportMarkdown(artifacts = state.artifacts) {
+	const sectionText = artifacts.report_sections
 		.map((section, index) => `## ${reportTitle(section, index)}\n\n${reportText(section)}`)
 		.join('\n\n');
 	if (sectionText) {

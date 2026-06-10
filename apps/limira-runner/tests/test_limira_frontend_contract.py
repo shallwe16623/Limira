@@ -478,8 +478,17 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "data-report-tab" in app
     assert "data-report-archive" in app
     assert "function currentArtifactTaskId()" in app
+    assert "function artifactsForTask(taskId)" in app
     assert "function archiveStatusForTask(taskId)" in app
     assert "state.artifactTaskId" in app
+    assert "state.artifactsByTaskId" in app
+    assert "const shouldSelect =" in app
+    assert "options.select === true" in app
+    assert "state.artifactsByTaskId = {" in app
+    assert "upsertReportMessage(reportMarkdown(artifacts));" in app
+    assert "upsertArtifactThinkingStep(artifacts);" in app
+    assert "return artifacts ? artifactCounts(artifacts) : {};" in app
+    assert "function artifactCounts(artifacts = state.artifacts)" in app
     assert "item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message)" in render_messages_block
     assert "item.message.kind === 'report' && messageBelongsToCurrentTask(item.message)" in render_messages_block
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]
@@ -532,9 +541,9 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "state.activeTab = CONVERSATION_VIEW;" in app
     assert "state.activeTab = tabs.includes(button.dataset.tab) ? button.dataset.tab : CONVERSATION_VIEW;" in app
     assert "upsertReportMessage(state.finalReportText);" in app
-    assert "upsertReportMessage(reportMarkdown());" in app
+    assert "upsertReportMessage(reportMarkdown(artifacts));" in app
     assert "function upsertReportMessage(content)" in app
-    assert "function upsertArtifactThinkingStep()" in app
+    assert "function upsertArtifactThinkingStep(artifacts = state.artifacts)" in app
     assert "kind: 'artifact-summary'" in app
     assert "state.activeTab = '报告'" not in app
     assert "function initialMessages()" in app
