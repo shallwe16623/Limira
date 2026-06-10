@@ -729,7 +729,9 @@ def _task_context_from_payload(
         "upload_scope": upload_scope,
         "source_policy": default_source_policy,
     }
-    _assert_context_json_size(context)
+    _assert_context_json_size(
+        {key: value for key, value in context.items() if key != "query"}
+    )
     return context
 
 

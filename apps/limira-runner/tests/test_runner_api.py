@@ -12,7 +12,9 @@ from archive_writer import ResearchArchiveWriter
 from runner_api import (
     ACTIVE_TASKS_KEY,
     CANCELLED_TASKS_KEY,
+    MAX_CONTEXT_JSON_CHARS,
     INIT_RENDER_STATE_KEY,
+    MAX_QUERY_CHARS,
     RENDER_MARKDOWN_KEY,
     STREAM_EVENTS_KEY,
     UPDATE_STATE_KEY,
@@ -82,6 +84,17 @@ async def completed_stream(task_id, query, _unused, disconnect_check=None):
     yield {
         "event": "message",
         "data": {"delta": {"content": "final from state"}},
+    }
+
+
+async def echo_query_stream(task_id, query, context, disconnect_check=None):
+    assert task_id
+    assert isinstance(query, str)
+    assert isinstance(context, dict)
+    assert disconnect_check is not None
+    yield {
+        "event": "message",
+        "data": {"delta": {"content": f"query length {len(query)}"}},
     }
 
 
@@ -453,6 +466,53 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         assert download_response.status == 200
         with zipfile.ZipFile(io.BytesIO(await download_response.read())) as archive:
             assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_accepts_max_length_query_with_default_context(tmp_path):
+    client, store = await make_client(tmp_path, stream_events=echo_query_stream)
+    try:
+        max_query = "q" * MAX_QUERY_CHARS
+        response = await client.post(
+            "/limira-runner/research",
+            headers=USER_A_HEADERS,
+            json={"query": max_query},
+        )
+
+        assert response.status == 202
+        task_id = (await response.json())["task_id"]
+        completed = await wait_for_task_status(store, task_id, "completed")
+        assert completed.query == max_query
+        assert completed.context["query"] == max_query
+
+        oversized_response = await client.post(
+            "/limira-runner/research",
+            headers=USER_A_HEADERS,
+            json={"query": f"{max_query}x"},
+        )
+        assert oversized_response.status == 400
+        assert await oversized_response.json() == {"error": "query_too_long"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_still_rejects_oversized_optional_context(tmp_path):
+    client, _store = await make_client(tmp_path, stream_events=echo_query_stream)
+    try:
+        response = await client.post(
+            "/limira-runner/research",
+            headers=USER_A_HEADERS,
+            json={
+                "query": "short query",
+                "upload_scope": {"blob": "x" * MAX_CONTEXT_JSON_CHARS},
+            },
+        )
+
+        assert response.status == 400
+        assert await response.json() == {"error": "task_context_too_large"}
     finally:
         await client.close()
 
