@@ -2568,7 +2568,9 @@ function renderThinking() {
 	const steps = state.thinkingSteps.length ? state.thinkingSteps : initialThinkingSteps();
 	dom.thinkingPanel.classList.toggle('collapsed', state.thinkingCollapsed);
 	dom.thinkingToggleButton.setAttribute('aria-expanded', state.thinkingCollapsed ? 'false' : 'true');
-	dom.thinkingToggleLabel.textContent = state.thinkingCollapsed ? '展开思考过程' : '隐藏思考过程';
+	dom.thinkingToggleButton.setAttribute('aria-label', state.thinkingCollapsed ? '展开工作过程' : '折叠工作过程');
+	dom.thinkingToggleIcon.textContent = state.thinkingCollapsed ? '>' : '⌄';
+	dom.thinkingToggleLabel.textContent = '工作过程';
 	dom.thinkingStepCount.textContent = `${steps.length}`;
 	dom.thinkingList.innerHTML = state.thinkingCollapsed
 		? ''
@@ -2588,12 +2590,10 @@ function renderThinking() {
 }
 
 function scrollThinkingToLatest() {
-	if (!dom.thinkingList || isArtifactView()) {
+	if (!dom.workspaceContent || isArtifactView()) {
 		return;
 	}
-	window.requestAnimationFrame(() => {
-		dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;
-	});
+	scrollConversationToBottom();
 }
 
 function renderTabs() {

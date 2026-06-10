@@ -392,13 +392,16 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function scrollThinkingListToBottom()" not in app
     assert "function keepThinkingListAboveInput()" not in app
     assert "dom.thinkingList.lastElementChild?.scrollIntoView({" not in app
-    assert "dom.workspaceContent.scrollTop = dom.workspaceContent.scrollHeight;" not in app
-    assert "dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;" in app
-    assert "max-height: min(52vh, 560px);" in styles
-    assert "overflow-y: auto;" in styles
-    assert "overscroll-behavior-y: auto;" in styles
-    assert "padding: 1rem 1rem 2rem;" in styles
-    assert "scrollbar-gutter: stable;" in styles
+    assert "dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;" not in app
+    assert "dom.thinkingToggleIcon.textContent = state.thinkingCollapsed ? '>' : '⌄';" in app
+    assert index.index('id="messageList"') < index.index('id="thinkingPanel"')
+    assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
+    assert ".conversation-panel {\n\twidth: 100%;" in styles
+    assert ".conversation-panel {\n\twidth: 100%;\n\tmax-width: 880px;\n\tmargin: 0 auto;\n\tdisplay: flex;\n\tflex-direction: column;\n\tgap: 0.9rem;\n}" in styles
+    assert ".thinking-list {\n\tdisplay: grid;\n\tgap: 0.85rem;\n\toverflow: visible;\n\tpadding: 1rem;\n}" in styles
+    assert "max-height: min(52vh, 560px);" not in styles
+    assert "overscroll-behavior-y: auto;" not in styles
+    assert "scrollbar-gutter: stable;" not in styles
     assert "overscroll-behavior: contain;" not in styles
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app
@@ -500,8 +503,8 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "function hasConversationActivity()" in app
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
     assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');" in app
-    assert index.index('id="conversationPanel"') < index.index('id="artifactTabs"')
-    assert index.index('id="artifactTabs"') < index.index('id="thinkingPanel"')
+    assert index.index('id="conversationPanel"') < index.index('id="thinkingPanel"')
+    assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
     assert index.index('id="workspaceContent"') < index.index('id="inputContainer"')
     assert index.index('id="artifactContent"') < index.index('id="inputContainer"')

@@ -798,11 +798,13 @@ label {
 }
 
 /* Realtime Message List - Pinned above input */
-.conversation-panel,
-.thinking-panel {
+.conversation-panel {
 	width: 100%;
 	max-width: 880px;
 	margin: 0 auto;
+	display: flex;
+	flex-direction: column;
+	gap: 0.9rem;
 }
 
 .message-list-bottom {
@@ -888,7 +890,8 @@ label {
 }
 
 .thinking-panel {
-	overflow: hidden;
+	width: 100%;
+	overflow: visible;
 	border: 1px solid var(--border);
 	border-radius: var(--radius);
 	background: var(--surface);
@@ -898,8 +901,8 @@ label {
 .thinking-toggle {
 	display: flex;
 	align-items: center;
-	justify-content: center;
-	gap: 0.6rem;
+	justify-content: flex-start;
+	gap: 0.55rem;
 	width: 100%;
 	min-height: 42px;
 	padding: 0.65rem 1rem;
@@ -912,6 +915,16 @@ label {
 .thinking-toggle:hover {
 	background: var(--surface-muted);
 	color: var(--text);
+}
+
+.thinking-toggle-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 1rem;
+	color: var(--text-secondary);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+	font-size: 0.9rem;
 }
 
 .thinking-step-count {
@@ -930,11 +943,8 @@ label {
 .thinking-list {
 	display: grid;
 	gap: 0.85rem;
-	max-height: min(52vh, 560px);
-	overflow-y: auto;
-	overscroll-behavior-y: auto;
-	padding: 1rem 1rem 2rem;
-	scrollbar-gutter: stable;
+	overflow: visible;
+	padding: 1rem;
 }
 
 .thinking-panel.collapsed .thinking-list {

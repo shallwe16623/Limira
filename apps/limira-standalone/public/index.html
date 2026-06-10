@@ -138,15 +138,16 @@
 					<div id="workspaceContent" class="scrollable-canvas">
 						<section id="conversationPanel" class="conversation-panel" aria-label="对话消息">
 							<div id="messageList" class="message-list-bottom" aria-label="对话消息"></div>
+							<section id="thinkingPanel" class="thinking-panel" aria-label="工作过程">
+								<button id="thinkingToggleButton" class="thinking-toggle" type="button" aria-expanded="true">
+									<span id="thinkingToggleIcon" class="thinking-toggle-icon" aria-hidden="true">⌄</span>
+									<span id="thinkingToggleLabel">工作过程</span>
+									<span id="thinkingStepCount" class="thinking-step-count">0</span>
+								</button>
+								<div id="thinkingList" class="thinking-list"></div>
+							</section>
 						</section>
 						<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
-						<section id="thinkingPanel" class="thinking-panel" aria-label="工作过程">
-							<button id="thinkingToggleButton" class="thinking-toggle" type="button" aria-expanded="true">
-								<span id="thinkingToggleLabel">隐藏思考过程</span>
-								<span id="thinkingStepCount" class="thinking-step-count">0</span>
-							</button>
-							<div id="thinkingList" class="thinking-list"></div>
-						</section>
 						<section id="artifactContent" class="artifact-content"></section>
 
 						<!-- Hidden elements to preserve JS bindings -->
