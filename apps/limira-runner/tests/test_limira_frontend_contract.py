@@ -409,7 +409,11 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "const tabs = ['证据', '实体', '图谱', '时间线', '地图'];" in app
     assert "state.activeTab = CONVERSATION_VIEW;" in app
     assert "state.activeTab = tabs.includes(button.dataset.tab) ? button.dataset.tab : CONVERSATION_VIEW;" in app
-    assert "addMessage('assistant', state.finalReportText, { format: 'markdown', kind: 'report' });" in app
+    assert "upsertReportMessage(state.finalReportText);" in app
+    assert "upsertReportMessage(reportMarkdown());" in app
+    assert "function upsertReportMessage(content)" in app
+    assert "function upsertArtifactThinkingStep()" in app
+    assert "kind: 'artifact-summary'" in app
     assert "state.activeTab = '报告'" not in app
     assert "function initialMessages()" in app
     assert "return [];" in app

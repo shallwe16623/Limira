@@ -1703,7 +1703,7 @@ function handleToolCall(data) {
 			detail: '报告内容已直接写入对话，后续归档会一并打包保存。',
 			status: 'done'
 		});
-		addMessage('assistant', state.finalReportText, { format: 'markdown', kind: 'report' });
+		upsertReportMessage(state.finalReportText);
 		state.activeTab = CONVERSATION_VIEW;
 		saveWorkspace();
 		renderMessages();
@@ -1865,7 +1865,11 @@ async function loadArtifacts() {
 			return;
 		}
 		state.artifacts = normalizeArtifacts(data);
+		upsertReportMessage(reportMarkdown());
+		upsertArtifactThinkingStep();
 		saveWorkspace();
+		renderMessages();
+		renderThinking();
 		renderTabs();
 		renderReportControls();
 	} catch (error) {
@@ -3187,6 +3191,32 @@ function addMessage(role, content, options = {}) {
 	renderMessages();
 }
 
+function upsertReportMessage(content) {
+	const text = reportTextFromValue(content);
+	if (!text) {
+		return false;
+	}
+	const index = state.messages.findIndex((message) => message.kind === 'report');
+	const message = {
+		role: 'assistant',
+		content: text,
+		time: index >= 0 ? state.messages[index].time || now() : now(),
+		format: 'markdown',
+		kind: 'report'
+	};
+	if (
+		index >= 0 &&
+		state.messages[index].content === message.content &&
+		state.messages[index].format === message.format
+	) {
+		return false;
+	}
+	state.messages = index >= 0
+		? state.messages.map((item, itemIndex) => (itemIndex === index ? message : item))
+		: [...state.messages, message];
+	return true;
+}
+
 function addThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '' }) {
 	const normalizedTitle = String(title || '').trim();
 	if (!normalizedTitle) {
@@ -3210,6 +3240,39 @@ function completeActiveThinkingSteps() {
 	state.thinkingSteps = state.thinkingSteps.map((step) => (
 		step.status === 'active' ? { ...step, status: 'done' } : step
 	));
+}
+
+function upsertArtifactThinkingStep() {
+	const reportText = reportMarkdown();
+	const counts = artifactCounts();
+	const hasArtifacts = Boolean(reportText) || Object.values(counts).some((count) => Number(count || 0) > 0);
+	if (!hasArtifacts) {
+		return false;
+	}
+	const title = reportText ? '已恢复最终报告' : '已恢复研究成果';
+	const detail = reportText
+		? `最终报告已恢复到对话中。${artifactThinkingSummary()}`
+		: artifactThinkingSummary();
+	const step = {
+		kind: 'artifact-summary',
+		title,
+		detail,
+		status: 'done',
+		meta: '',
+		time: now()
+	};
+	const next = state.thinkingSteps.filter((item) => item.kind !== 'ready');
+	const index = next.findIndex((item) => item.kind === step.kind);
+	if (index >= 0) {
+		if (next[index].title === step.title && next[index].detail === step.detail) {
+			return false;
+		}
+		next[index] = { ...step, time: next[index].time || step.time };
+		state.thinkingSteps = next;
+		return true;
+	}
+	state.thinkingSteps = [...next, step].slice(-MAX_THINKING_STEPS);
+	return true;
 }
 
 async function api(path, options = {}) {
