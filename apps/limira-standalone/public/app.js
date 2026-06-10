@@ -214,7 +214,7 @@ function bindEvents() {
 		void submitResearch();
 	});
 	dom.refreshArtifactsButton.addEventListener('click', () => void loadArtifacts());
-	dom.downloadArchiveButton.addEventListener('click', downloadArchive);
+	dom.downloadArchiveButton.addEventListener('click', () => void downloadArchive());
 	dom.clearStreamButton.addEventListener('click', () => {
 		state.messages = [];
 		saveWorkspace();
@@ -237,24 +237,26 @@ function bindEvents() {
 		void createEnterpriseMember();
 	});
 
-	// Sandbox Event Bindings
-		dom.artifactContent.addEventListener('click', (event) => {
-			const link = event.target.closest('.sandbox-link');
-			if (link) {
-				event.preventDefault();
-				const url = link.href;
-				const title = link.getAttribute('data-title') || '网页预览';
+	dom.artifactContent.addEventListener('click', (event) => {
+		const link = event.target.closest('.sandbox-link');
+		if (link) {
+			event.preventDefault();
+			const url = link.href;
+			const title = link.getAttribute('data-title') || '网页预览';
+			const summary = link.getAttribute('data-summary') || '';
 
-				dom.sandboxIframe.src = url;
-				dom.sandboxTitle.textContent = title;
-				dom.sandboxExternalLink.href = url;
-				dom.sandboxModal.classList.remove('hidden');
+			dom.sandboxIframe.removeAttribute('src');
+			dom.sandboxIframe.srcdoc = evidencePreviewHtml({ title, url, summary });
+			dom.sandboxTitle.textContent = title;
+			dom.sandboxExternalLink.href = url;
+			dom.sandboxModal.classList.remove('hidden');
 		}
 	});
 
 	dom.sandboxCloseButton.addEventListener('click', () => {
 		dom.sandboxModal.classList.add('hidden');
-		dom.sandboxIframe.src = ''; // clear iframe
+		dom.sandboxIframe.removeAttribute('src');
+		dom.sandboxIframe.srcdoc = '';
 	});
 }
 
@@ -1668,17 +1670,52 @@ async function downloadGeneratedPdf(url, filename) {
 	window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
-function downloadArchive() {
+async function downloadArchive() {
 	if (state.restoreBlocked) {
 		dom.reportMessage.textContent = '任务暂未从后端确认，恢复后再下载归档。';
 		return;
 	}
-	if (state.archiveStatus === 'ready' && state.archiveDownloadUrl) {
-		window.location.href = state.archiveDownloadUrl;
+	if (!state.taskId) {
 		return;
 	}
-	dom.reportMessage.textContent =
-		state.archiveStatus === 'failed' ? '归档生成失败，暂时无法下载。' : '归档尚未生成完成。';
+	const url = state.archiveDownloadUrl || defaultArchiveDownloadUrl(state.taskId);
+	try {
+		await downloadGeneratedArchive(url, 'archive.zip');
+		state.archiveStatus = 'ready';
+		state.archiveDownloadUrl = url;
+		saveWorkspace();
+		renderStatus();
+		dom.reportMessage.textContent = '归档已下载。';
+	} catch (error) {
+		dom.reportMessage.textContent = `归档下载失败：${errorMessage(error)}`;
+	}
+}
+
+async function downloadGeneratedArchive(url, filename) {
+	const headers = new Headers({ accept: 'application/zip' });
+	if (state.token) {
+		headers.set('authorization', `Bearer ${state.token}`);
+	}
+	const response = await fetch(url, {
+		method: 'GET',
+		headers,
+		credentials: 'include'
+	});
+	if (!response.ok) {
+		throw new Error(await responseDetail(response));
+	}
+	const blob = await response.blob();
+	if (!blob.size) {
+		throw new Error('empty_archive_download');
+	}
+	const objectUrl = URL.createObjectURL(blob);
+	const link = document.createElement('a');
+	link.href = objectUrl;
+	link.download = filename;
+	document.body.appendChild(link);
+	link.click();
+	link.remove();
+	window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
 function renderStatus() {
@@ -1689,8 +1726,7 @@ function renderStatus() {
 			}`
 		: '暂无任务';
 	dom.submitResearchButton.disabled = state.isSubmitting;
-	dom.downloadArchiveButton.disabled =
-		state.restoreBlocked || !(state.archiveStatus === 'ready' && state.archiveDownloadUrl);
+	dom.downloadArchiveButton.disabled = state.restoreBlocked || !state.taskId;
 }
 
 function renderMessages() {
@@ -1760,8 +1796,36 @@ function evidenceCard(item, index) {
 			${item.published_at ? `<span>${escapeHtml(item.published_at)}</span>` : ''}
 		</div>
 		<div class="artifact-body">${escapeHtml(summary)}</div>
-		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
+		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
 	</article>`;
+}
+
+function evidencePreviewHtml({ title, url, summary }) {
+	const safeTitle = escapeHtml(title || '网页预览');
+	const safeUrl = escapeAttr(url || '');
+	const safeDisplayUrl = escapeHtml(url || '');
+	const safeSummary = escapeHtml(summary || '该来源没有可用的本地摘要。');
+	return `<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<style>
+			body{margin:0;padding:24px;font-family:Inter,Arial,sans-serif;color:#111827;background:#fff;line-height:1.65}
+			h1{font-size:20px;margin:0 0 12px}
+			p{margin:0 0 16px}
+			.notice{border:1px solid #d8dee8;border-radius:8px;padding:14px 16px;background:#f8fafc;color:#334155}
+			a{color:#2563eb;text-decoration:none;word-break:break-all}
+			.summary{white-space:pre-wrap}
+		</style>
+	</head>
+	<body>
+		<h1>${safeTitle}</h1>
+		<p><a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeDisplayUrl}</a></p>
+		<p class="notice">部分网站禁止被第三方页面嵌入预览。这里显示 Limira 已保存的来源摘要；需要查看原网页时，请使用右上角外部打开按钮。</p>
+		<div class="summary">${safeSummary}</div>
+	</body>
+</html>`;
 }
 
 function renderEntities() {

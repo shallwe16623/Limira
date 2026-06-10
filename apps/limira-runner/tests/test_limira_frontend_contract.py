@@ -372,6 +372,29 @@ def test_limira_standalone_frontend_keeps_pdf_download_bound_to_current_report()
     assert "导出并下载 PDF" in index
 
 
+def test_limira_standalone_archive_download_uses_authenticated_fetch():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    assert "dom.downloadArchiveButton.addEventListener('click', () => void downloadArchive());" in app
+    assert "async function downloadArchive()" in app
+    assert "async function downloadGeneratedArchive(url, filename)" in app
+    assert "accept: 'application/zip'" in app
+    assert "headers.set('authorization', `Bearer ${state.token}`);" in app
+    assert "credentials: 'include'" in app
+    assert "empty_archive_download" in app
+    assert "dom.downloadArchiveButton.disabled = state.restoreBlocked || !state.taskId;" in app
+
+
+def test_limira_standalone_evidence_preview_uses_local_srcdoc_fallback():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    assert "function evidencePreviewHtml({ title, url, summary })" in app
+    assert "dom.sandboxIframe.srcdoc = evidencePreviewHtml({ title, url, summary });" in app
+    assert "dom.sandboxIframe.removeAttribute('src');" in app
+    assert "部分网站禁止被第三方页面嵌入预览" in app
+    assert 'data-summary="${escapeAttr(summary)}"' in app
+
+
 def test_limira_standalone_hides_raw_event_log_and_keeps_progress_panel():
     app = _read(LIMIRA_STANDALONE_APP)
     index = _read(LIMIRA_STANDALONE_INDEX)
