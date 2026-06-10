@@ -243,11 +243,18 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/enterprise/usage" in app
     assert 'id="personalScopeButton"' in index
     assert 'id="enterpriseScopeButton"' in index
+    assert 'id="organizationCategorySelect"' in index
     assert 'id="organizationSelect"' in index
     assert 'id="enterpriseContactActions"' in index
     assert 'href="tel:+8617267052536"' in index
     assert 'href="mailto:admin@limira-inc.com"' in index
     assert "dom.enterpriseContactActions.classList.toggle('hidden', personalScope)" in app
+    assert "DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'public_institution'" in app
+    assert "DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'ndrc-international-cooperation-center'" in app
+    assert "renderOrganizationCategoryOptions()" in app
+    assert "organizationsForSelectedCategory()" in app
+    for category_label in ("事业单位", "高校", "智库", "国家部委", "地方政府"):
+        assert category_label in app
     assert 'id="enterpriseAdminPanel"' in index
     assert 'id="enterpriseMemberForm"' in index
     assert "/api/limira/auth/google/config" in app

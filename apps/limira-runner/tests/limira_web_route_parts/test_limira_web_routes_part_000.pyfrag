@@ -54,11 +54,30 @@ def test_limira_enterprise_auth_seeds_economic_unit_login_list(tmp_path, monkeyp
         "财政部",
         "商务部",
         "中国人民银行",
+        "北京大学新结构经济学研究院",
+        "南开大学新结构经济学研究中心",
+        "辽宁大学新结构经济学研究中心",
+        "北京市人民政府",
+        "吉林省人民政府",
+        "湖南省人民政府",
     } <= names
     assert by_slug["ndrc-general-office"] == "国家发展改革委办公厅"
+    assert by_slug["ndrc-international-cooperation-center"] == "国家发展改革委国际合作中心"
     assert by_slug["ndrc-price-monitoring-center"] == "国家发展改革委价格监测中心"
     assert by_slug["cass-economics-institute"] == "中国社会科学院经济研究所"
     assert len(organizations) >= len(limira.DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS)
+    by_name = {organization.name: organization for organization in organizations}
+    assert limira._limira_auth_organization_category(by_name["国家发展改革委办公厅"]) == "ministry"
+    assert (
+        limira._limira_auth_organization_category(
+            by_name["国家发展改革委国际合作中心"]
+        )
+        == "public_institution"
+    )
+    assert limira._limira_auth_organization_category(by_name["北京大学新结构经济学研究院"]) == "university"
+    assert limira._limira_auth_organization_category(by_name["国务院发展研究中心"]) == "think_tank"
+    assert limira._limira_auth_organization_category(by_name["财政部"]) == "ministry"
+    assert limira._limira_auth_organization_category(by_name["北京市人民政府"]) == "local_government"
 
 
 def _latest_auth_link_token(outbox_path: Path, query_key: str) -> str:
@@ -412,10 +431,13 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
             "id": organization.id,
             "name": "Example Intelligence Unit",
             "slug": "example-unit",
+            "category": "public_institution",
+            "category_label": "事业单位",
             "billing_mode": "metered",
         } in listed_organizations
         listed_names = {listed["name"] for listed in listed_organizations}
         assert "国家发展改革委办公厅" in listed_names
+        assert "国家发展改革委国际合作中心" in listed_names
         assert "中国社会科学院经济研究所" in listed_names
 
         personal_signin = await client.post(

@@ -12,6 +12,7 @@ def _limira_wechat_oauth_userinfo_url(env: Any = os.environ) -> str:
 
 
 DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS: tuple[tuple[str, str, str], ...] = (
+    ("builtin-ministry-national-development-reform-commission", "国家发展和改革委员会", "ministry-national-development-reform-commission"),
     ("builtin-ndrc-general-office", "国家发展改革委办公厅", "ndrc-general-office"),
     ("builtin-ndrc-policy-research-office", "国家发展改革委政策研究室", "ndrc-policy-research-office"),
     ("builtin-ndrc-development-planning", "国家发展改革委发展战略和规划司", "ndrc-development-planning"),
@@ -79,7 +80,107 @@ DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS: tuple[tuple[str, str, str], ...] = (
     ("builtin-ministry-industry-information-technology", "工业和信息化部", "ministry-industry-information-technology"),
     ("builtin-peoples-bank-china", "中国人民银行", "peoples-bank-china"),
     ("builtin-national-data-administration", "国家数据局", "national-data-administration"),
+    ("builtin-pku-new-structural-economics-institute", "北京大学新结构经济学研究院", "pku-new-structural-economics-institute"),
+    ("builtin-nankai-new-structural-economics-center", "南开大学新结构经济学研究中心", "nankai-new-structural-economics-center"),
+    ("builtin-liaoning-new-structural-economics-center", "辽宁大学新结构经济学研究中心", "liaoning-new-structural-economics-center"),
+    ("builtin-university-nottingham-ningbo-new-structural-economics-center", "宁波新结构经济学研究中心", "university-nottingham-ningbo-new-structural-economics-center"),
+    ("builtin-hohai-new-structural-economics-center", "河海大学新结构经济学研究中心", "hohai-new-structural-economics-center"),
+    ("builtin-xian-jiaotong-new-structural-economics-center", "西安交通大学新结构经济学研究中心", "xian-jiaotong-new-structural-economics-center"),
+    ("builtin-central-finance-economics-new-structural-economics-center", "中央财经大学新结构经济学研究中心", "central-finance-economics-new-structural-economics-center"),
+    ("builtin-fuzhou-new-structural-economics-center", "福州大学新结构经济学研究中心", "fuzhou-new-structural-economics-center"),
+    ("builtin-northwest-new-structural-silk-road-development-center", "西北大学新结构丝路发展研究中心", "northwest-new-structural-silk-road-development-center"),
+    ("builtin-jilin-new-structural-economics-center", "吉林大学新结构经济学研究中心", "jilin-new-structural-economics-center"),
+    ("builtin-nanchang-new-structural-economics-institute", "南昌大学新结构经济学研究院", "nanchang-new-structural-economics-institute"),
+    ("builtin-zhengzhou-new-structural-economics-institute", "郑州大学新结构经济学研究院", "zhengzhou-new-structural-economics-institute"),
+    ("builtin-xinjiang-finance-economics-new-structural-economics-center", "新疆财经大学新结构经济学研究中心", "xinjiang-finance-economics-new-structural-economics-center"),
+    ("builtin-beijing-municipal-government", "北京市人民政府", "beijing-municipal-government"),
+    ("builtin-jilin-provincial-government", "吉林省人民政府", "jilin-provincial-government"),
+    ("builtin-hunan-provincial-government", "湖南省人民政府", "hunan-provincial-government"),
 )
+
+
+LIMIRA_ORGANIZATION_CATEGORIES = {
+    "ministry": "国家部委",
+    "public_institution": "事业单位",
+    "think_tank": "智库",
+    "university": "高校",
+    "local_government": "地方政府",
+}
+
+LIMIRA_ORGANIZATION_DEFAULT_CATEGORY = "public_institution"
+
+LIMIRA_ORGANIZATION_CATEGORY_BY_ID = {
+    "builtin-ministry-national-development-reform-commission": "ministry",
+    "builtin-ministry-finance": "ministry",
+    "builtin-peoples-bank-china": "ministry",
+    "builtin-ministry-commerce": "ministry",
+    "builtin-ministry-industry-information-technology": "ministry",
+    "builtin-national-bureau-statistics": "ministry",
+    "builtin-national-data-administration": "ministry",
+    "builtin-drc-state-council": "think_tank",
+    "builtin-cciee": "think_tank",
+    "builtin-cass-economics-institute": "think_tank",
+    "builtin-cass-industrial-economics-institute": "think_tank",
+    "builtin-cass-rural-development-institute": "think_tank",
+    "builtin-cass-naes": "think_tank",
+    "builtin-cass-finance-institute": "think_tank",
+    "builtin-cass-quantitative-technical-economics-institute": "think_tank",
+    "builtin-cass-population-labor-economics-institute": "think_tank",
+    "builtin-cass-ecological-civilization-institute": "think_tank",
+    "builtin-pku-new-structural-economics-institute": "university",
+    "builtin-nankai-new-structural-economics-center": "university",
+    "builtin-liaoning-new-structural-economics-center": "university",
+    "builtin-university-nottingham-ningbo-new-structural-economics-center": "university",
+    "builtin-hohai-new-structural-economics-center": "university",
+    "builtin-xian-jiaotong-new-structural-economics-center": "university",
+    "builtin-central-finance-economics-new-structural-economics-center": "university",
+    "builtin-fuzhou-new-structural-economics-center": "university",
+    "builtin-northwest-new-structural-silk-road-development-center": "university",
+    "builtin-jilin-new-structural-economics-center": "university",
+    "builtin-nanchang-new-structural-economics-institute": "university",
+    "builtin-zhengzhou-new-structural-economics-institute": "university",
+    "builtin-xinjiang-finance-economics-new-structural-economics-center": "university",
+    "builtin-beijing-municipal-government": "local_government",
+    "builtin-jilin-provincial-government": "local_government",
+    "builtin-hunan-provincial-government": "local_government",
+}
+LIMIRA_ORGANIZATION_CATEGORY_BY_ID.update(
+    {
+        "builtin-ndrc-general-office": "ministry",
+        "builtin-ndrc-policy-research-office": "ministry",
+        "builtin-ndrc-development-planning": "ministry",
+        "builtin-ndrc-national-economy": "ministry",
+        "builtin-ndrc-economic-operation": "ministry",
+        "builtin-ndrc-reform": "ministry",
+        "builtin-ndrc-fixed-asset-investment": "ministry",
+        "builtin-ndrc-foreign-investment": "ministry",
+        "builtin-ndrc-regional-economy": "ministry",
+        "builtin-ndrc-regional-revitalization": "ministry",
+        "builtin-ndrc-regional-opening": "ministry",
+        "builtin-ndrc-rural-economy": "ministry",
+        "builtin-ndrc-infrastructure": "ministry",
+        "builtin-ndrc-industrial-development": "ministry",
+        "builtin-ndrc-innovation-high-tech": "ministry",
+        "builtin-ndrc-resource-conservation": "ministry",
+        "builtin-ndrc-social-development": "ministry",
+        "builtin-ndrc-employment-income-consumption": "ministry",
+        "builtin-ndrc-economic-trade": "ministry",
+        "builtin-ndrc-fiscal-finance-credit": "ministry",
+        "builtin-ndrc-price": "ministry",
+        "builtin-ndrc-laws-regulations": "ministry",
+        "builtin-ndrc-international-cooperation": "ministry",
+        "builtin-ndrc-personnel": "ministry",
+        "builtin-ndrc-economic-defense": "ministry",
+        "builtin-ndrc-evaluation-supervision": "ministry",
+        "builtin-ndrc-party-committee": "ministry",
+        "builtin-ndrc-retired-cadres": "ministry",
+    }
+)
+
+LIMIRA_ORGANIZATION_CATEGORY_BY_SLUG = {
+    slug: LIMIRA_ORGANIZATION_CATEGORY_BY_ID.get(organization_id, LIMIRA_ORGANIZATION_DEFAULT_CATEGORY)
+    for organization_id, _name, slug in DEFAULT_LIMIRA_ENTERPRISE_ORGANIZATIONS
+}
 
 
 def _limira_auth_connect(env: Any = os.environ) -> sqlite3.Connection:
@@ -1265,12 +1366,23 @@ def _limira_auth_upsert_wechat_user(
 def _limira_auth_public_organization(
     organization: LimiraAuthOrganization,
 ) -> dict[str, Any]:
+    category = _limira_auth_organization_category(organization)
     return {
         "id": organization.id,
         "name": organization.name,
         "slug": organization.slug,
+        "category": category,
+        "category_label": LIMIRA_ORGANIZATION_CATEGORIES[category],
         "billing_mode": organization.billing_mode,
     }
+
+
+def _limira_auth_organization_category(organization: LimiraAuthOrganization) -> str:
+    return (
+        LIMIRA_ORGANIZATION_CATEGORY_BY_ID.get(organization.id)
+        or LIMIRA_ORGANIZATION_CATEGORY_BY_SLUG.get(str(organization.slug or ""))
+        or LIMIRA_ORGANIZATION_DEFAULT_CATEGORY
+    )
 
 
 def _limira_auth_get_organization(

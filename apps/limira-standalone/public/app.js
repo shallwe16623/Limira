@@ -75,6 +75,16 @@ const SCENARIO_TEXT = {
 	}
 };
 
+const ORGANIZATION_CATEGORY_OPTIONS = [
+	{ value: 'public_institution', label: '事业单位' },
+	{ value: 'university', label: '高校' },
+	{ value: 'think_tank', label: '智库' },
+	{ value: 'ministry', label: '国家部委' },
+	{ value: 'local_government', label: '地方政府' }
+];
+const DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY = 'public_institution';
+const DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'ndrc-international-cooperation-center';
+
 const state = {
 	authScope: 'personal',
 	authMode: 'signin',
@@ -84,6 +94,7 @@ const state = {
 	googleAuthEnabled: false,
 	wechatAuthEnabled: false,
 	organizations: [],
+	selectedOrganizationCategory: DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY,
 	selectedOrganizationId: '',
 	enterpriseMembers: [],
 	enterpriseUsage: null,
@@ -139,6 +150,13 @@ function bindEvents() {
 	dom.enterpriseScopeButton.addEventListener('click', () => setAuthScope('enterprise'));
 	dom.signinModeButton.addEventListener('click', () => setAuthMode('signin'));
 	dom.signupModeButton.addEventListener('click', () => setAuthMode('signup'));
+	dom.organizationCategorySelect.addEventListener('change', () => {
+		state.selectedOrganizationCategory =
+			dom.organizationCategorySelect.value || DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY;
+		state.selectedOrganizationId = '';
+		selectDefaultOrganizationForCategory();
+		renderOrganizationOptions();
+	});
 	dom.organizationSelect.addEventListener('change', () => {
 		state.selectedOrganizationId = dom.organizationSelect.value;
 	});
@@ -258,8 +276,11 @@ function renderAuthMode() {
 	dom.authModeControl.classList.toggle('hidden', !personalScope);
 	dom.signinModeButton.classList.toggle('active', state.authMode === 'signin');
 	dom.signupModeButton.classList.toggle('active', state.authMode === 'signup');
+	dom.organizationCategoryLabel.classList.toggle('hidden', personalScope);
 	dom.organizationLabel.classList.toggle('hidden', personalScope);
 	dom.enterpriseContactActions.classList.toggle('hidden', personalScope);
+	renderOrganizationCategoryOptions();
+	selectDefaultOrganizationForCategory();
 	dom.organizationSelect.disabled = personalScope;
 	dom.organizationSelect.required = !personalScope;
 	renderOrganizationOptions();
@@ -308,13 +329,12 @@ async function loadAuthOptions() {
 		state.organizations = Array.isArray(organizations?.organizations)
 			? organizations.organizations
 			: [];
-		if (!state.selectedOrganizationId && state.organizations[0]) {
-			state.selectedOrganizationId = state.organizations[0].id;
-		}
+		selectDefaultOrganizationForCategory();
 	} catch {
 		state.googleAuthEnabled = false;
 		state.wechatAuthEnabled = false;
 		state.organizations = [];
+		state.selectedOrganizationId = '';
 	}
 }
 
@@ -322,6 +342,7 @@ function setAuthScope(scope) {
 	state.authScope = scope === 'enterprise' ? 'enterprise' : 'personal';
 	if (state.authScope === 'enterprise') {
 		state.authMode = 'signin';
+		selectDefaultOrganizationForCategory();
 	}
 	dom.authMessage.textContent = '';
 	renderAuthMode();
@@ -337,17 +358,55 @@ function renderOrganizationOptions() {
 	if (!dom.organizationSelect) {
 		return;
 	}
-	if (!state.organizations.length) {
+	const organizations = organizationsForSelectedCategory();
+	if (!organizations.length) {
 		dom.organizationSelect.innerHTML = '<option value="">暂无可选单位</option>';
+		state.selectedOrganizationId = '';
 		return;
 	}
-	dom.organizationSelect.innerHTML = state.organizations
+	dom.organizationSelect.innerHTML = organizations
 		.map((organization) => {
 			const id = String(organization.id || '');
 			const selected = id === state.selectedOrganizationId ? ' selected' : '';
 			return `<option value="${escapeAttr(id)}"${selected}>${escapeHtml(organization.name || id)}</option>`;
 		})
 		.join('');
+}
+
+function renderOrganizationCategoryOptions() {
+	if (!dom.organizationCategorySelect) {
+		return;
+	}
+	dom.organizationCategorySelect.innerHTML = ORGANIZATION_CATEGORY_OPTIONS
+		.map((category) => {
+			const selected = category.value === state.selectedOrganizationCategory ? ' selected' : '';
+			return `<option value="${escapeAttr(category.value)}"${selected}>${escapeHtml(category.label)}</option>`;
+		})
+		.join('');
+}
+
+function organizationsForSelectedCategory() {
+	return state.organizations.filter(
+		(organization) =>
+			String(organization.category || DEFAULT_ENTERPRISE_ORGANIZATION_CATEGORY) ===
+			state.selectedOrganizationCategory
+	);
+}
+
+function selectDefaultOrganizationForCategory() {
+	const selectedStillVisible = organizationsForSelectedCategory().some(
+		(organization) => String(organization.id || '') === state.selectedOrganizationId
+	);
+	if (selectedStillVisible) {
+		return;
+	}
+	const preferred = state.organizations.find(
+		(organization) =>
+			String(organization.slug || '') === DEFAULT_ENTERPRISE_ORGANIZATION_SLUG &&
+			String(organization.category || '') === state.selectedOrganizationCategory
+	);
+	const fallback = preferred || organizationsForSelectedCategory()[0];
+	state.selectedOrganizationId = fallback ? String(fallback.id || '') : '';
 }
 
 function googleSignIn() {
