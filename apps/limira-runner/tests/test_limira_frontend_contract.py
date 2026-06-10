@@ -278,6 +278,11 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="enterpriseAdminPanel"' in index
     assert 'id="enterpriseMemberForm"' in index
     assert '<option value="admin">管理员</option>' not in index
+    assert 'id="scenarioSelect"' not in index
+    assert 'id="useScenarioButton"' not in index
+    assert "填入模板" not in index
+    assert "关键矿产竞争" not in app
+    assert "scenario: state.selectedScenario" not in app
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
     assert "/api/limira/auth/wechat/config" in app

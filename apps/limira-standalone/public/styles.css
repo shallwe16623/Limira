@@ -409,23 +409,6 @@ label {
 }
 .upload-trigger { cursor: pointer; }
 
-.scenario-selector {
-	display: flex;
-	align-items: center;
-	gap: 0.5rem;
-	flex: 1;
-}
-.subtle-select {
-	background: transparent;
-	border: none;
-	padding: 0.25rem;
-	font-size: 0.85rem;
-	color: var(--muted);
-	width: auto;
-	box-shadow: none;
-}
-.subtle-select:focus { box-shadow: none; border: none; }
-
 .chat-input-wrapper {
 	display: flex;
 	align-items: flex-end;

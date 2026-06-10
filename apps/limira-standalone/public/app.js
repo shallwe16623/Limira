@@ -39,42 +39,6 @@ const LEGACY_TAB_LABELS = {
 	Map: '地图',
 	Report: '报告'
 };
-const SCENARIO_TEXT = {
-	sanctions_export_controls: {
-		title: '制裁与出口管制',
-		description: '跟踪影响企业、行业或供应链的制裁、出口管制、实体清单和许可变化。',
-		focus: [
-			'官方制裁、出口管制、实体清单和许可通知',
-			'受影响公司、中间商、司法辖区和供应链关系',
-			'生效日期、执法节点和合规期限',
-			'冲突或不明确说法的来源支持置信度分级'
-		],
-		defaultQuery: '分析近期影响半导体供应链的制裁与出口管制变化。'
-	},
-	geopolitical_risk_assessment: {
-		title: '地缘政治风险评估',
-		description: '评估可能影响市场、供应链或运营资产的地缘政治风险。',
-		focus: [
-			'近期官方公告、事件、制裁和监管动作',
-			'国家与非国家行为体、联盟、关键瓶颈和暴露资产',
-			'风险升级、缓和和缓释措施的时间线',
-			'可信坐标或地图为空的明确理由'
-		],
-		defaultQuery: '评估近期红海航运风险对能源与制造业供应链的影响。'
-	},
-	critical_minerals_competition: {
-		title: '关键矿产竞争',
-		description: '梳理关键矿产项目、包销协议、加工能力、政策动作和战略关键瓶颈。',
-		focus: [
-			'可核验位置的矿山、炼厂、加工和运输资产',
-			'政府政策、投资审查、补贴和贸易限制',
-			'公司、国有资本、包销协议和供应链依赖',
-			'项目与关键瓶颈的证据支持时间线和地图'
-		],
-		defaultQuery: '分析近期国际锂和镍供应链竞争，包括项目、政策变化和关键瓶颈。'
-	}
-};
-
 const ORGANIZATION_CATEGORY_OPTIONS = [
 	{ value: 'enterprise', label: '企业' },
 	{ value: 'public_institution', label: '事业单位' },
@@ -101,8 +65,6 @@ const state = {
 	enterpriseUsage: null,
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
-	scenarios: [],
-	selectedScenario: '',
 	savedUserId: '',
 	query: '',
 	taskId: '',
@@ -184,12 +146,6 @@ function bindEvents() {
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
-	dom.scenarioSelect.addEventListener('change', () => {
-		state.selectedScenario = dom.scenarioSelect.value;
-		saveWorkspace();
-		renderScenario();
-	});
-	dom.useScenarioButton.addEventListener('click', useScenarioQuery);
 	dom.researchForm.addEventListener('submit', (event) => {
 		event.preventDefault();
 		void submitResearch();
@@ -245,7 +201,6 @@ async function boot() {
 	await loadAuthOptions();
 	const authLinkState = await handleAuthLinkTokens();
 	if (authLinkState === 'signed-in') {
-		await loadScenarios();
 		await loadTaskHistory();
 		await resumeWorkspace();
 		renderShell();
@@ -257,7 +212,6 @@ async function boot() {
 	}
 	try {
 		await loadSession();
-		await loadScenarios();
 		await loadTaskHistory();
 		await loadEnterpriseAdmin();
 		await resumeWorkspace();
@@ -285,7 +239,6 @@ function renderShell() {
 	renderAuthMode();
 	renderStatus();
 	renderHistory();
-	renderScenarios();
 	renderMessages();
 	renderTabs();
 	renderUploads();
@@ -526,7 +479,6 @@ async function authenticate() {
 async function finishAuthenticated(user) {
 	setUser(user);
 	dom.authMessage.textContent = '';
-	await loadScenarios();
 	await loadTaskHistory();
 	await loadUploads();
 	await loadEnterpriseAdmin();
@@ -841,9 +793,6 @@ function taskHistoryTitle(task) {
 
 function taskHistoryMeta(task) {
 	const parts = [statusLabel(task.status), `归档${archiveStatusLabel(task.archive_status)}`];
-	if (task.scenario) {
-		parts.push(task.scenario);
-	}
 	return parts.filter(Boolean).join(' · ');
 }
 
@@ -877,7 +826,6 @@ function restoreWorkspace() {
 	if (!saved || typeof saved !== 'object') {
 		return;
 	}
-	state.selectedScenario = typeof saved.selectedScenario === 'string' ? saved.selectedScenario : '';
 	state.savedUserId = typeof saved.userId === 'string' ? saved.userId : '';
 	state.taskId = typeof saved.taskId === 'string' ? saved.taskId : '';
 	state.status = typeof saved.status === 'string' ? saved.status : 'ready';
@@ -905,7 +853,6 @@ function restoreWorkspace() {
 function saveWorkspace() {
 	const payload = {
 		userId: state.user?.id || state.savedUserId || '',
-		selectedScenario: state.selectedScenario,
 		taskId: state.taskId,
 		status: state.status,
 		archiveStatus: state.archiveStatus,
@@ -987,48 +934,6 @@ async function signOut() {
 	renderShell();
 }
 
-async function loadScenarios() {
-	const data = await api('/api/limira/scenarios');
-	state.scenarios = Array.isArray(data.scenarios) ? data.scenarios : [];
-	if (!state.selectedScenario && state.scenarios[0]) {
-		state.selectedScenario = state.scenarios[0].id;
-	}
-	renderScenarios();
-}
-
-function renderScenarios() {
-	dom.scenarioSelect.innerHTML = state.scenarios
-		.map(
-			(scenario) =>
-				`<option value="${escapeHtml(scenario.id)}"${scenario.id === state.selectedScenario ? ' selected' : ''}>${escapeHtml(scenarioTitle(scenario))}</option>`
-		)
-		.join('');
-	renderScenario();
-}
-
-function renderScenario() {
-	const scenario = selectedScenario();
-	if (!scenario) {
-		dom.scenarioDetails.textContent = '尚未加载场景信息。';
-		return;
-	}
-	const focus = scenarioFocus(scenario).join(' · ');
-	dom.scenarioDetails.innerHTML = `<strong>${escapeHtml(scenarioDescription(scenario))}</strong>${
-		focus ? `<br>${escapeHtml(focus)}` : ''
-	}`;
-}
-
-function selectedScenario() {
-	return state.scenarios.find((scenario) => scenario.id === state.selectedScenario) || state.scenarios[0];
-}
-
-function useScenarioQuery() {
-	const scenario = selectedScenario();
-	if (scenario) {
-		dom.queryInput.value = scenarioDefaultQuery(scenario);
-	}
-}
-
 async function submitResearch() {
 	const query = dom.queryInput.value.trim();
 	if (!query || state.isSubmitting) {
@@ -1058,10 +963,7 @@ async function submitResearch() {
 	try {
 		const task = await api('/api/limira/research', {
 			method: 'POST',
-			body: {
-				query,
-				scenario: state.selectedScenario || undefined
-			}
+			body: { query }
 		});
 		if (!state.isSubmitting || !isCurrentAsyncContext(context)) {
 			return;
@@ -2437,26 +2339,6 @@ function eventLabel(eventType) {
 		report_section_generated: '报告章节已生成'
 	};
 	return labels[eventType] || eventType;
-}
-
-function scenarioText(scenario) {
-	return SCENARIO_TEXT[scenario?.id] || {};
-}
-
-function scenarioTitle(scenario) {
-	return scenarioText(scenario).title || scenario?.title || '';
-}
-
-function scenarioDescription(scenario) {
-	return scenarioText(scenario).description || scenario?.description || '';
-}
-
-function scenarioFocus(scenario) {
-	return scenarioText(scenario).focus || (Array.isArray(scenario?.focus_areas) ? scenario.focus_areas : []);
-}
-
-function scenarioDefaultQuery(scenario) {
-	return scenarioText(scenario).defaultQuery || scenario?.default_query || '';
 }
 
 function now() {
