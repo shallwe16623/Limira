@@ -7359,6 +7359,106 @@ async def test_record_research_artifact_tool_call_reaches_artifacts_and_archive_
 
 
 @pytest.mark.asyncio
+async def test_tool_evidence_ledger_events_reach_artifacts_and_archive_trace():
+    from limira_tools.limira_evidence import ToolEvidenceLedger
+    from pipeline_helpers import expand_stream_message
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    ledger = ToolEvidenceLedger(task_id="runner-task-a")
+    runner_events = []
+    runner_events.extend(
+        expand_stream_message(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": "call-search",
+                    "tool_name": "google_search",
+                    "tool_input": {"q": "BYD 1260H"},
+                },
+            },
+            evidence_ledger=ledger,
+        )
+    )
+    runner_events.extend(
+        expand_stream_message(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": "call-search",
+                    "tool_name": "google_search",
+                    "tool_input": {
+                        "result": json.dumps(
+                            {
+                                "organic": [
+                                    {
+                                        "title": "DoD 1260H List",
+                                        "link": "https://example.test/dod-1260h.pdf",
+                                        "snippet": "Official list entry summary.",
+                                    }
+                                ],
+                                "searchParameters": {"q": "BYD 1260H"},
+                            }
+                        )
+                    },
+                },
+            },
+            evidence_ledger=ledger,
+        )
+    )
+    research = FakeResearchClient(events=runner_events)
+
+    created = await limira.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    evidence_event = next(
+        event for event in events if event["type"] == "evidence_collected"
+    )
+    assert evidence_event["payload"]["source_event_type"] == "tool_evidence_ledger"
+    assert evidence_event["payload"]["source_type"] == "web_search_result"
+    assert evidence_event["payload"]["query"] == "BYD 1260H"
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    evidence = artifacts["evidence"][0]
+    assert evidence["evidence_id"].startswith("EVID-")
+    assert evidence["title"] == "DoD 1260H List"
+    assert evidence["source_url"] == "https://example.test/dod-1260h.pdf"
+    assert evidence["summary"] == "Official list entry summary."
+    assert evidence["source_event_type"] == "tool_evidence_ledger"
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+
+    assert trace["artifacts"]["evidence"][0]["title"] == "DoD 1260H List"
+    assert trace["artifact_events"][0]["type"] == "evidence_collected"
+    assert trace["artifact_events"][0]["source_event_type"] == "tool_evidence_ledger"
+    assert trace["artifact_events"][0]["local_artifact_id"].startswith("EVID-")
+    assert trace["artifact_warnings"] == []
+    _assert_no_browser_leak(trace)
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_records_runtime_state_to_redis():
     repo = limira.InMemoryLimiraTaskRepository()
     user = limira.LimiraUser("user-a")

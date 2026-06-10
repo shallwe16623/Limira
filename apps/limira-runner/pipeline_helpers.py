@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from typing import AsyncGenerator, List, Optional
 from dotenv import load_dotenv
 from hydra import compose, initialize_config_dir
 from limira_artifacts import artifact_event_from_tool_call
+from limira_tools.limira_evidence import ToolEvidenceLedger
 from omegaconf import DictConfig
 from prompt_patch import apply_prompt_patch
 from src.config.settings import expose_sub_agents_as_tools
@@ -271,6 +273,25 @@ def filter_message(message: dict) -> dict:
     return message
 
 
+def expand_stream_message(
+    message: dict,
+    *,
+    evidence_ledger: ToolEvidenceLedger | None = None,
+) -> list[dict]:
+    """Filter one runner message and append derived evidence events.
+
+    Existing stream behavior is preserved by keeping the filtered original event
+    first. Tool-layer evidence is appended so reports and archives can persist
+    source records even when the model does not call the artifact recorder.
+    """
+
+    filtered = filter_message(copy.deepcopy(message))
+    expanded = [filtered]
+    if evidence_ledger is not None:
+        expanded.extend(evidence_ledger.events_from_message(message))
+    return expanded
+
+
 async def stream_events_optimized(
     task_id: str, query: str, _: Optional[dict] = None, disconnect_check=None
 ) -> AsyncGenerator[dict, None]:
@@ -294,12 +315,17 @@ async def stream_events_optimized(
                 def __init__(self, thread_queue, cancel_event):
                     self.thread_queue = thread_queue
                     self.cancel_event = cancel_event
+                    self.evidence_ledger = ToolEvidenceLedger(task_id=workflow_id)
 
                 async def put(self, item):
                     if self.cancel_event.is_set():
                         logger.info("Pipeline cancelled, stopping execution")
                         return
-                    self.thread_queue.put_nowait_threadsafe(filter_message(item))
+                    for message in expand_stream_message(
+                        item,
+                        evidence_ledger=self.evidence_ledger,
+                    ):
+                        self.thread_queue.put_nowait_threadsafe(message)
 
             wrapper_queue = ThreadQueueWrapper(stream_queue, cancel_event)
 
