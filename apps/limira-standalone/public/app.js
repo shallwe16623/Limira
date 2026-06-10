@@ -2022,7 +2022,7 @@ function evidenceCard(item, index) {
 			${item.confidence ? `<span>置信度 ${escapeHtml(item.confidence)}</span>` : ''}
 			${item.published_at ? `<span>${escapeHtml(item.published_at)}</span>` : ''}
 		</div>
-		<div class="artifact-body">${escapeHtml(summary)}</div>
+		<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>
 		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
 	</article>`;
 }
@@ -2031,7 +2031,7 @@ function evidencePreviewHtml({ title, url, summary }) {
 	const safeTitle = escapeHtml(title || '网页预览');
 	const safeUrl = escapeAttr(url || '');
 	const safeDisplayUrl = escapeHtml(url || '');
-	const safeSummary = escapeHtml(summary || '该来源没有可用的本地摘要。');
+	const safeSummary = renderMarkdown(summary || '该来源没有可用的本地摘要。');
 	return `<!doctype html>
 <html lang="zh-CN">
 	<head>
@@ -2043,7 +2043,13 @@ function evidencePreviewHtml({ title, url, summary }) {
 			p{margin:0 0 16px}
 			.notice{border:1px solid #d8dee8;border-radius:8px;padding:14px 16px;background:#f8fafc;color:#334155}
 			a{color:#2563eb;text-decoration:none;word-break:break-all}
-			.summary{white-space:pre-wrap}
+			.summary{line-height:1.65}
+			.summary h1,.summary h2,.summary h3{font-size:16px;margin:16px 0 8px}
+			.summary p{margin:0 0 12px}
+			.summary ul,.summary ol{padding-left:20px;margin:0 0 12px}
+			.summary li{margin:4px 0}
+			.summary table{border-collapse:collapse;width:100%;margin:0 0 12px}
+			.summary th,.summary td{border:1px solid #d8dee8;padding:6px 8px;text-align:left}
 		</style>
 	</head>
 	<body>

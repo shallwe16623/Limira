@@ -430,6 +430,8 @@ def test_limira_standalone_evidence_preview_uses_local_srcdoc_fallback():
     assert "dom.sandboxIframe.removeAttribute('src');" in app
     assert "部分网站禁止被第三方页面嵌入预览" in app
     assert 'data-summary="${escapeAttr(summary)}"' in app
+    assert '<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>' in app
+    assert "const safeSummary = renderMarkdown(summary || '该来源没有可用的本地摘要。');" in app
 
 
 def test_limira_standalone_hides_raw_event_log_and_keeps_progress_panel():

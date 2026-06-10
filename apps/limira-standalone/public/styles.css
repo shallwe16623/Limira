@@ -401,7 +401,39 @@ label {
 .artifact-card:last-child { border-bottom: none; }
 .artifact-title { font-size: 1.25rem; font-weight: 600; color: var(--text); margin-bottom: 0.5rem; }
 .artifact-meta { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; font-size: 0.8rem; color: var(--muted); }
-.artifact-body { font-size: 0.95rem; line-height: 1.7; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.artifact-body { font-size: 0.95rem; line-height: 1.7; color: var(--text); word-break: break-word; }
+
+.artifact-body:not(.markdown-body) {
+	white-space: pre-wrap;
+}
+
+.compact-markdown h1,
+.compact-markdown h2,
+.compact-markdown h3 {
+	margin-top: 0.9rem;
+	margin-bottom: 0.35rem;
+	font-size: 1rem;
+}
+
+.compact-markdown h1:first-child,
+.compact-markdown h2:first-child,
+.compact-markdown h3:first-child,
+.compact-markdown p:first-child,
+.compact-markdown ul:first-child,
+.compact-markdown ol:first-child {
+	margin-top: 0;
+}
+
+.compact-markdown p,
+.compact-markdown ul,
+.compact-markdown ol,
+.compact-markdown table {
+	margin-bottom: 0.75rem;
+}
+
+.compact-markdown > :last-child {
+	margin-bottom: 0;
+}
 
 /* Bottom Input Area */
 .input-container {
