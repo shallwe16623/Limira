@@ -2282,6 +2282,19 @@ function renderMessages() {
 		)
 		.join('');
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
+	scrollConversationToBottom();
+}
+
+function scrollConversationToBottom() {
+	if (!dom.workspaceContent || isArtifactView()) {
+		return;
+	}
+	window.requestAnimationFrame(() => {
+		dom.workspaceContent.scrollTo({
+			top: dom.workspaceContent.scrollHeight,
+			behavior: 'smooth'
+		});
+	});
 }
 
 function renderThinking() {

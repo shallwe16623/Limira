@@ -426,8 +426,10 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
     assert ".tabs {\n\tz-index: 8;" in styles
     assert "bottom: 7.15rem;" not in styles
-    assert ".scrollable-canvas.conversation-mode .input-container" in styles
-    assert ".scrollable-canvas.artifact-mode .input-container" in styles
+    assert ".input-container {\n\tposition: absolute;" in styles
+    assert ".input-container .tabs" in styles
+    assert "function scrollConversationToBottom()" in app
+    assert "dom.workspaceContent.scrollTo({\n\t\t\ttop: dom.workspaceContent.scrollHeight," in app
     assert "const top = Math.max(0, dom.conversationPanel.offsetTop - 16);" in app
     assert "dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });" in app
     assert ".conversation-panel.compact .message-list-bottom {\n\tmax-height: none;" in styles
