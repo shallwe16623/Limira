@@ -366,6 +366,9 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     styles = _read(LIMIRA_STANDALONE_STYLES)
 
     assert 'id="historyList"' in index
+    assert 'id="conversationNavigator"' in index
+    assert 'id="conversationNavigatorList"' in index
+    assert 'id="conversationNavigatorPreview"' in index
     assert 'id="historyMessage"' in index
     assert 'id="newChatButton"' in index
     assert 'id="refreshHistoryButton"' in index
@@ -405,11 +408,15 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert ".conversation-panel {\n\twidth: 100%;" in styles
     assert ".conversation-panel {\n\twidth: 100%;\n\tmax-width: 880px;\n\tmargin: 0 auto;\n\tdisplay: flex;\n\tflex-direction: column;\n\tgap: 0.9rem;\n}" in styles
     assert ".thinking-list {\n\tdisplay: grid;\n\tgap: 0.85rem;\n\toverflow: visible;\n\tpadding: 1rem;\n}" in styles
+    assert ".task-thinking-panel" in styles
+    assert ".conversation-navigator" in styles
+    assert ".conversation-navigator-line" in styles
+    assert ".conversation-navigator-preview" in styles
     assert "max-height: min(52vh, 560px);" not in styles
     assert "overscroll-behavior-y: auto;" not in styles
     assert "scrollbar-gutter: stable;" not in styles
     assert "overscroll-behavior: contain;" not in styles
-    render_messages_block = app[app.index("function renderMessages()") : app.index("function latestUserMessageIndex()")]
+    render_messages_block = app[app.index("function renderMessages(options = {})") : app.index("function latestUserMessageIndex()")]
     assert "message-meta" not in render_messages_block
     assert "roleLabel(message.role)" not in render_messages_block
     assert "message.time" not in render_messages_block
@@ -438,7 +445,25 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "state.taskHistory = collapseCurrentConversationHistory(Array.isArray(data.tasks) ? data.tasks : []);" in app
     assert "async function loadTaskProgressRecords()" in app
     assert "function rebuildThinkingFromProgressRecords(records)" in app
+    assert "function thinkingStepsFromProgressRecords(records, taskId)" in app
     assert "function appendProgressRecordThinkingStep(record)" in app
+    assert "thinkingStepsByTaskId: {}" in app
+    assert "thinkingCollapsedByTaskId: {}" in app
+    assert "function renderTaskThinkingPanel(message)" in app
+    assert "function ensureReportThinkingSnapshots()" in app
+    assert "async function loadTaskThinkingSnapshot(taskId)" in app
+    assert "state.thinkingStepsByTaskId = {" in app
+    assert "rememberTaskThinkingSteps(state.taskId);" in app
+    assert "thinkingStepsByTaskId: savedThinkingStepsByTaskId()" in app
+    assert "function renderMessages(options = {})" in app
+    assert "preserveScroll" in app
+    assert "function handleWorkspaceScroll()" in app
+    assert "function renderConversationNavigator()" in app
+    assert "function conversationNavigationItems()" in app
+    assert "function scrollToConversationMessage(index)" in app
+    assert "data-navigator-message-index" in app
+    assert "dom.workspaceContent.addEventListener('scroll', handleWorkspaceScroll);" in app
+    assert "conversationNavigatorVisible" in app
     assert "function selectHistoryTask(taskId)" in app
     assert "function startNewChat()" in app
     assert "function switchToWorkspaceRoute()" in app
@@ -479,7 +504,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
     assert "message.kind === 'report' && String(message.taskId || '') === taskId" in app
     assert "taskId" in app[app.index("function upsertReportMessage(content)") : app.index("function appendThinkingStep")]
-    render_messages_block = app[app.index("function renderMessages()") : app.index("function latestUserMessageIndex()")]
+    render_messages_block = app[app.index("function renderMessages(options = {})") : app.index("function latestUserMessageIndex()")]
     assert "function messageBelongsToCurrentTask(message)" in app
     assert "function renderReportTaskControls(message)" in app
     assert "data-report-task-id" in app
@@ -604,7 +629,8 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "function initialMessages()" in app
     assert "return [];" in app
     assert "function hasConversationActivity()" in app
-    assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
+    assert "function hasCurrentReportMessage()" in app
+    assert "!conversationView || !hasConversationActivity() || hasCurrentReportMessage()" in app
     assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');" in app
     assert index.index('id="conversationPanel"') < index.index('id="thinkingPanel"')
     assert index.index('id="thinkingPanel"') < index.index('id="reportList"')

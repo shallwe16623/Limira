@@ -666,6 +666,75 @@ label {
 	padding: 1.25rem 1.5rem 12rem;
 }
 
+.conversation-navigator {
+	position: fixed;
+	right: 1.25rem;
+	top: 50%;
+	z-index: 35;
+	display: flex;
+	align-items: center;
+	gap: 0.7rem;
+	opacity: 0;
+	pointer-events: none;
+	transform: translateY(-50%) translateX(10px);
+	transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.conversation-navigator.visible {
+	opacity: 1;
+	pointer-events: auto;
+	transform: translateY(-50%) translateX(0);
+}
+
+.conversation-navigator-list {
+	display: grid;
+	gap: 0.42rem;
+	padding: 0.5rem 0.35rem;
+	border: 1px solid var(--border-light);
+	border-radius: var(--radius-full);
+	background: rgba(255, 255, 255, 0.92);
+	box-shadow: var(--shadow);
+	backdrop-filter: blur(12px);
+}
+
+.conversation-navigator-item {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 2rem;
+	height: 0.9rem;
+	border-radius: var(--radius-full);
+}
+
+.conversation-navigator-line {
+	display: block;
+	width: 1.25rem;
+	height: 2px;
+	border-radius: var(--radius-full);
+	background: #94a3b8;
+	transition: width 0.15s ease, background 0.15s ease, height 0.15s ease;
+}
+
+.conversation-navigator-item:hover .conversation-navigator-line,
+.conversation-navigator-item.active .conversation-navigator-line {
+	width: 1.7rem;
+	height: 3px;
+	background: var(--text);
+}
+
+.conversation-navigator-preview {
+	max-width: min(300px, 40vw);
+	padding: 0.65rem 0.75rem;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: rgba(255, 255, 255, 0.96);
+	box-shadow: var(--shadow);
+	color: var(--text);
+	font-size: 0.86rem;
+	line-height: 1.45;
+	backdrop-filter: blur(12px);
+}
+
 /* Tabs */
 .tabs {
 	z-index: 8;
@@ -1036,6 +1105,15 @@ label {
 
 .thinking-panel.collapsed .thinking-toggle {
 	border-bottom: none;
+}
+
+.task-thinking-panel {
+	margin-bottom: 0.7rem;
+	box-shadow: none;
+}
+
+.message.report .task-thinking-panel {
+	width: 100%;
 }
 
 .thinking-step {

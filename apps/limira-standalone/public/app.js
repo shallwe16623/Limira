@@ -19,6 +19,8 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = 'limiraSidebarCollapsed:v1';
 const MAX_STORED_MESSAGES = 100;
 const MAX_THINKING_STEPS = 120;
 const MAX_HISTORY_TASKS = 30;
+const CONVERSATION_NAVIGATOR_MIN_HEIGHT = 1400;
+const CONVERSATION_NAVIGATOR_HIDE_DELAY_MS = 1500;
 const STATUS_LABELS = {
 	ready: '就绪',
 	starting: '启动中',
@@ -79,6 +81,7 @@ const DIRECT_EXTERNAL_EVIDENCE_HOSTS = [
 	'yougov.com'
 ];
 const artifactSnapshotLoads = new Set();
+const thinkingHistoryLoads = new Set();
 
 const state = {
 	authScope: 'personal',
@@ -130,6 +133,11 @@ const state = {
 	messages: initialMessages(),
 	thinkingCollapsed: false,
 	thinkingSteps: initialThinkingSteps(),
+	thinkingStepsByTaskId: {},
+	thinkingCollapsedByTaskId: {},
+	conversationNavigatorVisible: false,
+	conversationNavigatorHovered: false,
+	conversationNavigatorHideTimer: null,
 	artifacts: emptyArtifacts(),
 	artifactsByTaskId: {},
 	uploads: [],
@@ -390,6 +398,29 @@ function bindEvents() {
 		void searchTaskHistory();
 		renderHistorySearchControls();
 	});
+	dom.workspaceContent.addEventListener('scroll', handleWorkspaceScroll);
+	dom.conversationNavigator.addEventListener('mouseenter', () => {
+		state.conversationNavigatorHovered = true;
+		showConversationNavigator();
+	});
+	dom.conversationNavigator.addEventListener('mouseleave', () => {
+		state.conversationNavigatorHovered = false;
+		scheduleConversationNavigatorHide();
+	});
+	dom.conversationNavigatorList.addEventListener('click', (event) => {
+		const button = event.target.closest('[data-navigator-message-index]');
+		if (!button) {
+			return;
+		}
+		event.preventDefault();
+		scrollToConversationMessage(Number(button.dataset.navigatorMessageIndex));
+	});
+	dom.conversationNavigatorList.addEventListener('mouseover', (event) => {
+		const button = event.target.closest('[data-navigator-message-index]');
+		if (button) {
+			renderConversationNavigatorPreview(button);
+		}
+	});
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
 	dom.researchForm.addEventListener('submit', (event) => {
 		event.preventDefault();
@@ -405,6 +436,9 @@ function bindEvents() {
 	dom.clearStreamButton.addEventListener('click', () => {
 		state.messages = [];
 		state.thinkingSteps = initialThinkingSteps();
+		state.thinkingStepsByTaskId = {};
+		state.thinkingCollapsedByTaskId = {};
+		hideConversationNavigator({ immediate: true });
 		saveWorkspace();
 		renderMessages();
 		renderThinking();
@@ -1416,7 +1450,7 @@ async function deleteHistoryTask(taskId) {
 			dom.queryInput.value = '';
 			saveWorkspace();
 			renderStatus();
-			renderMessages();
+			renderMessages({ preserveScroll: true });
 			renderTabs();
 			renderReportControls();
 		}
@@ -1510,6 +1544,7 @@ async function selectHistoryTask(taskId) {
 	state.messages = historyMessages(cached);
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = historyThinkingSteps(cached);
+	rememberTaskThinkingSteps(normalizedTaskId, state.thinkingSteps);
 	dom.queryInput.value = '';
 	saveWorkspace();
 	renderShell();
@@ -1561,6 +1596,9 @@ function resetCurrentTaskView() {
 	state.messages = initialMessages();
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = initialThinkingSteps();
+	state.thinkingStepsByTaskId = {};
+	state.thinkingCollapsedByTaskId = {};
+	hideConversationNavigator({ immediate: true });
 	state.artifacts = emptyArtifacts();
 	state.artifactsByTaskId = {};
 	state.uploads = [];
@@ -1763,6 +1801,12 @@ function restoreWorkspace() {
 	state.thinkingSteps = Array.isArray(saved.thinkingSteps) && saved.thinkingSteps.length
 		? saved.thinkingSteps.slice(-MAX_THINKING_STEPS)
 		: state.thinkingSteps;
+	state.thinkingStepsByTaskId = normalizeThinkingStepsByTaskId(saved.thinkingStepsByTaskId);
+	state.thinkingCollapsedByTaskId =
+		saved.thinkingCollapsedByTaskId && typeof saved.thinkingCollapsedByTaskId === 'object'
+			? saved.thinkingCollapsedByTaskId
+			: {};
+	rememberTaskThinkingSteps(state.taskId);
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
 		: emptyArtifacts();
@@ -1787,6 +1831,8 @@ function saveWorkspace() {
 		messages: state.messages.slice(-MAX_STORED_MESSAGES),
 		thinkingCollapsed: state.thinkingCollapsed,
 		thinkingSteps: state.thinkingSteps.slice(-MAX_THINKING_STEPS),
+		thinkingStepsByTaskId: savedThinkingStepsByTaskId(),
+		thinkingCollapsedByTaskId: state.thinkingCollapsedByTaskId,
 		artifacts: state.artifacts,
 		uploads: state.uploads
 	};
@@ -1806,6 +1852,46 @@ function saveWorkspace() {
 			// A private or quota-limited browser can still use the live page.
 		}
 	}
+}
+
+function normalizeThinkingStepsByTaskId(value) {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return {};
+	}
+	return Object.fromEntries(
+		Object.entries(value)
+			.map(([taskId, steps]) => [
+				String(taskId || '').trim(),
+				Array.isArray(steps) ? steps.slice(-MAX_THINKING_STEPS) : []
+			])
+			.filter(([taskId, steps]) => taskId && steps.length)
+	);
+}
+
+function savedThinkingStepsByTaskId() {
+	const taskIds = uniqueTaskIds([
+		state.conversationRootTaskId,
+		...state.conversationTaskIds,
+		...taskIdsFromMessages(state.messages),
+		state.taskId
+	]);
+	return Object.fromEntries(
+		taskIds
+			.map((taskId) => [taskId, taskThinkingSteps(taskId).slice(-MAX_THINKING_STEPS)])
+			.filter(([taskId, steps]) => taskId && steps.length)
+	);
+}
+
+function rememberTaskThinkingSteps(taskId = state.taskId, steps = state.thinkingSteps) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || !Array.isArray(steps) || !steps.length) {
+		return false;
+	}
+	state.thinkingStepsByTaskId = {
+		...state.thinkingStepsByTaskId,
+		[normalizedTaskId]: steps.slice(-MAX_THINKING_STEPS)
+	};
+	return true;
 }
 
 function clearWorkspaceStorage() {
@@ -1833,6 +1919,9 @@ function resetWorkspaceState() {
 	state.messages = initialMessages();
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = initialThinkingSteps();
+	state.thinkingStepsByTaskId = {};
+	state.thinkingCollapsedByTaskId = {};
+	hideConversationNavigator({ immediate: true });
 	state.artifacts = emptyArtifacts();
 	state.artifactsByTaskId = {};
 	state.uploads = [];
@@ -1905,6 +1994,10 @@ async function submitResearch() {
 	state.isSearching = false;
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = [];
+	if (!wasContinuingConversation) {
+		state.thinkingStepsByTaskId = {};
+		state.thinkingCollapsedByTaskId = {};
+	}
 	saveWorkspace();
 	addMessage('user', query);
 	addThinkingStep({
@@ -1949,6 +2042,7 @@ async function submitResearch() {
 		state.status = task.status || 'queued';
 		updateArchiveState(task);
 		assignLatestUserMessageTaskId(state.taskId);
+		rememberTaskThinkingSteps(state.taskId);
 		mergeTaskHistory(task, { suppressIfCurrentConversation: wasContinuingConversation });
 		state.savedUserId = state.user?.id || state.savedUserId;
 		dom.queryInput.value = '';
@@ -2160,10 +2254,40 @@ function rebuildThinkingFromProgressRecords(records) {
 	if (!events.length) {
 		return false;
 	}
-	state.thinkingSteps = [];
-	const query = currentTaskQuery();
+	state.thinkingSteps = thinkingStepsFromProgressRecords(events, state.taskId);
+	rememberTaskThinkingSteps(state.taskId, state.thinkingSteps);
+	return state.thinkingSteps.length > 0;
+}
+
+function currentTaskQuery() {
+	return taskQueryForTask(state.taskId);
+}
+
+function taskQueryForTask(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	const message = state.messages.find(
+		(item) => item.role === 'user' && String(item.taskId || '') === normalizedTaskId
+	);
+	const historyTask = state.taskHistory.find((task) => task.task_id === normalizedTaskId)
+		|| state.archivedTaskHistory.find((task) => task.task_id === normalizedTaskId)
+		|| {};
+	return String(
+		message?.content ||
+		(normalizedTaskId === state.taskId ? state.query || dom.queryInput?.value : '') ||
+		historyTask.query ||
+		''
+	).trim();
+}
+
+function thinkingStepsFromProgressRecords(records, taskId) {
+	const events = Array.isArray(records) ? records : [];
+	if (!events.length) {
+		return [];
+	}
+	const steps = [];
+	const query = taskQueryForTask(taskId);
 	if (query) {
-		appendThinkingStep({
+		steps.push({
 			kind: 'planning',
 			title: '研究问题',
 			detail: query,
@@ -2172,16 +2296,12 @@ function rebuildThinkingFromProgressRecords(records) {
 		});
 	}
 	for (const record of events) {
-		appendProgressRecordThinkingStep(record);
+		const step = progressRecordThinkingStep(record, taskId);
+		if (step) {
+			steps.push(step);
+		}
 	}
-	return state.thinkingSteps.length > 0;
-}
-
-function currentTaskQuery() {
-	const historyTask = state.taskHistory.find((task) => task.task_id === state.taskId)
-		|| state.archivedTaskHistory.find((task) => task.task_id === state.taskId)
-		|| {};
-	return String(state.query || dom.queryInput?.value || historyTask.query || '').trim();
+	return steps.slice(-MAX_THINKING_STEPS);
 }
 
 function progressRecordDisplayTime(value) {
@@ -2204,100 +2324,84 @@ function progressRecordDisplayTime(value) {
 }
 
 function appendProgressRecordThinkingStep(record) {
+	const step = progressRecordThinkingStep(record, state.taskId);
+	if (step) {
+		appendThinkingStep(step);
+	}
+}
+
+function progressRecordThinkingStep(record, taskId) {
 	const logged = record && typeof record === 'object' ? record : {};
 	const loggedPayload = logged.payload && typeof logged.payload === 'object' ? logged.payload : {};
 	const streamPayload = {
-		task_id: logged.task_id || state.taskId,
+		task_id: logged.task_id || taskId,
 		type: loggedPayload.event || loggedPayload.type || logged.event_type || logged.type || 'task_update',
 		payload: loggedPayload
 	};
 	const { payload, eventType, data, nested, eventData, status } = normalizeStreamPayload(streamPayload);
 	const time = progressRecordDisplayTime(logged.created_at);
-	updateArchiveState(payload);
-	updateArchiveState(data);
-	updateArchiveState(nested);
-	updateArchiveState(eventData);
-	if (status) {
-		state.status = String(status);
-	}
 	if (eventType === 'heartbeat') {
-		return;
+		return null;
 	}
 	if (eventType === 'tool_call') {
-		appendThinkingStep(thinkingStepForLoggedToolCall(eventData, time));
-		return;
+		return thinkingStepForLoggedToolCall(eventData, time);
 	}
 	if (eventType === 'error') {
-		state.status = 'failed';
-		completeActiveThinkingSteps();
-		appendThinkingStep({
+		return {
 			kind: 'error',
 			title: '任务执行失败',
 			detail: errorMessage(eventData.error || data.error || payload),
 			status: 'error',
 			time
-		});
-		return;
+		};
 	}
 	if (eventType === 'archive_generated') {
-		state.archiveStatus = 'ready';
-		state.archiveDownloadUrl = safeArchiveDownloadUrl(eventData.archive_url, state.taskId);
-		appendThinkingStep({
+		return {
 			kind: 'archive',
 			title: '任务归档已生成',
 			detail: '报告、证据和运行材料已打包并保存到云盘，可在底部“归档”入口下载。',
 			status: 'done',
 			time
-		});
-		return;
+		};
 	}
 	if (eventType === 'completion_asset_warning') {
-		appendThinkingStep({
+		return {
 			kind: 'warning',
 			title: '部分导出材料生成失败',
 			detail: '任务主体已完成，但部分归档材料需要稍后重试或检查运行配置。',
 			status: 'warning',
 			time
-		});
-		return;
+		};
 	}
 	if (eventType === 'end_of_workflow') {
-		state.status = 'completed';
-		completeActiveThinkingSteps();
-		appendThinkingStep({
+		return {
 			kind: 'done',
 			title: '工作流已完成',
-			detail: artifactThinkingSummary(),
+			detail: artifactThinkingSummary(artifactsForTask(taskId) || emptyArtifacts()),
 			status: 'done',
 			time
-		});
-		return;
+		};
 	}
 	if (eventType.startsWith('start_of_')) {
-		appendThinkingStep({ ...thinkingStepForStartEvent(eventType, eventData), time });
-		return;
+		return { ...thinkingStepForStartEvent(eventType, eventData), time };
 	}
 	if (artifactEvents.has(eventType)) {
-		appendThinkingStep({ ...thinkingStepForArtifactEvent(eventType, eventData), time });
-		return;
+		return { ...thinkingStepForArtifactEvent(eventType, eventData), time };
 	}
 	const summary = eventData.message || eventData.summary || data.message || data.summary || payload.message || eventType;
-	appendThinkingStep({
+	return {
 		kind: 'status',
 		title: eventLabel(eventType),
 		detail: truncateText(stringifyCompact(summary), 260),
 		status: terminalStatuses.has(String(status || state.status)) ? 'done' : 'active',
 		time
-	});
+	};
 }
 
 function thinkingStepForLoggedToolCall(data, time) {
 	const toolName = data.tool_name || data.name || 'tool';
 	const input = data.tool_input && typeof data.tool_input === 'object' ? data.tool_input : {};
 	if (toolName === 'show_text' && typeof input.text === 'string') {
-		state.finalReportText = reportTextFromValue(input.text, { includeTitle: true }) || input.text;
-		upsertReportMessage(state.finalReportText);
-		state.activeTab = CONVERSATION_VIEW;
 		return {
 			kind: 'report',
 			title: '最终报告已生成',
@@ -2481,7 +2585,7 @@ async function loadArtifacts(taskId = state.taskId, options = {}) {
 			upsertArtifactThinkingStep(artifacts);
 		}
 		saveWorkspace();
-		renderMessages();
+		renderMessages({ preserveScroll: options.silent === true });
 		renderThinking();
 		renderTabs();
 		renderReportControls();
@@ -2923,7 +3027,8 @@ function renderStatus() {
 	dom.submitResearchButton.disabled = state.isSubmitting;
 }
 
-function renderMessages() {
+function renderMessages(options = {}) {
+	const previousScrollTop = dom.workspaceContent?.scrollTop || 0;
 	const artifactView = isArtifactView();
 	dom.conversationPanel?.classList.toggle('compact', artifactView);
 	const indexedMessages = state.messages.map((message, index) => ({ message, index }));
@@ -2939,33 +3044,169 @@ function renderMessages() {
 			.slice(-8);
 	const latestUserIndex = latestUserMessageIndex();
 	dom.messageList.innerHTML = messages
-		.map(
-				({ message, index }) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
-					<div class="message-bubble">
-						<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
-					</div>
-					${message.kind === 'report' ? renderReportTaskControls(message) : ''}
-					${renderMessageActions(message, index, latestUserIndex)}
-				</article>`
-		)
+		.map(({ message, index }) => renderMessageArticle(message, index, latestUserIndex))
 		.join('');
 	if (dom.reportList) {
 		dom.reportList.innerHTML = reportMessages
-			.map(
-				({ message, index }) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
-					<div class="message-bubble">
-						<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
-					</div>
-					${renderReportTaskControls(message)}
-					${renderMessageActions(message, index, latestUserIndex)}
-				</article>`
-			)
+			.map(({ message, index }) => renderMessageArticle(message, index, latestUserIndex))
 			.join('');
 	}
 	bindMessageActions();
+	bindTaskThinkingControls();
 	ensureReportArtifactSnapshots();
+	ensureReportThinkingSnapshots();
+	renderConversationNavigator();
+	if (options.preserveScroll) {
+		window.requestAnimationFrame(() => {
+			if (dom.workspaceContent) {
+				dom.workspaceContent.scrollTop = previousScrollTop;
+			}
+		});
+		return;
+	}
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 	scrollConversationToBottom();
+}
+
+function renderMessageArticle(message, index, latestUserIndex) {
+	return `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
+		${message.kind === 'report' ? renderTaskThinkingPanel(message) : ''}
+		<div class="message-bubble">
+			<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
+		</div>
+		${message.kind === 'report' ? renderReportTaskControls(message) : ''}
+		${renderMessageActions(message, index, latestUserIndex)}
+	</article>`;
+}
+
+function renderTaskThinkingPanel(message) {
+	const taskId = String(message?.taskId || '').trim();
+	if (!taskId) {
+		return '';
+	}
+	const steps = taskThinkingSteps(taskId);
+	if (!steps.length && thinkingHistoryLoads.has(taskId)) {
+		return `<section class="thinking-panel task-thinking-panel">
+			<button class="thinking-toggle" type="button" disabled>
+				<span class="thinking-toggle-icon" aria-hidden="true">⌄</span>
+				<span>工作过程</span>
+				<span class="thinking-step-count">...</span>
+			</button>
+			<div class="thinking-list">
+				<article class="thinking-step active">
+					<div class="thinking-step-dot" aria-hidden="true"></div>
+					<div class="thinking-step-content">
+						<div class="thinking-step-title">正在恢复工作过程</div>
+						<div class="thinking-step-detail">正在读取这轮任务的历史进展。</div>
+					</div>
+				</article>
+			</div>
+		</section>`;
+	}
+	if (!steps.length) {
+		return '';
+	}
+	const collapsed = isTaskThinkingCollapsed(taskId);
+	return `<section class="thinking-panel task-thinking-panel ${collapsed ? 'collapsed' : ''}" data-task-thinking-id="${escapeAttr(taskId)}">
+		<button class="thinking-toggle" type="button" aria-expanded="${collapsed ? 'false' : 'true'}" data-task-thinking-toggle-id="${escapeAttr(taskId)}">
+			<span class="thinking-toggle-icon" aria-hidden="true">${collapsed ? '>' : '⌄'}</span>
+			<span>工作过程</span>
+			<span class="thinking-step-count">${steps.length}</span>
+		</button>
+		<div class="thinking-list">${collapsed ? '' : steps.map(renderThinkingStep).join('')}</div>
+	</section>`;
+}
+
+function renderThinkingStep(step) {
+	return `<article class="thinking-step ${escapeAttr(step.kind || 'task')} ${escapeAttr(step.status || 'active')}">
+		<div class="thinking-step-dot" aria-hidden="true"></div>
+		<div class="thinking-step-content">
+			<div class="thinking-step-title">${escapeHtml(step.title)}</div>
+			${step.detail ? `<div class="thinking-step-detail">${escapeHtml(step.detail)}</div>` : ''}
+			<div class="thinking-step-meta">${[step.meta, step.time].filter(Boolean).map(escapeHtml).join(' · ')}</div>
+		</div>
+	</article>`;
+}
+
+function bindTaskThinkingControls() {
+	for (const root of [dom.messageList, dom.reportList].filter(Boolean)) {
+		for (const button of root.querySelectorAll('[data-task-thinking-toggle-id]')) {
+			button.addEventListener('click', () => {
+				const taskId = String(button.dataset.taskThinkingToggleId || '').trim();
+				if (!taskId) {
+					return;
+				}
+				state.thinkingCollapsedByTaskId = {
+					...state.thinkingCollapsedByTaskId,
+					[taskId]: !isTaskThinkingCollapsed(taskId)
+				};
+				saveWorkspace();
+				renderMessages();
+			});
+		}
+	}
+}
+
+function taskThinkingSteps(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
+		return [];
+	}
+	if (normalizedTaskId === state.taskId && state.thinkingSteps.some((step) => step.kind !== 'ready')) {
+		return state.thinkingSteps;
+	}
+	return Array.isArray(state.thinkingStepsByTaskId[normalizedTaskId])
+		? state.thinkingStepsByTaskId[normalizedTaskId]
+		: [];
+}
+
+function isTaskThinkingCollapsed(taskId) {
+	return Boolean(state.thinkingCollapsedByTaskId[String(taskId || '').trim()]);
+}
+
+function ensureReportThinkingSnapshots() {
+	for (const taskId of reportTaskIds()) {
+		if (!taskThinkingSteps(taskId).length) {
+			void loadTaskThinkingSnapshot(taskId);
+		}
+	}
+}
+
+function reportTaskIds() {
+	return uniqueTaskIds(
+		state.messages
+			.filter((message) => message?.kind === 'report')
+			.map((message) => message.taskId)
+	);
+}
+
+async function loadTaskThinkingSnapshot(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || thinkingHistoryLoads.has(normalizedTaskId)) {
+		return;
+	}
+	thinkingHistoryLoads.add(normalizedTaskId);
+	const context = captureAsyncContext({ includeTask: false });
+	try {
+		const data = await api(`/api/limira/tasks/${encodeURIComponent(normalizedTaskId)}/event-logs`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		const events = Array.isArray(data.events) ? data.events : [];
+		const steps = thinkingStepsFromProgressRecords(events, normalizedTaskId);
+		if (steps.length) {
+			state.thinkingStepsByTaskId = {
+				...state.thinkingStepsByTaskId,
+				[normalizedTaskId]: steps
+			};
+			saveWorkspace();
+			renderMessages({ preserveScroll: true });
+		}
+	} catch {
+		// Missing logs should not break the report view.
+	} finally {
+		thinkingHistoryLoads.delete(normalizedTaskId);
+	}
 }
 
 function messageBelongsToCurrentTask(message) {
@@ -3164,6 +3405,152 @@ function scrollConversationToBottom() {
 	});
 }
 
+function handleWorkspaceScroll() {
+	if (!conversationNavigatorNeeded()) {
+		hideConversationNavigator({ immediate: true });
+		return;
+	}
+	showConversationNavigator();
+	scheduleConversationNavigatorHide();
+	updateConversationNavigatorActiveItem();
+}
+
+function conversationNavigatorNeeded() {
+	if (!dom.workspaceContent || !isConversationView()) {
+		return false;
+	}
+	return (
+		conversationNavigationItems().length > 1 &&
+		dom.workspaceContent.scrollHeight - dom.workspaceContent.clientHeight >
+			Math.min(CONVERSATION_NAVIGATOR_MIN_HEIGHT, dom.workspaceContent.clientHeight * 0.9)
+	);
+}
+
+function conversationNavigationItems() {
+	return state.messages
+		.map((message, index) => ({ message, index }))
+		.filter(({ message }) => message?.role === 'user' && String(message.content || '').trim())
+		.map(({ message, index }) => ({
+			index,
+			taskId: String(message.taskId || ''),
+			prompt: String(message.content || '').replace(/\s+/g, ' ').trim()
+		}));
+}
+
+function showConversationNavigator() {
+	if (!conversationNavigatorNeeded()) {
+		return;
+	}
+	state.conversationNavigatorVisible = true;
+	window.clearTimeout(state.conversationNavigatorHideTimer);
+	state.conversationNavigatorHideTimer = null;
+	renderConversationNavigator();
+}
+
+function scheduleConversationNavigatorHide() {
+	window.clearTimeout(state.conversationNavigatorHideTimer);
+	if (state.conversationNavigatorHovered) {
+		return;
+	}
+	state.conversationNavigatorHideTimer = window.setTimeout(
+		() => hideConversationNavigator(),
+		CONVERSATION_NAVIGATOR_HIDE_DELAY_MS
+	);
+}
+
+function hideConversationNavigator(options = {}) {
+	window.clearTimeout(state.conversationNavigatorHideTimer);
+	state.conversationNavigatorHideTimer = null;
+	state.conversationNavigatorVisible = false;
+	state.conversationNavigatorHovered = false;
+	if (!dom.conversationNavigator) {
+		return;
+	}
+	dom.conversationNavigator.classList.add('hidden');
+	dom.conversationNavigator.classList.remove('visible');
+	dom.conversationNavigatorPreview?.classList.add('hidden');
+	if (options.immediate) {
+		dom.conversationNavigatorList.innerHTML = '';
+	}
+}
+
+function renderConversationNavigator() {
+	if (!dom.conversationNavigator || !dom.conversationNavigatorList) {
+		return;
+	}
+	if (!conversationNavigatorNeeded() || !state.conversationNavigatorVisible) {
+		hideConversationNavigator();
+		return;
+	}
+	const items = conversationNavigationItems();
+	dom.conversationNavigator.classList.remove('hidden');
+	dom.conversationNavigator.classList.add('visible');
+	dom.conversationNavigatorList.innerHTML = items
+		.map((item) => `<button type="button" class="conversation-navigator-item" data-navigator-message-index="${item.index}" data-prompt="${escapeAttr(item.prompt)}" title="${escapeAttr(item.prompt)}">
+			<span class="conversation-navigator-line" aria-hidden="true"></span>
+		</button>`)
+		.join('');
+	updateConversationNavigatorActiveItem();
+}
+
+function renderConversationNavigatorPreview(button) {
+	if (!dom.conversationNavigatorPreview) {
+		return;
+	}
+	const prompt = String(button?.dataset.prompt || '').trim();
+	if (!prompt) {
+		dom.conversationNavigatorPreview.classList.add('hidden');
+		return;
+	}
+	dom.conversationNavigatorPreview.textContent = truncateText(prompt, 96);
+	dom.conversationNavigatorPreview.classList.remove('hidden');
+}
+
+function updateConversationNavigatorActiveItem() {
+	if (!dom.conversationNavigatorList || dom.conversationNavigator.classList.contains('hidden')) {
+		return;
+	}
+	const activeIndex = nearestConversationMessageIndex();
+	for (const button of dom.conversationNavigatorList.querySelectorAll('[data-navigator-message-index]')) {
+		button.classList.toggle(
+			'active',
+			Number(button.dataset.navigatorMessageIndex) === activeIndex
+		);
+	}
+}
+
+function nearestConversationMessageIndex() {
+	const roots = [dom.messageList, dom.reportList].filter(Boolean);
+	const viewportTop = dom.workspaceContent.getBoundingClientRect().top;
+	let best = { index: -1, distance: Number.POSITIVE_INFINITY };
+	for (const root of roots) {
+		for (const node of root.querySelectorAll('.message[data-message-index]')) {
+			const index = Number(node.dataset.messageIndex);
+			if (!Number.isFinite(index) || state.messages[index]?.role !== 'user') {
+				continue;
+			}
+			const distance = Math.abs(node.getBoundingClientRect().top - viewportTop - 24);
+			if (distance < best.distance) {
+				best = { index, distance };
+			}
+		}
+	}
+	return best.index;
+}
+
+function scrollToConversationMessage(index) {
+	if (!Number.isFinite(index)) {
+		return;
+	}
+	const target = document.querySelector(`.message[data-message-index="${index}"]`);
+	if (!target) {
+		return;
+	}
+	target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+	showConversationNavigator();
+	updateConversationNavigatorActiveItem();
+}
+
 function renderThinking() {
 	if (!dom.thinkingPanel) {
 		return;
@@ -3177,16 +3564,7 @@ function renderThinking() {
 	dom.thinkingStepCount.textContent = `${steps.length}`;
 	dom.thinkingList.innerHTML = state.thinkingCollapsed
 		? ''
-		: steps
-				.map((step) => `<article class="thinking-step ${escapeAttr(step.kind || 'task')} ${escapeAttr(step.status || 'active')}">
-					<div class="thinking-step-dot" aria-hidden="true"></div>
-					<div class="thinking-step-content">
-						<div class="thinking-step-title">${escapeHtml(step.title)}</div>
-						${step.detail ? `<div class="thinking-step-detail">${escapeHtml(step.detail)}</div>` : ''}
-						<div class="thinking-step-meta">${[step.meta, step.time].filter(Boolean).map(escapeHtml).join(' · ')}</div>
-					</div>
-				</article>`)
-				.join('');
+		: steps.map(renderThinkingStep).join('');
 	if (!state.thinkingCollapsed) {
 		scrollThinkingToLatest();
 	}
@@ -3205,7 +3583,10 @@ function renderTabs() {
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
 	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');
-	dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());
+	dom.thinkingPanel?.classList.toggle(
+		'hidden',
+		!conversationView || !hasConversationActivity() || hasCurrentReportMessage()
+	);
 	dom.artifactContent.classList.toggle('hidden', conversationView || !surfaceVisible);
 	dom.artifactTabs.classList.toggle('hidden', conversationView || !surfaceVisible);
 	if (!surfaceVisible || conversationView) {
@@ -3230,6 +3611,13 @@ function renderTabs() {
 	}
 	renderArtifactContent();
 	renderStatus();
+}
+
+function hasCurrentReportMessage() {
+	const taskId = String(state.taskId || '').trim();
+	return Boolean(taskId) && state.messages.some(
+		(message) => message.kind === 'report' && String(message.taskId || '') === taskId
+	);
 }
 
 function renderArtifactContent() {
@@ -4611,6 +4999,7 @@ function appendThinkingStep({ kind = 'task', title, detail = '', status = 'activ
 	};
 	const next = state.thinkingSteps.filter((item) => item.kind !== 'ready');
 	state.thinkingSteps = [...next, step].slice(-MAX_THINKING_STEPS);
+	rememberTaskThinkingSteps();
 	return true;
 }
 
@@ -4626,6 +5015,7 @@ function completeActiveThinkingSteps() {
 	state.thinkingSteps = state.thinkingSteps.map((step) => (
 		step.status === 'active' ? { ...step, status: 'done' } : step
 	));
+	rememberTaskThinkingSteps();
 }
 
 function upsertArtifactThinkingStep(artifacts = state.artifacts) {
@@ -4655,9 +5045,11 @@ function upsertArtifactThinkingStep(artifacts = state.artifacts) {
 		}
 		next[index] = { ...step, time: next[index].time || step.time };
 		state.thinkingSteps = next;
+		rememberTaskThinkingSteps();
 		return true;
 	}
 	state.thinkingSteps = [...next, step].slice(-MAX_THINKING_STEPS);
+	rememberTaskThinkingSteps();
 	return true;
 }
 
