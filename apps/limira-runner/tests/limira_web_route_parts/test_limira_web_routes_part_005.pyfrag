@@ -289,6 +289,100 @@ async def test_event_proxy_records_authoritative_terminal_status_to_redis():
 
 
 @pytest.mark.asyncio
+async def test_completed_event_stream_persists_pdf_and_archive_to_cloud_drive():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = FakePdfExporter()
+    user = limira.LimiraUser(
+        "user-a",
+        account_type="enterprise",
+        organization_id="org-a",
+        organization_role="member",
+    )
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "section_id": "REPORT-001",
+                        "title": "Final report",
+                        "markdown": "# Final report\n\nThe completed answer is ready.",
+                    },
+                    "evidence_refs": [],
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "completed cloud assets"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    event_types = [event["type"] for event in events]
+    task = repo.get_task(task_id)
+    reports = repo.list_task_reports(task_id=task_id)
+    cloud_documents = limira._cloud_storage_documents(repo, owner_user_id=user.id)
+    generated_asset_types = {
+        document.metadata.get("generated_asset_type")
+        for document in cloud_documents
+    }
+
+    assert event_types == [
+        "record_research_artifact",
+        "report_pdf_generated",
+        "archive_generated",
+        "status",
+    ]
+    assert task.status == "completed"
+    assert task.archive_status == "ready"
+    assert task.archive_object_key in storage.objects
+    assert len(reports) == 1
+    assert reports[0].report_id == "REPORT-001"
+    assert reports[0].pdf_object_key in storage.objects
+    assert reports[0].metadata["pdf_size_bytes"] == len(pdf_exporter.pdf_bytes)
+    assert {"report_pdf", "task_archive"} <= generated_asset_types
+    archive_bytes = storage.objects[task.archive_object_key]["data"]
+    assert sum(document.byte_size for document in cloud_documents) == (
+        len(pdf_exporter.pdf_bytes) + len(archive_bytes)
+    )
+    for document in cloud_documents:
+        download_response = await limira.download_uploaded_document(
+            document.document_id,
+            user=user,
+            repo=repo,
+            object_storage=storage,
+        )
+        assert download_response.status_code == 200
+        assert download_response.body == storage.objects[document.object_key]["data"]
+    assert events[1]["payload"]["pdf_url"].endswith("/reports/REPORT-001/pdf")
+    assert events[2]["payload"]["archive_url"].endswith(f"/tasks/{task_id}/archive.zip")
+    _assert_no_browser_leak(events)
+
+
+@pytest.mark.asyncio
 async def test_postgres_event_proxy_authoritative_terminal_status_closes_runtime_stream():
     engine = FakeLimiraPostgresEngine()
     repo = limira.PostgresLimiraTaskRepository(

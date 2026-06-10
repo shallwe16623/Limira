@@ -63,6 +63,7 @@ const state = {
 	selectedOrganizationId: '',
 	enterpriseMembers: [],
 	enterpriseUsage: null,
+	route: window.location.hash === '#cloud-drive' ? 'cloud-drive' : 'workspace',
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
 	uploadMenuOpen: false,
@@ -140,6 +141,27 @@ function bindEvents() {
 		if (state.userSettingsOpen && isEnterpriseAccount()) {
 			void loadCloudStorage();
 		}
+	});
+	window.addEventListener('hashchange', () => {
+		syncRouteFromHash();
+		renderShell();
+		if (state.route === 'cloud-drive') {
+			void loadUploads();
+		}
+	});
+	dom.cloudDriveManageButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		state.userSettingsOpen = false;
+		window.location.hash = 'cloud-drive';
+		syncRouteFromHash();
+		renderShell();
+		void loadUploads();
+	});
+	dom.cloudDriveBackButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		window.location.hash = '';
+		syncRouteFromHash();
+		renderShell();
 	});
 	dom.uploadMenuButton.addEventListener('click', (event) => {
 		event.preventDefault();
@@ -289,12 +311,17 @@ async function boot() {
 function renderShell() {
 	const signedIn = Boolean(state.user);
 	const enterpriseAdmin = signedIn && isEnterpriseAdmin();
+	const cloudDriveVisible = signedIn && state.route === 'cloud-drive';
 	dom.authPanel.classList.toggle('hidden', signedIn);
 	dom.workspace.classList.toggle('hidden', !signedIn);
+	dom.workspaceContent.classList.toggle('hidden', cloudDriveVisible);
+	dom.inputContainer.classList.toggle('hidden', cloudDriveVisible);
+	dom.cloudDrivePage.classList.toggle('hidden', !cloudDriveVisible);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
 	dom.userSettingsButton.classList.toggle('hidden', !signedIn);
 	if (!signedIn) {
 		state.userSettingsOpen = false;
+		state.route = 'workspace';
 		setUploadMenuOpen(false);
 		setHistoryFilesOpen(false);
 	}
@@ -315,6 +342,11 @@ function renderShell() {
 	renderUploads();
 	renderReportControls();
 	renderEnterpriseAdmin();
+	renderCloudDrive();
+}
+
+function syncRouteFromHash() {
+	state.route = window.location.hash === '#cloud-drive' ? 'cloud-drive' : 'workspace';
 }
 
 function setUploadMenuOpen(open) {
@@ -1184,6 +1216,22 @@ function handleStreamEvent(payload) {
 	} else if (eventType === 'error') {
 		state.status = 'failed';
 		addMessage('error', errorMessage(eventData.error || data.error || payload));
+	} else if (eventType === 'report_pdf_generated') {
+		const report = normalizeGeneratedReport(eventData);
+		if (report) {
+			state.latestReport = report;
+			state.latestReportMarkdown = reportMarkdown().trim();
+			addMessage('assistant', '报告 PDF 已生成并保存到云盘。');
+			void loadUploads();
+			renderReportControls();
+		}
+	} else if (eventType === 'archive_generated') {
+		state.archiveStatus = 'ready';
+		state.archiveDownloadUrl = safeArchiveDownloadUrl(eventData.archive_url, state.taskId);
+		addMessage('assistant', '任务归档已生成并保存到云盘。');
+		void loadUploads();
+	} else if (eventType === 'completion_asset_warning') {
+		addMessage('error', '任务已完成，但部分导出文件生成失败，请稍后重试下载。');
 	} else if (eventType === 'end_of_workflow') {
 		state.status = 'completed';
 		addMessage('assistant', '工作流已完成。');
@@ -1261,6 +1309,7 @@ async function loadArtifacts() {
 			return;
 		}
 		state.artifacts = normalizeArtifacts(data);
+		await loadTaskReports(context);
 		saveWorkspace();
 		renderTabs();
 		renderReportControls();
@@ -1270,6 +1319,45 @@ async function loadArtifacts() {
 		}
 		addMessage('error', `无法加载研究成果：${errorMessage(error)}`);
 	}
+}
+
+async function loadTaskReports(context = captureAsyncContext()) {
+	if (!state.taskId) {
+		state.latestReport = null;
+		state.latestReportMarkdown = '';
+		return;
+	}
+	try {
+		const data = await api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/reports`);
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		applyLatestReportFromReports(Array.isArray(data.reports) ? data.reports : []);
+	} catch {
+		if (!latestReportMatchesCurrentMarkdown()) {
+			state.latestReport = null;
+			state.latestReportMarkdown = '';
+		}
+	}
+}
+
+function applyLatestReportFromReports(reports) {
+	const normalizedReports = (Array.isArray(reports) ? reports : [])
+		.map((report) => normalizeGeneratedReport(report))
+		.filter(Boolean);
+	const report =
+		normalizedReports.find(
+			(candidate) => candidate.report_type === 'final' && reportPdfUrl(candidate)
+		) || normalizedReports.find((candidate) => reportPdfUrl(candidate));
+	if (!report) {
+		if (!latestReportMatchesCurrentMarkdown()) {
+			state.latestReport = null;
+			state.latestReportMarkdown = '';
+		}
+		return;
+	}
+	state.latestReport = report;
+	state.latestReportMarkdown = reportMarkdown().trim();
 }
 
 async function loadUploads() {
@@ -1285,6 +1373,7 @@ async function loadUploads() {
 		renderUploads();
 		renderHistoryFiles();
 		renderCloudStorage();
+		renderCloudDrive();
 		return;
 	}
 	const context = captureAsyncContext();
@@ -1310,6 +1399,7 @@ async function loadUploads() {
 		renderUploads();
 		renderHistoryFiles();
 		renderCloudStorage();
+		renderCloudDrive();
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
@@ -1318,6 +1408,7 @@ async function loadUploads() {
 		renderUploads();
 		renderHistoryFiles();
 		renderCloudStorage();
+		renderCloudDrive();
 	}
 }
 
@@ -1329,9 +1420,11 @@ async function loadCloudStorage() {
 		const data = await api('/api/limira/uploads/storage');
 		state.cloudStorage = data.storage || state.cloudStorage;
 		renderCloudStorage();
+		renderCloudDrive();
 	} catch (error) {
 		dom.uploadMessage.textContent = errorMessage(error);
 		renderUploads();
+		renderCloudDrive();
 	}
 }
 
@@ -1577,6 +1670,10 @@ async function exportPdf() {
 	if (!state.taskId || !markdown || state.isExporting) {
 		return;
 	}
+	if (latestReportPdfUrl()) {
+		await downloadPdf();
+		return;
+	}
 	state.isExporting = true;
 	dom.reportMessage.textContent = '正在导出...';
 	const context = captureAsyncContext();
@@ -1602,6 +1699,7 @@ async function exportPdf() {
 		if (pdfUrl) {
 			await downloadPdf();
 		}
+		await loadUploads();
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
@@ -1634,6 +1732,7 @@ async function downloadPdf() {
 	}
 	try {
 		await downloadGeneratedPdf(url, `${state.latestReport.report_id}.pdf`);
+		dom.reportMessage.textContent = 'PDF 已下载。';
 	} catch (error) {
 		state.latestReport = null;
 		state.latestReportMarkdown = '';
@@ -1686,6 +1785,7 @@ async function downloadArchive() {
 		saveWorkspace();
 		renderStatus();
 		dom.reportMessage.textContent = '归档已下载。';
+		await loadUploads();
 	} catch (error) {
 		dom.reportMessage.textContent = `归档下载失败：${errorMessage(error)}`;
 	}
@@ -2269,7 +2369,9 @@ function mergeUploadedDocument(documents, uploaded) {
 
 function renderReportControls() {
 	const hasMarkdown = Boolean(reportMarkdown().trim());
-	dom.exportPdfButton.disabled = state.restoreBlocked || !state.taskId || !hasMarkdown || state.isExporting;
+	const hasPdf = Boolean(latestReportPdfUrl());
+	dom.exportPdfButton.disabled =
+		state.restoreBlocked || !state.taskId || state.isExporting || (!hasMarkdown && !hasPdf);
 }
 
 function renderEnterpriseAdmin() {
@@ -2306,6 +2408,7 @@ function renderCloudStorage() {
 	}
 	const visible = Boolean(state.user) && isEnterpriseAccount();
 	dom.cloudStoragePanel.classList.toggle('hidden', !visible);
+	dom.cloudDriveManageButton.classList.toggle('hidden', !visible);
 	if (!visible) {
 		return;
 	}
@@ -2316,6 +2419,44 @@ function renderCloudStorage() {
 	const percent = quota ? Math.max(0, Math.min(100, (used / quota) * 100)) : 0;
 	dom.cloudStorageSummary.textContent = `已用 ${formatBytes(used)} / ${formatBytes(quota)}，剩余 ${formatBytes(remaining)}。`;
 	dom.cloudStorageMeter.style.width = `${percent}%`;
+}
+
+function renderCloudDrive() {
+	if (!dom.cloudDrivePage) {
+		return;
+	}
+	const storage = state.cloudStorage || {};
+	const used = Number(storage.used_bytes || 0);
+	const quota = Number(storage.quota_bytes || 0);
+	const remaining = Math.max(0, Number(storage.remaining_bytes || quota - used));
+	const percent = quota ? Math.max(0, Math.min(100, (used / quota) * 100)) : 0;
+	dom.cloudDriveStorageSummary.textContent = isEnterpriseAccount()
+		? `已用 ${formatBytes(used)} / ${formatBytes(quota)}，剩余 ${formatBytes(remaining)}。`
+		: '云盘仅支持单位账号。';
+	dom.cloudDriveStorageMeter.style.width = `${percent}%`;
+	dom.cloudDriveFileList.innerHTML = state.cloudFiles.length
+		? state.cloudFiles.map((document) => renderCloudDriveFile(document)).join('')
+		: '<div class="empty-state compact-empty">暂无云文件。</div>';
+}
+
+function renderCloudDriveFile(document) {
+	const id = String(document.document_id || '');
+	const filename = document.filename || document.original_filename || id || '云文件';
+	const contentType = document.content_type || '文档';
+	const downloadUrl = document.download_url || (id ? `/api/limira/uploads/${encodeURIComponent(id)}/download` : '');
+	const download = downloadUrl
+		? `<a class="attachment-download" href="${escapeAttr(downloadUrl)}" title="下载文件">下载</a>`
+		: '<span class="attachment-message">下载不可用</span>';
+	return `<article class="cloud-drive-file">
+		<div class="attachment-icon" aria-hidden="true">
+			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M14 3H7C5.89543 3 5 3.89543 5 5V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V8M14 3L19 8M14 3V8H19" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+		</div>
+		<div class="attachment-content">
+			<div class="attachment-title">${escapeHtml(filename)}</div>
+			<div class="attachment-meta"><span>${escapeHtml(contentType)}</span><span>${formatBytes(document.byte_size)}</span></div>
+		</div>
+		<div class="attachment-actions">${download}</div>
+	</article>`;
 }
 
 function enterpriseMemberResearchCount(member) {

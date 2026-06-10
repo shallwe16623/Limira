@@ -1171,15 +1171,130 @@ def _get_owned_report(
     return report
 
 
+def _completion_asset_dependencies_available(
+    object_storage: Any,
+    pdf_exporter: Any,
+) -> bool:
+    return (
+        hasattr(object_storage, "put_object")
+        and hasattr(object_storage, "get_object")
+        and hasattr(pdf_exporter, "render_pdf")
+    )
+
+
+def _event_payload_status(event: Mapping[str, Any] | None) -> str:
+    payload = event.get("payload") if isinstance(event, Mapping) else None
+    if isinstance(payload, Mapping):
+        return str(payload.get("status") or "")
+    return ""
+
+
+def _completion_asset_warning_event(task_id: str, *, asset: str) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "type": "completion_asset_warning",
+        "payload": {
+            "asset": asset,
+            "warning": "completion_asset_generation_failed",
+        },
+    }
+
+
+async def _completed_task_asset_events(
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    object_storage: Any,
+    pdf_exporter: Any,
+) -> list[dict[str, Any]]:
+    if not _completion_asset_dependencies_available(object_storage, pdf_exporter):
+        return []
+    current = repo.get_task(task.task_id) or task
+    if current.status != "completed":
+        return []
+
+    events: list[dict[str, Any]] = []
+    try:
+        report = await _ensure_completed_task_report_pdf(
+            task=current,
+            user=user,
+            repo=repo,
+            object_storage=object_storage,
+            pdf_exporter=pdf_exporter,
+        )
+        if report:
+            events.append(
+                {
+                    "task_id": current.task_id,
+                    "type": "report_pdf_generated",
+                    "payload": report.public_dict(),
+                }
+            )
+    except Exception:
+        log.exception(
+            "Limira completed-task PDF generation failed for task_id=%s",
+            current.task_id,
+        )
+        events.append(_completion_asset_warning_event(current.task_id, asset="report_pdf"))
+
+    try:
+        await _load_or_create_persisted_archive(
+            current,
+            user=user,
+            repo=repo,
+            object_storage=object_storage,
+        )
+        current = repo.get_task(current.task_id) or current
+        events.append(
+            {
+                "task_id": current.task_id,
+                "type": "archive_generated",
+                "payload": {
+                    "archive_status": current.archive_status,
+                    "archive_url": f"/api/limira/tasks/{current.task_id}/archive.zip",
+                },
+            }
+        )
+    except Exception:
+        log.exception(
+            "Limira completed-task archive generation failed for task_id=%s",
+            current.task_id,
+        )
+        events.append(_completion_asset_warning_event(current.task_id, asset="archive"))
+
+    return events
+
+
 async def _limira_event_stream(
     task: LimiraTask,
     user: LimiraUser,
     repo: LimiraTaskRepository,
     research_client: RunnerResearchClientProtocol,
     runtime_state: LimiraRuntimeState,
+    object_storage: Any = None,
+    pdf_exporter: Any = None,
 ) -> AsyncIterator[bytes]:
+    completion_assets_generated = False
+
+    async def completion_asset_events() -> list[dict[str, Any]]:
+        nonlocal completion_assets_generated
+        if completion_assets_generated:
+            return []
+        completion_assets_generated = True
+        return await _completed_task_asset_events(
+            task,
+            user,
+            repo,
+            object_storage,
+            pdf_exporter,
+        )
+
     current = repo.get_task(task.task_id) or task
     if current.status in FINAL_TASK_STATUSES:
+        if current.status == "completed":
+            for asset_event in await completion_asset_events():
+                await _record_stream_event(repo, runtime_state, task.task_id, asset_event)
+                yield _sse_bytes(_assert_browser_safe(asset_event))
         terminal_event = _terminal_status_event(current)
         await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
         await _mark_terminal_reattach_closed(
@@ -1248,6 +1363,15 @@ async def _limira_event_stream(
                 event,
                 current_agent_name=current_agent_name,
             )
+            if applied_status == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_stream_event(
+                        repo,
+                        runtime_state,
+                        task.task_id,
+                        asset_event,
+                    )
+                    yield _sse_bytes(_assert_browser_safe(asset_event))
             await _record_stream_event(repo, runtime_state, task.task_id, event)
             if applied_status in FINAL_TASK_STATUSES:
                 await runtime_state.update_task_runtime(
@@ -1274,6 +1398,15 @@ async def _limira_event_stream(
                 research_client,
             )
             if status_event:
+                if _event_payload_status(status_event) == "completed":
+                    for asset_event in await completion_asset_events():
+                        await _record_stream_event(
+                            repo,
+                            runtime_state,
+                            task.task_id,
+                            asset_event,
+                        )
+                        yield _sse_bytes(_assert_browser_safe(asset_event))
                 await _record_stream_event(repo, runtime_state, task.task_id, status_event)
                 stream_close_reason = _stream_close_reason_from_event(
                     status_event,
@@ -1290,6 +1423,15 @@ async def _limira_event_stream(
             reason=exc.reason,
         )
         if status_event:
+            if _event_payload_status(status_event) == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_stream_event(
+                        repo,
+                        runtime_state,
+                        task.task_id,
+                        asset_event,
+                    )
+                    yield _sse_bytes(_assert_browser_safe(asset_event))
             await _record_stream_event(repo, runtime_state, task.task_id, status_event)
             stream_close_reason = _stream_close_reason_from_event(
                 status_event,
@@ -1331,6 +1473,15 @@ async def _limira_event_stream(
         stream_close_reason = "http_exception"
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
+            if current.status == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_stream_event(
+                        repo,
+                        runtime_state,
+                        task.task_id,
+                        asset_event,
+                    )
+                    yield _sse_bytes(_assert_browser_safe(asset_event))
             terminal_event = _terminal_status_event(current)
             await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
             yield _sse_bytes(_assert_browser_safe(terminal_event))
@@ -1356,6 +1507,15 @@ async def _limira_event_stream(
         stream_close_reason = "limira_event_proxy_failed"
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
+            if current.status == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_stream_event(
+                        repo,
+                        runtime_state,
+                        task.task_id,
+                        asset_event,
+                    )
+                    yield _sse_bytes(_assert_browser_safe(asset_event))
             terminal_event = _terminal_status_event(current)
             await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
             yield _sse_bytes(_assert_browser_safe(terminal_event))

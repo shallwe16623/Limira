@@ -878,10 +878,20 @@ async def get_task_events(
     repo: LimiraTaskRepository = Depends(get_task_repository),
     research_client: RunnerResearchClientProtocol = Depends(get_research_client),
     runtime_state: LimiraRuntimeState = Depends(get_runtime_state),
+    object_storage: LimiraObjectStorage = Depends(get_object_storage),
+    pdf_exporter: LimiraPdfExporter = Depends(get_pdf_exporter),
 ) -> StreamingResponse:
     task = _get_owned_task(repo, task_id, user)
     return StreamingResponse(
-        _limira_event_stream(task, user, repo, research_client, runtime_state),
+        _limira_event_stream(
+            task,
+            user,
+            repo,
+            research_client,
+            runtime_state,
+            object_storage,
+            pdf_exporter,
+        ),
         media_type="text/event-stream",
     )
 
@@ -896,6 +906,22 @@ async def get_task_artifacts(
     artifacts = _public_artifacts(repo.get_artifacts(task_id))
     artifacts["timeline"] = artifacts["timeline_events"]
     return _assert_browser_safe(artifacts)
+
+
+@router.get("/tasks/{task_id}/reports")
+async def list_task_generated_reports(
+    task_id: str,
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+) -> dict[str, Any]:
+    _get_owned_task(repo, task_id, user)
+    reports = repo.list_task_reports(task_id=task_id)
+    return _assert_browser_safe(
+        {
+            "reports": [report.public_dict() for report in reports],
+            "count": len(reports),
+        }
+    )
 
 
 @router.get("/tasks/{task_id}/archive.zip")
@@ -1122,6 +1148,90 @@ def _ensure_enterprise_storage_capacity(
     payload = _enterprise_storage_payload(repo, user)
     if payload["used_bytes"] + max(0, int(incoming_bytes or 0)) > payload["quota_bytes"]:
         raise HTTPException(status_code=413, detail="enterprise_cloud_storage_quota_exceeded")
+
+
+def _enterprise_cloud_storage_enabled(user: LimiraUser) -> bool:
+    return user.account_type == "enterprise" and bool(user.organization_id)
+
+
+def _generated_cloud_document_id(
+    *,
+    owner_user_id: str,
+    object_key: str,
+) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"limira-cloud:{owner_user_id}:{object_key}"))
+
+
+def _record_generated_cloud_document(
+    repo: LimiraTaskRepository,
+    user: LimiraUser,
+    *,
+    task: LimiraTask,
+    stored: LimiraStoredObject,
+    filename: str,
+    extracted_text: str,
+    metadata: Mapping[str, Any],
+) -> LimiraUploadedDocument | None:
+    if not _enterprise_cloud_storage_enabled(user):
+        return None
+    document_id = _generated_cloud_document_id(
+        owner_user_id=user.id,
+        object_key=stored.object_key,
+    )
+    existing = repo.get_user_document(document_id, user.id)
+    incoming_bytes = max(
+        0,
+        int(stored.size_bytes or 0) - int(existing.byte_size if existing else 0),
+    )
+    _ensure_enterprise_storage_capacity(repo, user, incoming_bytes=incoming_bytes)
+    document = repo.record_uploaded_document(
+        document_id=document_id,
+        owner_user_id=user.id,
+        task_id=None,
+        original_filename=_safe_original_filename(filename),
+        content_type=stored.content_type,
+        byte_size=stored.size_bytes,
+        minio_bucket=stored.bucket,
+        object_key=stored.object_key,
+        extracted_text=extracted_text,
+        language=None,
+        metadata={
+            "sha256": stored.sha256,
+            "upload_source": "generated_task_asset",
+            "source_task_id": task.task_id,
+            **dict(metadata),
+        },
+        embedding=None,
+    )
+    return document
+
+
+def _try_record_generated_cloud_document(
+    repo: LimiraTaskRepository,
+    user: LimiraUser,
+    *,
+    task: LimiraTask,
+    stored: LimiraStoredObject,
+    filename: str,
+    extracted_text: str,
+    metadata: Mapping[str, Any],
+) -> LimiraUploadedDocument | None:
+    try:
+        return _record_generated_cloud_document(
+            repo,
+            user,
+            task=task,
+            stored=stored,
+            filename=filename,
+            extracted_text=extracted_text,
+            metadata=metadata,
+        )
+    except Exception:
+        log.exception(
+            "Limira generated asset cloud registration failed for task_id=%s",
+            task.task_id,
+        )
+        return None
 
 
 def _normalize_research_document_ids(document_ids: list[str]) -> list[str]:
@@ -1446,6 +1556,173 @@ async def download_uploaded_document(
     )
 
 
+def _report_filename_from_markdown(markdown: str, *, fallback: str) -> str:
+    title = fallback
+    for line in str(markdown or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip() or fallback
+            break
+    return _safe_original_filename(f"{title}.pdf")
+
+
+def _task_final_report_payload(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+) -> tuple[str, list[str], str]:
+    artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
+    reports = repo.list_task_reports(task_id=task.task_id)
+    selected_report = _select_archive_report(reports)
+    markdown = _archive_report_markdown(task, selected_report, artifacts).strip()
+    evidence_refs = _archive_evidence_refs(selected_report, artifacts)
+    report_id = (
+        selected_report.report_id
+        if selected_report
+        else str(
+            (artifacts.get("report_sections") or [{}])[0].get("section_id")
+            or "REPORT-001"
+        )
+    )
+    return markdown, evidence_refs, _safe_report_id(report_id)
+
+
+def _select_existing_pdf_report(
+    reports: list[LimiraGeneratedReport],
+    *,
+    markdown: str,
+) -> LimiraGeneratedReport | None:
+    for report in reports:
+        if (
+            report.markdown.strip() == markdown.strip()
+            and _is_valid_report_pdf_metadata(
+                report.pdf_object_key,
+                (report.metadata or {}).get("pdf_sha256"),
+            )
+        ):
+            return report
+    return None
+
+
+async def _store_task_report_pdf(
+    *,
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    object_storage: LimiraObjectStorage,
+    pdf_exporter: LimiraPdfExporter,
+    report_id: str,
+    report_type: str,
+    markdown: str,
+    evidence_refs: list[str],
+    metadata: Mapping[str, Any] | None = None,
+) -> LimiraGeneratedReport:
+    report_html = _render_report_html(
+        markdown=markdown,
+        evidence_refs=evidence_refs,
+    )
+    try:
+        pdf_bytes = await pdf_exporter.render_pdf(report_html)
+        if _persisted_report_pdf_appears_blank(pdf_bytes):
+            raise RuntimeError("limira_pdf_blank_rendered_pdf")
+    except Exception as exc:
+        log.exception(
+            "Limira PDF export failed for task_id=%s report_id=%s",
+            task.task_id,
+            report_id,
+        )
+        raise HTTPException(status_code=503, detail="pdf_export_failed") from exc
+    pdf_debug_artifacts = _write_pdf_debug_artifacts(
+        task_id=task.task_id,
+        report_id=report_id,
+        html_content=report_html,
+        pdf_bytes=pdf_bytes,
+    )
+
+    object_key = build_limira_object_key(
+        owner_user_id=user.id,
+        category="reports",
+        task_id=task.task_id,
+        filename=f"{report_id}.pdf",
+        object_id=report_id,
+    )
+    stored = await object_storage.put_object(
+        object_key=object_key,
+        data=pdf_bytes,
+        content_type="application/pdf",
+        metadata=scrub_limira_secrets({
+            "task_id": task.task_id,
+            "report_id": report_id,
+            "owner_user_id": user.id,
+            "report_type": report_type,
+        }),
+    )
+    report_metadata = scrub_limira_secrets({
+        **dict(metadata or {}),
+        "pdf_bucket": stored.bucket,
+        "pdf_sha256": stored.sha256,
+        "pdf_size_bytes": stored.size_bytes,
+        "exporter": "playwright",
+    })
+    if pdf_debug_artifacts:
+        report_metadata["pdf_debug"] = pdf_debug_artifacts
+    report = repo.record_generated_report(
+        report_id=report_id,
+        task_id=task.task_id,
+        report_type=report_type,
+        markdown=markdown,
+        html=report_html,
+        pdf_object_key=stored.object_key,
+        evidence_refs=evidence_refs,
+        creator_user_id=user.id,
+        metadata=report_metadata,
+    )
+    _try_record_generated_cloud_document(
+        repo,
+        user,
+        task=task,
+        stored=stored,
+        filename=_report_filename_from_markdown(markdown, fallback=report_id),
+        extracted_text=markdown,
+        metadata={
+            "generated_asset_type": "report_pdf",
+            "report_id": report_id,
+            "report_type": report_type,
+        },
+    )
+    return report
+
+
+async def _ensure_completed_task_report_pdf(
+    *,
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    object_storage: LimiraObjectStorage,
+    pdf_exporter: LimiraPdfExporter,
+) -> LimiraGeneratedReport | None:
+    markdown, evidence_refs, report_id = _task_final_report_payload(repo, task)
+    if not markdown.strip():
+        return None
+    existing_pdf = _select_existing_pdf_report(
+        repo.list_task_reports(task_id=task.task_id),
+        markdown=markdown,
+    )
+    if existing_pdf:
+        return existing_pdf
+    return await _store_task_report_pdf(
+        task=task,
+        user=user,
+        repo=repo,
+        object_storage=object_storage,
+        pdf_exporter=pdf_exporter,
+        report_id=report_id,
+        report_type="final",
+        markdown=markdown,
+        evidence_refs=evidence_refs,
+        metadata={"source_event_type": "auto_task_completion"},
+    )
+
+
 @router.post("/tasks/{task_id}/reports/pdf", status_code=201)
 async def export_task_pdf(
     task_id: str,
@@ -1484,64 +1761,17 @@ async def export_task_pdf(
     report_id = _safe_report_id(
         str(scrubbed_report_id) if scrubbed_report_id is not None else None
     )
-    report_html = _render_report_html(
-        markdown=scrubbed_markdown,
-        evidence_refs=scrubbed_evidence_refs,
-    )
-    try:
-        pdf_bytes = await pdf_exporter.render_pdf(report_html)
-        if _persisted_report_pdf_appears_blank(pdf_bytes):
-            raise RuntimeError("limira_pdf_blank_rendered_pdf")
-    except Exception as exc:
-        log.exception(
-            "Limira PDF export failed for task_id=%s report_id=%s",
-            task.task_id,
-            report_id,
-        )
-        raise HTTPException(status_code=503, detail="pdf_export_failed") from exc
-    pdf_debug_artifacts = _write_pdf_debug_artifacts(
-        task_id=task.task_id,
+    report = await _store_task_report_pdf(
+        task=task,
+        user=user,
+        repo=repo,
+        object_storage=object_storage,
+        pdf_exporter=pdf_exporter,
         report_id=report_id,
-        html_content=report_html,
-        pdf_bytes=pdf_bytes,
-    )
-
-    object_key = build_limira_object_key(
-        owner_user_id=user.id,
-        category="reports",
-        task_id=task.task_id,
-        filename=f"{report_id}.pdf",
-        object_id=report_id,
-    )
-    stored = await object_storage.put_object(
-        object_key=object_key,
-        data=pdf_bytes,
-        content_type="application/pdf",
-        metadata=scrub_limira_secrets({
-            "task_id": task.task_id,
-            "report_id": report_id,
-            "owner_user_id": user.id,
-            "report_type": scrubbed_report_type,
-        }),
-    )
-    report_metadata = scrub_limira_secrets({
-        "pdf_bucket": stored.bucket,
-        "pdf_sha256": stored.sha256,
-        "pdf_size_bytes": stored.size_bytes,
-        "exporter": "playwright",
-    })
-    if pdf_debug_artifacts:
-        report_metadata["pdf_debug"] = pdf_debug_artifacts
-    report = repo.record_generated_report(
-        report_id=report_id,
-        task_id=task.task_id,
         report_type=scrubbed_report_type,
         markdown=scrubbed_markdown,
-        html=report_html,
-        pdf_object_key=stored.object_key,
         evidence_refs=scrubbed_evidence_refs,
-        creator_user_id=user.id,
-        metadata=report_metadata,
+        metadata={"source_event_type": "browser_pdf_export"},
     )
     return _assert_browser_safe(report.public_dict())
 
@@ -1730,6 +1960,19 @@ async def _store_persisted_archive_bytes(
     task.archive_status = "ready"
     task.archive_object_key = stored.object_key
     task.archive_zip_sha256 = stored.sha256
+    if user.id == task.owner_user_id:
+        _try_record_generated_cloud_document(
+            repo,
+            user,
+            task=task,
+            stored=stored,
+            filename=f"{task.task_id}-archive.zip",
+            extracted_text="",
+            metadata={
+                "generated_asset_type": "task_archive",
+                "archive_sha256": stored.sha256,
+            },
+        )
     return stored
 
 

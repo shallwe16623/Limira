@@ -103,6 +103,7 @@
 								<div id="cloudStorageSummary" class="inline-message"></div>
 								<div class="cloud-storage-meter" aria-label="云空间用量"><span id="cloudStorageMeter"></span></div>
 							</div>
+							<button id="cloudDriveManageButton" class="settings-menu-item hidden" type="button">管理云盘</button>
 							<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
 								<div class="enterprise-admin-header">
 									<div class="sidebar-section-title">单位管理</div>
@@ -141,11 +142,11 @@
 					</header>
 
 					<!-- Content Area -->
-						<div class="scrollable-canvas">
-							<!-- Tabs centered at top -->
-							<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
+					<div id="workspaceContent" class="scrollable-canvas">
+						<!-- Tabs centered at top -->
+						<nav id="artifactTabs" class="tabs" aria-label="研究成果标签页"></nav>
 
-							<section id="artifactContent" class="artifact-content"></section>
+						<section id="artifactContent" class="artifact-content"></section>
 
 						<!-- Hidden elements to preserve JS bindings -->
 						<div class="hidden">
@@ -159,9 +160,23 @@
 							<button id="clearStreamButton" type="button"></button>
 						</div>
 					</div>
+					<section id="cloudDrivePage" class="cloud-drive-page hidden" aria-label="云盘空间">
+						<div class="cloud-drive-header">
+							<button id="cloudDriveBackButton" class="ghost-button compact" type="button">返回工作台</button>
+							<div>
+								<h2>云盘空间</h2>
+								<p>长期保存单位文件、任务报告 PDF 和任务归档。</p>
+							</div>
+						</div>
+						<div class="cloud-drive-summary">
+							<div id="cloudDriveStorageSummary" class="cloud-drive-storage-text"></div>
+							<div class="cloud-drive-meter" aria-label="云盘用量"><span id="cloudDriveStorageMeter"></span></div>
+						</div>
+						<div id="cloudDriveFileList" class="cloud-drive-list"></div>
+					</section>
 
 					<!-- Bottom Input Area (ChatGPT Style) -->
-					<div class="input-container">
+					<div id="inputContainer" class="input-container">
 						<!-- Realtime Progress just above the input box -->
 						<div id="messageList" class="message-list-bottom" aria-label="实时进展"></div>
 

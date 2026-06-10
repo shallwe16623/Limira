@@ -249,6 +249,10 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/enterprise/signin" in app
     assert "/api/limira/enterprise/members" in app
     assert "/api/limira/enterprise/usage" in app
+    assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}/reports" in app
+    assert "report_pdf_generated" in app
+    assert "archive_generated" in app
+    assert "completion_asset_warning" in app
     assert 'id="personalScopeButton"' in index
     assert 'id="enterpriseScopeButton"' in index
     assert 'id="organizationCategorySelect"' in index
@@ -258,6 +262,9 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="enterpriseMemberUsernameInput"' in index
     assert 'id="enterpriseMemberEmailInput"' not in index
     assert 'id="userSettingsButton"' in index
+    assert 'id="cloudDriveManageButton"' in index
+    assert 'id="cloudDrivePage"' in index
+    assert 'id="cloudDriveFileList"' in index
     assert 'id="userSettingsPanel"' in index
     assert 'class="settings-menu-item danger"' in index
     assert "此页面直接连接 limira 后端" not in index
