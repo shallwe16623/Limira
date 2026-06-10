@@ -84,14 +84,15 @@
 						</button>
 					</div>
 					<div class="sidebar-body">
-						<div class="sidebar-section-row">
-							<div class="sidebar-section-title">历史记录</div>
-							<button id="historyArchiveToggleButton" class="history-toggle-button" type="button">已归档</button>
-						</div>
-						<div class="history-search" role="search">
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M11 19A8 8 0 1 0 11 3A8 8 0 0 0 11 19Z" stroke="currentColor" stroke-width="2"/><path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-							<input id="historySearchInput" type="search" placeholder="搜索对话历史" autocomplete="off" />
-							<button id="clearHistorySearchButton" class="history-search-clear hidden" type="button" title="清空搜索" aria-label="清空搜索">×</button>
+						<div class="sidebar-section-row history-header-row">
+							<button id="historyExpandToggleButton" class="history-expand-button" type="button" aria-expanded="true">
+								<span id="historyExpandIcon" class="history-expand-icon" aria-hidden="true">›</span>
+								<span>对话历史</span>
+							</button>
+							<div class="history-header-actions">
+								<button id="historySearchButton" class="history-toggle-button" type="button">搜索</button>
+								<button id="historyArchiveToggleButton" class="history-toggle-button" type="button">已归档</button>
+							</div>
 						</div>
 						<div id="historyMessage" class="inline-message"></div>
 						<div id="historyList" class="history-list"></div>
@@ -247,12 +248,32 @@
 						<div id="enterpriseMemberList" class="enterprise-member-list"></div>
 					</section>
 
-				</section>
-			</main>
-		</div>
+					</section>
+				</main>
+			</div>
 
-		<!-- Sandbox Modal for Evidence Links -->
-		<div id="sandboxModal" class="sandbox-modal hidden">
+			<div id="historySearchModal" class="history-search-modal hidden" role="dialog" aria-modal="true" aria-labelledby="historySearchTitle">
+				<div id="historySearchBackdrop" class="history-search-backdrop"></div>
+				<div class="history-search-dialog">
+					<div class="history-search-dialog-header">
+						<div>
+							<h2 id="historySearchTitle">搜索对话历史</h2>
+							<p>搜索当前账号下的普通历史和已归档对话。</p>
+						</div>
+						<button id="historySearchCloseButton" class="modal-close-button" type="button" title="关闭" aria-label="关闭">×</button>
+					</div>
+					<div class="history-search" role="search">
+						<svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M11 19A8 8 0 1 0 11 3A8 8 0 0 0 11 19Z" stroke="currentColor" stroke-width="2"/><path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+						<input id="historySearchInput" type="search" placeholder="输入关键词搜索历史" autocomplete="off" />
+						<button id="clearHistorySearchButton" class="history-search-clear hidden" type="button" title="清空搜索" aria-label="清空搜索">×</button>
+					</div>
+					<div id="historySearchMessage" class="inline-message"></div>
+					<div id="historySearchResults" class="history-search-results"></div>
+				</div>
+			</div>
+
+			<!-- Sandbox Modal for Evidence Links -->
+			<div id="sandboxModal" class="sandbox-modal hidden">
 			<div class="sandbox-backdrop"></div>
 			<div class="sandbox-content">
 				<div class="sandbox-header">

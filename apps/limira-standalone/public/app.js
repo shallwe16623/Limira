@@ -99,8 +99,13 @@ const state = {
 	uploadMenuOpen: false,
 	historyFilesOpen: false,
 	showArchivedHistory: false,
+	historyExpanded: true,
+	historySearchModalOpen: false,
 	historySearchQuery: '',
 	historySearchTimer: null,
+	historySearchResults: [],
+	historySearchError: '',
+	isSearchingHistory: false,
 	savedUserId: '',
 	query: '',
 	taskId: '',
@@ -288,6 +293,9 @@ function bindEvents() {
 		if (event.key === 'Escape' && state.isVoiceRecording) {
 			stopVoiceInput();
 		}
+		if (event.key === 'Escape' && state.historySearchModalOpen) {
+			closeHistorySearchModal();
+		}
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.sidebarCollapseButton.addEventListener('click', () => {
@@ -330,6 +338,24 @@ function bindEvents() {
 			void deleteArchivedHistoryTask(deleteButton.dataset.archivedDeleteId || '');
 		}
 	});
+	dom.historyExpandToggleButton.addEventListener('click', () => {
+		state.historyExpanded = !state.historyExpanded;
+		renderHistory();
+	});
+	dom.historySearchButton.addEventListener('click', () => {
+		openHistorySearchModal();
+	});
+	dom.historySearchBackdrop.addEventListener('click', closeHistorySearchModal);
+	dom.historySearchCloseButton.addEventListener('click', closeHistorySearchModal);
+	dom.historySearchResults.addEventListener('click', (event) => {
+		const button = event.target.closest('[data-search-task-id]');
+		if (!button) {
+			return;
+		}
+		event.preventDefault();
+		closeHistorySearchModal();
+		void selectHistoryTask(button.dataset.searchTaskId || '');
+	});
 	dom.historyArchiveToggleButton.addEventListener('click', () => {
 		state.showArchivedHistory = !state.showArchivedHistory;
 		void loadTaskHistory();
@@ -339,13 +365,13 @@ function bindEvents() {
 		state.historySearchQuery = dom.historySearchInput.value.trim();
 		renderHistorySearchControls();
 		window.clearTimeout(state.historySearchTimer);
-		state.historySearchTimer = window.setTimeout(() => void loadTaskHistory(), 250);
+		state.historySearchTimer = window.setTimeout(() => void searchTaskHistory(), 250);
 	});
 	dom.clearHistorySearchButton.addEventListener('click', () => {
 		state.historySearchQuery = '';
 		dom.historySearchInput.value = '';
 		window.clearTimeout(state.historySearchTimer);
-		void loadTaskHistory();
+		void searchTaskHistory();
 		renderHistorySearchControls();
 	});
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
@@ -473,6 +499,10 @@ function renderShell() {
 		state.archivedTaskHistory = [];
 		state.enterpriseMembers = [];
 		state.enterpriseUsage = null;
+		state.historySearchModalOpen = false;
+		state.historySearchResults = [];
+		state.historySearchError = '';
+		state.historySearchQuery = '';
 		state.route = 'workspace';
 		setUploadMenuOpen(false);
 		setHistoryFilesOpen(false);
@@ -492,6 +522,7 @@ function renderShell() {
 	renderAuthMode();
 	renderStatus();
 	renderHistory();
+	renderHistorySearchModal();
 	renderMessages();
 	renderThinking();
 	renderTabs();
@@ -993,10 +1024,6 @@ async function loadTaskHistory() {
 			limit: String(MAX_HISTORY_TASKS),
 			archived
 		});
-		const historyQuery = state.historySearchQuery.trim();
-		if (historyQuery) {
-			params.set('query', historyQuery);
-		}
 		const data = await api(`/api/limira/tasks?${params.toString()}`);
 		if (!isCurrentAsyncContext(context)) {
 			return;
@@ -1005,7 +1032,7 @@ async function loadTaskHistory() {
 		if (dom.historyMessage) {
 			dom.historyMessage.textContent = state.taskHistory.length
 				? ''
-				: historyQuery ? '没有找到相关历史。' : state.showArchivedHistory ? '暂无已归档历史。' : '暂无历史聊天。';
+				: state.showArchivedHistory ? '暂无已归档历史。' : '暂无历史聊天。';
 		}
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
@@ -1093,21 +1120,25 @@ function renderHistory() {
 	if (!dom.historyList) {
 		return;
 	}
-	renderHistorySearchControls();
+	renderHistorySectionControls();
 	dom.refreshHistoryButton.disabled = !state.user || state.isLoadingHistory;
 	dom.newChatButton.disabled = !state.user;
 	dom.historyArchiveToggleButton.disabled = !state.user || state.isLoadingHistory;
 	dom.historyArchiveToggleButton.textContent = state.showArchivedHistory ? '返回历史' : '已归档';
 	dom.historyArchiveToggleButton.classList.toggle('active', state.showArchivedHistory);
+	dom.historySearchButton.disabled = !state.user;
+	dom.historyList.classList.toggle('hidden', !state.historyExpanded);
+	dom.historyMessage.classList.toggle('hidden', !state.historyExpanded);
+	if (!state.historyExpanded) {
+		return;
+	}
 	if (!state.user) {
 		dom.historyList.innerHTML = '';
 		dom.historyMessage.textContent = '';
 		return;
 	}
 	if (!state.taskHistory.length) {
-		dom.historyList.innerHTML = state.historySearchQuery
-			? '<div class="empty-state compact-empty">没有找到相关历史。</div>'
-			: state.showArchivedHistory
+		dom.historyList.innerHTML = state.showArchivedHistory
 			? '<div class="empty-state compact-empty">暂无已归档历史。</div>'
 			: '<div class="empty-state compact-empty">暂无历史聊天。</div>';
 		return;
@@ -1143,6 +1174,67 @@ function renderHistory() {
 	}
 }
 
+function renderHistorySectionControls() {
+	if (!dom.historyExpandToggleButton || !dom.historyExpandIcon) {
+		return;
+	}
+	dom.historyExpandToggleButton.setAttribute('aria-expanded', state.historyExpanded ? 'true' : 'false');
+	dom.historyExpandIcon.classList.toggle('expanded', state.historyExpanded);
+}
+
+function openHistorySearchModal() {
+	state.historySearchModalOpen = true;
+	state.userSettingsOpen = false;
+	renderHistorySearchModal();
+	window.setTimeout(() => dom.historySearchInput?.focus(), 0);
+	if (state.historySearchQuery.trim()) {
+		void searchTaskHistory();
+	}
+}
+
+function closeHistorySearchModal() {
+	state.historySearchModalOpen = false;
+	renderHistorySearchModal();
+}
+
+function renderHistorySearchModal() {
+	if (!dom.historySearchModal) {
+		return;
+	}
+	dom.historySearchModal.classList.toggle('hidden', !state.historySearchModalOpen);
+	if (!state.historySearchModalOpen) {
+		return;
+	}
+	renderHistorySearchControls();
+	if (!state.user) {
+		dom.historySearchMessage.textContent = '请先登录。';
+		dom.historySearchResults.innerHTML = '';
+		return;
+	}
+	const query = state.historySearchQuery.trim();
+	if (!query) {
+		dom.historySearchMessage.textContent = '输入关键词后搜索对话标题、状态和报告摘要。';
+		dom.historySearchResults.innerHTML = '';
+		return;
+	}
+	if (state.isSearchingHistory) {
+		dom.historySearchMessage.textContent = '正在搜索历史...';
+		dom.historySearchResults.innerHTML = '';
+		return;
+	}
+	if (state.historySearchError) {
+		dom.historySearchMessage.textContent = state.historySearchError;
+		dom.historySearchResults.innerHTML = '';
+		return;
+	}
+	dom.historySearchMessage.textContent = state.historySearchResults.length
+		? `找到 ${state.historySearchResults.length} 条相关历史。`
+		: '没有找到相关历史。';
+	dom.historySearchResults.innerHTML = state.historySearchResults.length
+		? state.historySearchResults.map(renderHistorySearchResult).join('')
+		: '<div class="empty-state compact-empty">没有找到相关历史。</div>';
+}
+
 function renderHistorySearchControls() {
 	if (!dom.historySearchInput || !dom.clearHistorySearchButton) {
 		return;
@@ -1150,10 +1242,77 @@ function renderHistorySearchControls() {
 	if (dom.historySearchInput.value.trim() !== state.historySearchQuery) {
 		dom.historySearchInput.value = state.historySearchQuery;
 	}
-	dom.historySearchInput.placeholder = state.showArchivedHistory ? '搜索已归档历史' : '搜索对话历史';
-	dom.historySearchInput.disabled = !state.user || state.isLoadingHistory;
+	dom.historySearchInput.disabled = !state.user || state.isSearchingHistory;
 	dom.clearHistorySearchButton.classList.toggle('hidden', !state.historySearchQuery);
-	dom.clearHistorySearchButton.disabled = !state.user || state.isLoadingHistory;
+	dom.clearHistorySearchButton.disabled = !state.user || state.isSearchingHistory;
+}
+
+function renderHistorySearchResult(task) {
+	const taskId = String(task.task_id || '');
+	return `<article class="history-search-result">
+		<button type="button" class="history-search-result-main" data-search-task-id="${escapeAttr(taskId)}">
+			<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
+			<span class="history-meta">${escapeHtml(taskHistoryMeta(task))}</span>
+		</button>
+	</article>`;
+}
+
+async function searchTaskHistory() {
+	if (!state.user || !state.historySearchModalOpen) {
+		return;
+	}
+	const query = state.historySearchQuery.trim();
+	if (!query) {
+		state.historySearchResults = [];
+		state.historySearchError = '';
+		state.isSearchingHistory = false;
+		renderHistorySearchModal();
+		return;
+	}
+	state.isSearchingHistory = true;
+	state.historySearchError = '';
+	renderHistorySearchModal();
+	const context = captureAsyncContext({ includeTask: false });
+	try {
+		const activeParams = new URLSearchParams({
+			limit: String(MAX_HISTORY_TASKS),
+			archived: 'false',
+			query
+		});
+		const archivedParams = new URLSearchParams({
+			limit: String(MAX_HISTORY_TASKS),
+			archived: 'true',
+			query
+		});
+		const [activeData, archivedData] = await Promise.all([
+			api(`/api/limira/tasks?${activeParams.toString()}`),
+			api(`/api/limira/tasks?${archivedParams.toString()}`)
+		]);
+		if (!isCurrentAsyncContext(context) || state.historySearchQuery.trim() !== query) {
+			return;
+		}
+		const byId = new Map();
+		for (const task of [
+			...(Array.isArray(activeData?.tasks) ? activeData.tasks : []),
+			...(Array.isArray(archivedData?.tasks) ? archivedData.tasks : [])
+		]) {
+			const taskId = String(task.task_id || '');
+			if (taskId && !byId.has(taskId)) {
+				byId.set(taskId, task);
+			}
+		}
+		state.historySearchResults = [...byId.values()];
+	} catch (error) {
+		if (isCurrentAsyncContext(context)) {
+			state.historySearchError = `搜索失败：${errorMessage(error)}`;
+			state.historySearchResults = [];
+		}
+	} finally {
+		if (isCurrentAsyncContext(context)) {
+			state.isSearchingHistory = false;
+			renderHistorySearchModal();
+		}
+	}
 }
 
 async function archiveHistoryTask(taskId) {

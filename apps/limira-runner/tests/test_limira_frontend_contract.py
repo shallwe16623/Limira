@@ -363,18 +363,32 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert 'id="historyMessage"' in index
     assert 'id="newChatButton"' in index
     assert 'id="refreshHistoryButton"' in index
+    assert 'id="historyExpandToggleButton"' in index
+    assert 'id="historyExpandIcon"' in index
+    assert 'id="historySearchButton"' in index
+    assert 'id="historySearchModal"' in index
+    assert 'id="historySearchResults"' in index
     assert 'id="historySearchInput"' in index
     assert 'id="clearHistorySearchButton"' in index
+    assert index.index('id="historySearchButton"') < index.index('id="historySearchModal"')
+    assert index.index('id="historySearchModal"') < index.index('id="historySearchInput"')
     assert 'id="sidebarCollapseButton"' in index
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app
     assert "dom.workspace.classList.toggle('sidebar-collapsed'" in app
+    assert "state.historyExpanded = !state.historyExpanded;" in app
+    assert "dom.historyList.classList.toggle('hidden', !state.historyExpanded);" in app
+    assert "function openHistorySearchModal()" in app
+    assert "function closeHistorySearchModal()" in app
+    assert "function renderHistorySearchModal()" in app
+    assert "function searchTaskHistory()" in app
     assert "function loadTaskHistory()" in app
     assert "function selectHistoryTask(taskId)" in app
     assert "function startNewChat()" in app
     assert "const params = new URLSearchParams({" in app
-    assert "params.set('query', historyQuery);" in app
-    assert "`/api/limira/tasks?${params.toString()}`" in app
+    assert "api(`/api/limira/tasks?${activeParams.toString()}`)" in app
+    assert "api(`/api/limira/tasks?${archivedParams.toString()}`)" in app
+    assert "Promise.all([" in app
     assert 'id="historyArchiveToggleButton"' in index
     assert 'id="archivedHistoryManageButton"' in index
     assert "window.location.hash = 'archived-chats';" in app
