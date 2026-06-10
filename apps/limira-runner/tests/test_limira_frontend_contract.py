@@ -285,9 +285,13 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "scenario: state.selectedScenario" not in app
     assert 'id="uploadMenuButton"' in index
     assert 'id="uploadFileButton"' in index
+    assert 'id="uploadList" class="attachment-list"' in index
+    assert 'id="uploadMessage" class="upload-message"' in index
     assert "上传文件" in index
     assert "upload-trigger" not in index
     assert "dom.uploadFileButton.addEventListener" in app
+    assert "xhr.upload.addEventListener('progress'" in app
+    assert "function renderUploadCard(document, options = {})" in app
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
     assert "/api/limira/auth/wechat/config" in app

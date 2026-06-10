@@ -148,10 +148,8 @@
 							<button id="refreshArtifactsButton" type="button"></button>
 							<button id="refreshUploadsButton" type="button"></button>
 							<button id="uploadButton" type="button"></button>
-							<div id="uploadMessage"></div>
 							<input id="uploadSearchInput" />
 							<button id="uploadSearchButton" type="button"></button>
-							<div id="uploadList"></div>
 							<div id="reportMessage"></div>
 							<button id="clearStreamButton" type="button"></button>
 						</div>
@@ -163,6 +161,8 @@
 						<div id="messageList" class="message-list-bottom" aria-label="实时进展"></div>
 
 						<form id="researchForm" class="chat-input-box">
+							<div id="uploadMessage" class="upload-message" aria-live="polite"></div>
+							<div id="uploadList" class="attachment-list" aria-label="上传文件列表"></div>
 							<div class="chat-input-wrapper">
 								<div class="upload-menu-wrapper">
 									<button id="uploadMenuButton" class="icon-button upload-menu-button" type="button" title="添加" aria-haspopup="menu" aria-expanded="false">

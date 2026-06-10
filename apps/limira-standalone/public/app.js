@@ -75,6 +75,7 @@ const state = {
 	activeTab: '证据',
 	isSubmitting: false,
 	isUploading: false,
+	currentUpload: null,
 	isSearching: false,
 	isExporting: false,
 	isLoadingHistory: false,
@@ -934,6 +935,7 @@ function resetWorkspaceState() {
 	state.restoreBlocked = false;
 	state.isSubmitting = false;
 	state.isUploading = false;
+	state.currentUpload = null;
 	state.isSearching = false;
 	state.isExporting = false;
 	state.isLoadingHistory = false;
@@ -1194,6 +1196,7 @@ async function loadUploads() {
 			return;
 		}
 		dom.uploadMessage.textContent = errorMessage(error);
+		renderUploads();
 	}
 }
 
@@ -1201,10 +1204,20 @@ async function uploadDocument() {
 	const file = dom.uploadInput.files?.[0];
 	if (!file || state.isUploading) {
 		dom.uploadMessage.textContent = file ? '' : '请先选择文件。';
+		renderUploads();
 		return;
 	}
 	state.isUploading = true;
-	dom.uploadMessage.textContent = '正在上传...';
+	state.currentUpload = {
+		filename: file.name,
+		byte_size: file.size,
+		content_type: file.type || '文档',
+		progress: 0,
+		status: 'uploading',
+		message: '正在上传'
+	};
+	dom.uploadMessage.textContent = '';
+	renderUploads();
 	const context = captureAsyncContext();
 	const form = new FormData();
 	form.append('file', file);
@@ -1212,9 +1225,21 @@ async function uploadDocument() {
 		form.append('task_id', state.taskId);
 	}
 	try {
-		const uploaded = await api('/api/limira/uploads', { method: 'POST', body: form });
+		const uploaded = await uploadFormData('/api/limira/uploads', form, (progress) => {
+			if (!isCurrentAsyncContext(context) || !state.currentUpload) {
+				return;
+			}
+			state.currentUpload.progress = progress;
+			renderUploads();
+		});
 		if (!isCurrentAsyncContext(context)) {
 			return;
+		}
+		if (state.currentUpload) {
+			state.currentUpload.progress = 100;
+			state.currentUpload.status = 'complete';
+			state.currentUpload.message = '上传完成';
+			renderUploads();
 		}
 		if (uploaded && typeof uploaded === 'object') {
 			state.uploads = mergeUploadedDocument(state.uploads, uploaded);
@@ -1224,15 +1249,75 @@ async function uploadDocument() {
 		dom.uploadInput.value = '';
 		dom.uploadMessage.textContent = '上传完成。';
 		await loadUploads();
+		if (isCurrentAsyncContext(context)) {
+			state.currentUpload = null;
+			renderUploads();
+		}
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
+		if (state.currentUpload) {
+			state.currentUpload.status = 'error';
+			state.currentUpload.message = errorMessage(error);
+		}
 		dom.uploadMessage.textContent = errorMessage(error);
+		renderUploads();
 	} finally {
 		if (isCurrentAsyncContext(context)) {
 			state.isUploading = false;
 		}
+	}
+}
+
+function uploadFormData(path, form, onProgress) {
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		xhr.open('POST', path);
+		xhr.withCredentials = true;
+		xhr.setRequestHeader('accept', 'application/json');
+		if (state.token) {
+			xhr.setRequestHeader('authorization', `Bearer ${state.token}`);
+		}
+		xhr.upload.addEventListener('progress', (event) => {
+			if (!event.lengthComputable) {
+				return;
+			}
+			const progress = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+			onProgress(progress);
+		});
+		xhr.addEventListener('load', () => {
+			const contentType = xhr.getResponseHeader('content-type') || '';
+			if (xhr.status >= 200 && xhr.status < 300) {
+				try {
+					resolve(contentType.includes('application/json') && xhr.responseText ? JSON.parse(xhr.responseText) : xhr.responseText);
+				} catch {
+					reject(new Error('服务返回的 JSON 不完整。请强制刷新页面后重试。'));
+				}
+				return;
+			}
+			if (xhr.status === 401) {
+				state.user = null;
+				renderShell();
+			}
+			const error = new Error(xhrResponseDetail(xhr));
+			error.status = xhr.status;
+			reject(error);
+		});
+		xhr.addEventListener('error', () => reject(new Error('上传失败，请检查网络后重试。')));
+		xhr.addEventListener('abort', () => reject(new Error('上传已取消。')));
+		xhr.send(form);
+	});
+}
+
+function xhrResponseDetail(xhr) {
+	const text = xhr.responseText || xhr.statusText || `请求失败，状态码 ${xhr.status}`;
+	try {
+		const json = JSON.parse(text);
+		const detail = typeof json.detail === 'string' ? json.detail : JSON.stringify(json.detail || json);
+		return localizedErrorDetail(detail);
+	} catch {
+		return text;
 	}
 }
 
@@ -1256,6 +1341,7 @@ async function searchUploads() {
 			return;
 		}
 		dom.uploadMessage.textContent = errorMessage(error);
+		renderUploads();
 	} finally {
 		if (isCurrentAsyncContext(context)) {
 			state.isSearching = false;
@@ -1846,21 +1932,54 @@ function bindRefChips() {
 
 function renderUploads() {
 	const uploads = state.uploadResults.length ? state.uploadResults : state.uploads;
-	dom.uploadList.innerHTML = uploads.length
-		? uploads
-				.map((document) => {
-					const id = document.document_id;
-					const title = document.filename || document.original_filename || id;
-					const score = typeof document.score === 'number' ? `相关度 ${document.score.toFixed(3)}` : '';
-					return `<article class="upload-card">
-						<div class="artifact-title">${escapeHtml(title)}</div>
-						<div class="artifact-meta"><span>${escapeHtml(document.content_type || '文档')}</span><span>${formatBytes(document.byte_size)}</span>${score ? `<span>${score}</span>` : ''}</div>
-						${document.snippet ? `<div class="artifact-body">${escapeHtml(document.snippet)}</div>` : ''}
-						<a href="/api/limira/uploads/${encodeURIComponent(id)}/download">下载</a>
-					</article>`;
-				})
-				.join('')
-		: '<div class="empty-state">暂无上传文档。</div>';
+	const cards = [];
+	if (state.currentUpload) {
+		cards.push(renderUploadCard(state.currentUpload, { transient: true }));
+	}
+	for (const document of uploads) {
+		cards.push(renderUploadCard(document));
+	}
+	dom.uploadList.innerHTML = cards.join('');
+	dom.uploadList.classList.toggle('hidden', cards.length === 0);
+	dom.uploadMessage.classList.toggle('hidden', !dom.uploadMessage.textContent.trim());
+}
+
+function renderUploadCard(document, options = {}) {
+	const transient = Boolean(options.transient);
+	const id = String(document.document_id || '');
+	const title = document.filename || document.original_filename || id || '上传文件';
+	const progress = Math.max(0, Math.min(100, Number(document.progress || 0)));
+	const status = String(document.status || '').toLowerCase();
+	const score = typeof document.score === 'number' ? `相关度 ${document.score.toFixed(3)}` : '';
+	const statusText =
+		status === 'error'
+			? '上传失败'
+			: status === 'complete'
+				? '上传完成'
+				: transient
+					? `上传中 ${progress}%`
+					: '已上传';
+	const meta = [document.content_type || '文档', formatBytes(document.byte_size), score, statusText].filter(Boolean);
+	const progressBar = transient
+		? `<div class="attachment-progress" aria-label="上传进度"><span style="width: ${progress}%"></span></div>`
+		: '';
+	const message = document.message ? `<div class="attachment-message">${escapeHtml(document.message)}</div>` : '';
+	const download =
+		!transient && id
+			? `<a class="attachment-download" href="/api/limira/uploads/${encodeURIComponent(id)}/download" title="下载文件">下载</a>`
+			: '';
+	return `<article class="attachment-card ${transient ? `upload-${escapeAttr(status || 'uploading')}` : ''}">
+		<div class="attachment-icon" aria-hidden="true">
+			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M14 3H7C5.89543 3 5 3.89543 5 5V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V8M14 3L19 8M14 3V8H19" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+		</div>
+		<div class="attachment-content">
+			<div class="attachment-title">${escapeHtml(title)}</div>
+			<div class="attachment-meta">${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>
+			${progressBar}
+			${document.snippet ? `<div class="attachment-message">${escapeHtml(document.snippet)}</div>` : message}
+		</div>
+		${download}
+	</article>`;
 }
 
 function mergeUploadedDocument(documents, uploaded) {
