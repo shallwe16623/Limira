@@ -391,6 +391,90 @@ async def test_archive_download_regenerates_after_task_scoped_writes():
 
 
 @pytest.mark.asyncio
+async def test_archive_download_regenerates_stale_archive_when_pdf_report_is_added():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-stale-archive-pdf",
+        owner_user_id=user.id,
+        query="stale archive pdf",
+        scenario=None,
+        runner_task_id="runner-stale-archive-pdf",
+    )
+    task.archive_status = "ready"
+    repo.record_generated_report(
+        report_id="REPORT-001",
+        task_id=task.task_id,
+        report_type="final",
+        markdown="# Final report\n\nArchive text without a PDF yet.",
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=[],
+        creator_user_id=user.id,
+        metadata={},
+    )
+    first_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    stale_archive_key = task.archive_object_key
+    stale_archive_sha = task.archive_zip_sha256
+    with zipfile.ZipFile(io.BytesIO(first_response.body)) as archive:
+        assert "report.pdf" not in archive.namelist()
+
+    pdf_bytes = b"%PDF-1.7\nfake limira report with rendered content\n%%EOF"
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="reports",
+        task_id=task.task_id,
+        filename="standalone-final.pdf",
+        object_id="standalone-final",
+    )
+    stored_pdf = await storage.put_object(
+        object_key=pdf_key,
+        data=pdf_bytes,
+        content_type="application/pdf",
+        metadata={
+            "task_id": task.task_id,
+            "report_id": "standalone-final",
+            "owner_user_id": user.id,
+            "report_type": "final",
+        },
+    )
+    repo.record_generated_report(
+        report_id="standalone-final",
+        task_id=task.task_id,
+        report_type="final",
+        markdown="# Browser exported report\n\nPDF-backed report.",
+        html=None,
+        pdf_object_key=stored_pdf.object_key,
+        evidence_refs=[],
+        creator_user_id=user.id,
+        metadata={
+            "pdf_sha256": stored_pdf.sha256,
+            "pdf_size_bytes": stored_pdf.size_bytes,
+            "source_event_type": "browser_pdf_export",
+        },
+    )
+    task.archive_object_key = stale_archive_key
+    task.archive_zip_sha256 = stale_archive_sha
+
+    second_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert task.archive_zip_sha256 != stale_archive_sha
+    with zipfile.ZipFile(io.BytesIO(second_response.body)) as archive:
+        assert archive.read("report.pdf") == pdf_bytes
+
+
+@pytest.mark.asyncio
 async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

@@ -254,6 +254,27 @@ def _select_archive_report(
     return reports[0] if reports else None
 
 
+def _select_archive_pdf_report(
+    reports: list[LimiraGeneratedReport],
+) -> LimiraGeneratedReport | None:
+    for report in reports:
+        if (
+            report.report_type == "final"
+            and _is_valid_report_pdf_metadata(
+                report.pdf_object_key,
+                (report.metadata or {}).get("pdf_sha256"),
+            )
+        ):
+            return report
+    for report in reports:
+        if _is_valid_report_pdf_metadata(
+            report.pdf_object_key,
+            (report.metadata or {}).get("pdf_sha256"),
+        ):
+            return report
+    return None
+
+
 def _archive_evidence_refs(
     report: LimiraGeneratedReport | None,
     artifacts: dict[str, list[dict[str, Any]]],

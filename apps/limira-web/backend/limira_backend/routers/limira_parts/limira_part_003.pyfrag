@@ -1987,7 +1987,7 @@ async def _archive_report_pdf_bytes(
     repo: LimiraTaskRepository,
     object_storage: LimiraObjectStorage,
 ) -> bytes | None:
-    report = _select_archive_report(repo.list_task_reports(task_id=task.task_id))
+    report = _select_archive_pdf_report(repo.list_task_reports(task_id=task.task_id))
     if not report or not report.pdf_object_key:
         return None
     try:
@@ -2073,10 +2073,24 @@ def _persisted_archive_reuse_failure_reason(
     if actual_sha != task.archive_zip_sha256:
         return "archive_sha_mismatch"
     expected_snapshot_members = _expected_archive_snapshot_member_names(task, repo)
-    if expected_snapshot_members:
+    expected_pdf_report = _select_archive_pdf_report(
+        repo.list_task_reports(task_id=task.task_id)
+    )
+    if expected_snapshot_members or expected_pdf_report:
         try:
             with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
                 names = set(archive.namelist())
+                if expected_pdf_report:
+                    if "report.pdf" not in names:
+                        return "archive_report_pdf_missing"
+                    expected_pdf_sha = (expected_pdf_report.metadata or {}).get(
+                        "pdf_sha256"
+                    )
+                    actual_pdf_sha = hashlib.sha256(
+                        archive.read("report.pdf")
+                    ).hexdigest()
+                    if actual_pdf_sha != expected_pdf_sha:
+                        return "archive_report_pdf_mismatch"
         except zipfile.BadZipFile:
             return "invalid_archive_zip"
         if not set(expected_snapshot_members).issubset(names):
