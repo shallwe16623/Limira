@@ -500,6 +500,17 @@ async def test_upload_route_stores_pdf_with_extracted_text(monkeypatch):
     assert storage.objects[document.object_key]["data"] == b"%PDF-1.7"
 
 
+def test_pdf_text_extractor_accepts_valid_pdf_bytes():
+    from pypdf import PdfWriter
+
+    output = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(output)
+
+    assert limira._extract_pdf_text(output.getvalue()) == ""
+
+
 @pytest.mark.asyncio
 async def test_upload_route_stores_pdf_when_text_extraction_fails(monkeypatch):
     app, repo, storage = _limira_asgi_app()
