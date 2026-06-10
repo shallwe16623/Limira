@@ -247,6 +247,11 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/auth/password-reset/request" in app
     assert "/api/limira/auth/password-reset/confirm" in app
     assert "/api/limira/auth/organizations" in app
+    load_auth_options_block = app[app.index("async function loadAuthOptions()") : app.index("function setAuthScope(scope)")]
+    assert "Promise.allSettled([" in load_auth_options_block
+    assert "api('/api/limira/auth/organizations')" in load_auth_options_block
+    assert "state.organizations = [];" not in load_auth_options_block
+    assert "renderAuthMode();" in load_auth_options_block
     assert "/api/limira/auth/enterprise/signin" in app
     assert "/api/limira/enterprise/members" in app
     assert "/api/limira/enterprise/usage" in app
@@ -499,12 +504,24 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "state.artifactsByTaskId" in app
     assert "const shouldSelect =" in app
     assert "options.select === true" in app
+    assert "options.select !== false" in app
     assert "await loadArtifacts(normalizedTaskId, { updateReport: false, select: true });" in app
+    assert "void loadArtifacts(taskId, { updateReport: false, silent: true, select: false })" in app
     assert "state.artifactsByTaskId = {" in app
+    assert "function ensureReportArtifactSnapshots()" in app
+    assert "function rememberReportArtifactCounts(taskId, artifacts)" in app
+    assert "artifactCountsSnapshot" in app
+    assert "message.artifactCountsSnapshot || {}" in app
     assert "upsertReportMessage(reportMarkdown(artifacts));" in app
     assert "upsertArtifactThinkingStep(artifacts);" in app
     assert "return artifacts ? artifactCounts(artifacts) : {};" in app
     assert "function artifactCounts(artifacts = state.artifacts)" in app
+    render_timeline_block = app[app.index("function renderTimeline()") : app.index("function renderMap()")]
+    assert "function timelineEventBody(item)" in render_timeline_block
+    assert "function timelineEventDate(item)" in render_timeline_block
+    assert "item.event" in render_timeline_block
+    assert "item.key_findings" in render_timeline_block
+    assert "stringifyCompact(item)" not in render_timeline_block
     assert "item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message)" in render_messages_block
     assert "item.message.kind === 'report' && messageBelongsToCurrentTask(item.message)" in render_messages_block
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]

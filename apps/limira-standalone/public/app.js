@@ -78,6 +78,7 @@ const DIRECT_EXTERNAL_EVIDENCE_HOSTS = [
 	'x.com',
 	'yougov.com'
 ];
+const artifactSnapshotLoads = new Set();
 
 const state = {
 	authScope: 'personal',
@@ -718,24 +719,22 @@ function renderAuthMode() {
 }
 
 async function loadAuthOptions() {
-	try {
-		const [googleConfig, wechatConfig, organizations] = await Promise.all([
-			api('/api/limira/auth/google/config'),
-			api('/api/limira/auth/wechat/config'),
-			api('/api/limira/auth/organizations')
-		]);
-		state.googleAuthEnabled = Boolean(googleConfig?.enabled);
-		state.wechatAuthEnabled = Boolean(wechatConfig?.enabled);
-		state.organizations = Array.isArray(organizations?.organizations)
-			? organizations.organizations
+	const [googleConfig, wechatConfig, organizations] = await Promise.allSettled([
+		api('/api/limira/auth/google/config'),
+		api('/api/limira/auth/wechat/config'),
+		api('/api/limira/auth/organizations')
+	]);
+	state.googleAuthEnabled =
+		googleConfig.status === 'fulfilled' && Boolean(googleConfig.value?.enabled);
+	state.wechatAuthEnabled =
+		wechatConfig.status === 'fulfilled' && Boolean(wechatConfig.value?.enabled);
+	if (organizations.status === 'fulfilled') {
+		state.organizations = Array.isArray(organizations.value?.organizations)
+			? organizations.value.organizations
 			: [];
-		selectDefaultOrganizationForCategory();
-	} catch {
-		state.googleAuthEnabled = false;
-		state.wechatAuthEnabled = false;
-		state.organizations = [];
-		state.selectedOrganizationId = '';
 	}
+	selectDefaultOrganizationForCategory();
+	renderAuthMode();
 }
 
 function setAuthScope(scope) {
@@ -2466,10 +2465,13 @@ async function loadArtifacts(taskId = state.taskId, options = {}) {
 			...state.artifactsByTaskId,
 			[normalizedTaskId]: artifacts
 		};
+		rememberReportArtifactCounts(normalizedTaskId, artifacts);
 		const shouldSelect =
 			options.select === true ||
-			!state.artifactTaskId ||
-			state.artifactTaskId === normalizedTaskId;
+			(options.select !== false && (
+				!state.artifactTaskId ||
+				state.artifactTaskId === normalizedTaskId
+			));
 		if (shouldSelect) {
 			state.artifacts = artifacts;
 			state.artifactTaskId = normalizedTaskId;
@@ -2961,6 +2963,7 @@ function renderMessages() {
 			.join('');
 	}
 	bindMessageActions();
+	ensureReportArtifactSnapshots();
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 	scrollConversationToBottom();
 }
@@ -2975,7 +2978,10 @@ function renderReportTaskControls(message) {
 	if (!taskId) {
 		return '';
 	}
-	const counts = reportArtifactCounts(taskId);
+	const liveCounts = reportArtifactCounts(taskId);
+	const counts = hasArtifactCounts(liveCounts)
+		? liveCounts
+		: message.artifactCountsSnapshot || {};
 	const archiveStatus = archiveStatusForTask(taskId);
 	return `<div class="report-artifact-controls" data-report-task-id="${escapeAttr(taskId)}" aria-label="本次输出成果">
 		${tabs
@@ -2988,6 +2994,25 @@ function renderReportTaskControls(message) {
 function reportArtifactCounts(taskId) {
 	const artifacts = artifactsForTask(taskId);
 	return artifacts ? artifactCounts(artifacts) : {};
+}
+
+function hasArtifactCounts(counts) {
+	return Object.values(counts || {}).some((count) => Number(count || 0) > 0);
+}
+
+function ensureReportArtifactSnapshots() {
+	const taskIds = uniqueTaskIds(
+		state.messages
+			.filter((message) => message?.kind === 'report')
+			.map((message) => message.taskId)
+	);
+	for (const taskId of taskIds) {
+		if (!artifactsForTask(taskId) && !artifactSnapshotLoads.has(taskId)) {
+			artifactSnapshotLoads.add(taskId);
+			void loadArtifacts(taskId, { updateReport: false, silent: true, select: false })
+				.finally(() => artifactSnapshotLoads.delete(taskId));
+		}
+	}
 }
 
 function currentArtifactTaskId() {
@@ -3508,15 +3533,48 @@ function renderTimeline() {
 		? `<div class="timeline">${items
 				.map((item, index) => {
 					const title = item.title || item.event_title || `时间线事件 ${index + 1}`;
-					const date = item.date || item.timestamp || item.occurred_at || '';
+					const date = timelineEventDate(item);
+					const body = timelineEventBody(item);
 					return `<article class="timeline-item">
 						<div class="artifact-title">${escapeHtml(title)}</div>
 						<div class="artifact-meta">${date ? `<span>${escapeHtml(date)}</span>` : ''}</div>
-						<div class="artifact-body">${escapeHtml(item.summary || item.description || stringifyCompact(item))}</div>
+						${body ? `<div class="artifact-body">${escapeHtml(body)}</div>` : ''}
 					</article>`;
 				})
 				.join('')}</div>`
 		: emptyState('时间线事件会显示在这里。');
+}
+
+function timelineEventDate(item) {
+	const payload = item?.payload && typeof item.payload === 'object' ? item.payload : {};
+	return item.start_date ||
+		item.date ||
+		item.timestamp ||
+		item.occurred_at ||
+		payload.start_date ||
+		payload.date ||
+		payload.timestamp ||
+		payload.occurred_at ||
+		'';
+}
+
+function timelineEventBody(item) {
+	const payload = item?.payload && typeof item.payload === 'object' ? item.payload : {};
+	const value =
+		item.summary ||
+		item.description ||
+		item.event ||
+		item.key_findings ||
+		item.findings ||
+		item.notes ||
+		payload.summary ||
+		payload.description ||
+		payload.event ||
+		payload.key_findings ||
+		payload.findings ||
+		payload.notes ||
+		'';
+	return String(value || '').trim();
 }
 
 function renderMap() {
@@ -4339,13 +4397,18 @@ function upsertReportMessage(content) {
 	const index = state.messages.findIndex((message) => (
 		message.kind === 'report' && String(message.taskId || '') === taskId
 	));
+	const liveCounts = taskId ? reportArtifactCounts(taskId) : {};
+	const artifactCountsSnapshot = hasArtifactCounts(liveCounts)
+		? liveCounts
+		: index >= 0 ? state.messages[index].artifactCountsSnapshot || {} : {};
 	const message = {
 		role: 'assistant',
 		content: text,
 		time: index >= 0 ? state.messages[index].time || now() : now(),
 		format: 'markdown',
 		kind: 'report',
-		taskId
+		taskId,
+		artifactCountsSnapshot
 	};
 	if (
 		index >= 0 &&
@@ -4365,6 +4428,23 @@ function upsertReportMessage(content) {
 		? state.messages.map((item, itemIndex) => (itemIndex === index ? message : item))
 		: [...messages, message];
 	return true;
+}
+
+function rememberReportArtifactCounts(taskId, artifacts) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId) {
+		return false;
+	}
+	const counts = artifactCounts(artifacts);
+	let changed = false;
+	state.messages = state.messages.map((message) => {
+		if (message.kind !== 'report' || String(message.taskId || '') !== normalizedTaskId) {
+			return message;
+		}
+		changed = true;
+		return { ...message, artifactCountsSnapshot: counts };
+	});
+	return changed;
 }
 
 function appendThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '', time = '' }) {
