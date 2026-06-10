@@ -2587,12 +2587,8 @@ function renderUploadCard(document, options = {}) {
 		? `<div class="attachment-progress" aria-label="上传进度"><span style="width: ${progress}%"></span></div>`
 		: '';
 	const message = document.message ? `<div class="attachment-message">${escapeHtml(document.message)}</div>` : '';
-	const download =
-		!transient && id
-			? `<a class="attachment-download" href="/api/limira/uploads/${encodeURIComponent(id)}/download" title="下载文件">下载</a>`
-			: '';
 	const remove =
-		!transient && !state.taskId && id
+		!transient && id
 			? `<button class="attachment-remove" type="button" data-remove-upload-id="${escapeAttr(id)}" title="从本次对话移除">×</button>`
 			: '';
 	return `<article class="attachment-card ${transient ? `upload-${escapeAttr(status || 'uploading')}` : ''}">
@@ -2605,7 +2601,7 @@ function renderUploadCard(document, options = {}) {
 			${progressBar}
 			${document.snippet ? `<div class="attachment-message">${escapeHtml(document.snippet)}</div>` : message}
 		</div>
-		<div class="attachment-actions">${download}${remove}</div>
+		<div class="attachment-actions">${remove}</div>
 	</article>`;
 }
 
@@ -2648,10 +2644,13 @@ function selectHistoryFile(documentId) {
 }
 
 function removeSelectedUpload(documentId) {
-	if (!documentId || state.taskId) {
+	if (!documentId) {
 		return;
 	}
 	state.uploads = state.uploads.filter(
+		(document) => String(document.document_id || '') !== documentId
+	);
+	state.uploadResults = state.uploadResults.filter(
 		(document) => String(document.document_id || '') !== documentId
 	);
 	saveWorkspace();

@@ -326,6 +326,10 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "/api/limira/uploads/storage" in app
     assert "xhr.upload.addEventListener('progress'" in app
     assert "function renderUploadCard(document, options = {})" in app
+    assert 'data-remove-upload-id="${escapeAttr(id)}"' in app
+    assert '<div class="attachment-actions">${remove}</div>' in app
+    assert '<div class="attachment-actions">${download}</div>' in app
+    assert 'href="/api/limira/uploads/${encodeURIComponent(id)}/download"' not in app
     assert "/api/limira/auth/google/config" in app
     assert "/api/limira/auth/google/start" in app
     assert "/api/limira/auth/wechat/config" in app
