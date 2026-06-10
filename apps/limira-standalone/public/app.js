@@ -1501,7 +1501,7 @@ async function selectHistoryTask(taskId) {
 	state.messages = historyMessages(cached);
 	state.thinkingCollapsed = false;
 	state.thinkingSteps = historyThinkingSteps(cached);
-	dom.queryInput.value = cached.query || '';
+	dom.queryInput.value = '';
 	saveWorkspace();
 	renderShell();
 	try {
@@ -1642,9 +1642,6 @@ function restoreWorkspace() {
 	state.savedUserId = typeof saved.userId === 'string' ? saved.userId : '';
 	state.taskId = typeof saved.taskId === 'string' ? saved.taskId : '';
 	state.query = typeof saved.query === 'string' ? saved.query : '';
-	if (state.query && dom.queryInput) {
-		dom.queryInput.value = state.query;
-	}
 	state.status = typeof saved.status === 'string' ? saved.status : 'ready';
 	state.archiveStatus = typeof saved.archiveStatus === 'string' ? saved.archiveStatus : 'pending';
 	state.archiveDownloadUrl = safeArchiveDownloadUrl(saved.archiveDownloadUrl, state.taskId);
@@ -2751,7 +2748,10 @@ function renderMessages() {
 	const indexedMessages = state.messages.map((message, index) => ({ message, index }));
 	const messages = artifactView
 		? indexedMessages.filter((item) => item.message.kind !== 'report').slice(-2)
-		: indexedMessages.slice(-80);
+		: indexedMessages.filter((item) => item.message.kind !== 'report').slice(-80);
+	const reportMessages = artifactView
+		? []
+		: indexedMessages.filter((item) => item.message.kind === 'report').slice(-8);
 	const latestUserIndex = latestUserMessageIndex();
 	dom.messageList.innerHTML = messages
 		.map(
@@ -2763,6 +2763,18 @@ function renderMessages() {
 			</article>`
 		)
 		.join('');
+	if (dom.reportList) {
+		dom.reportList.innerHTML = reportMessages
+			.map(
+				({ message, index }) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
+					<div class="message-bubble">
+						<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
+					</div>
+					${renderMessageActions(message, index, latestUserIndex)}
+				</article>`
+			)
+			.join('');
+	}
 	bindMessageActions();
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 	scrollConversationToBottom();
@@ -2792,16 +2804,18 @@ function renderMessageActions(message, index, latestUserIndex) {
 }
 
 function bindMessageActions() {
-	for (const button of dom.messageList.querySelectorAll('[data-message-action]')) {
-		button.addEventListener('click', (event) => {
-			const index = Number(button.dataset.messageIndex);
-			if (button.dataset.messageAction === 'copy') {
-				void copyMessageContent(index, button);
-			} else if (button.dataset.messageAction === 'edit') {
-				editMessageForResend(index);
-			}
-			event.stopPropagation();
-		});
+	for (const root of [dom.messageList, dom.reportList].filter(Boolean)) {
+		for (const button of root.querySelectorAll('[data-message-action]')) {
+			button.addEventListener('click', (event) => {
+				const index = Number(button.dataset.messageIndex);
+				if (button.dataset.messageAction === 'copy') {
+					void copyMessageContent(index, button);
+				} else if (button.dataset.messageAction === 'edit') {
+					editMessageForResend(index);
+				}
+				event.stopPropagation();
+			});
+		}
 	}
 }
 

@@ -395,7 +395,8 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;" not in app
     assert "dom.thinkingToggleIcon.textContent = state.thinkingCollapsed ? '>' : '⌄';" in app
     assert index.index('id="messageList"') < index.index('id="thinkingPanel"')
-    assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
+    assert index.index('id="thinkingPanel"') < index.index('id="reportList"')
+    assert index.index('id="reportList"') < index.index('id="artifactTabs"')
     assert ".conversation-panel {\n\twidth: 100%;" in styles
     assert ".conversation-panel {\n\twidth: 100%;\n\tmax-width: 880px;\n\tmargin: 0 auto;\n\tdisplay: flex;\n\tflex-direction: column;\n\tgap: 0.9rem;\n}" in styles
     assert ".thinking-list {\n\tdisplay: grid;\n\tgap: 0.85rem;\n\toverflow: visible;\n\tpadding: 1rem;\n}" in styles
@@ -441,6 +442,8 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "switchToWorkspaceRoute();" in select_history_block
     assert "renderShell();" in select_history_block
     assert "await loadTaskProgressRecords();" in select_history_block
+    assert "dom.queryInput.value = '';" in select_history_block
+    assert "dom.queryInput.value = cached.query" not in select_history_block
     assert "switchToWorkspaceRoute();" in start_new_chat_block
     assert "renderShell();" in start_new_chat_block
     assert "const params = new URLSearchParams({" in app
@@ -468,6 +471,8 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
     assert "message.kind === 'report' && String(message.taskId || '') === taskId" in app
     assert "taskId" in app[app.index("function upsertReportMessage(content)") : app.index("function appendThinkingStep")]
+    restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]
+    assert "dom.queryInput.value = state.query" not in restore_workspace_block
     assert LEGACY_AUTH_PREFIX not in app
 
 
@@ -527,7 +532,8 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
     assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');" in app
     assert index.index('id="conversationPanel"') < index.index('id="thinkingPanel"')
-    assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
+    assert index.index('id="thinkingPanel"') < index.index('id="reportList"')
+    assert index.index('id="reportList"') < index.index('id="artifactTabs"')
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
     assert index.index('id="workspaceContent"') < index.index('id="inputContainer"')
     assert index.index('id="artifactContent"') < index.index('id="inputContainer"')
@@ -605,6 +611,7 @@ def test_limira_standalone_hides_raw_event_log_and_keeps_progress_panel():
     assert 'id="thinkingList"' in index
     assert 'aria-label="工作过程"' in index
     assert 'id="messageList"' in index
+    assert 'id="reportList"' in index
     assert 'id="clearStreamButton"' in index
     assert "function renderThinking()" in app
     assert "function addThinkingStep" in app
