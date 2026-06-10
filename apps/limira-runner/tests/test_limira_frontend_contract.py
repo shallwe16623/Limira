@@ -266,7 +266,8 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="cloudDriveFileList"' in index
     assert 'id="userSettingsPanel"' in index
     assert 'id="archivedHistoryManageButton"' in index
-    assert 'id="archivedHistoryPanel"' in index
+    assert 'id="archivedHistoryPage"' in index
+    assert 'id="archivedHistoryBackButton"' in index
     assert 'id="archivedHistoryList"' in index
     assert 'class="settings-menu-item danger"' in index
     assert "此页面直接连接 limira 后端" not in index
@@ -357,6 +358,9 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "`/api/limira/tasks?limit=${MAX_HISTORY_TASKS}&archived=${archived}`" in app
     assert 'id="historyArchiveToggleButton"' in index
     assert 'id="archivedHistoryManageButton"' in index
+    assert "window.location.hash = 'archived-chats';" in app
+    assert "state.route === 'archived-chats'" in app
+    assert "function routeFromHash()" in app
     assert "function loadArchivedTaskHistory()" in app
     assert "function renderArchivedHistory()" in app
     assert "function archiveHistoryTask(taskId)" in app

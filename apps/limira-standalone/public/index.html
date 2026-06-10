@@ -107,15 +107,7 @@
 								<div class="cloud-storage-meter" aria-label="云空间用量"><span id="cloudStorageMeter"></span></div>
 							</div>
 							<button id="cloudDriveManageButton" class="settings-menu-item hidden" type="button">管理云盘</button>
-							<button id="archivedHistoryManageButton" class="settings-menu-item" type="button" aria-expanded="false">已归档对话</button>
-							<div id="archivedHistoryPanel" class="archived-history-panel hidden">
-								<div class="archived-history-header">
-									<div class="sidebar-section-title">已归档对话</div>
-									<button id="refreshArchivedHistoryButton" class="ghost-button compact" type="button">刷新</button>
-								</div>
-								<div id="archivedHistoryMessage" class="inline-message"></div>
-								<div id="archivedHistoryList" class="settings-history-list"></div>
-							</div>
+							<button id="archivedHistoryManageButton" class="settings-menu-item" type="button">已归档对话</button>
 							<div id="enterpriseAdminPanel" class="enterprise-admin-panel hidden">
 								<div class="enterprise-admin-header">
 									<div class="sidebar-section-title">单位管理</div>
@@ -184,6 +176,18 @@
 							<div class="cloud-drive-meter" aria-label="云盘用量"><span id="cloudDriveStorageMeter"></span></div>
 						</div>
 						<div id="cloudDriveFileList" class="cloud-drive-list"></div>
+					</section>
+					<section id="archivedHistoryPage" class="archived-history-page hidden" aria-label="已归档对话">
+						<div class="archived-history-page-header">
+							<button id="archivedHistoryBackButton" class="ghost-button compact" type="button">返回工作台</button>
+							<div>
+								<h2>已归档对话</h2>
+								<p>查看已经收起的研究对话，并按需恢复到普通历史。</p>
+							</div>
+							<button id="refreshArchivedHistoryButton" class="ghost-button compact" type="button">刷新</button>
+						</div>
+						<div id="archivedHistoryMessage" class="inline-message"></div>
+						<div id="archivedHistoryList" class="archived-history-list"></div>
 					</section>
 
 					<!-- Bottom Input Area (ChatGPT Style) -->

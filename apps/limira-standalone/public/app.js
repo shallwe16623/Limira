@@ -63,10 +63,9 @@ const state = {
 	selectedOrganizationId: '',
 	enterpriseMembers: [],
 	enterpriseUsage: null,
-	route: window.location.hash === '#cloud-drive' ? 'cloud-drive' : 'workspace',
+	route: routeFromHash(),
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
-	archivedHistoryOpen: false,
 	uploadMenuOpen: false,
 	historyFilesOpen: false,
 	showArchivedHistory: false,
@@ -148,6 +147,8 @@ function bindEvents() {
 		renderShell();
 		if (state.route === 'cloud-drive') {
 			void loadUploads();
+		} else if (state.route === 'archived-chats') {
+			void loadArchivedTaskHistory();
 		}
 	});
 	dom.cloudDriveManageButton.addEventListener('click', (event) => {
@@ -159,6 +160,12 @@ function bindEvents() {
 		void loadUploads();
 	});
 	dom.cloudDriveBackButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		window.location.hash = '';
+		syncRouteFromHash();
+		renderShell();
+	});
+	dom.archivedHistoryBackButton.addEventListener('click', (event) => {
 		event.preventDefault();
 		window.location.hash = '';
 		syncRouteFromHash();
@@ -231,12 +238,13 @@ function bindEvents() {
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
 	dom.newChatButton.addEventListener('click', startNewChat);
-	dom.archivedHistoryManageButton.addEventListener('click', () => {
-		state.archivedHistoryOpen = !state.archivedHistoryOpen;
-		renderArchivedHistory();
-		if (state.archivedHistoryOpen) {
-			void loadArchivedTaskHistory();
-		}
+	dom.archivedHistoryManageButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		state.userSettingsOpen = false;
+		window.location.hash = 'archived-chats';
+		syncRouteFromHash();
+		renderShell();
+		void loadArchivedTaskHistory();
 	});
 	dom.refreshArchivedHistoryButton.addEventListener('click', () => void loadArchivedTaskHistory());
 	dom.archivedHistoryList.addEventListener('click', (event) => {
@@ -338,16 +346,18 @@ function renderShell() {
 	const signedIn = Boolean(state.user);
 	const enterpriseAdmin = signedIn && isEnterpriseAdmin();
 	const cloudDriveVisible = signedIn && state.route === 'cloud-drive';
+	const archivedHistoryVisible = signedIn && state.route === 'archived-chats';
+	const utilityPageVisible = cloudDriveVisible || archivedHistoryVisible;
 	dom.authPanel.classList.toggle('hidden', signedIn);
 	dom.workspace.classList.toggle('hidden', !signedIn);
-	dom.workspaceContent.classList.toggle('hidden', cloudDriveVisible);
-	dom.inputContainer.classList.toggle('hidden', cloudDriveVisible);
+	dom.workspaceContent.classList.toggle('hidden', utilityPageVisible);
+	dom.inputContainer.classList.toggle('hidden', utilityPageVisible);
 	dom.cloudDrivePage.classList.toggle('hidden', !cloudDriveVisible);
+	dom.archivedHistoryPage.classList.toggle('hidden', !archivedHistoryVisible);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
 	dom.userSettingsButton.classList.toggle('hidden', !signedIn);
 	if (!signedIn) {
 		state.userSettingsOpen = false;
-		state.archivedHistoryOpen = false;
 		state.archivedTaskHistory = [];
 		state.route = 'workspace';
 		setUploadMenuOpen(false);
@@ -375,7 +385,17 @@ function renderShell() {
 }
 
 function syncRouteFromHash() {
-	state.route = window.location.hash === '#cloud-drive' ? 'cloud-drive' : 'workspace';
+	state.route = routeFromHash();
+}
+
+function routeFromHash() {
+	if (window.location.hash === '#cloud-drive') {
+		return 'cloud-drive';
+	}
+	if (window.location.hash === '#archived-chats') {
+		return 'archived-chats';
+	}
+	return 'workspace';
 }
 
 function setUploadMenuOpen(open) {
@@ -891,13 +911,11 @@ async function loadArchivedTaskHistory() {
 }
 
 function renderArchivedHistory() {
-	if (!dom.archivedHistoryPanel) {
+	if (!dom.archivedHistoryPage) {
 		return;
 	}
-	const visible = Boolean(state.user) && state.archivedHistoryOpen;
-	dom.archivedHistoryPanel.classList.toggle('hidden', !visible);
+	const visible = Boolean(state.user) && state.route === 'archived-chats';
 	dom.archivedHistoryManageButton.classList.toggle('active', visible);
-	dom.archivedHistoryManageButton.setAttribute('aria-expanded', visible ? 'true' : 'false');
 	dom.refreshArchivedHistoryButton.disabled = !state.user || state.isLoadingArchivedHistory;
 	if (!visible) {
 		return;
@@ -985,7 +1003,7 @@ async function archiveHistoryTask(taskId) {
 		});
 		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
 		renderHistory();
-		if (state.archivedHistoryOpen) {
+		if (state.route === 'archived-chats') {
 			await loadArchivedTaskHistory();
 		}
 		await loadTaskHistory();
@@ -1005,7 +1023,7 @@ async function restoreHistoryTask(taskId) {
 		});
 		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
 		renderHistory();
-		if (state.archivedHistoryOpen) {
+		if (state.route === 'archived-chats') {
 			await loadArchivedTaskHistory();
 		}
 		await loadTaskHistory();
@@ -1037,7 +1055,7 @@ async function deleteHistoryTask(taskId) {
 			renderReportControls();
 		}
 		renderHistory();
-		if (state.archivedHistoryOpen) {
+		if (state.route === 'archived-chats') {
 			await loadArchivedTaskHistory();
 		}
 		await loadTaskHistory();
