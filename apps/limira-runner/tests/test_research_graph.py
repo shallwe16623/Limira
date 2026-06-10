@@ -67,6 +67,29 @@ def test_initial_research_graph_creates_bounded_scope_and_plan():
     assert "Cross-check" in state.plan.verification_strategy
 
 
+def test_initial_research_graph_applies_upload_context_and_source_policy():
+    state = build_initial_research_graph(
+        task_id="task-context",
+        query="Assess export control exposure",
+        scenario="sanctions_export_controls",
+        document_ids=["doc-a", "doc-b"],
+        upload_scope={"document_count": 2},
+        source_policy={
+            "min_sources": 5,
+            "prefer_primary_sources": False,
+            "allow_secondary_sources": True,
+            "require_retrieved_at": True,
+        },
+    )
+
+    assert "sanctions_export_controls" in state.brief.scope
+    assert "2 attached upload source(s)" in state.brief.scope
+    assert any("attached upload documents" in item for item in state.brief.required_sources)
+    assert any("uploaded document facts" in item for item in state.brief.constraints)
+    assert state.plan.research_units[0].source_policy.min_sources == 5
+    assert state.plan.research_units[0].source_policy.prefer_primary_sources is False
+
+
 def test_research_graph_bootstrap_events_are_serializable_and_ordered():
     state = build_initial_research_graph(
         task_id="task-graph",
@@ -163,6 +186,12 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
         output_formatter=object(),
         log_dir=str(tmp_path),
         stream_queue=stream_queue,
+        research_context={
+            "scenario": "sanctions_export_controls",
+            "document_ids": ["doc-a"],
+            "upload_scope": {"document_count": 1},
+            "source_policy": {"min_sources": 5},
+        },
     )
 
     assert result[0] == "summary"
@@ -179,3 +208,6 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
     assert len(_FakeOrchestrator.task_descriptions) == 1
     assert "## Limira Research Workflow" in _FakeOrchestrator.task_descriptions[0]
     assert "### Research Units" in _FakeOrchestrator.task_descriptions[0]
+    assert "sanctions_export_controls" in _FakeOrchestrator.task_descriptions[0]
+    assert "1 attached upload source(s)" in _FakeOrchestrator.task_descriptions[0]
+    assert "at least 5" in _FakeOrchestrator.task_descriptions[0]

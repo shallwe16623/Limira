@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ class TaskRecord:
     error: str | None = None
     model_summary: dict[str, Any] | None = None
     warnings: list[str] | None = None
+    context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -48,6 +49,7 @@ class TaskStore:
         query: str,
         created_at: str,
         model_summary: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> TaskRecord:
         record = TaskRecord(
             task_id=task_id,
@@ -60,6 +62,7 @@ class TaskStore:
             created_at=created_at,
             model_summary=model_summary or {},
             warnings=[],
+            context=context or {},
         )
         with self._connect() as conn:
             conn.execute(
@@ -67,8 +70,8 @@ class TaskStore:
                 INSERT INTO limira_runner_research_tasks (
                     task_id, user_id, query, status, archive_status,
                     archive_dir, archive_zip_path, created_at, started_at,
-                    completed_at, error, model_summary, warnings
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    completed_at, error, model_summary, warnings, context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._record_values(record),
             )
@@ -214,10 +217,12 @@ class TaskStore:
                     completed_at TEXT,
                     error TEXT,
                     model_summary TEXT,
-                    warnings TEXT
+                    warnings TEXT,
+                    context TEXT
                 )
                 """
             )
+            self._ensure_sqlite_column(conn, "context", "TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_limira_runner_tasks_user_created
@@ -245,6 +250,7 @@ class TaskStore:
             record.error,
             self._serialize_value(record.model_summary or {}),
             self._serialize_value(record.warnings or []),
+            self._serialize_value(record.context or {}),
         )
 
     def _row_to_record(self, row: sqlite3.Row) -> TaskRecord:
@@ -262,7 +268,23 @@ class TaskStore:
             error=row["error"],
             model_summary=self._deserialize_json(row["model_summary"], default={}),
             warnings=self._deserialize_json(row["warnings"], default=[]),
+            context=self._deserialize_json(row["context"], default={}),
         )
+
+    def _ensure_sqlite_column(
+        self,
+        conn: sqlite3.Connection,
+        column_name: str,
+        column_sql: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(limira_runner_research_tasks)")
+        }
+        if column_name not in columns:
+            conn.execute(
+                f"ALTER TABLE limira_runner_research_tasks ADD COLUMN {column_name} {column_sql}"
+            )
 
     def _serialize_value(self, value: Any) -> str:
         return json.dumps(value, ensure_ascii=False)
@@ -370,6 +392,7 @@ class PostgresTaskStore:
         query: str,
         created_at: str,
         model_summary: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> TaskRecord:
         row = self._fetch_one(
             self.CREATE_TASK_SQL,
@@ -380,7 +403,7 @@ class PostgresTaskStore:
                 task_id,
                 created_at,
                 _serialize_json(model_summary or {}),
-                _serialize_json(_runner_metadata()),
+                _serialize_json(_runner_metadata(task_context=context or {})),
             ),
         )
         if not row:
@@ -518,6 +541,9 @@ class PostgresTaskStore:
         warnings = metadata.get("warnings", [])
         if not isinstance(warnings, list):
             warnings = [str(warnings)]
+        context = metadata.get("task_context", {})
+        if not isinstance(context, dict):
+            context = {}
         return TaskRecord(
             task_id=str(row["task_id"]),
             user_id=str(row["owner_user_id"]),
@@ -532,6 +558,7 @@ class PostgresTaskStore:
             error=_optional_string(row.get("error")),
             model_summary=_deserialize_json(row.get("model_summary"), default={}),
             warnings=warnings,
+            context=context,
         )
 
 
@@ -558,12 +585,13 @@ def create_task_store_from_env(
     raise RuntimeError(f"unsupported_runner_task_store_backend:{backend}")
 
 
-def _runner_metadata() -> dict[str, Any]:
+def _runner_metadata(*, task_context: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "runner_archive_dir": None,
         "archive_dir": None,
         "archive_zip_path": None,
         "warnings": [],
+        "task_context": task_context or {},
     }
 
 

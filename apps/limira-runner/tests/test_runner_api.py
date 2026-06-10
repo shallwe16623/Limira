@@ -85,6 +85,21 @@ async def completed_stream(task_id, query, _unused, disconnect_check=None):
     }
 
 
+class ContextCaptureStream:
+    def __init__(self):
+        self.context = None
+
+    async def stream(self, task_id, query, context, disconnect_check=None):
+        assert task_id
+        assert query == "context query"
+        assert disconnect_check is not None
+        self.context = context
+        yield {
+            "event": "message",
+            "data": {"delta": {"content": "context propagated"}},
+        }
+
+
 async def structured_secret_stream(task_id, query, _unused, disconnect_check=None):
     yield {
         "event": "message",
@@ -438,6 +453,54 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         assert download_response.status == 200
         with zipfile.ZipFile(io.BytesIO(await download_response.read())) as archive:
             assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_persists_and_streams_task_context(tmp_path):
+    context_probe = ContextCaptureStream()
+    client, store = await make_client(tmp_path, stream_events=context_probe.stream)
+    try:
+        response = await client.post(
+            "/limira-runner/research",
+            headers=USER_A_HEADERS,
+            json={
+                "query": "context query",
+                "scenario": "sanctions_export_controls",
+                "conversation_id": "conversation-a",
+                "document_ids": ["doc-a", "doc-a", "doc-b"],
+                "upload_scope": {
+                    "document_ids": ["doc-a", "doc-b"],
+                    "document_count": 2,
+                    "retrieval_status": "context_only",
+                },
+                "source_policy": {
+                    "min_sources": 5,
+                    "prefer_uploaded_documents": True,
+                },
+            },
+        )
+        assert response.status == 202
+        task_id = (await response.json())["task_id"]
+
+        completed = await wait_for_task_status(store, task_id, "completed")
+        assert completed.context["query"] == "context query"
+        assert completed.context["scenario"] == "sanctions_export_controls"
+        assert completed.context["conversation_id"] == "conversation-a"
+        assert completed.context["document_ids"] == ["doc-a", "doc-b"]
+        assert completed.context["upload_scope"]["document_count"] == 2
+        assert completed.context["source_policy"]["min_sources"] == 5
+        assert completed.context["source_policy"]["prefer_uploaded_documents"] is True
+        assert context_probe.context == completed.context
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        status_payload = await status_response.json()
+        assert "context" not in status_payload
+        assert_public_task_response_hides_internal_identifiers(status_payload)
     finally:
         await client.close()
 

@@ -15,6 +15,14 @@ def test_task_store_creates_updates_and_lists_by_user(tmp_path):
         query="first",
         created_at="2026-06-06T12:00:00+00:00",
         model_summary={"provider": "deepseek"},
+        context={
+            "query": "first",
+            "scenario": "sanctions",
+            "conversation_id": "conversation-a",
+            "document_ids": ["doc-a"],
+            "upload_scope": {"document_count": 1},
+            "source_policy": {"prefer_uploaded_documents": True},
+        },
     )
     store.create_task(
         task_id="task-b",
@@ -42,6 +50,8 @@ def test_task_store_creates_updates_and_lists_by_user(tmp_path):
     assert updated.status == "completed"
     assert updated.archive_status == "ready"
     assert updated.warnings == ["warning"]
+    assert updated.context["scenario"] == "sanctions"
+    assert updated.context["document_ids"] == ["doc-a"]
     assert store.user_owns_task("task-a", "user-a") is True
     assert store.user_owns_task("task-a", "user-b") is False
     assert [record.task_id for record in store.list_user_tasks("user-a")] == [
@@ -281,6 +291,14 @@ def test_postgres_task_store_matches_runner_task_store_contract():
         query="first",
         created_at="2026-06-06T12:00:00+00:00",
         model_summary={"provider": "deepseek"},
+        context={
+            "query": "first",
+            "scenario": "sanctions",
+            "conversation_id": "conversation-a",
+            "document_ids": ["doc-a"],
+            "upload_scope": {"document_count": 1},
+            "source_policy": {"prefer_uploaded_documents": True},
+        },
     )
     store.create_task(
         task_id="task-b",
@@ -297,6 +315,8 @@ def test_postgres_task_store_matches_runner_task_store_contract():
 
     assert first.status == "queued"
     assert first.model_summary == {"provider": "deepseek"}
+    assert first.context["scenario"] == "sanctions"
+    assert first.context["document_ids"] == ["doc-a"]
     assert [record.task_id for record in store.list_user_tasks("user-a")] == [
         "task-b",
         "task-a",
@@ -314,6 +334,7 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     )
     assert claimed is not None
     assert claimed.status == "running"
+    assert claimed.context["upload_scope"]["document_count"] == 1
     assert duplicate_claim is None
 
     updated = store.update_task(
@@ -330,6 +351,7 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert updated.archive_dir == "/archives/task-a"
     assert updated.archive_zip_path == "/archives/task-a/archive.zip"
     assert updated.warnings == ["warning"]
+    assert updated.context["source_policy"]["prefer_uploaded_documents"] is True
 
     cancelled = store.cancel_queued_task(
         "task-b",

@@ -122,12 +122,26 @@ class FakeResearchClient:
         self.stream_calls = []
         self.status_calls = []
 
-    async def create_research_task(self, *, query, scenario, user):
+    async def create_research_task(
+        self,
+        *,
+        query,
+        scenario,
+        user,
+        conversation_id=None,
+        document_ids=None,
+        upload_scope=None,
+        source_policy=None,
+    ):
         self.create_calls.append(
             {
                 "query": query,
                 "scenario": scenario,
                 "user": user,
+                "conversation_id": conversation_id,
+                "document_ids": list(document_ids or []),
+                "upload_scope": dict(upload_scope or {}),
+                "source_policy": dict(source_policy or {}),
             }
         )
         return {
@@ -174,6 +188,23 @@ async def test_create_research_uses_limira_namespace_and_rejects_body_user_id():
             "query": "track sanctions",
             "scenario": "sanctions",
             "user": user,
+            "conversation_id": payload["conversation_id"],
+            "document_ids": [],
+            "upload_scope": {
+                "source_type": "limira_upload",
+                "document_ids": [],
+                "attached_document_ids": [],
+                "document_count": 0,
+                "retrieval_status": "context_only",
+            },
+            "source_policy": {
+                "min_sources": 3,
+                "prefer_primary_sources": True,
+                "allow_secondary_sources": True,
+                "require_retrieved_at": True,
+                "prefer_uploaded_documents": False,
+                "prefer_scenario_sources": True,
+            },
         }
     ]
     task = repo.get_task(payload["task_id"])
@@ -1203,12 +1234,26 @@ async def test_create_research_hides_internal_runner_start_error_details_and_hea
     )
 
     class FailingResearchClient(FakeResearchClient):
-        async def create_research_task(self, *, query, scenario, user):
+        async def create_research_task(
+            self,
+            *,
+            query,
+            scenario,
+            user,
+            conversation_id=None,
+            document_ids=None,
+            upload_scope=None,
+            source_policy=None,
+        ):
             self.create_calls.append(
                 {
                     "query": query,
                     "scenario": scenario,
                     "user": user,
+                    "conversation_id": conversation_id,
+                    "document_ids": list(document_ids or []),
+                    "upload_scope": dict(upload_scope or {}),
+                    "source_policy": dict(source_policy or {}),
                 }
             )
             raise HTTPException(

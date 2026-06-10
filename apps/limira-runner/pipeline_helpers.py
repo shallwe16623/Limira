@@ -293,7 +293,10 @@ def expand_stream_message(
 
 
 async def stream_events_optimized(
-    task_id: str, query: str, _: Optional[dict] = None, disconnect_check=None
+    task_id: str,
+    query: str,
+    context: Optional[dict] = None,
+    disconnect_check=None,
 ) -> AsyncGenerator[dict, None]:
     """Optimized event stream generator that directly outputs structured events, no longer wrapped as SSE strings."""
     workflow_id = task_id
@@ -352,6 +355,7 @@ async def stream_events_optimized(
                         sub_agent_tool_definitions=_preload_cache[
                             "sub_agent_tool_definitions"
                         ],
+                        research_context=context or {},
                     )
                 )
 

@@ -51,6 +51,7 @@ async def execute_task_pipeline(
     tool_definitions: Optional[List[Dict[str, Any]]] = None,
     sub_agent_tool_definitions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     is_final_retry: bool = False,
+    research_context: Optional[Dict[str, Any]] = None,
 ):
     """
     Executes the full pipeline for a single task.
@@ -101,6 +102,10 @@ async def execute_task_pipeline(
         graph_state = build_initial_research_graph(
             task_id=task_id,
             query=task_description,
+            scenario=_context_string(research_context, "scenario"),
+            document_ids=_context_string_list(research_context, "document_ids"),
+            upload_scope=_context_mapping(research_context, "upload_scope"),
+            source_policy=_context_mapping(research_context, "source_policy"),
         )
         planned_task_description = graph_task_description(
             graph_state,
@@ -232,3 +237,38 @@ def create_pipeline_components(cfg: DictConfig):
         sub_agent_tool_managers[sub_agent] = sub_agent_tool_manager
 
     return main_agent_tool_manager, sub_agent_tool_managers, output_formatter
+
+
+def _context_mapping(
+    context: Optional[Dict[str, Any]],
+    key: str,
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    value = context.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _context_string(
+    context: Optional[Dict[str, Any]],
+    key: str,
+) -> str | None:
+    if not isinstance(context, dict):
+        return None
+    value = context.get(key)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _context_string_list(
+    context: Optional[Dict[str, Any]],
+    key: str,
+) -> list[str]:
+    if not isinstance(context, dict):
+        return []
+    value = context.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]

@@ -25,6 +25,9 @@ from task_store import TaskRecord, TaskStore, create_task_store_from_env
 
 
 MAX_QUERY_CHARS = 20_000
+MAX_CONTEXT_STRING_CHARS = 120
+MAX_DOCUMENT_IDS = 20
+MAX_CONTEXT_JSON_CHARS = 20_000
 
 StreamEvents = Callable[..., Awaitable[Any]]
 PipelineHelpers = tuple[
@@ -152,6 +155,10 @@ async def start_research(request: web.Request) -> web.Response:
     query = query.strip()
     if len(query) > MAX_QUERY_CHARS:
         return _error("query_too_long", status=400)
+    try:
+        task_context = _task_context_from_payload(payload, query=query)
+    except ValueError as exc:
+        return _error(str(exc), status=400)
 
     task_id = str(uuid.uuid4())
     model_summary = _model_summary_from_env()
@@ -162,6 +169,7 @@ async def start_research(request: web.Request) -> web.Response:
         query=query,
         created_at=request.app[CLOCK_KEY](),
         model_summary=model_summary,
+        context=task_context,
     )
     _ensure_task_worker(request.app, record.task_id)
     return web.json_response(
@@ -289,7 +297,7 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
         async for message in app[STREAM_EVENTS_KEY](
             record.task_id,
             record.query,
-            None,
+            record.context,
             cancel_check,
         ):
             normalized = normalize_stream_event(record.task_id, message, clock())
@@ -678,6 +686,105 @@ def _task_response(record: TaskRecord) -> dict[str, Any]:
         "error": scrub_secrets(record.error),
         "warnings": record.warnings or [],
     }
+
+
+def _task_context_from_payload(
+    payload: dict[str, Any],
+    *,
+    query: str,
+) -> dict[str, Any]:
+    scenario = _optional_context_string(payload.get("scenario"), "scenario")
+    conversation_id = _optional_context_string(
+        payload.get("conversation_id"),
+        "conversation_id",
+    )
+    document_ids = _document_ids_from_payload(payload.get("document_ids"))
+    upload_scope = _context_mapping_from_payload(
+        payload.get("upload_scope"),
+        "upload_scope",
+    )
+    source_policy = _context_mapping_from_payload(
+        payload.get("source_policy"),
+        "source_policy",
+    )
+
+    upload_scope.setdefault("source_type", "limira_upload")
+    upload_scope.setdefault("document_ids", list(document_ids))
+    upload_scope.setdefault("document_count", len(document_ids))
+
+    default_source_policy = {
+        "prefer_primary_sources": True,
+        "allow_secondary_sources": True,
+        "require_retrieved_at": True,
+        "prefer_uploaded_documents": bool(document_ids),
+        "prefer_scenario_sources": bool(scenario),
+    }
+    default_source_policy.update(source_policy)
+
+    context = {
+        "query": query,
+        "scenario": scenario,
+        "conversation_id": conversation_id,
+        "document_ids": document_ids,
+        "upload_scope": upload_scope,
+        "source_policy": default_source_policy,
+    }
+    _assert_context_json_size(context)
+    return context
+
+
+def _optional_context_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}_invalid")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > MAX_CONTEXT_STRING_CHARS:
+        raise ValueError(f"{field_name}_invalid")
+    return normalized
+
+
+def _document_ids_from_payload(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("document_ids_invalid")
+    if len(value) > MAX_DOCUMENT_IDS:
+        raise ValueError("too_many_documents")
+    document_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_document_id in value:
+        if not isinstance(raw_document_id, str):
+            raise ValueError("document_ids_invalid")
+        document_id = raw_document_id.strip()
+        if not document_id:
+            continue
+        if len(document_id) > MAX_CONTEXT_STRING_CHARS:
+            raise ValueError("document_ids_invalid")
+        if document_id not in seen:
+            seen.add(document_id)
+            document_ids.append(document_id)
+    return document_ids
+
+
+def _context_mapping_from_payload(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name}_invalid")
+    _assert_context_json_size(value)
+    return dict(value)
+
+
+def _assert_context_json_size(value: Any) -> None:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task_context_invalid") from exc
+    if len(serialized) > MAX_CONTEXT_JSON_CHARS:
+        raise ValueError("task_context_too_large")
 
 
 async def _write_sse(response: web.StreamResponse, event: dict[str, Any]) -> None:

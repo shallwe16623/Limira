@@ -118,6 +118,9 @@ def build_initial_research_graph(
     task_id: str,
     query: str,
     scenario: str | None = None,
+    document_ids: list[str] | None = None,
+    upload_scope: dict[str, Any] | None = None,
+    source_policy: dict[str, Any] | None = None,
     max_units: int = 4,
 ) -> ResearchGraphState:
     """Create a deterministic graph seed before model-assisted planning.
@@ -129,25 +132,21 @@ def build_initial_research_graph(
 
     normalized_query = _normalize_query(query)
     bounded_units = max(1, min(int(max_units), 8))
+    upload_document_ids = _upload_document_ids(document_ids, upload_scope)
+    policy = _source_policy_from_context(source_policy)
     brief = ResearchBrief(
         original_query=normalized_query,
         clarified_question=normalized_query,
-        scope=_scope_text(normalized_query, scenario),
+        scope=_scope_text(normalized_query, scenario, upload_document_ids),
         success_criteria=[
             "Answer the user's question directly.",
             "Use source-backed claims and preserve source attribution.",
             "Separate confirmed facts from uncertainty or conflicting claims.",
         ],
-        required_sources=[
-            "Primary or official sources when available.",
-            "Recent secondary reporting for context when primary sources are incomplete.",
-        ],
-        constraints=[
-            "Do not invent citations.",
-            "Prefer evidence that can be archived and later rechecked.",
-        ],
+        required_sources=_required_sources(upload_document_ids, scenario),
+        constraints=_constraints(upload_document_ids),
     )
-    units = _research_units_for_query(normalized_query, bounded_units)
+    units = _research_units_for_query(normalized_query, bounded_units, policy)
     plan = ResearchPlan(
         research_units=units,
         expected_artifacts=[
@@ -252,13 +251,27 @@ def _normalize_query(query: str) -> str:
     return normalized
 
 
-def _scope_text(query: str, scenario: str | None) -> str:
+def _scope_text(
+    query: str,
+    scenario: str | None,
+    upload_document_ids: list[str] | None = None,
+) -> str:
+    upload_count = len(upload_document_ids or [])
+    upload_note = (
+        f" Use {upload_count} attached upload source(s) as scoped user-provided context."
+        if upload_count
+        else ""
+    )
     if scenario:
-        return f"Research scenario '{scenario}' for: {query}"
-    return f"Research the user question end to end: {query}"
+        return f"Research scenario '{scenario}' for: {query}.{upload_note}"
+    return f"Research the user question end to end: {query}.{upload_note}"
 
 
-def _research_units_for_query(query: str, max_units: int) -> list[ResearchUnit]:
+def _research_units_for_query(
+    query: str,
+    max_units: int,
+    source_policy: SourcePolicy,
+) -> list[ResearchUnit]:
     base_queries = _query_variants(query)
     unit_specs = [
         (
@@ -287,10 +300,84 @@ def _research_units_for_query(query: str, max_units: int) -> list[ResearchUnit]:
             id=f"unit-{index + 1}-{unit_id}",
             question=question,
             search_queries=_dedupe_queries(queries or [query]),
+            source_policy=source_policy.model_copy(),
             max_sources=6,
         )
         for index, (unit_id, question, queries) in enumerate(unit_specs[:max_units])
     ]
+
+
+def _required_sources(
+    upload_document_ids: list[str],
+    scenario: str | None,
+) -> list[str]:
+    required_sources = [
+        "Primary or official sources when available.",
+        "Recent secondary reporting for context when primary sources are incomplete.",
+    ]
+    if scenario:
+        required_sources.append(
+            f"Apply the '{scenario}' scenario source priorities when selecting sources."
+        )
+    if upload_document_ids:
+        required_sources.append(
+            "Use attached upload documents as user-provided source candidates before "
+            "web-only secondary context."
+        )
+    return required_sources
+
+
+def _constraints(upload_document_ids: list[str]) -> list[str]:
+    constraints = [
+        "Do not invent citations.",
+        "Prefer evidence that can be archived and later rechecked.",
+    ]
+    if upload_document_ids:
+        constraints.append(
+            "Do not claim uploaded document facts were verified unless the retrieved "
+            "upload chunk or parsed document content is cited."
+        )
+    return constraints
+
+
+def _source_policy_from_context(source_policy: dict[str, Any] | None) -> SourcePolicy:
+    if not isinstance(source_policy, dict):
+        return SourcePolicy()
+    candidate: dict[str, Any] = {}
+    if "min_sources" in source_policy:
+        candidate["min_sources"] = source_policy["min_sources"]
+    if "prefer_primary_sources" in source_policy:
+        candidate["prefer_primary_sources"] = source_policy["prefer_primary_sources"]
+    if "allow_secondary_sources" in source_policy:
+        candidate["allow_secondary_sources"] = source_policy["allow_secondary_sources"]
+    if "require_retrieved_at" in source_policy:
+        candidate["require_retrieved_at"] = source_policy["require_retrieved_at"]
+    try:
+        return SourcePolicy.model_validate(candidate)
+    except Exception:
+        return SourcePolicy()
+
+
+def _upload_document_ids(
+    document_ids: list[str] | None,
+    upload_scope: dict[str, Any] | None,
+) -> list[str]:
+    raw_ids = document_ids
+    if not raw_ids and isinstance(upload_scope, dict):
+        value = upload_scope.get("document_ids")
+        if isinstance(value, list):
+            raw_ids = value
+    if not raw_ids:
+        return []
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for raw_id in raw_ids[:20]:
+        document_id = str(raw_id or "").strip()
+        if not document_id or document_id in seen:
+            continue
+        seen.add(document_id)
+        deduped.append(document_id)
+    return deduped
 
 
 def _query_variants(query: str) -> list[str]:

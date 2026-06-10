@@ -287,6 +287,18 @@ async def test_research_can_attach_history_documents_without_duplicate_storage()
         "doc-cloud",
         attached[0].document_id,
     }
+    runner_call = research.create_calls[0]
+    assert runner_call["conversation_id"] == payload["conversation_id"]
+    assert runner_call["document_ids"] == ["doc-cloud"]
+    assert runner_call["upload_scope"] == {
+        "source_type": "limira_upload",
+        "document_ids": ["doc-cloud"],
+        "attached_document_ids": [attached[0].document_id],
+        "document_count": 1,
+        "retrieval_status": "context_only",
+    }
+    assert runner_call["source_policy"]["prefer_uploaded_documents"] is True
+    assert runner_call["source_policy"]["prefer_primary_sources"] is True
     assert storage_payload["used_bytes"] == 11
     assert storage_payload["quota_bytes"] == limira.LIMIRA_DEFAULT_ENTERPRISE_USER_STORAGE_QUOTA_BYTES
 

@@ -846,6 +846,10 @@ class RunnerResearchClientProtocol(Protocol):
         query: str,
         scenario: str | None,
         user: LimiraUser,
+        conversation_id: str | None = None,
+        document_ids: list[str] | None = None,
+        upload_scope: Mapping[str, Any] | None = None,
+        source_policy: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     def stream_events(

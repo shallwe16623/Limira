@@ -161,6 +161,10 @@ class RunnerResearchClient:
         query: str,
         scenario: str | None,
         user: LimiraUser,
+        conversation_id: str | None = None,
+        document_ids: list[str] | None = None,
+        upload_scope: Mapping[str, Any] | None = None,
+        source_policy: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.runner_url:
             raise HTTPException(status_code=503, detail="runner_url_not_configured")
@@ -168,6 +172,14 @@ class RunnerResearchClient:
         payload: dict[str, Any] = {"query": query}
         if scenario:
             payload["scenario"] = scenario
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
+        if document_ids:
+            payload["document_ids"] = list(document_ids)
+        if upload_scope:
+            payload["upload_scope"] = dict(upload_scope)
+        if source_policy:
+            payload["source_policy"] = dict(source_policy)
 
         url = f"{self.runner_url}/limira-runner/research"
         async with httpx.AsyncClient(timeout=30) as client:
@@ -808,6 +820,16 @@ async def create_research_task(
             query=runner_query,
             scenario=scenario,
             user=user,
+            conversation_id=conversation_id,
+            document_ids=[document.document_id for document in attached_source_documents],
+            upload_scope=_runner_upload_scope_for_documents(
+                attached_source_documents,
+                attached_documents,
+            ),
+            source_policy=_runner_source_policy(
+                scenario=scenario,
+                documents=attached_source_documents,
+            ),
         )
         runner_task_id = _runner_task_id_from_payload(runner_payload)
         task = repo.update_task(
@@ -1378,6 +1400,34 @@ def _attach_documents_to_task(
             )
         )
     return attached
+
+
+def _runner_upload_scope_for_documents(
+    source_documents: list[LimiraUploadedDocument],
+    attached_documents: list[LimiraUploadedDocument],
+) -> dict[str, Any]:
+    return {
+        "source_type": "limira_upload",
+        "document_ids": [document.document_id for document in source_documents],
+        "attached_document_ids": [document.document_id for document in attached_documents],
+        "document_count": len(source_documents),
+        "retrieval_status": "context_only",
+    }
+
+
+def _runner_source_policy(
+    *,
+    scenario: str | None,
+    documents: list[LimiraUploadedDocument],
+) -> dict[str, Any]:
+    return {
+        "min_sources": 3,
+        "prefer_primary_sources": True,
+        "allow_secondary_sources": True,
+        "require_retrieved_at": True,
+        "prefer_uploaded_documents": bool(documents),
+        "prefer_scenario_sources": bool(scenario),
+    }
 
 
 @router.post("/speech/transcribe")
