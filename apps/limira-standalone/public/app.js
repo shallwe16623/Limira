@@ -2533,20 +2533,116 @@ function renderStatus() {
 function renderMessages() {
 	const artifactView = isArtifactView();
 	dom.conversationPanel?.classList.toggle('compact', artifactView);
-	const sourceMessages = artifactView
-		? state.messages.filter((message) => message.kind !== 'report').slice(-2)
-		: state.messages.slice(-80);
-	const messages = sourceMessages;
+	const indexedMessages = state.messages.map((message, index) => ({ message, index }));
+	const messages = artifactView
+		? indexedMessages.filter((item) => item.message.kind !== 'report').slice(-2)
+		: indexedMessages.slice(-80);
+	const latestUserIndex = latestUserMessageIndex();
 	dom.messageList.innerHTML = messages
 		.map(
-			(message) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}">
-				<div class="message-meta"><span>${escapeHtml(roleLabel(message.role))}</span><span>${escapeHtml(message.time)}</span></div>
-				<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
+			({ message, index }) => `<article class="message ${escapeHtml(message.role)} ${escapeHtml(message.kind || '')}" data-message-index="${index}">
+				<div class="message-bubble">
+					<div class="message-body ${message.format === 'markdown' ? 'markdown-body compact-markdown' : ''}">${message.format === 'markdown' ? renderMarkdown(message.content) : escapeHtml(message.content)}</div>
+				</div>
+				${renderMessageActions(message, index, latestUserIndex)}
 			</article>`
 		)
 		.join('');
+	bindMessageActions();
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 	scrollConversationToBottom();
+}
+
+function latestUserMessageIndex() {
+	for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+		if (state.messages[index]?.role === 'user') {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function renderMessageActions(message, index, latestUserIndex) {
+	const editButton = message.role === 'user' && index === latestUserIndex
+		? `<button class="message-action-button" type="button" data-message-action="edit" data-message-index="${index}" title="修改后再次发送" aria-label="修改后再次发送" ${state.isSubmitting ? 'disabled' : ''}>
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M4 20H8L18.5 9.5C19.6046 8.39543 19.6046 6.60457 18.5 5.5C17.3954 4.39543 15.6046 4.39543 14.5 5.5L4 16V20Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M13.5 6.5L17.5 10.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+			</button>`
+		: '';
+	return `<div class="message-actions" aria-label="消息操作">
+		<button class="message-action-button" type="button" data-message-action="copy" data-message-index="${index}" title="复制" aria-label="复制">
+			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2"/><rect x="4" y="4" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2"/></svg>
+		</button>
+		${editButton}
+	</div>`;
+}
+
+function bindMessageActions() {
+	for (const button of dom.messageList.querySelectorAll('[data-message-action]')) {
+		button.addEventListener('click', (event) => {
+			const index = Number(button.dataset.messageIndex);
+			if (button.dataset.messageAction === 'copy') {
+				void copyMessageContent(index, button);
+			} else if (button.dataset.messageAction === 'edit') {
+				editMessageForResend(index);
+			}
+			event.stopPropagation();
+		});
+	}
+}
+
+async function copyMessageContent(index, button) {
+	const message = state.messages[index];
+	if (!message) {
+		return;
+	}
+	const text = String(message.content || '');
+	try {
+		await copyText(text);
+		button.classList.add('copied');
+		button.setAttribute('aria-label', '已复制');
+		button.title = '已复制';
+		window.setTimeout(() => {
+			button.classList.remove('copied');
+			button.setAttribute('aria-label', '复制');
+			button.title = '复制';
+		}, 1200);
+	} catch {
+		button.setAttribute('aria-label', '复制失败');
+		button.title = '复制失败';
+	}
+}
+
+async function copyText(text) {
+	if (navigator.clipboard?.writeText && window.isSecureContext) {
+		await navigator.clipboard.writeText(text);
+		return;
+	}
+	const textarea = document.createElement('textarea');
+	textarea.value = text;
+	textarea.setAttribute('readonly', '');
+	textarea.style.position = 'fixed';
+	textarea.style.top = '-1000px';
+	document.body.appendChild(textarea);
+	textarea.select();
+	const copied = document.execCommand('copy');
+	textarea.remove();
+	if (!copied) {
+		throw new Error('copy_failed');
+	}
+}
+
+function editMessageForResend(index) {
+	const message = state.messages[index];
+	if (!message || message.role !== 'user' || state.isSubmitting) {
+		return;
+	}
+	state.activeTab = CONVERSATION_VIEW;
+	setQueryInputValue(String(message.content || ''));
+	renderTabs();
+	dom.queryInput.focus();
+	dom.queryInput.setSelectionRange(dom.queryInput.value.length, dom.queryInput.value.length);
+	setVoiceMessage('已载入上一条提问，可修改后再次发送。');
+	renderVoiceInput();
 }
 
 function scrollConversationToBottom() {

@@ -403,6 +403,22 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "overscroll-behavior-y: auto;" not in styles
     assert "scrollbar-gutter: stable;" not in styles
     assert "overscroll-behavior: contain;" not in styles
+    render_messages_block = app[app.index("function renderMessages()") : app.index("function latestUserMessageIndex()")]
+    assert "message-meta" not in render_messages_block
+    assert "roleLabel(message.role)" not in render_messages_block
+    assert "message.time" not in render_messages_block
+    assert 'class="message-bubble"' in render_messages_block
+    assert "function latestUserMessageIndex()" in app
+    assert "function renderMessageActions(message, index, latestUserIndex)" in app
+    assert "function copyMessageContent(index, button)" in app
+    assert "navigator.clipboard?.writeText" in app
+    assert "document.execCommand('copy')" in app
+    assert "function editMessageForResend(index)" in app
+    assert "setQueryInputValue(String(message.content || ''));" in app
+    assert "title=\"修改后再次发送\"" in app
+    assert ".message-actions {\n\tdisplay: flex;" in styles
+    assert ".message-list-bottom .message:hover .message-actions" in styles
+    assert ".message-action-button.copied" in styles
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app
     assert "dom.workspace.classList.toggle('sidebar-collapsed'" in app
