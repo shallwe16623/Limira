@@ -2689,7 +2689,7 @@ async function openReportArtifacts(taskId, tab) {
 		return;
 	}
 	state.activeTab = tabs.includes(tab) ? tab : CONVERSATION_VIEW;
-	await loadArtifacts(normalizedTaskId, { updateReport: false });
+	await loadArtifacts(normalizedTaskId, { updateReport: false, select: true });
 	if (isArtifactView() && dom.workspaceContent) {
 		const top = Math.max(0, dom.conversationPanel.offsetTop - 16);
 		dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });

@@ -484,6 +484,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "state.artifactsByTaskId" in app
     assert "const shouldSelect =" in app
     assert "options.select === true" in app
+    assert "await loadArtifacts(normalizedTaskId, { updateReport: false, select: true });" in app
     assert "state.artifactsByTaskId = {" in app
     assert "upsertReportMessage(reportMarkdown(artifacts));" in app
     assert "upsertArtifactThinkingStep(artifacts);" in app
