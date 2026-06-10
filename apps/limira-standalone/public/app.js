@@ -2592,8 +2592,32 @@ function scrollThinkingToLatest() {
 		return;
 	}
 	window.requestAnimationFrame(() => {
-		dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;
+		scrollThinkingListToBottom();
+		window.requestAnimationFrame(() => {
+			scrollThinkingListToBottom();
+			keepThinkingListAboveInput();
+		});
 	});
+}
+
+function scrollThinkingListToBottom() {
+	dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;
+	dom.thinkingList.lastElementChild?.scrollIntoView({
+		block: 'end',
+		inline: 'nearest'
+	});
+}
+
+function keepThinkingListAboveInput() {
+	if (!dom.workspaceContent || !dom.thinkingList || !dom.inputContainer || isArtifactView()) {
+		return;
+	}
+	const listRect = dom.thinkingList.getBoundingClientRect();
+	const inputRect = dom.inputContainer.getBoundingClientRect();
+	const overlap = listRect.bottom - inputRect.top + 18;
+	if (overlap > 0) {
+		dom.workspaceContent.scrollTop += overlap;
+	}
 }
 
 function renderTabs() {

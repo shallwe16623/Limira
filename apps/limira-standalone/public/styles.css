@@ -932,8 +932,9 @@ label {
 	gap: 0.85rem;
 	max-height: min(44vh, 440px);
 	overflow-y: auto;
-	overscroll-behavior: contain;
-	padding: 1rem;
+	overscroll-behavior-y: auto;
+	padding: 1rem 1rem 1.5rem;
+	scroll-padding-bottom: 1.5rem;
 }
 
 .thinking-panel.collapsed .thinking-list {

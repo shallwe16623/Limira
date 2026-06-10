@@ -389,7 +389,14 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert ".sidebar-overlay-backdrop" in styles
     assert "function scrollThinkingToLatest()" in app
     assert "scrollThinkingToLatest();" in app
+    assert "function scrollThinkingListToBottom()" in app
+    assert "function keepThinkingListAboveInput()" in app
+    assert "dom.thinkingList.lastElementChild?.scrollIntoView({" in app
+    assert "dom.workspaceContent.scrollTop += overlap;" in app
     assert "overflow-y: auto;" in styles
+    assert "overscroll-behavior-y: auto;" in styles
+    assert "scroll-padding-bottom: 1.5rem;" in styles
+    assert "overscroll-behavior: contain;" not in styles
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app
     assert "dom.workspace.classList.toggle('sidebar-collapsed'" in app
