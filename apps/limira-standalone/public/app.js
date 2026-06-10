@@ -4084,9 +4084,16 @@ function upsertReportMessage(content) {
 	) {
 		return false;
 	}
+	const messages = index >= 0 || !taskId
+		? state.messages
+		: state.messages.filter((item) => !(
+			item.kind === 'report' &&
+			!item.taskId &&
+			item.content === message.content
+		));
 	state.messages = index >= 0
 		? state.messages.map((item, itemIndex) => (itemIndex === index ? message : item))
-		: [...state.messages, message];
+		: [...messages, message];
 	return true;
 }
 
