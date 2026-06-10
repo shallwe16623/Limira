@@ -2914,11 +2914,6 @@ function renderStatus() {
 			}`
 		: '暂无任务';
 	dom.submitResearchButton.disabled = state.isSubmitting;
-	if (dom.downloadArchiveButton) {
-		const archiveTaskId = currentArtifactTaskId();
-		dom.downloadArchiveButton.disabled = (state.restoreBlocked && archiveTaskId === state.taskId) || !archiveTaskId;
-		dom.downloadArchiveButton.textContent = `归档 ${archiveStatusLabel(archiveStatusForTask(archiveTaskId))}`;
-	}
 }
 
 function renderMessages() {
@@ -3177,33 +3172,19 @@ function scrollThinkingToLatest() {
 function renderTabs() {
 	const surfaceVisible = hasResearchSurface();
 	const conversationView = isConversationView();
-	const archiveTaskId = currentArtifactTaskId();
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
 	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');
 	dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());
 	dom.artifactContent.classList.toggle('hidden', conversationView || !surfaceVisible);
-	dom.artifactTabs.classList.toggle('hidden', !surfaceVisible);
-	if (!surfaceVisible) {
+	dom.artifactTabs.classList.toggle('hidden', conversationView || !surfaceVisible);
+	if (!surfaceVisible || conversationView) {
 		dom.artifactTabs.innerHTML = '';
-		dom.downloadArchiveButton = null;
 		renderArtifactContent();
 		renderStatus();
 		return;
 	}
-	const counts = artifactCounts();
-	const archiveDisabled = (state.restoreBlocked && archiveTaskId === state.taskId) || !archiveTaskId;
-	dom.artifactTabs.innerHTML = [
-		isArtifactView()
-			? `<button type="button" class="back-tab" data-tab="${CONVERSATION_VIEW}">${BACK_TO_CHAT_LABEL}</button>`
-			: '',
-		...tabs
-		.map(
-			(tab) =>
-				`<button type="button" class="${tab === state.activeTab ? 'active' : ''}" data-tab="${tab}">${tab} ${counts[tab] || ''}</button>`
-		),
-		`<button id="downloadArchiveButton" type="button" class="archive-tab" data-archive-download="${escapeAttr(archiveTaskId)}" ${archiveDisabled ? 'disabled' : ''}>归档 ${archiveStatusLabel(archiveStatusForTask(archiveTaskId))}</button>`
-	].join('');
+	dom.artifactTabs.innerHTML = `<button type="button" class="back-tab" data-tab="${CONVERSATION_VIEW}">${BACK_TO_CHAT_LABEL}</button>`;
 	for (const button of dom.artifactTabs.querySelectorAll('[data-tab]')) {
 		button.addEventListener('click', () => {
 			state.activeTab = tabs.includes(button.dataset.tab) ? button.dataset.tab : CONVERSATION_VIEW;
@@ -3217,8 +3198,6 @@ function renderTabs() {
 			}
 		});
 	}
-	dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');
-	dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive(dom.downloadArchiveButton.dataset.archiveDownload || ''));
 	renderArtifactContent();
 	renderStatus();
 }

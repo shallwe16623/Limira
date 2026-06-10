@@ -547,8 +547,8 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "导出并下载 PDF" not in index
     assert 'class="header-actions"' not in index
     assert 'id="downloadArchiveButton"' not in index
-    assert 'id="downloadArchiveButton"' in app
-    assert "data-archive-download" in app
+    assert 'id="downloadArchiveButton"' not in app
+    assert "data-archive-download" not in app
     assert "const CONVERSATION_VIEW = '对话';" in app
     assert "const BACK_TO_CHAT_LABEL = '回到对话';" in app
     assert "const tabs = ['证据', '实体', '图谱', '时间线', '地图'];" in app
@@ -560,6 +560,8 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "function upsertArtifactThinkingStep(artifacts = state.artifacts)" in app
     assert "kind: 'artifact-summary'" in app
     assert "state.activeTab = '报告'" not in app
+    assert "dom.artifactTabs.classList.toggle('hidden', conversationView || !surfaceVisible);" in app
+    assert "dom.artifactTabs.innerHTML = `<button type=\"button\" class=\"back-tab\" data-tab=\"${CONVERSATION_VIEW}\">${BACK_TO_CHAT_LABEL}</button>`;" in app
     assert "function initialMessages()" in app
     assert "return [];" in app
     assert "function hasConversationActivity()" in app
@@ -609,8 +611,8 @@ def test_limira_standalone_report_sections_take_precedence_over_cached_final_tex
 def test_limira_standalone_archive_download_uses_authenticated_fetch():
     app = _read(LIMIRA_STANDALONE_APP)
 
-    assert "dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');" in app
-    assert "dom.downloadArchiveButton?.addEventListener('click', () => void downloadArchive(dom.downloadArchiveButton.dataset.archiveDownload || ''));" in app
+    assert "dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');" not in app
+    assert "data-archive-download" not in app
     assert "async function downloadArchive(taskId = currentArtifactTaskId())" in app
     assert "void downloadArchive(button.dataset.reportTaskId || '');" in app
     assert "void openReportArtifacts(button.dataset.reportTaskId || '', button.dataset.reportTab || '');" in app
@@ -619,7 +621,6 @@ def test_limira_standalone_archive_download_uses_authenticated_fetch():
     assert "headers.set('authorization', `Bearer ${state.token}`);" in app
     assert "credentials: 'include'" in app
     assert "empty_archive_download" in app
-    assert "dom.downloadArchiveButton.disabled = (state.restoreBlocked && archiveTaskId === state.taskId) || !archiveTaskId;" in app
 
 
 def test_limira_standalone_evidence_preview_uses_local_srcdoc_fallback():
