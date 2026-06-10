@@ -7,6 +7,7 @@ from src.core.research_graph import (
     build_initial_research_graph,
     evidence_id_for_source,
     graph_bootstrap_events,
+    graph_task_description,
 )
 
 
@@ -35,10 +36,13 @@ class _FakeClientFactory:
 
 
 class _FakeOrchestrator:
+    task_descriptions = []
+
     def __init__(self, *, stream_queue=None, **_kwargs):
         self.stream_queue = stream_queue
 
-    async def run_main_agent(self, **_kwargs):
+    async def run_main_agent(self, **kwargs):
+        self.__class__.task_descriptions.append(kwargs["task_description"])
         await self.stream_queue.put(
             {"event": "message", "data": {"delta": {"content": "legacy executor"}}}
         )
@@ -83,6 +87,27 @@ def test_research_graph_bootstrap_events_are_serializable_and_ordered():
     assert events[1]["data"]["plan"]["research_units"]
 
 
+def test_graph_task_description_includes_plan_for_compatibility_executor():
+    state = build_initial_research_graph(
+        task_id="task-graph",
+        query="Verify a company designation with primary sources",
+    )
+
+    task_description = graph_task_description(
+        state,
+        "Verify a company designation with primary sources",
+    )
+
+    assert task_description.startswith(
+        "Verify a company designation with primary sources"
+    )
+    assert "## Limira Research Workflow" in task_description
+    assert "### Research Units" in task_description
+    assert "unit-1-background" in task_description
+    assert "### Verification Strategy" in task_description
+    assert "### Report Contract" in task_description
+
+
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():
     first = evidence_id_for_source(task_id="task-a", source="https://example.test", index=0)
     second = evidence_id_for_source(task_id="task-a", source="https://example.test", index=0)
@@ -101,6 +126,7 @@ def test_evidence_id_for_source_is_stable_per_task_source_and_index():
 async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
     tmp_path, monkeypatch
 ):
+    _FakeOrchestrator.task_descriptions = []
     monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
     monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
 
@@ -150,3 +176,6 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
         == "Verify a company designation with primary sources"
     )
     assert stream_queue.items[1]["data"]["plan"]["research_units"]
+    assert len(_FakeOrchestrator.task_descriptions) == 1
+    assert "## Limira Research Workflow" in _FakeOrchestrator.task_descriptions[0]
+    assert "### Research Units" in _FakeOrchestrator.task_descriptions[0]

@@ -19,6 +19,7 @@ from .research_graph import (
     build_initial_research_graph,
     evidence_id_for_source,
     graph_bootstrap_events,
+    graph_task_description,
 )
 from .stream_handler import StreamHandler
 from .tool_executor import ToolExecutor
@@ -42,4 +43,5 @@ __all__ = [
     "evidence_id_for_source",
     "execute_task_pipeline",
     "graph_bootstrap_events",
+    "graph_task_description",
 ]

@@ -193,6 +193,53 @@ def graph_bootstrap_events(state: ResearchGraphState) -> list[dict[str, Any]]:
     ]
 
 
+def graph_task_description(
+    state: ResearchGraphState,
+    original_task_description: str,
+) -> str:
+    """Build the compatibility executor prompt from graph state.
+
+    This keeps the current single-agent executor, but makes it operate from the
+    same brief/plan contract that later graph nodes will use.
+    """
+
+    unit_lines = []
+    for unit in state.plan.research_units:
+        queries = "; ".join(unit.search_queries)
+        unit_lines.append(
+            f"- {unit.id}: {unit.question}\n"
+            f"  Search queries: {queries}\n"
+            f"  Source target: at least {unit.source_policy.min_sources}, "
+            f"max {unit.max_sources} sources"
+        )
+    success_criteria = "\n".join(f"- {item}" for item in state.brief.success_criteria)
+    required_sources = "\n".join(f"- {item}" for item in state.brief.required_sources)
+    constraints = "\n".join(f"- {item}" for item in state.brief.constraints)
+    expected_artifacts = ", ".join(state.plan.expected_artifacts)
+    return (
+        f"{str(original_task_description or '').strip()}\n\n"
+        "## Limira Research Workflow\n\n"
+        "Follow this scoped research graph before writing the final answer. "
+        "Use the available search, scrape, local-analysis, and artifact tools. "
+        "Treat tool-derived evidence as the source ledger and keep claims "
+        "grounded in retrieved sources.\n\n"
+        f"### Scope\n{state.brief.scope}\n\n"
+        f"### Success Criteria\n{success_criteria}\n\n"
+        f"### Required Source Policy\n{required_sources}\n\n"
+        f"### Constraints\n{constraints}\n\n"
+        "### Research Units\n"
+        f"{chr(10).join(unit_lines)}\n\n"
+        "### Verification Strategy\n"
+        f"{state.plan.verification_strategy}\n\n"
+        "### Expected Structured Artifacts\n"
+        f"{expected_artifacts}\n\n"
+        "### Report Contract\n"
+        "Write an answer-first final report. Separate confirmed facts, "
+        "uncertain claims, and unresolved contradictions. Preserve source URLs "
+        "and dates whenever available."
+    )
+
+
 def evidence_id_for_source(*, task_id: str, source: str, index: int = 0) -> str:
     digest = hashlib.sha256(f"{task_id}:{source}:{index}".encode("utf-8")).hexdigest()
     return f"EVID-{digest[:12]}"

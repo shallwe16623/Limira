@@ -30,7 +30,11 @@ from ..logging.task_logger import (
     get_utc_plus_8_time,
 )
 from .orchestrator import Orchestrator
-from .research_graph import build_initial_research_graph, graph_bootstrap_events
+from .research_graph import (
+    build_initial_research_graph,
+    graph_bootstrap_events,
+    graph_task_description,
+)
 
 
 async def execute_task_pipeline(
@@ -94,11 +98,15 @@ async def execute_task_pipeline(
             sub_agent_tool_manager.set_task_log(task_log)
 
     try:
+        graph_state = build_initial_research_graph(
+            task_id=task_id,
+            query=task_description,
+        )
+        planned_task_description = graph_task_description(
+            graph_state,
+            task_description,
+        )
         if stream_queue is not None:
-            graph_state = build_initial_research_graph(
-                task_id=task_id,
-                query=task_description,
-            )
             for event in graph_bootstrap_events(graph_state):
                 await stream_queue.put(event)
 
@@ -125,7 +133,7 @@ async def execute_task_pipeline(
             final_boxed_answer,
             failure_experience_summary,
         ) = await orchestrator.run_main_agent(
-            task_description=task_description,
+            task_description=planned_task_description,
             task_file_name=task_file_name,
             task_id=task_id,
             is_final_retry=is_final_retry,
