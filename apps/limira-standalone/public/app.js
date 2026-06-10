@@ -2748,10 +2748,14 @@ function renderMessages() {
 	const indexedMessages = state.messages.map((message, index) => ({ message, index }));
 	const messages = artifactView
 		? indexedMessages.filter((item) => item.message.kind !== 'report').slice(-2)
-		: indexedMessages.filter((item) => item.message.kind !== 'report').slice(-80);
+		: indexedMessages
+			.filter((item) => item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message))
+			.slice(-80);
 	const reportMessages = artifactView
 		? []
-		: indexedMessages.filter((item) => item.message.kind === 'report').slice(-8);
+		: indexedMessages
+			.filter((item) => item.message.kind === 'report' && messageBelongsToCurrentTask(item.message))
+			.slice(-8);
 	const latestUserIndex = latestUserMessageIndex();
 	dom.messageList.innerHTML = messages
 		.map(
@@ -2778,6 +2782,11 @@ function renderMessages() {
 	bindMessageActions();
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 	scrollConversationToBottom();
+}
+
+function messageBelongsToCurrentTask(message) {
+	const taskId = state.taskId || '';
+	return Boolean(taskId) && String(message?.taskId || '') === taskId;
 }
 
 function latestUserMessageIndex() {

@@ -471,6 +471,10 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
     assert "message.kind === 'report' && String(message.taskId || '') === taskId" in app
     assert "taskId" in app[app.index("function upsertReportMessage(content)") : app.index("function appendThinkingStep")]
+    render_messages_block = app[app.index("function renderMessages()") : app.index("function latestUserMessageIndex()")]
+    assert "function messageBelongsToCurrentTask(message)" in app
+    assert "item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message)" in render_messages_block
+    assert "item.message.kind === 'report' && messageBelongsToCurrentTask(item.message)" in render_messages_block
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]
     assert "dom.queryInput.value = state.query" not in restore_workspace_block
     assert LEGACY_AUTH_PREFIX not in app
