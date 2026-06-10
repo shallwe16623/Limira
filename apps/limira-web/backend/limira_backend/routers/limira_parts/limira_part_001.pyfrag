@@ -233,19 +233,130 @@ def _playwright_chromium_launch_env() -> dict[str, str] | None:
     return env
 
 
+def _report_pdf_fallback_text(html_content: str) -> str:
+    content = re.sub(
+        r"(?is)<(?:script|style|head)\b[^>]*>.*?</(?:script|style|head)>",
+        " ",
+        str(html_content or ""),
+    )
+    content = re.sub(r"(?i)<br\s*/?>", "\n", content)
+    content = re.sub(r"(?i)</(?:p|div|h[1-6]|li|tr|section|article)>", "\n", content)
+    content = re.sub(r"<[^>]+>", " ", content)
+    content = html.unescape(content)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in content.splitlines()]
+    text = "\n".join(line for line in lines if line)
+    return text.strip() or "Limira report"
+
+
+def _report_pdf_fallback_font_path() -> str | None:
+    candidates = [
+        os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "static",
+            "fonts",
+            "NotoSansSC-Regular.ttf",
+        ),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _render_report_pdf_fallback(html_content: str) -> bytes:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception as exc:  # pragma: no cover - depends on runtime image
+        raise RuntimeError("limira_pdf_fallback_dependency_missing") from exc
+
+    text = _report_pdf_fallback_text(html_content)
+    font_path = _report_pdf_fallback_font_path()
+    if font_path:
+        font = ImageFont.truetype(font_path, 28)
+    else:
+        font = ImageFont.load_default()
+        text = text.encode("latin-1", errors="replace").decode("latin-1")
+
+    page_width, page_height = 1240, 1754
+    margin = 90
+    line_height = 42
+    max_text_width = page_width - (margin * 2)
+    measure_image = Image.new("RGB", (1, 1), "white")
+    measure_draw = ImageDraw.Draw(measure_image)
+
+    def text_width(value: str) -> int:
+        bbox = measure_draw.textbbox((0, 0), value or " ", font=font)
+        return int(bbox[2] - bbox[0])
+
+    lines: list[str] = []
+    for paragraph in text.splitlines():
+        paragraph = paragraph.strip()
+        if not paragraph:
+            lines.append("")
+            continue
+        current = ""
+        for character in paragraph:
+            candidate = f"{current}{character}"
+            if not current or text_width(candidate) <= max_text_width:
+                current = candidate
+                continue
+            lines.append(current)
+            current = character
+        if current:
+            lines.append(current)
+        lines.append("")
+
+    pages = []
+    image = Image.new("RGB", (page_width, page_height), "white")
+    draw = ImageDraw.Draw(image)
+    y = margin
+    for line in lines or ["Limira report"]:
+        if y + line_height > page_height - margin:
+            pages.append(image)
+            image = Image.new("RGB", (page_width, page_height), "white")
+            draw = ImageDraw.Draw(image)
+            y = margin
+        if line:
+            draw.text((margin, y), line, fill=(20, 24, 31), font=font)
+        y += line_height
+    pages.append(image)
+
+    output = io.BytesIO()
+    pages[0].save(
+        output,
+        format="PDF",
+        save_all=True,
+        append_images=pages[1:],
+        resolution=150,
+    )
+    return output.getvalue()
+
+
 class PlaywrightLimiraPdfExporter:
     async def render_pdf(self, html_content: str) -> bytes:
         try:
             from playwright.async_api import async_playwright
         except Exception as exc:  # pragma: no cover - depends on runtime image
-            raise RuntimeError("limira_pdf_playwright_dependency_missing") from exc
+            log.warning(
+                "Limira Playwright PDF dependency is unavailable; using fallback PDF renderer",
+                exc_info=True,
+            )
+            return _render_report_pdf_fallback(html_content)
 
         async with async_playwright() as playwright:
             launch_kwargs: dict[str, Any] = {"args": ["--no-sandbox"]}
             launch_env = _playwright_chromium_launch_env()
             if launch_env is not None:
                 launch_kwargs["env"] = launch_env
-            browser = await playwright.chromium.launch(**launch_kwargs)
+            try:
+                browser = await playwright.chromium.launch(**launch_kwargs)
+            except Exception:
+                log.warning(
+                    "Limira Playwright Chromium launch failed; using fallback PDF renderer",
+                    exc_info=True,
+                )
+                return _render_report_pdf_fallback(html_content)
             try:
                 page = await browser.new_page()
                 await page.route("**/*", _abort_playwright_route)

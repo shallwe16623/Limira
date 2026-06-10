@@ -721,7 +721,7 @@ async def test_playwright_pdf_exporter_rejects_blank_rendered_pdf(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_playwright_pdf_exporter_raises_when_browser_launch_fails(monkeypatch):
+async def test_playwright_pdf_exporter_falls_back_when_browser_launch_fails(monkeypatch):
     class FakeChromium:
         async def launch(self, **_kwargs):
             raise RuntimeError("missing browser deps")
@@ -738,10 +738,14 @@ async def test_playwright_pdf_exporter_raises_when_browser_launch_fails(monkeypa
     monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
     monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
 
-    with pytest.raises(RuntimeError, match="missing browser deps"):
-        await limira.PlaywrightLimiraPdfExporter().render_pdf(
-            "<!doctype html><html><body><h1>Report title</h1><p>中文正文</p></body></html>"
-        )
+    pdf_bytes = await limira.PlaywrightLimiraPdfExporter().render_pdf(
+        "<!doctype html><html><body><h1>Report title</h1><p>中文正文</p></body></html>"
+    )
+
+    assert pdf_bytes.startswith(b"%PDF")
+    assert b"/Image" in pdf_bytes
+    assert not limira._persisted_report_pdf_appears_blank(pdf_bytes)
+    assert len(pdf_bytes) > 1_000
 
 
 def test_postgres_repository_sql_targets_limira_task_and_artifact_tables():

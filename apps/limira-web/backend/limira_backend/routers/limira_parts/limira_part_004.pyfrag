@@ -140,6 +140,8 @@ def _persisted_report_pdf_reuse_failure_reason(
 def _persisted_report_pdf_appears_blank(pdf_bytes: bytes) -> bool:
     if not pdf_bytes.strip().startswith(b"%PDF-"):
         return False
+    if b"/Subtype /Image" in pdf_bytes or b"/Image" in pdf_bytes:
+        return False
     stream_lengths = [
         int(match.group(1))
         for match in re.finditer(rb"/Length\s+(\d+)\s*>>\s*stream", pdf_bytes)
