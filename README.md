@@ -151,6 +151,12 @@ cp .env.example .env
 /home/limira/MiroLimira/android/
 ```
 
+分支职责固定如下：
+
+- `dev`：网页版开发工作树，日常 UI、前端交互和 Web 功能优先在这里迭代。
+- `main`：稳定版网页来源，线上 HTTPS 域名服务从这个工作树运行。
+- `ios` / `android`：默认与 `main` 保持一致，移动端只从稳定网页版本取来源；不要直接从 `dev` 同步到 app 工作树。
+
 如果要让某个 worktree 跑真实研究任务，至少要确保这个 worktree 下的 `apps/limira-agent/.env` 和 `apps/limira-runner/.env` 已存在并包含有效密钥。`.env` 文件属于本机密钥配置，已被 git 忽略，不要提交到仓库。
 
 至少需要填写：
