@@ -420,14 +420,15 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "function hasConversationActivity()" in app
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
     assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');" in app
-    assert index.index('id="conversationPanel"') < index.index('id="thinkingPanel"')
-    assert index.index('id="thinkingPanel"') < index.index('id="inputContainer"')
-    assert index.index('id="researchForm"') < index.index('id="artifactTabs"')
+    assert index.index('id="conversationPanel"') < index.index('id="artifactTabs"')
+    assert index.index('id="artifactTabs"') < index.index('id="thinkingPanel"')
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
+    assert index.index('id="workspaceContent"') < index.index('id="inputContainer"')
+    assert index.index('id="artifactContent"') < index.index('id="inputContainer"')
     assert ".tabs {\n\tz-index: 8;" in styles
     assert "bottom: 7.15rem;" not in styles
     assert ".input-container {\n\tposition: absolute;" in styles
-    assert ".input-container .tabs" in styles
+    assert ".input-container .tabs" not in styles
     assert "function scrollConversationToBottom()" in app
     assert "dom.workspaceContent.scrollTo({\n\t\t\ttop: dom.workspaceContent.scrollHeight," in app
     assert "const top = Math.max(0, dom.conversationPanel.offsetTop - 16);" in app

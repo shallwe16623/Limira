@@ -498,11 +498,6 @@ label {
 	z-index: 10;
 }
 
-.input-container .tabs {
-	max-width: 880px;
-	margin-top: 0.5rem;
-}
-
 /* Realtime Message List - Pinned above input */
 .conversation-panel,
 .thinking-panel {
