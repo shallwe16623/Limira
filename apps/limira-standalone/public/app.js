@@ -256,7 +256,7 @@ function renderShell() {
 	dom.workspace.classList.toggle('hidden', !signedIn);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
 	dom.sessionLabel.textContent = signedIn
-		? `${state.user.name || state.user.email || '已登录'} · ${accountLabel(state.user)}`
+		? `${state.user.name || state.user.username || state.user.email || '已登录'} · ${accountLabel(state.user)}`
 		: '未登录';
 	renderAuthMode();
 	renderStatus();
@@ -271,6 +271,10 @@ function renderShell() {
 
 function renderAuthMode() {
 	const personalScope = state.authScope === 'personal';
+	const usernameVisible =
+		!personalScope || state.authMode === 'signin' || state.authMode === 'signup';
+	const emailVisible = personalScope && (state.authMode === 'signup' || state.authMode === 'forgot');
+	const passwordVisible = !personalScope || state.authMode !== 'forgot';
 	dom.personalScopeButton.classList.toggle('active', personalScope);
 	dom.enterpriseScopeButton.classList.toggle('active', !personalScope);
 	dom.authModeControl.classList.toggle('hidden', !personalScope);
@@ -286,15 +290,21 @@ function renderAuthMode() {
 	dom.organizationSelect.required = !personalScope;
 	renderOrganizationOptions();
 	dom.nameLabel.classList.toggle('hidden', !personalScope || state.authMode !== 'signup');
-	dom.emailLabel.classList.toggle('hidden', state.authMode === 'reset');
-	dom.passwordLabel.classList.toggle('hidden', personalScope && state.authMode === 'forgot');
+	dom.usernameLabel.classList.toggle('hidden', !usernameVisible);
+	dom.emailLabel.classList.toggle('hidden', !emailVisible);
+	dom.passwordLabel.classList.toggle('hidden', !passwordVisible);
 	dom.resetTokenLabel.classList.toggle('hidden', !personalScope || state.authMode !== 'reset');
 	dom.forgotPasswordButton.classList.toggle('hidden', !personalScope || state.authMode !== 'signin');
-	dom.resendVerificationButton.classList.toggle('hidden', !personalScope || state.authMode === 'reset');
-	dom.emailInput.disabled = personalScope && state.authMode === 'reset';
-	dom.emailInput.required = !personalScope || state.authMode !== 'reset';
+	dom.resendVerificationButton.classList.toggle(
+		'hidden',
+		!personalScope || state.authMode === 'reset' || (state.authMode === 'signin' && !state.pendingAuthEmail)
+	);
+	dom.usernameInput.disabled = !usernameVisible;
+	dom.usernameInput.required = usernameVisible;
+	dom.emailInput.disabled = !emailVisible;
+	dom.emailInput.required = emailVisible;
 	dom.passwordInput.disabled = personalScope && state.authMode === 'forgot';
-	dom.passwordInput.required = !personalScope || state.authMode !== 'forgot';
+	dom.passwordInput.required = passwordVisible;
 	dom.resetTokenInput.disabled = !personalScope || state.authMode !== 'reset';
 	dom.resetTokenInput.required = personalScope && state.authMode === 'reset';
 	dom.googleSigninButton.classList.toggle(
@@ -419,6 +429,7 @@ function wechatSignIn() {
 }
 
 async function authenticate() {
+	const username = dom.usernameInput.value.trim();
 	const email = dom.emailInput.value.trim();
 	const password = dom.passwordInput.value;
 	const name = dom.nameInput.value.trim();
@@ -433,7 +444,7 @@ async function authenticate() {
 				method: 'POST',
 				body: {
 					organization_id: state.selectedOrganizationId,
-					email,
+					username,
 					password
 				}
 			});
@@ -462,13 +473,13 @@ async function authenticate() {
 		const path = state.authMode === 'signup' ? '/api/limira/auth/signup' : '/api/limira/auth/signin';
 		const payload =
 			state.authMode === 'signup'
-				? { name: name || email, email, password }
-				: { email, password };
+				? { username, name: name || username, email, password }
+				: { username, password };
 		const user = await api(path, { method: 'POST', body: payload });
 		if (state.authMode === 'signup' && user?.email_verification_required) {
 			state.pendingAuthEmail = email;
 			setAuthMode('signin');
-			dom.emailInput.value = email;
+			dom.usernameInput.value = username;
 			dom.authMessage.textContent = '注册成功，请打开验证邮件完成邮箱验证后再登录。';
 			return;
 		}
@@ -1333,12 +1344,12 @@ async function createEnterpriseMember() {
 	if (!isEnterpriseAdmin()) {
 		return;
 	}
-	const email = dom.enterpriseMemberEmailInput.value.trim();
+	const username = dom.enterpriseMemberUsernameInput.value.trim();
 	const password = dom.enterpriseMemberPasswordInput.value;
 	const name = dom.enterpriseMemberNameInput.value.trim();
 	const organizationRole = dom.enterpriseMemberRoleSelect.value || 'member';
-	if (!email || !password) {
-		dom.enterpriseMemberMessage.textContent = '请输入邮箱和初始密码。';
+	if (!username || !password) {
+		dom.enterpriseMemberMessage.textContent = '请输入用户名和初始密码。';
 		return;
 	}
 	dom.createEnterpriseMemberButton.disabled = true;
@@ -1347,14 +1358,14 @@ async function createEnterpriseMember() {
 		await api('/api/limira/enterprise/members', {
 			method: 'POST',
 			body: {
-				email,
+				username,
 				password,
-				name: name || email,
+				name: name || username,
 				organization_role: organizationRole
 			}
 		});
 		dom.enterpriseMemberNameInput.value = '';
-		dom.enterpriseMemberEmailInput.value = '';
+		dom.enterpriseMemberUsernameInput.value = '';
 		dom.enterpriseMemberPasswordInput.value = '';
 		dom.enterpriseMemberRoleSelect.value = 'member';
 		dom.enterpriseMemberMessage.textContent = '单位账号已添加。';
@@ -1920,9 +1931,10 @@ function renderEnterpriseAdmin() {
 		? state.enterpriseMembers
 				.map((member) => {
 					const role = member.organization_role === 'admin' ? '管理员' : '成员';
+					const account = member.username || member.email || '';
 					return `<article class="management-card">
-						<div class="artifact-title">${escapeHtml(member.name || member.email || '单位账号')}</div>
-						<div class="artifact-meta"><span>${escapeHtml(member.email || '')}</span><span>${role}</span></div>
+						<div class="artifact-title">${escapeHtml(member.name || account || '单位账号')}</div>
+						<div class="artifact-meta"><span>${escapeHtml(account)}</span><span>${role}</span></div>
 					</article>`;
 				})
 				.join('')
@@ -2103,10 +2115,13 @@ async function responseDetail(response) {
 
 function localizedErrorDetail(detail) {
 	const messages = {
-		invalid_credentials: '邮箱或密码不正确。',
+		invalid_credentials: '用户名或密码不正确。',
 		not_authenticated: '请先登录。',
 		admin_required: '当前账号没有管理员权限。',
 		email_already_registered: '这个邮箱已经注册。',
+		username_already_registered: '这个用户名已经被使用。',
+		username_required: '请输入用户名。',
+		invalid_username: '请输入有效用户名。',
 		email_not_verified: '请先打开验证邮件完成邮箱验证。',
 		invalid_email: '请输入有效邮箱。',
 		password_too_long: '密码太长，请使用 72 字节以内的密码。',

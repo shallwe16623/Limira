@@ -245,6 +245,7 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
         signup = await client.post(
             "/api/limira/auth/signup",
             json={
+                "username": "analyst",
                 "email": "analyst@example.test",
                 "name": "Analyst",
                 "password": "correct-password",
@@ -253,6 +254,7 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
         assert signup.status_code == 201
         signup_payload = signup.json()
         assert signup_payload["email"] == "analyst@example.test"
+        assert signup_payload["username"] == "analyst"
         assert signup_payload["name"] == "Analyst"
         assert signup_payload["role"] == "user"
         assert signup_payload["email_verified"] is False
@@ -263,7 +265,7 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
 
         unverified_signin = await client.post(
             "/api/limira/auth/signin",
-            json={"email": "analyst@example.test", "password": "correct-password"},
+            json={"username": "analyst", "password": "correct-password"},
         )
         assert unverified_signin.status_code == 403
         assert unverified_signin.json() == {"detail": "email_not_verified"}
@@ -276,6 +278,7 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
         assert verified.status_code == 200
         verified_payload = verified.json()
         assert verified_payload["email"] == "analyst@example.test"
+        assert verified_payload["username"] == "analyst"
         assert verified_payload["email_verified"] is True
         assert verified_payload["token_type"] == "bearer"
         token = verified_payload["token"]
@@ -290,6 +293,7 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
         assert session.json() == {
             "id": signup_payload["id"],
             "email": "analyst@example.test",
+            "username": "analyst",
             "name": "Analyst",
             "role": "user",
             "email_verified": True,
@@ -308,17 +312,18 @@ async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_
 
         rejected = await client.post(
             "/api/limira/auth/signin",
-            json={"email": "analyst@example.test", "password": "wrong-password"},
+            json={"username": "analyst", "password": "wrong-password"},
         )
         assert rejected.status_code == 401
         assert rejected.json() == {"detail": "invalid_credentials"}
 
         signin = await client.post(
             "/api/limira/auth/signin",
-            json={"email": "analyst@example.test", "password": "correct-password"},
+            json={"username": "analyst", "password": "correct-password"},
         )
         assert signin.status_code == 200
         assert signin.json()["email"] == "analyst@example.test"
+        assert signin.json()["username"] == "analyst"
         assert signin.json()["email_verified"] is True
 
 
@@ -343,6 +348,7 @@ async def test_limira_native_auth_password_reset_uses_email_token(
         signup = await client.post(
             "/api/limira/auth/signup",
             json={
+                "username": "reset-user",
                 "email": "reset@example.test",
                 "name": "Reset User",
                 "password": "old-password",
@@ -369,6 +375,7 @@ async def test_limira_native_auth_password_reset_uses_email_token(
         assert reset.status_code == 200
         reset_payload = reset.json()
         assert reset_payload["email"] == "reset@example.test"
+        assert reset_payload["username"] == "reset-user"
         assert reset_payload["email_verified"] is True
         assert reset_payload["token"]
         assert "limira_session=" in reset.headers.get("set-cookie", "")
@@ -382,16 +389,17 @@ async def test_limira_native_auth_password_reset_uses_email_token(
 
         old_password = await client.post(
             "/api/limira/auth/signin",
-            json={"email": "reset@example.test", "password": "old-password"},
+            json={"username": "reset-user", "password": "old-password"},
         )
         assert old_password.status_code == 401
 
         new_password = await client.post(
             "/api/limira/auth/signin",
-            json={"email": "reset@example.test", "password": "new-password"},
+            json={"username": "reset-user", "password": "new-password"},
         )
         assert new_password.status_code == 200
         assert new_password.json()["email"] == "reset@example.test"
+        assert new_password.json()["username"] == "reset-user"
 
 
 @pytest.mark.asyncio
@@ -409,6 +417,7 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
     )
     admin = limira._limira_auth_insert_user(
         email="unit-admin@example.test",
+        username="unit-admin",
         password="enterprise-password",
         name="Unit Admin",
         account_type="enterprise",
@@ -454,13 +463,14 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
             "/api/limira/auth/enterprise/signin",
             json={
                 "organization_id": organization.id,
-                "email": "unit-admin@example.test",
+                "username": "unit-admin",
                 "password": "enterprise-password",
             },
         )
         assert signin.status_code == 200
         payload = signin.json()
         assert payload["id"] == admin.id
+        assert payload["username"] == "unit-admin"
         assert payload["account_type"] == "enterprise"
         assert payload["organization_id"] == organization.id
         assert payload["organization_role"] == "admin"
@@ -474,12 +484,13 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
         assert members.status_code == 200
         assert members.json()["count"] == 1
         assert members.json()["members"][0]["email"] == "unit-admin@example.test"
+        assert members.json()["members"][0]["username"] == "unit-admin"
 
         created = await client.post(
             "/api/limira/enterprise/members",
             headers={"Authorization": f"Bearer {token}"},
             json={
-                "email": "analyst-unit@example.test",
+                "username": "unit-analyst",
                 "name": "Unit Analyst",
                 "password": "member-password",
                 "organization_role": "member",
@@ -487,6 +498,8 @@ async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_ma
         )
         assert created.status_code == 201
         assert created.json()["member"]["account_type"] == "enterprise"
+        assert created.json()["member"]["email"] is None
+        assert created.json()["member"]["username"] == "unit-analyst"
         assert created.json()["member"]["organization_id"] == organization.id
         assert created.json()["member"]["organization_role"] == "member"
 
@@ -531,6 +544,7 @@ async def test_personal_auth_research_is_limited_to_one_task_per_utc_day(
         signup = await client.post(
             "/api/limira/auth/signup",
             json={
+                "username": "quota-user",
                 "email": "quota@example.test",
                 "name": "Quota User",
                 "password": "quota-password",
@@ -588,6 +602,7 @@ async def test_enterprise_auth_research_records_metered_usage_without_daily_limi
     )
     limira._limira_auth_insert_user(
         email="metered@example.test",
+        username="metered-user",
         password="metered-password",
         name="Metered User",
         account_type="enterprise",
@@ -618,7 +633,7 @@ async def test_enterprise_auth_research_records_metered_usage_without_daily_limi
             "/api/limira/auth/enterprise/signin",
             json={
                 "organization_id": organization.id,
-                "email": "metered@example.test",
+                "username": "metered-user",
                 "password": "metered-password",
             },
         )
@@ -676,6 +691,7 @@ async def test_limira_auth_email_links_use_forwarded_public_origin(
                 "x-forwarded-proto": "https",
             },
             json={
+                "username": "forwarded-user",
                 "email": "forwarded@example.test",
                 "name": "Forwarded User",
                 "password": "correct-password",
@@ -948,16 +964,24 @@ async def test_limira_native_auth_migrates_existing_legacy_sqlite_user_once(
         )
         assert signin.status_code == 200
         assert signin.json()["id"] == "existing-user"
+        assert signin.json()["username"] == "existing"
         assert signin.json()["name"] == "Existing User"
         assert signin.json()["role"] == "admin"
+
+        username_signin = await client.post(
+            "/api/limira/auth/signin",
+            json={"username": "existing", "password": "existing-password"},
+        )
+        assert username_signin.status_code == 200
+        assert username_signin.json()["id"] == "existing-user"
 
     assert auth_path.exists()
     with sqlite3.connect(auth_path) as connection:
         migrated = connection.execute(
-            "SELECT email, name, role FROM limira_auth_users WHERE id = ?",
+            "SELECT email, username, name, role FROM limira_auth_users WHERE id = ?",
             ("existing-user",),
         ).fetchone()
-    assert migrated == ("existing@example.test", "Existing User", "admin")
+    assert migrated == ("existing@example.test", "existing", "Existing User", "admin")
 
 
 @pytest.mark.asyncio

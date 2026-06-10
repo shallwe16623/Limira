@@ -31,6 +31,10 @@
 						单位
 						<select id="organizationSelect"></select>
 					</label>
+					<label id="usernameLabel">
+						用户名
+						<input id="usernameInput" autocomplete="username" placeholder="请输入用户名" required />
+					</label>
 					<label id="nameLabel">
 						姓名
 						<input id="nameInput" autocomplete="name" placeholder="请输入姓名" />
@@ -88,7 +92,7 @@
 							<div id="enterpriseUsageSummary" class="inline-message"></div>
 							<form id="enterpriseMemberForm" class="compact-form">
 								<input id="enterpriseMemberNameInput" placeholder="姓名" autocomplete="off" />
-								<input id="enterpriseMemberEmailInput" type="email" placeholder="member@example.com" autocomplete="off" />
+								<input id="enterpriseMemberUsernameInput" placeholder="用户名" autocomplete="username" />
 								<input id="enterpriseMemberPasswordInput" type="password" placeholder="初始密码" autocomplete="new-password" />
 								<select id="enterpriseMemberRoleSelect">
 									<option value="member">成员</option>

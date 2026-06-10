@@ -245,6 +245,10 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="enterpriseScopeButton"' in index
     assert 'id="organizationCategorySelect"' in index
     assert 'id="organizationSelect"' in index
+    assert 'id="usernameInput"' in index
+    assert 'id="usernameLabel"' in index
+    assert 'id="enterpriseMemberUsernameInput"' in index
+    assert 'id="enterpriseMemberEmailInput"' not in index
     assert "此页面直接连接 limira 后端" not in index
     assert 'id="enterpriseContactPrompt"' in index
     assert "如需开通单位账号，请通过以下方式联系团队。" in index
@@ -257,6 +261,13 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert "DEFAULT_ENTERPRISE_ORGANIZATION_SLUG = 'ndrc-international-cooperation-center'" in app
     assert "renderOrganizationCategoryOptions()" in app
     assert "organizationsForSelectedCategory()" in app
+    assert "const username = dom.usernameInput.value.trim();" in app
+    assert "{ username, password }" in app
+    assert "organization_id: state.selectedOrganizationId,\n\t\t\t\t\tusername," in app
+    assert "dom.usernameLabel.classList.toggle('hidden', !usernameVisible)" in app
+    assert "dom.emailLabel.classList.toggle('hidden', !emailVisible)" in app
+    assert "enterpriseMemberUsernameInput" in app
+    assert "enterpriseMemberEmailInput" not in app
     for category_label in ("事业单位", "高校", "智库", "国家部委", "地方政府"):
         assert category_label in app
     assert 'id="enterpriseAdminPanel"' in index

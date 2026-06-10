@@ -199,6 +199,7 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS limira_auth_users (
             id TEXT PRIMARY KEY,
             email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            username TEXT,
             name TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'user',
             password_hash TEXT NOT NULL,
@@ -230,8 +231,28 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE limira_auth_users ADD COLUMN organization_id TEXT")
     if "organization_role" not in columns:
         connection.execute("ALTER TABLE limira_auth_users ADD COLUMN organization_role TEXT")
+    if "username" not in columns:
+        connection.execute("ALTER TABLE limira_auth_users ADD COLUMN username TEXT")
+    _backfill_limira_auth_usernames(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_limira_auth_users_email ON limira_auth_users(email)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_limira_auth_users_username ON limira_auth_users(username)"
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_limira_auth_users_personal_username
+        ON limira_auth_users(username)
+        WHERE account_type = 'personal' AND username IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_limira_auth_users_enterprise_username
+        ON limira_auth_users(organization_id, username)
+        WHERE account_type = 'enterprise' AND organization_id IS NOT NULL AND username IS NOT NULL
+        """
     )
     connection.execute(
         """
@@ -338,6 +359,60 @@ def _ensure_limira_auth_schema(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def _backfill_limira_auth_usernames(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT id, email, username, account_type, organization_id
+        FROM limira_auth_users
+        ORDER BY created_at, id
+        """
+    ).fetchall()
+    personal_usernames = {
+        str(row["username"])
+        for row in rows
+        if str(row["account_type"] or "personal") == "personal" and row["username"]
+    }
+    enterprise_usernames: dict[str, set[str]] = {}
+    for row in rows:
+        if str(row["account_type"] or "personal") != "enterprise" or not row["username"]:
+            continue
+        organization_id = str(row["organization_id"] or "")
+        enterprise_usernames.setdefault(organization_id, set()).add(str(row["username"]))
+
+    for row in rows:
+        existing = str(row["username"] or "").strip()
+        if existing:
+            continue
+        account_type = str(row["account_type"] or "personal")
+        organization_id = str(row["organization_id"] or "")
+        base = _limira_auth_username_from_email(str(row["email"] or ""))
+        if account_type == "enterprise":
+            used = enterprise_usernames.setdefault(organization_id, set())
+        else:
+            used = personal_usernames
+        username = _limira_auth_available_username(base, used)
+        used.add(username)
+        connection.execute(
+            """
+            UPDATE limira_auth_users
+            SET username = ?, updated_at = COALESCE(updated_at, ?)
+            WHERE id = ?
+            """,
+            (username, int(time.time()), str(row["id"])),
+        )
+
+
+def _limira_auth_available_username(base: str, used: set[str]) -> str:
+    candidate_base = _limira_auth_username_slug(base) or "user"
+    candidate = candidate_base
+    suffix = 2
+    while candidate in used:
+        suffix_text = f"-{suffix}"
+        candidate = f"{candidate_base[: 80 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    return candidate
+
+
 def _ensure_limira_default_organizations(connection: sqlite3.Connection) -> None:
     timestamp = int(time.time())
     connection.executemany(
@@ -407,12 +482,14 @@ def _migrate_legacy_auth_if_needed(connection: sqlite3.Connection, env: Any = os
         connection.execute(
             """
             INSERT OR IGNORE INTO limira_auth_users (
-                id, email, name, role, password_hash, active, email_verified_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, email, username, name, role, password_hash, active,
+                email_verified_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(row["id"]),
                 str(row["email"]).strip().lower(),
+                _limira_auth_username_from_email(str(row["email"] or "")),
                 str(row["name"] or row["email"]),
                 str(row["role"] or "user"),
                 str(row["password_hash"]),
@@ -429,6 +506,7 @@ def _limira_auth_user_from_row(row: sqlite3.Row | Mapping[str, Any]) -> LimiraAu
     return LimiraAuthRecord(
         id=str(row["id"]),
         email=str(row["email"]),
+        username=str(row["username"]) if row["username"] is not None else None,
         name=str(row["name"]),
         role=str(row["role"] or "user"),
         password_hash=str(row["password_hash"]),
@@ -443,7 +521,7 @@ def _limira_auth_user_from_row(row: sqlite3.Row | Mapping[str, Any]) -> LimiraAu
 def _limira_auth_user_select_columns(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     return (
-        f"{prefix}id, {prefix}email, {prefix}name, {prefix}role, "
+        f"{prefix}id, {prefix}email, {prefix}username, {prefix}name, {prefix}role, "
         f"{prefix}password_hash, {prefix}active, {prefix}email_verified_at, "
         f"{prefix}account_type, {prefix}organization_id, {prefix}organization_role"
     )
@@ -475,14 +553,49 @@ def _limira_auth_get_user_by_email(email: str, env: Any = os.environ) -> LimiraA
     return _limira_auth_user_from_row(row) if row else None
 
 
+def _limira_auth_get_personal_user_by_username(
+    username: str,
+    env: Any = os.environ,
+) -> LimiraAuthRecord | None:
+    normalized_username = _normalize_auth_username(username)
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            f"""
+            SELECT {_limira_auth_user_select_columns()}
+            FROM limira_auth_users
+            WHERE username = ?
+                AND account_type = 'personal'
+            """,
+            (normalized_username,),
+        ).fetchone()
+    return _limira_auth_user_from_row(row) if row else None
+
+
 def _limira_auth_get_enterprise_user(
     *,
-    email: str,
+    username: str | None = None,
+    email: str | None = None,
     organization_id: str,
     env: Any = os.environ,
 ) -> LimiraAuthRecord | None:
-    normalized_email = _normalize_auth_email(email)
     normalized_organization_id = str(organization_id or "").strip()
+    if username:
+        normalized_username = _normalize_auth_username(username)
+        with _limira_auth_connect(env) as connection:
+            row = connection.execute(
+                f"""
+                SELECT {_limira_auth_user_select_columns()}
+                FROM limira_auth_users
+                WHERE username = ?
+                    AND account_type = 'enterprise'
+                    AND organization_id = ?
+                """,
+                (normalized_username, normalized_organization_id),
+            ).fetchone()
+        return _limira_auth_user_from_row(row) if row else None
+    if not email:
+        return None
+    normalized_email = _normalize_auth_email(email)
     with _limira_auth_connect(env) as connection:
         row = connection.execute(
             f"""
@@ -512,7 +625,8 @@ def _limira_auth_get_user_by_id(user_id: str, env: Any = os.environ) -> LimiraAu
 
 def _limira_auth_insert_user(
     *,
-    email: str,
+    email: str | None = None,
+    username: str | None = None,
     password: str,
     name: str | None = None,
     role: str = "user",
@@ -522,8 +636,6 @@ def _limira_auth_insert_user(
     email_verified_at: int | None = None,
     env: Any = os.environ,
 ) -> LimiraAuthRecord:
-    normalized_email = _normalize_auth_email(email)
-    normalized_name = str(name or normalized_email).strip() or normalized_email
     normalized_account_type = _normalize_auth_account_type(account_type)
     normalized_organization_id = str(organization_id).strip() if organization_id else None
     normalized_organization_role = _normalize_organization_role(
@@ -532,6 +644,19 @@ def _limira_auth_insert_user(
     )
     if normalized_account_type == "enterprise" and not normalized_organization_id:
         raise HTTPException(status_code=400, detail="organization_required")
+    normalized_username = _normalize_auth_username(
+        username or _limira_auth_username_from_email(str(email or ""))
+    )
+    if email:
+        normalized_email = _normalize_auth_email(email)
+    elif normalized_account_type == "enterprise":
+        normalized_email = _limira_enterprise_synthetic_email(
+            normalized_username,
+            normalized_organization_id,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="invalid_email")
+    normalized_name = str(name or normalized_username).strip() or normalized_username
     _validate_auth_password(password)
     timestamp = int(time.time())
     password_hash = _limira_hash_password(password)
@@ -542,13 +667,14 @@ def _limira_auth_insert_user(
             connection.execute(
                 """
                 INSERT INTO limira_auth_users (
-                    id, email, name, role, password_hash, active, email_verified_at,
+                    id, email, username, name, role, password_hash, active, email_verified_at,
                     account_type, organization_id, organization_role, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
                     normalized_email,
+                    normalized_username,
                     normalized_name,
                     role,
                     password_hash,
@@ -562,7 +688,12 @@ def _limira_auth_insert_user(
             )
             connection.commit()
     except sqlite3.IntegrityError as exc:
-        raise HTTPException(status_code=409, detail="email_already_registered") from exc
+        detail = (
+            "username_already_registered"
+            if "username" in str(exc).casefold()
+            else "email_already_registered"
+        )
+        raise HTTPException(status_code=409, detail=detail) from exc
     created = _limira_auth_get_user_by_id(user_id, env)
     if created is None:
         raise HTTPException(status_code=500, detail="auth_user_create_failed")
@@ -601,6 +732,40 @@ def _normalize_auth_email(email: str) -> str:
     if "@" not in normalized:
         raise HTTPException(status_code=400, detail="invalid_email")
     return normalized
+
+
+def _limira_auth_username_slug(value: str) -> str:
+    normalized = re.sub(r"\s+", "-", str(value or "").strip().casefold())
+    normalized = re.sub(r"[@:/\\]+", "-", normalized)
+    normalized = normalized.strip(".-_")
+    return normalized[:80]
+
+
+def _normalize_auth_username(username: str | None) -> str:
+    raw = str(username or "").strip()
+    if "@" in raw:
+        raise HTTPException(status_code=400, detail="invalid_username")
+    normalized = _limira_auth_username_slug(raw)
+    if len(normalized) < 2:
+        raise HTTPException(status_code=400, detail="invalid_username")
+    return normalized
+
+
+def _limira_auth_username_from_email(email: str) -> str:
+    local_part = str(email or "").split("@", 1)[0]
+    return _limira_auth_username_slug(local_part) or "user"
+
+
+def _limira_enterprise_synthetic_email(username: str, organization_id: str | None) -> str:
+    digest = hashlib.sha256(
+        f"{organization_id or ''}:{username}".encode("utf-8")
+    ).hexdigest()[:16]
+    safe_prefix = re.sub(r"[^a-z0-9]+", "-", username.casefold()).strip("-")[:24] or "user"
+    return f"{safe_prefix}-{digest}@enterprise.limira.local"
+
+
+def _limira_is_enterprise_synthetic_email(email: str | None) -> bool:
+    return str(email or "").casefold().endswith("@enterprise.limira.local")
 
 
 def _limira_hash_password(password: str) -> str:
@@ -1204,17 +1369,32 @@ def _limira_auth_upsert_google_user(
             user_id = str(row["id"])
         else:
             user_id = str(uuid.uuid4())
+            used_usernames = {
+                str(existing["username"])
+                for existing in connection.execute(
+                    """
+                    SELECT username
+                    FROM limira_auth_users
+                    WHERE account_type = 'personal' AND username IS NOT NULL
+                    """
+                ).fetchall()
+            }
+            username = _limira_auth_available_username(
+                _limira_auth_username_from_email(normalized_email),
+                used_usernames,
+            )
             connection.execute(
                 """
                 INSERT INTO limira_auth_users (
-                    id, email, name, role, password_hash, active,
+                    id, email, username, name, role, password_hash, active,
                     email_verified_at, account_type, organization_id, organization_role,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, 'user', ?, 1, ?, 'personal', NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'user', ?, 1, ?, 'personal', NULL, NULL, ?, ?)
                 """,
                 (
                     user_id,
                     normalized_email,
+                    username,
                     normalized_name,
                     _limira_hash_password(secrets.token_urlsafe(32)),
                     now,
@@ -1331,17 +1511,29 @@ def _limira_auth_upsert_wechat_user(
     email = _limira_synthetic_oauth_email("wechat", subject)
     user_id = str(uuid.uuid4())
     with _limira_auth_connect(env) as connection:
+        used_usernames = {
+            str(existing["username"])
+            for existing in connection.execute(
+                """
+                SELECT username
+                FROM limira_auth_users
+                WHERE account_type = 'personal' AND username IS NOT NULL
+                """
+            ).fetchall()
+        }
+        username = _limira_auth_available_username(f"wechat-{subject[:12]}", used_usernames)
         connection.execute(
             """
             INSERT INTO limira_auth_users (
-                id, email, name, role, password_hash, active,
+                id, email, username, name, role, password_hash, active,
                 email_verified_at, account_type, organization_id, organization_role,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 'user', ?, 1, ?, 'personal', NULL, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'user', ?, 1, ?, 'personal', NULL, NULL, ?, ?)
             """,
             (
                 user_id,
                 email,
+                username,
                 display_name,
                 _limira_hash_password(secrets.token_urlsafe(32)),
                 now,
@@ -1579,13 +1771,18 @@ def _limira_auth_public_user(
     *,
     token: str | None = None,
 ) -> dict[str, Any]:
+    account_type = getattr(user, "account_type", "personal") or "personal"
+    email = getattr(user, "email", None)
+    if account_type == "enterprise" and _limira_is_enterprise_synthetic_email(email):
+        email = None
     payload = {
         "id": user.id,
-        "email": getattr(user, "email", None),
+        "email": email,
+        "username": getattr(user, "username", None),
         "name": getattr(user, "name", None),
         "role": user.role,
         "email_verified": getattr(user, "email_verified_at", None) is not None,
-        "account_type": getattr(user, "account_type", "personal") or "personal",
+        "account_type": account_type,
         "organization_id": getattr(user, "organization_id", None),
         "organization_role": getattr(user, "organization_role", None),
     }
@@ -1602,6 +1799,7 @@ def _limira_user_from_auth_record(user: LimiraAuthRecord) -> LimiraUser:
         id=user.id,
         role=user.role,
         email=user.email,
+        username=user.username,
         name=user.name,
         email_verified_at=user.email_verified_at,
         account_type=user.account_type,
@@ -1624,6 +1822,7 @@ def _limira_issue_auth_token(user: LimiraAuthRecord, env: Any = os.environ) -> s
     data = {
         "sub": user.id,
         "email": user.email,
+        "username": user.username,
         "role": user.role,
         "iat": now,
         "exp": now + _limira_auth_token_ttl_seconds(env),

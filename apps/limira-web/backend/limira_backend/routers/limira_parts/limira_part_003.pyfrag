@@ -365,6 +365,7 @@ async def limira_auth_signup(
 ) -> dict[str, Any]:
     user = _limira_auth_insert_user(
         email=request_data.email,
+        username=request_data.username,
         password=request_data.password,
         name=request_data.name,
     )
@@ -611,7 +612,12 @@ async def limira_auth_signin(
     request_data: LimiraAuthSigninRequest,
     response: Response,
 ) -> dict[str, Any]:
-    user = _limira_auth_get_user_by_email(request_data.email)
+    if request_data.username:
+        user = _limira_auth_get_personal_user_by_username(request_data.username)
+    elif request_data.email:
+        user = _limira_auth_get_user_by_email(request_data.email)
+    else:
+        raise HTTPException(status_code=400, detail="username_required")
     if user is None or not user.active or not _limira_verify_password(
         request_data.password,
         user.password_hash,
@@ -635,6 +641,7 @@ async def limira_enterprise_auth_signin(
     if organization is None or not organization.active:
         raise HTTPException(status_code=404, detail="organization_not_found")
     user = _limira_auth_get_enterprise_user(
+        username=request_data.username,
         email=request_data.email,
         organization_id=organization.id,
     )
@@ -708,6 +715,7 @@ async def limira_enterprise_create_member(
     _require_enterprise_admin(user)
     created = _limira_auth_insert_user(
         email=request_data.email,
+        username=request_data.username,
         password=request_data.password,
         name=request_data.name,
         role="user",

@@ -387,11 +387,13 @@ class ReportPdfRequest(BaseModel):
 
 
 class LimiraAuthSigninRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=4096)
 
 
 class LimiraAuthSignupRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=4096)
     name: str | None = Field(default=None, max_length=320)
@@ -416,12 +418,14 @@ class LimiraAuthPasswordResetConfirmRequest(BaseModel):
 
 class LimiraEnterpriseSigninRequest(BaseModel):
     organization_id: str = Field(min_length=1, max_length=120)
-    email: str = Field(min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=4096)
 
 
 class LimiraEnterpriseMemberCreateRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=4096)
     name: str | None = Field(default=None, max_length=320)
     organization_role: str = Field(default="member", max_length=40)
@@ -437,6 +441,7 @@ class LimiraUser:
     id: str
     role: str = "user"
     email: str | None = None
+    username: str | None = None
     name: str | None = None
     email_verified_at: int | None = None
     account_type: str = "personal"
@@ -452,6 +457,7 @@ class LimiraUser:
 class LimiraAuthRecord:
     id: str
     email: str
+    username: str | None
     name: str
     role: str
     password_hash: str
