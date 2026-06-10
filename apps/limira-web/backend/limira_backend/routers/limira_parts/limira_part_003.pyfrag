@@ -903,6 +903,97 @@ async def admin_get_task(
     return _assert_browser_safe(payload)
 
 
+_ADMIN_EVENT_LOG_DROP = object()
+_ADMIN_EVENT_LOG_FORBIDDEN_FIELDS = {
+    *INTERNAL_ARCHIVE_TASK_FIELDS,
+    *OBJECT_KEY_FORBIDDEN_FIELDS,
+    "adminUserId",
+    "admin_user_id",
+    "ownerUserId",
+    "runnerTaskId",
+    "userId",
+    "user_id",
+}
+_ADMIN_EVENT_LOG_FORBIDDEN_TEXT = {
+    *FORBIDDEN_BROWSER_SUBSTRINGS,
+    "archiveObjectKey",
+    "archive_object_key",
+    "limira/users/",
+    "objectKey",
+    "object_key",
+    "ownerUserId",
+    "owner_user_id",
+    "pdfObjectKey",
+    "pdf_object_key",
+    "runnerTaskId",
+    "runner_task_id",
+    "userId",
+    "user_id",
+}
+
+
+def _public_admin_event_log_sequence(
+    values: list[Any] | tuple[Any, ...],
+    *,
+    forbidden_values: set[str],
+) -> list[Any]:
+    shaped = []
+    for item in values:
+        public_item = _public_admin_event_log_value(
+            item,
+            forbidden_values=forbidden_values,
+        )
+        if public_item is not _ADMIN_EVENT_LOG_DROP:
+            shaped.append(public_item)
+    return shaped
+
+
+def _public_admin_event_log_value(
+    value: Any,
+    *,
+    forbidden_values: set[str],
+) -> Any:
+    if isinstance(value, Mapping):
+        shaped = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in _ADMIN_EVENT_LOG_FORBIDDEN_FIELDS:
+                continue
+            public_item = _public_admin_event_log_value(
+                item,
+                forbidden_values=forbidden_values,
+            )
+            if public_item is _ADMIN_EVENT_LOG_DROP:
+                continue
+            shaped[key] = public_item
+        return shaped
+    if isinstance(value, list):
+        return _public_admin_event_log_sequence(value, forbidden_values=forbidden_values)
+    if isinstance(value, tuple):
+        return _public_admin_event_log_sequence(value, forbidden_values=forbidden_values)
+    if isinstance(value, str):
+        if any(forbidden and forbidden in value for forbidden in forbidden_values):
+            return LIMIRA_SECRET_REDACTION
+        if any(marker in value for marker in _ADMIN_EVENT_LOG_FORBIDDEN_TEXT):
+            return LIMIRA_SECRET_REDACTION
+    return value
+
+
+def _public_admin_event_log(
+    event: dict[str, Any],
+    *,
+    owner_user_id: str,
+    admin_user_id: str,
+) -> dict[str, Any]:
+    public_event = dict(event)
+    forbidden_values = {owner_user_id, admin_user_id}
+    public_event["payload"] = _public_admin_event_log_value(
+        event.get("payload"),
+        forbidden_values=forbidden_values,
+    )
+    return public_event
+
+
 @router.get("/admin/tasks/{task_id}/event-logs")
 async def admin_get_task_event_logs(
     task_id: str,
@@ -913,7 +1004,14 @@ async def admin_get_task_event_logs(
     task = repo.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task_not_found")
-    events = repo.list_task_event_logs(task_id, limit=limit)
+    events = [
+        _public_admin_event_log(
+            event,
+            owner_user_id=task.owner_user_id,
+            admin_user_id=user.id,
+        )
+        for event in repo.list_task_event_logs(task_id, limit=limit)
+    ]
     return _assert_browser_safe(
         {
             "task_id": task_id,

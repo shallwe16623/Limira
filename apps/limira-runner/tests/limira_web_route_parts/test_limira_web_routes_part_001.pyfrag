@@ -719,6 +719,62 @@ async def test_admin_task_event_logs_are_persisted_for_operations_only():
 
 
 @pytest.mark.asyncio
+async def test_admin_task_event_logs_shape_identity_bearing_payloads():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+    admin = limira.LimiraUser("admin-user", role="admin")
+    created = await limira.create_research_task(
+        {"query": "admin event log payload leak"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    repo.record_task_event_log(
+        created["task_id"],
+        {
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "owner_user_id": user.id,
+                "user_id": admin.id,
+                "runner_task_id": "runner-admin-event-secret",
+                "object_key": "limira/users/user-a/tasks/task-admin-event/raw.json",
+                "archive_object_key": "limira/users/user-a/tasks/task-admin-event/archive.zip",
+                "pdf_object_key": "limira/users/user-a/tasks/task-admin-event/report.pdf",
+                "internal_runner_path": "/limira-runner/tasks/runner-admin-event-secret/events",
+                "nested": {
+                    "actor": admin.id,
+                    "owner": user.id,
+                    "objectKey": "limira/users/user-a/uploads/source.txt",
+                },
+            },
+        },
+    )
+
+    stored_payload = repo.list_task_event_logs(created["task_id"], limit=1)[0]["payload"]
+    assert stored_payload["owner_user_id"] == user.id
+    assert stored_payload["nested"]["actor"] == admin.id
+
+    payload = await limira.admin_get_task_event_logs(
+        created["task_id"],
+        limit=500,
+        user=admin,
+        repo=repo,
+    )
+
+    assert payload["admin_view"] is True
+    assert payload["count"] == 1
+    assert payload["events"][0]["payload"]["status"] == "completed"
+    _assert_admin_browser_payload_hides_raw_identities(
+        payload,
+        owner_user_id=user.id,
+        admin_user_id=admin.id,
+    )
+
+
+@pytest.mark.asyncio
 async def test_admin_task_route_hides_raw_identities_on_browser_surface():
     app, repo, _storage = _limira_asgi_app()
     admin = limira.LimiraUser("admin-user", role="admin")

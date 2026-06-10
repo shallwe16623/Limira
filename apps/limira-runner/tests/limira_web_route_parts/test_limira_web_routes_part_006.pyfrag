@@ -341,12 +341,17 @@ def _assert_admin_browser_payload_hides_raw_identities(
     serialized = json.dumps(payload, ensure_ascii=False)
     for leaked in (
         "owner_user_id",
+        "user_id",
         owner_user_id,
         admin_user_id,
         "runner_task_id",
+        "runnerTaskId",
         "object_key",
+        "objectKey",
         "archive_object_key",
+        "archiveObjectKey",
         "pdf_object_key",
+        "pdfObjectKey",
         "limira/users/",
         "/limira-runner/",
     ):
