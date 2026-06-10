@@ -396,7 +396,12 @@ def _limira_asgi_app():
     app.state.test_pdf_exporter = pdf_exporter
 
     async def current_user_override():
-        return limira.LimiraUser("user-a")
+        return limira.LimiraUser(
+            "user-a",
+            account_type="enterprise",
+            organization_id="org-a",
+            organization_role="member",
+        )
 
     async def task_repository_override():
         return repo

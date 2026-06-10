@@ -66,6 +66,7 @@ const state = {
 	isLoadingEnterpriseAdmin: false,
 	userSettingsOpen: false,
 	uploadMenuOpen: false,
+	historyFilesOpen: false,
 	savedUserId: '',
 	query: '',
 	taskId: '',
@@ -87,6 +88,8 @@ const state = {
 	messages: initialMessages(),
 	artifacts: emptyArtifacts(),
 	uploads: [],
+	cloudFiles: [],
+	cloudStorage: null,
 	uploadResults: [],
 	taskHistory: [],
 	eventSource: null
@@ -134,15 +137,46 @@ function bindEvents() {
 		event.stopPropagation();
 		state.userSettingsOpen = !state.userSettingsOpen;
 		renderShell();
+		if (state.userSettingsOpen && isEnterpriseAccount()) {
+			void loadCloudStorage();
+		}
 	});
 	dom.uploadMenuButton.addEventListener('click', (event) => {
+		event.preventDefault();
 		event.stopPropagation();
-		setUploadMenuOpen(!state.uploadMenuOpen);
+		const nextOpen = !state.uploadMenuOpen;
+		window.setTimeout(() => setUploadMenuOpen(nextOpen), 0);
 	});
 	dom.uploadFileButton.addEventListener('click', (event) => {
 		event.stopPropagation();
 		setUploadMenuOpen(false);
 		dom.uploadInput.click();
+	});
+	dom.historyFileButton.addEventListener('click', (event) => {
+		event.preventDefault();
+		event.stopPropagation();
+		const nextOpen = !state.historyFilesOpen;
+		window.setTimeout(() => setHistoryFilePanelOpen(nextOpen), 0);
+	});
+	dom.refreshHistoryFilesButton.addEventListener('click', (event) => {
+		event.stopPropagation();
+		void loadUploads();
+	});
+	dom.historyFileList.addEventListener('click', (event) => {
+		const button = event.target.closest('[data-history-document-id]');
+		if (!button) {
+			return;
+		}
+		event.preventDefault();
+		selectHistoryFile(button.dataset.historyDocumentId || '');
+	});
+	dom.uploadList.addEventListener('click', (event) => {
+		const button = event.target.closest('[data-remove-upload-id]');
+		if (!button) {
+			return;
+		}
+		event.preventDefault();
+		removeSelectedUpload(button.dataset.removeUploadId || '');
 	});
 	document.addEventListener('click', (event) => {
 		if (
@@ -155,15 +189,21 @@ function bindEvents() {
 		}
 		if (
 			state.uploadMenuOpen &&
-			!dom.uploadMenu.contains(event.target) &&
-			!dom.uploadMenuButton.contains(event.target)
+			!eventInside(event, dom.uploadMenuWrapper)
 		) {
 			setUploadMenuOpen(false);
 		}
+		if (
+			state.historyFilesOpen &&
+			!eventInside(event, dom.uploadMenuWrapper)
+		) {
+			setHistoryFilesOpen(false);
+		}
 	});
 	document.addEventListener('keydown', (event) => {
-		if (event.key === 'Escape' && state.uploadMenuOpen) {
+		if (event.key === 'Escape' && (state.uploadMenuOpen || state.historyFilesOpen)) {
 			setUploadMenuOpen(false);
+			setHistoryFilesOpen(false);
 		}
 	});
 	dom.signOutButton.addEventListener('click', () => void signOut());
@@ -254,9 +294,13 @@ function renderShell() {
 	if (!signedIn) {
 		state.userSettingsOpen = false;
 		setUploadMenuOpen(false);
+		setHistoryFilesOpen(false);
 	}
 	dom.userSettingsPanel.classList.toggle('hidden', !signedIn || !state.userSettingsOpen);
 	renderUploadMenu();
+	renderHistoryFiles();
+	renderFileControls();
+	renderCloudStorage();
 	const displayName = state.user?.name || state.user?.username || state.user?.email || '已登录';
 	const fullSessionLabel = signedIn ? `${displayName} · ${accountLabel(state.user)}` : '未登录';
 	dom.sessionLabel.textContent = signedIn ? displayName : '未登录';
@@ -273,6 +317,9 @@ function renderShell() {
 
 function setUploadMenuOpen(open) {
 	state.uploadMenuOpen = Boolean(open);
+	if (state.uploadMenuOpen) {
+		state.historyFilesOpen = false;
+	}
 	renderUploadMenu();
 }
 
@@ -282,6 +329,39 @@ function renderUploadMenu() {
 	}
 	dom.uploadMenu.classList.toggle('hidden', !state.uploadMenuOpen);
 	dom.uploadMenuButton.setAttribute('aria-expanded', state.uploadMenuOpen ? 'true' : 'false');
+}
+
+function setHistoryFilesOpen(open) {
+	state.historyFilesOpen = Boolean(open);
+	if (state.historyFilesOpen) {
+		state.uploadMenuOpen = false;
+	}
+	renderUploadMenu();
+	renderHistoryFiles();
+}
+
+function setHistoryFilePanelOpen(open) {
+	state.uploadMenuOpen = false;
+	state.historyFilesOpen = Boolean(open);
+	renderUploadMenu();
+	renderHistoryFiles();
+}
+
+function renderFileControls() {
+	const visible = Boolean(state.user) && isEnterpriseAccount();
+	dom.uploadMenuWrapper.classList.toggle('hidden', !visible);
+	if (!visible) {
+		setUploadMenuOpen(false);
+		setHistoryFilesOpen(false);
+	}
+}
+
+function eventInside(event, element) {
+	if (!element) {
+		return false;
+	}
+	const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+	return path.includes(element) || element.contains(event.target);
 }
 
 function renderAuthMode() {
@@ -811,7 +891,11 @@ function resetCurrentTaskView() {
 	state.finalReportText = '';
 	state.messages = initialMessages();
 	state.artifacts = emptyArtifacts();
+	state.uploads = [];
 	state.uploadResults = [];
+	state.currentUpload = null;
+	state.uploadMenuOpen = false;
+	state.historyFilesOpen = false;
 }
 
 function mergeTaskHistory(task) {
@@ -946,9 +1030,13 @@ function resetWorkspaceState() {
 	state.messages = initialMessages();
 	state.artifacts = emptyArtifacts();
 	state.uploads = [];
+	state.cloudFiles = [];
+	state.cloudStorage = null;
 	state.uploadResults = [];
 	state.taskHistory = [];
 	state.userSettingsOpen = false;
+	state.uploadMenuOpen = false;
+	state.historyFilesOpen = false;
 }
 
 async function signOut() {
@@ -1000,9 +1088,13 @@ async function submitResearch() {
 	renderReportControls();
 
 	try {
+		const documentIds = isEnterpriseAccount() ? selectedUploadDocumentIds() : [];
 		const task = await api('/api/limira/research', {
 			method: 'POST',
-			body: { query }
+			body: {
+				query,
+				document_ids: documentIds
+			}
 		});
 		if (!state.isSubmitting || !isCurrentAsyncContext(context)) {
 			return;
@@ -1180,27 +1272,71 @@ async function loadUploads() {
 	if (!state.user) {
 		return;
 	}
+	if (!isEnterpriseAccount()) {
+		state.uploads = [];
+		state.cloudFiles = [];
+		state.cloudStorage = null;
+		state.uploadResults = [];
+		state.currentUpload = null;
+		renderUploads();
+		renderHistoryFiles();
+		renderCloudStorage();
+		return;
+	}
 	const context = captureAsyncContext();
 	try {
-		const taskParam = state.taskId ? `?task_id=${encodeURIComponent(state.taskId)}` : '';
-		const data = await api(`/api/limira/uploads${taskParam}`);
+		const historyData = await api('/api/limira/uploads/history');
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
-		state.uploads = Array.isArray(data.documents) ? data.documents : [];
+		state.cloudFiles = Array.isArray(historyData.documents) ? historyData.documents : [];
+		state.cloudStorage = historyData.storage || null;
+		if (state.taskId) {
+			const taskData = await api(`/api/limira/uploads?task_id=${encodeURIComponent(state.taskId)}`);
+			if (!isCurrentAsyncContext(context)) {
+				return;
+			}
+			state.uploads = Array.isArray(taskData.documents) ? taskData.documents : [];
+			state.cloudStorage = taskData.storage || state.cloudStorage;
+		} else {
+			state.uploads = reconcileSelectedUploads(state.uploads, state.cloudFiles);
+		}
 		state.uploadResults = [];
 		saveWorkspace();
 		renderUploads();
+		renderHistoryFiles();
+		renderCloudStorage();
 	} catch (error) {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
 		dom.uploadMessage.textContent = errorMessage(error);
 		renderUploads();
+		renderHistoryFiles();
+		renderCloudStorage();
+	}
+}
+
+async function loadCloudStorage() {
+	if (!state.user || !isEnterpriseAccount()) {
+		return;
+	}
+	try {
+		const data = await api('/api/limira/uploads/storage');
+		state.cloudStorage = data.storage || state.cloudStorage;
+		renderCloudStorage();
+	} catch (error) {
+		dom.uploadMessage.textContent = errorMessage(error);
+		renderUploads();
 	}
 }
 
 async function uploadDocument() {
+	if (!isEnterpriseAccount()) {
+		dom.uploadMessage.textContent = '云文件仅支持单位账号。';
+		renderUploads();
+		return;
+	}
 	const file = dom.uploadInput.files?.[0];
 	if (!file || state.isUploading) {
 		dom.uploadMessage.textContent = file ? '' : '请先选择文件。';
@@ -1968,6 +2104,10 @@ function renderUploadCard(document, options = {}) {
 		!transient && id
 			? `<a class="attachment-download" href="/api/limira/uploads/${encodeURIComponent(id)}/download" title="下载文件">下载</a>`
 			: '';
+	const remove =
+		!transient && !state.taskId && id
+			? `<button class="attachment-remove" type="button" data-remove-upload-id="${escapeAttr(id)}" title="从本次对话移除">×</button>`
+			: '';
 	return `<article class="attachment-card ${transient ? `upload-${escapeAttr(status || 'uploading')}` : ''}">
 		<div class="attachment-icon" aria-hidden="true">
 			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M14 3H7C5.89543 3 5 3.89543 5 5V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V8M14 3L19 8M14 3V8H19" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
@@ -1978,8 +2118,76 @@ function renderUploadCard(document, options = {}) {
 			${progressBar}
 			${document.snippet ? `<div class="attachment-message">${escapeHtml(document.snippet)}</div>` : message}
 		</div>
-		${download}
+		<div class="attachment-actions">${download}${remove}</div>
 	</article>`;
+}
+
+function renderHistoryFiles() {
+	if (!dom.historyFilePanel || !dom.historyFileList) {
+		return;
+	}
+	dom.historyFilePanel.classList.toggle('hidden', !state.historyFilesOpen);
+	const selectedIds = new Set(selectedUploadDocumentIds());
+	dom.historyFileList.innerHTML = state.cloudFiles.length
+		? state.cloudFiles
+				.map((document) => {
+					const id = String(document.document_id || '');
+					const selected = selectedIds.has(id);
+					return `<button class="history-file-option${selected ? ' selected' : ''}" type="button" data-history-document-id="${escapeAttr(id)}" ${selected ? 'disabled' : ''}>
+						<span class="history-file-icon" aria-hidden="true">
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M14 3H7C5.89543 3 5 3.89543 5 5V19C5 20.1046 5.89543 21 7 21H17C18.1046 21 19 20.1046 19 19V8M14 3L19 8M14 3V8H19" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+						</span>
+						<span class="history-file-text">
+							<span class="history-file-title">${escapeHtml(document.filename || id || '历史文件')}</span>
+							<span class="history-file-meta">${escapeHtml(document.content_type || '文档')} · ${formatBytes(document.byte_size)}${selected ? ' · 已加入' : ''}</span>
+						</span>
+					</button>`;
+				})
+				.join('')
+		: '<div class="empty-state compact-empty">暂无历史文件。</div>';
+}
+
+function selectHistoryFile(documentId) {
+	const document = state.cloudFiles.find((item) => String(item.document_id || '') === documentId);
+	if (!document || state.taskId) {
+		return;
+	}
+	state.uploads = mergeUploadedDocument(state.uploads, document);
+	state.uploadResults = [];
+	state.historyFilesOpen = false;
+	saveWorkspace();
+	renderUploads();
+	renderHistoryFiles();
+}
+
+function removeSelectedUpload(documentId) {
+	if (!documentId || state.taskId) {
+		return;
+	}
+	state.uploads = state.uploads.filter(
+		(document) => String(document.document_id || '') !== documentId
+	);
+	saveWorkspace();
+	renderUploads();
+	renderHistoryFiles();
+}
+
+function selectedUploadDocumentIds() {
+	return state.uploads
+		.map((document) => String(document.document_id || '').trim())
+		.filter(Boolean);
+}
+
+function reconcileSelectedUploads(selectedUploads, cloudFiles) {
+	const cloudById = new Map(
+		(Array.isArray(cloudFiles) ? cloudFiles : []).map((document) => [
+			String(document.document_id || ''),
+			document,
+		])
+	);
+	return (Array.isArray(selectedUploads) ? selectedUploads : [])
+		.map((document) => cloudById.get(String(document.document_id || '')) || document)
+		.filter((document) => String(document.document_id || ''));
 }
 
 function mergeUploadedDocument(documents, uploaded) {
@@ -2024,6 +2232,24 @@ function renderEnterpriseAdmin() {
 				})
 				.join('')
 		: '<div class="empty-state compact-empty">暂无单位账号。</div>';
+}
+
+function renderCloudStorage() {
+	if (!dom.cloudStoragePanel) {
+		return;
+	}
+	const visible = Boolean(state.user) && isEnterpriseAccount();
+	dom.cloudStoragePanel.classList.toggle('hidden', !visible);
+	if (!visible) {
+		return;
+	}
+	const storage = state.cloudStorage || {};
+	const used = Number(storage.used_bytes || 0);
+	const quota = Number(storage.quota_bytes || 0);
+	const remaining = Math.max(0, Number(storage.remaining_bytes || quota - used));
+	const percent = quota ? Math.max(0, Math.min(100, (used / quota) * 100)) : 0;
+	dom.cloudStorageSummary.textContent = `已用 ${formatBytes(used)} / ${formatBytes(quota)}，剩余 ${formatBytes(remaining)}。`;
+	dom.cloudStorageMeter.style.width = `${percent}%`;
 }
 
 function enterpriseMemberResearchCount(member) {
@@ -2225,6 +2451,9 @@ function localizedErrorDetail(detail) {
 		enterprise_admin_required: '当前账号没有单位管理权限。',
 		enterprise_admin_already_exists: '每个单位只能保留一个管理员账号。',
 		organization_already_exists: '这个单位已经存在。',
+		enterprise_cloud_storage_required: '云文件仅支持单位账号。',
+		enterprise_cloud_storage_quota_exceeded: '云空间已满，请清理文件或联系管理员扩容。',
+		document_not_found: '没有找到这个历史文件。',
 		personal_daily_quota_exceeded: '个人方式登录每天只能创建一次研究任务。',
 		invalid_organization_role: '单位角色无效。',
 		google_auth_failed: 'Google 登录失败，请重试。',
@@ -2471,6 +2700,10 @@ function accountLabel(user) {
 		return `${organizationName} · ${role}`;
 	}
 	return `个人账号 · ${roleLabel(user?.role)}`;
+}
+
+function isEnterpriseAccount() {
+	return state.user?.account_type === 'enterprise';
 }
 
 function eventLabel(eventType) {

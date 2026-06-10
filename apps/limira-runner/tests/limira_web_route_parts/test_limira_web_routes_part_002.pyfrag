@@ -184,6 +184,114 @@ async def test_upload_route_rejects_active_or_unsupported_content_types():
 
 
 @pytest.mark.asyncio
+async def test_personal_users_cannot_use_cloud_file_storage():
+    app, _repo, _storage = _limira_asgi_app()
+
+    async def personal_user_override():
+        return limira.LimiraUser("personal-user")
+
+    app.dependency_overrides[limira.get_current_limira_user] = personal_user_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        list_response = await client.get("/api/limira/uploads")
+        history_response = await client.get("/api/limira/uploads/history")
+        storage_response = await client.get("/api/limira/uploads/storage")
+        upload_response = await client.post(
+            "/api/limira/uploads",
+            files={"file": ("personal.txt", b"personal", "text/plain")},
+        )
+
+    for response in [list_response, history_response, storage_response, upload_response]:
+        assert response.status_code == 403
+        assert response.json()["detail"] == "enterprise_cloud_storage_required"
+
+
+@pytest.mark.asyncio
+async def test_enterprise_uploads_enforce_per_user_cloud_storage_quota(monkeypatch):
+    monkeypatch.setenv(limira.LIMIRA_ENTERPRISE_USER_STORAGE_QUOTA_BYTES_ENV, "7")
+    app, repo, storage = _limira_asgi_app()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        first_response = await client.post(
+            "/api/limira/uploads",
+            files={"file": ("first.txt", b"12345", "text/plain")},
+        )
+        quota_response = await client.get("/api/limira/uploads/storage")
+        second_response = await client.post(
+            "/api/limira/uploads",
+            files={"file": ("second.txt", b"123", "text/plain")},
+        )
+
+    assert first_response.status_code == 201
+    assert quota_response.status_code == 200
+    assert quota_response.json()["storage"] == {
+        "used_bytes": 5,
+        "quota_bytes": 7,
+        "remaining_bytes": 2,
+        "usage_ratio": round(5 / 7, 6),
+    }
+    assert second_response.status_code == 413
+    assert second_response.json()["detail"] == "enterprise_cloud_storage_quota_exceeded"
+    assert len(repo.uploaded_documents) == 1
+    assert len(storage.objects) == 1
+
+
+@pytest.mark.asyncio
+async def test_research_can_attach_history_documents_without_duplicate_storage():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser(
+        "user-a",
+        account_type="enterprise",
+        organization_id="org-a",
+        organization_role="member",
+    )
+    source = repo.record_uploaded_document(
+        document_id="doc-cloud",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="cloud.txt",
+        content_type="text/plain",
+        byte_size=11,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/uploads/doc-cloud.txt",
+        extracted_text="cloud memo",
+        language=None,
+        metadata={"sha256": "cloud-sha"},
+    )
+
+    payload = await limira.create_research_task(
+        {"query": "use uploaded file", "document_ids": ["doc-cloud"]},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+
+    attached = repo.list_user_documents(owner_user_id="user-a", task_id=payload["task_id"])
+    all_documents = repo.list_user_documents(owner_user_id="user-a")
+    storage_payload = limira._enterprise_storage_payload(repo, user)
+
+    assert payload["uploaded_documents"][0]["filename"] == "cloud.txt"
+    assert [document.original_filename for document in attached] == ["cloud.txt"]
+    assert attached[0].document_id != source.document_id
+    assert attached[0].object_key == source.object_key
+    assert attached[0].metadata["source_document_id"] == "doc-cloud"
+    assert {document.document_id for document in all_documents} == {
+        "doc-cloud",
+        attached[0].document_id,
+    }
+    assert storage_payload["used_bytes"] == 11
+    assert storage_payload["quota_bytes"] == limira.LIMIRA_DEFAULT_ENTERPRISE_USER_STORAGE_QUOTA_BYTES
+
+
+@pytest.mark.asyncio
 async def test_upload_route_records_configured_embedding_with_fake_provider():
     app, repo, _storage = _limira_asgi_app()
     provider = FakeUploadEmbeddingProvider([0.25, 0.5, 0.75])

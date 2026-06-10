@@ -1074,7 +1074,11 @@ async def test_postgres_upload_download_clears_missing_persisted_document_object
     with pytest.raises(HTTPException) as exc:
         await limira.download_uploaded_document(
             "doc-postgres-missing",
-            user=limira.LimiraUser("user-a"),
+            user=limira.LimiraUser(
+                "user-a",
+                account_type="enterprise",
+                organization_id="org-a",
+            ),
             repo=repo,
             object_storage=storage,
         )
@@ -1130,7 +1134,11 @@ async def test_postgres_upload_download_clears_mismatched_persisted_document_obj
     with pytest.raises(HTTPException) as exc:
         await limira.download_uploaded_document(
             "doc-postgres-mismatch",
-            user=limira.LimiraUser("user-a"),
+            user=limira.LimiraUser(
+                "user-a",
+                account_type="enterprise",
+                organization_id="org-a",
+            ),
             repo=repo,
             object_storage=storage,
         )
@@ -1176,7 +1184,11 @@ async def test_postgres_upload_download_clears_invalid_persisted_document_object
     with pytest.raises(HTTPException) as exc:
         await limira.download_uploaded_document(
             "doc-postgres-invalid-key",
-            user=limira.LimiraUser("user-a"),
+            user=limira.LimiraUser(
+                "user-a",
+                account_type="enterprise",
+                organization_id="org-a",
+            ),
             repo=repo,
             object_storage=storage,
         )
@@ -1234,7 +1246,11 @@ async def test_postgres_upload_download_clears_malformed_persisted_document_chec
     with pytest.raises(HTTPException) as exc:
         await limira.download_uploaded_document(
             "doc-postgres-malformed-sha",
-            user=limira.LimiraUser("user-a"),
+            user=limira.LimiraUser(
+                "user-a",
+                account_type="enterprise",
+                organization_id="org-a",
+            ),
             repo=repo,
             object_storage=storage,
         )
