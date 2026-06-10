@@ -273,11 +273,11 @@ function renderShell() {
 	dom.authPanel.classList.toggle('hidden', signedIn);
 	dom.workspace.classList.toggle('hidden', !signedIn);
 	dom.signOutButton.classList.toggle('hidden', !signedIn);
-	dom.userSettingsButton.classList.toggle('hidden', !enterpriseAdmin);
-	if (!enterpriseAdmin) {
+	dom.userSettingsButton.classList.toggle('hidden', !signedIn);
+	if (!signedIn) {
 		state.userSettingsOpen = false;
 	}
-	dom.userSettingsPanel.classList.toggle('hidden', !enterpriseAdmin || !state.userSettingsOpen);
+	dom.userSettingsPanel.classList.toggle('hidden', !signedIn || !state.userSettingsOpen);
 	const displayName = state.user?.name || state.user?.username || state.user?.email || '已登录';
 	const fullSessionLabel = signedIn ? `${displayName} · ${accountLabel(state.user)}` : '未登录';
 	dom.sessionLabel.textContent = signedIn ? displayName : '未登录';

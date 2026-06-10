@@ -251,6 +251,7 @@ def test_limira_standalone_frontend_uses_native_auth_namespace_only():
     assert 'id="enterpriseMemberEmailInput"' not in index
     assert 'id="userSettingsButton"' in index
     assert 'id="userSettingsPanel"' in index
+    assert 'class="settings-menu-item danger"' in index
     assert "此页面直接连接 limira 后端" not in index
     assert 'id="enterpriseContactPrompt"' in index
     assert "如需开通单位账号，请通过以下方式联系团队。" in index
