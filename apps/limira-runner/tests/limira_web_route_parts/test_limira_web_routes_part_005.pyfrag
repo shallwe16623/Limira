@@ -1,0 +1,1500 @@
+    assert evidence_event["payload"]["query"] == "BYD 1260H"
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    evidence = artifacts["evidence"][0]
+    assert evidence["evidence_id"].startswith("EVID-")
+    assert evidence["title"] == "DoD 1260H List"
+    assert evidence["source_url"] == "https://example.test/dod-1260h.pdf"
+    assert evidence["summary"] == "Official list entry summary."
+    assert evidence["source_event_type"] == "tool_evidence_ledger"
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+
+    assert trace["artifacts"]["evidence"][0]["title"] == "DoD 1260H List"
+    assert trace["artifact_events"][0]["type"] == "evidence_collected"
+    assert trace["artifact_events"][0]["source_event_type"] == "tool_evidence_ledger"
+    assert trace["artifact_events"][0]["local_artifact_id"].startswith("EVID-")
+    assert trace["artifact_warnings"] == []
+    _assert_no_browser_leak(trace)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_records_runtime_state_to_redis():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(
+        redis,
+        key_prefix="test:limira:runtime",
+        ttl_seconds=120,
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "running", "archive_status": "pending"},
+            },
+            {
+                "type": "evidence_collected",
+                "payload": {"title": "Runtime source"},
+            },
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "redis runtime state"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    key = runtime_state.task_key(task_id)
+    runtime_hash = redis.hashes[key]
+    assert events[-1]["payload"]["status"] == "completed"
+    assert json.loads(runtime_hash["owner_user_id"]) == "user-a"
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert json.loads(runtime_hash["last_event_type"]) == "status"
+    assert key in {call["key"] for call in redis.hset_calls}
+    assert redis.expire_calls[-1] == {"key": key, "seconds": 120}
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_ignores_runner_events_after_terminal_status():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+            {
+                "type": "status",
+                "payload": {"status": "running", "archive_status": "pending"},
+            },
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "terminal should not regress"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    task = repo.get_task(task_id)
+    assert task.status == "completed"
+    assert task.archive_status == "ready"
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["last_event"]) == events[-1]
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_cancellation_after_terminal_yield_preserves_completed_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "terminal cancellation must not regress"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    task = repo.get_task(task_id)
+
+    stream = limira._limira_event_stream(
+        task,
+        user,
+        repo,
+        research,
+        runtime_state,
+    )
+    first_chunk = await stream.__anext__()
+    events = _parse_sse_chunks([first_chunk])
+
+    with pytest.raises(StopAsyncIteration):
+        await stream.athrow(asyncio.CancelledError())
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    persisted_task = repo.get_task(task_id)
+    assert persisted_task.status == "completed"
+    assert persisted_task.archive_status == "ready"
+    assert persisted_task.error is None
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert "error" not in runtime_hash
+    assert json.loads(runtime_hash["last_event"]) == events[-1]
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert research.stream_calls
+    assert research.status_calls == []
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(runtime_hash)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_records_nested_terminal_status_to_redis():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {
+                    "data": {"status": "completed", "archive_status": "ready"}
+                },
+            }
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "nested terminal status"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_records_authoritative_terminal_status_to_redis():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "completed",
+            "archive_status": "ready",
+        },
+    )
+
+    created = await limira.create_research_task(
+        {"query": "authoritative terminal status"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["payload"]["status_source"] == "runner"
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert len(research.status_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_event_proxy_authoritative_terminal_status_closes_runtime_stream():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "completed",
+            "archive_status": "ready",
+        },
+    )
+    created = await limira.create_research_task(
+        {"query": "postgres authoritative terminal status"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+                "status_source": "runner",
+            },
+        }
+    ]
+    persisted_task = repo.get_task(task_id)
+    assert persisted_task.status == "completed"
+    assert persisted_task.archive_status == "ready"
+    assert persisted_task.error is None
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["last_event"]) == events[-1]
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_completed"
+    assert len(research.stream_calls) == 1
+    assert len(research.status_calls) == 1
+
+    reattach_research = FakeResearchClient(
+        stream_exception=AssertionError("terminal reattach must not call runner")
+    )
+    reattach_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=reattach_research,
+        runtime_state=runtime_state,
+    )
+    reattach_events = _parse_sse_chunks(
+        [chunk async for chunk in reattach_response.body_iterator]
+    )
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert reattach_events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert reattach_research.stream_calls == []
+    assert reattach_research.status_calls == []
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_reattach"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "reattach_events": reattach_events,
+            "task": (await limira.get_task(task_id, user=user, repo=repo)),
+            "runtime": runtime_hash,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_reattach_records_terminal_runtime_state_to_redis():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("terminal reattach must not stream")
+    )
+    created = await limira.create_research_task(
+        {"query": "already terminal"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["payload"]["terminal"] is True
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_reattach"
+    assert research.stream_calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reattach_does_not_close_foreign_active_runtime_lease():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("terminal reattach must not stream")
+    )
+    created = await limira.create_research_task(
+        {"query": "terminal while active stream still owns lease"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    assert await runtime_state.try_open_stream(
+        task_id,
+        owner_user_id="user-a",
+        stream_id="active-stream",
+        fields={"status": "running", "archive_status": "pending"},
+    )
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["payload"]["terminal"] is True
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["status"]) == "completed"
+    assert json.loads(runtime_hash["archive_status"]) == "ready"
+    assert json.loads(runtime_hash["stream_state"]) == "open"
+    assert json.loads(runtime_hash["stream_id"]) == "active-stream"
+    assert not await runtime_state.try_open_stream(
+        task_id,
+        owner_user_id="user-a",
+        stream_id="new-stream",
+        fields={"status": "running", "archive_status": "pending"},
+    )
+    assert research.stream_calls == []
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_duplicate_active_stream_uses_runtime_lease_without_runner_call():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(
+        redis,
+        key_prefix="test:limira",
+        ttl_seconds=240,
+    )
+    research = FakeResearchClient(
+        stream_exception=AssertionError("duplicate stream must not call runner")
+    )
+    created = await limira.create_research_task(
+        {"query": "duplicate stream"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    assert await runtime_state.try_open_stream(
+        task_id,
+        owner_user_id="user-a",
+        stream_id="active-stream",
+        fields={"status": "running", "archive_status": "pending"},
+    )
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "running",
+                "archive_status": "pending",
+                "stream_state": "open",
+                "status_source": "limira_runtime_state",
+                "reason": "stream_already_open",
+            },
+        }
+    ]
+    assert research.stream_calls == []
+    assert json.loads(runtime_hash["stream_state"]) == "open"
+    assert json.loads(runtime_hash["stream_id"]) == "active-stream"
+    assert {"key": runtime_state.task_key(task_id), "seconds": 240} in redis.expire_calls
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_cancellation_closes_matching_runtime_stream():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(stream_exception=asyncio.CancelledError())
+    created = await limira.create_research_task(
+        {"query": "cancelled redis stream"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events == []
+    assert json.loads(runtime_hash["status"]) == "cancelled"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "event_stream_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_http_exception_records_failed_terminal_runtime_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        stream_exception=HTTPException(status_code=503, detail="runner_unavailable")
+    )
+    created = await limira.create_research_task(
+        {"query": "http exception redis state"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["payload"]["error"] == "runner_unavailable"
+    assert json.loads(runtime_hash["status"]) == "failed"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "runner_unavailable"
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "http_exception"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_http_exception_hides_internal_detail_from_browser_runtime_and_task_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    internal_detail = (
+        "runner stream failed at http://10.20.30.40:8091/internal/tasks/runner-task-a/events "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt"
+    )
+    research = FakeResearchClient(
+        stream_exception=HTTPException(status_code=503, detail=internal_detail)
+    )
+    created = await limira.create_research_task(
+        {"query": "http exception internal detail"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert events[-1]["payload"]["error"] == "limira_event_proxy_failed"
+    assert repo.get_task(task_id).error == "limira_event_proxy_failed"
+    assert task_payload["error"] == "limira_event_proxy_failed"
+    assert json.loads(runtime_hash["error"]) == "limira_event_proxy_failed"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "task": task_payload,
+            "runtime": runtime_hash,
+            "repo_error": repo.get_task(task_id).error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in ("http://10.20.30.40:8091", "limira/users/hash"):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_generic_exception_records_failed_terminal_runtime_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(stream_exception=RuntimeError("private failure"))
+    created = await limira.create_research_task(
+        {"query": "generic exception redis state"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["payload"]["error"] == "limira_event_proxy_failed"
+    assert json.loads(runtime_hash["status"]) == "failed"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "limira_event_proxy_failed"
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "limira_event_proxy_failed"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_generic_exception_hides_internal_error_from_task_payload():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    internal_error = (
+        "stream failed at http://10.20.30.40:8091/internal/tasks/runner-task-a/events "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-genericinternal123456"
+    )
+    research = FakeResearchClient(stream_exception=RuntimeError(internal_error))
+    created = await limira.create_research_task(
+        {"query": "generic exception internal error"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert events[-1]["payload"]["error"] == "limira_event_proxy_failed"
+    assert repo.get_task(task_id).error == "limira_event_proxy_failed"
+    assert task_payload["error"] == "limira_event_proxy_failed"
+    assert json.loads(runtime_hash["error"]) == "limira_event_proxy_failed"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+            "runtime": runtime_hash,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limira/users/hash",
+        "sk-genericinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_postgres_event_proxy_preserves_recorded_report_section_after_late_stream_failure():
+    class LateFailingResearchClient(FakeResearchClient):
+        async def stream_events(self, *, task, user):
+            self.stream_calls.append({"task": task, "user": user})
+            for event in self.events:
+                yield event
+            raise RuntimeError(
+                "late stream failure at http://10.20.30.40:8091/internal/tasks/"
+                "runner-task-a/events for limira/users/hash/tasks/task-a/uploads/doc.txt "
+                "OPENAI_API_KEY=sk-latefailureinternal123456"
+            )
+
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = LateFailingResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "title": "Late failure report",
+                        "markdown": "# Late answer\n\nRecorded before failure. [EVID-001]",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.72,
+                    "notes": "artifact emitted before runner failure",
+                },
+            }
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "late failure artifact persistence"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    reports = repo.list_task_reports(task_id=task_id)
+    trace_events = repo.get_artifact_trace_events(task_id)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert [event["type"] for event in events] == [
+        "record_research_artifact",
+        "error",
+    ]
+    assert events[-1]["payload"]["error"] == "limira_event_proxy_failed"
+    assert task_payload["status"] == "failed"
+    assert task_payload["archive_status"] == "failed"
+    assert task_payload["error"] == "limira_event_proxy_failed"
+    assert json.loads(runtime_hash["status"]) == "failed"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "limira_event_proxy_failed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == (
+        "limira_event_proxy_failed"
+    )
+
+    assert len(artifacts["report_sections"]) == 1
+    report_section = artifacts["report_sections"][0]
+    assert report_section["section_id"] == "REPORT-001"
+    assert report_section["title"] == "Late failure report"
+    assert report_section["markdown"].startswith("# Late answer")
+    assert report_section["source_event_type"] == "record_research_artifact"
+    assert report_section["evidence_refs"] == ["EVID-001"]
+    assert report_section["confidence"] == 0.72
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].markdown == report_section["markdown"]
+    assert trace_events[0]["type"] == "report_section_generated"
+    assert trace_events[0]["source_event_type"] == "record_research_artifact"
+    assert trace_events[0]["local_artifact_id"] == "REPORT-001"
+
+    serialized = json.dumps(
+        {
+            "events": events,
+            "task": task_payload,
+            "artifacts": artifacts,
+            "reports": [report.public_dict() for report in reports],
+            "trace_events": trace_events,
+            "runtime": runtime_hash,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limira/users/hash",
+        "sk-latefailureinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
+async def test_postgres_event_proxy_preserves_recorded_report_section_after_late_stream_cancellation():
+    class LateCancellingResearchClient(FakeResearchClient):
+        async def stream_events(self, *, task, user):
+            self.stream_calls.append({"task": task, "user": user})
+            for event in self.events:
+                yield event
+            raise asyncio.CancelledError()
+
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = LateCancellingResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "title": "Late cancellation report",
+                        "markdown": "# Cancelled answer\n\nRecorded before cancel. [EVID-001]",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.68,
+                    "notes": "artifact emitted before stream cancellation",
+                },
+            }
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "late cancellation artifact persistence"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    reports = repo.list_task_reports(task_id=task_id)
+    trace_events = repo.get_artifact_trace_events(task_id)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+    last_event = json.loads(runtime_hash["last_event"])
+
+    assert [event["type"] for event in events] == ["record_research_artifact"]
+    assert task_payload["status"] == "cancelled"
+    assert task_payload["archive_status"] == "failed"
+    assert task_payload["error"] == "event_stream_cancelled"
+    assert repo.get_task(task_id).status == "cancelled"
+    assert repo.get_task(task_id).error == "event_stream_cancelled"
+    assert json.loads(runtime_hash["status"]) == "cancelled"
+    assert json.loads(runtime_hash["archive_status"]) == "failed"
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["error"]) == "event_stream_cancelled"
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "event_stream_cancelled"
+    assert last_event["type"] == "record_research_artifact"
+
+    assert len(artifacts["report_sections"]) == 1
+    report_section = artifacts["report_sections"][0]
+    assert report_section["section_id"] == "REPORT-001"
+    assert report_section["title"] == "Late cancellation report"
+    assert report_section["markdown"].startswith("# Cancelled answer")
+    assert report_section["source_event_type"] == "record_research_artifact"
+    assert report_section["evidence_refs"] == ["EVID-001"]
+    assert report_section["confidence"] == 0.68
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].markdown == report_section["markdown"]
+    assert trace_events[0]["type"] == "report_section_generated"
+    assert trace_events[0]["source_event_type"] == "record_research_artifact"
+    assert trace_events[0]["local_artifact_id"] == "REPORT-001"
+
+    serialized = json.dumps(
+        {
+            "events": events,
+            "task": task_payload,
+            "artifacts": artifacts,
+            "reports": [report.public_dict() for report in reports],
+            "trace_events": trace_events,
+            "runtime": runtime_hash,
+            "last_event": last_event,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    _assert_no_browser_leak(serialized)
+
+
+@pytest.mark.asyncio
+async def test_completed_task_event_reattach_is_terminal_and_does_not_call_runner():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("final reattach must not call runner stream")
+    )
+    created = await limira.create_research_task(
+        {"query": "completed query"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    assert research.stream_calls == []
+    assert research.status_calls == []
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_postgres_terminal_reattach_preserves_persisted_final_summary_surfaces():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    redis = FakeRedisClient()
+    runtime_state = limira.RedisLimiraRuntimeState(redis, key_prefix="test:limira")
+    research = FakeResearchClient(
+        stream_exception=AssertionError("terminal final-answer reattach must not stream")
+    )
+    created = await limira.create_research_task(
+        {"query": "completed final summary query"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.record_artifact(
+        task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-001",
+            "title": "最终回答",
+            "markdown": "# Final answer\n\nPersisted answer survives reattach. [EVID-001]",
+            "evidence_refs": ["EVID-001"],
+            "source_event_type": "final_summary_show_text",
+        },
+    )
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    before_reports = repo.list_task_reports(task_id=task_id)
+    status_payload = await limira.get_task(task_id, user=user, repo=repo)
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    after_reports = repo.list_task_reports(task_id=task_id)
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    runtime_hash = redis.hashes[runtime_state.task_key(task_id)]
+
+    assert status_payload["status"] == "completed"
+    assert status_payload["archive_status"] == "ready"
+    assert events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "completed",
+                "archive_status": "ready",
+                "terminal": True,
+            },
+        }
+    ]
+    assert research.stream_calls == []
+    assert research.status_calls == []
+    assert json.loads(runtime_hash["terminal"]) is True
+    assert json.loads(runtime_hash["stream_state"]) == "closed"
+    assert json.loads(runtime_hash["stream_close_reason"]) == "terminal_reattach"
+
+    assert [report.report_id for report in before_reports] == ["REPORT-001"]
+    assert [report.report_id for report in after_reports] == ["REPORT-001"]
+    assert after_reports[0].markdown == before_reports[0].markdown
+    assert after_reports[0].markdown.startswith("# Final answer")
+    assert len(artifacts["report_sections"]) == 1
+    assert artifacts["report_sections"][0]["section_id"] == "REPORT-001"
+    assert artifacts["report_sections"][0]["markdown"] == after_reports[0].markdown
+    assert artifacts["report_sections"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+    assert "# Final answer" in members["report.md"]
+    assert "Persisted answer survives reattach" in members["report.md"]
+    trace = json.loads(members["trace.json"])
+    assert trace["reports"][0]["report_id"] == "REPORT-001"
+    assert trace["artifact_events"][0]["type"] == "report_section_generated"
+    assert trace["artifact_events"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    _assert_no_browser_leak(
+        {
+            "status": status_payload,
+            "events": events,
+            "artifacts": artifacts,
+            "archive": members,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_runner_conflict_hides_internal_reason_from_browser_runtime_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    internal_reason = (
+        "task conflict at http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt"
+    )
+    research = FakeResearchClient(
+        stream_exception=limira.RunnerStreamConflict(internal_reason),
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "running",
+            "archive_status": "pending",
+        },
+    )
+    created = await limira.create_research_task(
+        {"query": "conflict internal reason"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+
+    assert events[-1]["payload"]["reason"] == "runner_stream_conflict"
+    assert runtime_snapshot["last_event"]["payload"]["reason"] == "runner_stream_conflict"
+    serialized = json.dumps(
+        {"events": events, "runtime": runtime_snapshot},
+        ensure_ascii=False,
+    )
+    for leaked in ("http://10.20.30.40:8091", "limira/users/hash"):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_runner_status_warning_hides_internal_detail_from_browser_runtime_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    internal_detail = (
+        "runner status failed at http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt"
+    )
+
+    class StatusWarningResearchClient(FakeResearchClient):
+        async def get_task_status(self, *, task, user):
+            self.status_calls.append({"task": task, "user": user})
+            raise HTTPException(status_code=502, detail=internal_detail)
+
+    research = StatusWarningResearchClient(events=[])
+    created = await limira.create_research_task(
+        {"query": "warning internal detail"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+
+    assert events[-1]["payload"]["warning"] == "runner_status_warning"
+    assert runtime_snapshot["last_warning"] == "runner_status_warning"
+    assert runtime_snapshot["last_event"]["payload"]["warning"] == "runner_status_warning"
+    serialized = json.dumps(
+        {"events": events, "runtime": runtime_snapshot},
+        ensure_ascii=False,
+    )
+    for leaked in ("http://10.20.30.40:8091", "limira/users/hash"):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_terminal_reason_hides_internal_conflict_detail_from_browser_runtime_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    internal_reason = (
+        "terminal conflict at http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt"
+    )
+
+    class TerminalReasonResearchClient(FakeResearchClient):
+        async def get_task_status(self, *, task, user):
+            self.status_calls.append({"task": task, "user": user})
+            repo.update_task(
+                task.task_id,
+                status="failed",
+                archive_status="failed",
+                error="runner_task_failed",
+            )
+            raise HTTPException(status_code=409, detail="runner_terminal_conflict")
+
+    research = TerminalReasonResearchClient(
+        stream_exception=limira.RunnerStreamConflict(internal_reason)
+    )
+    created = await limira.create_research_task(
+        {"query": "terminal internal reason"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+
+    assert events[-1]["payload"]["reason"] == "runner_stream_conflict"
+    assert events[-1]["payload"]["error"] == "runner_task_failed"
+    assert runtime_snapshot["last_event"]["payload"]["reason"] == "runner_stream_conflict"
+    serialized = json.dumps(
+        {"events": events, "runtime": runtime_snapshot},
+        ensure_ascii=False,
+    )
+    for leaked in ("http://10.20.30.40:8091", "limira/users/hash"):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+
+
+@pytest.mark.asyncio
+async def test_eventsource_reconnect_after_completion_does_not_regress_task():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            }
+        ],
+        stream_exception=None,
+    )
+    created = await limira.create_research_task(
+        {"query": "finish once"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    first_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    first_events = _parse_sse_chunks([chunk async for chunk in first_response.body_iterator])
+
+    second_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    second_events = _parse_sse_chunks([chunk async for chunk in second_response.body_iterator])
+
+    assert first_events[-1]["payload"]["status"] == "completed"
+    assert second_events[-1]["payload"]["status"] == "completed"
+    assert second_events[-1]["payload"]["terminal"] is True
+    assert len(research.stream_calls) == 1
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_conflict_uses_authoritative_status_instead_of_failing():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        stream_exception=limira.RunnerStreamConflict("task_already_finished"),
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "completed",
+            "archive_status": "ready",
+        },
+    )
+    created = await limira.create_research_task(
+        {"query": "reattach via runner conflict"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events[-1]["type"] == "status"
+    assert events[-1]["payload"]["status"] == "completed"
+    assert events[-1]["payload"]["archive_status"] == "ready"
+    assert events[-1]["payload"]["reason"] == "task_already_finished"
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert repo.get_task(task_id).error is None
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_running_conflict_stays_running_without_failed_regression():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        stream_exception=limira.RunnerStreamConflict("task_already_running"),
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "running",
+            "archive_status": "pending",
+        },
+    )
+    created = await limira.create_research_task(
+        {"query": "active duplicate stream"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events[-1]["payload"]["status"] == "running"
+    assert events[-1]["payload"]["archive_status"] == "pending"
+    assert events[-1]["payload"]["reason"] == "task_already_running"
+    assert repo.get_task(task_id).status == "running"
+    assert repo.get_task(task_id).archive_status == "pending"
+    assert repo.get_task(task_id).error is None
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_cancellation_does_not_mark_task_completed():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(stream_exception=asyncio.CancelledError())
+    created = await limira.create_research_task(
+        {"query": "cancelled stream"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events == []
+    assert repo.get_task(task_id).status == "cancelled"
+    assert repo.get_task(task_id).archive_status == "failed"
+    assert repo.get_task(task_id).error == "event_stream_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_keeps_artifacts_user_scoped():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user_a = limira.LimiraUser("user-a")
+    user_b = limira.LimiraUser("user-b")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "evidence_collected",
+                "payload": {"evidence_id": "EVID-777", "title": "private"},
+            }
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "private query"},
+        request=None,
+        user=user_a,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user_a,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    with pytest.raises(HTTPException) as forbidden:
+        await limira.get_task_artifacts(task_id, user=user_b, repo=repo)
+    assert forbidden.value.status_code == 404
+
+
+def test_runner_research_client_uses_server_side_headers(monkeypatch):
+    monkeypatch.setenv("LIMIRA_RUNNER_INTERNAL_URL", "http://internal-runner")
+    monkeypatch.setenv("LIMIRA_RUNNER_SERVICE_TOKEN", "server-only-token")
+
+    client = limira.RunnerResearchClient()
+    assert client.runner_url == "http://internal-runner"
+    assert client.service_token == "server-only-token"
+
+
+def test_limira_router_defines_required_browser_facing_paths():
+    route_contract = {
+        ("/auth/session", "GET"),
+        ("/auth/signin", "POST"),
+        ("/auth/signout", "POST"),
+        ("/auth/signup", "POST"),
+        ("/auth/verify-email", "POST"),
+        ("/auth/resend-verification", "POST"),
+        ("/auth/password-reset/request", "POST"),
+        ("/auth/password-reset/confirm", "POST"),
+        ("/auth/organizations", "GET"),
+        ("/auth/enterprise/signin", "POST"),
+        ("/auth/google/config", "GET"),
+        ("/auth/google/start", "GET"),
+        ("/auth/google/callback", "GET"),
+        ("/auth/wechat/config", "GET"),
+        ("/auth/wechat/start", "GET"),
+        ("/auth/wechat/callback", "GET"),
+        ("/scenarios", "GET"),
+        ("/research", "POST"),
+        ("/tasks/{task_id}", "GET"),
+        ("/tasks/{task_id}/events", "GET"),
+        ("/tasks/{task_id}/artifacts", "GET"),
+        ("/tasks/{task_id}/archive.zip", "GET"),
+        ("/uploads", "GET"),
+        ("/uploads", "POST"),
+        ("/uploads/search", "GET"),
+        ("/uploads/{document_id}", "GET"),

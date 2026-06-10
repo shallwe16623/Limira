@@ -1,0 +1,345 @@
+    clean: dict[str, str] = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        clean_key = re.sub(r"[^A-Za-z0-9_.-]", "-", str(key)).strip("-_.")[:64]
+        if not clean_key:
+            continue
+        clean[clean_key] = str(value)[:1024]
+    return clean
+
+
+def _safe_object_segment(value: str, *, fallback: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", str(value)).strip(".-/")
+    return safe[:120] or fallback
+
+
+def _safe_object_extension(
+    *,
+    filename: str | None = None,
+    extension: str | None = None,
+) -> str:
+    candidate = extension or ""
+    if not candidate and filename:
+        basename = str(filename).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        _, candidate = os.path.splitext(basename)
+    if candidate and not candidate.startswith("."):
+        candidate = f".{candidate}"
+    candidate = candidate.lower()
+    if candidate in OBJECT_KEY_ALLOWED_EXTENSIONS:
+        return candidate
+    return ".bin"
+
+
+def _safe_original_filename(filename: str | None) -> str:
+    basename = (filename or "upload.bin").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    basename = basename.strip()[:255]
+    return basename or "upload.bin"
+
+
+def _content_disposition_attachment(filename: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _safe_original_filename(filename))[:120]
+    return f'attachment; filename="{safe or "upload.bin"}"'
+
+
+def _safe_report_id(report_id: str | None) -> str:
+    return _safe_object_segment(report_id or f"report-{uuid.uuid4().hex[:12]}", fallback="report")
+
+
+def _safe_report_type(report_type: str | None) -> str:
+    return _safe_object_segment(report_type or "final", fallback="final")
+
+
+def _render_report_html(
+    *,
+    markdown: str,
+    evidence_refs: list[str],
+) -> str:
+    body = _link_evidence_refs(_markdown_to_html(markdown), evidence_refs)
+    style = (
+        "<style>"
+        "@page{size:A4;margin:18mm;}"
+        "html,body{margin:0;padding:0;background:#fff;color:#111;}"
+        "body{font-family:\"Noto Sans CJK SC\",\"Noto Sans SC\",\"Microsoft YaHei\","
+        "\"PingFang SC\",Arial,sans-serif;font-size:11pt;line-height:1.55;}"
+        "h1,h2,h3,h4,h5,h6{color:#111;line-height:1.25;margin:0 0 0.55em;}"
+        "p,ul,ol,table{margin:0 0 0.9em;}"
+        "table{width:100%;border-collapse:collapse;}"
+        "th,td{border:1px solid #bbb;padding:4px 6px;text-align:left;}"
+        "a{color:#0645ad;text-decoration:none;}"
+        "*{-webkit-print-color-adjust:exact;print-color-adjust:exact;}"
+        "</style>"
+    )
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<meta http-equiv=\"Content-Security-Policy\" content=\"{REPORT_CSP}\">"
+        f"<title>limira report</title>{style}</head><body>"
+        f"{body}</body></html>"
+    )
+
+
+def _markdown_to_html(markdown: str) -> str:
+    safe_markdown = _strip_active_report_markup(markdown)
+    lines = safe_markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if heading:
+            level = len(heading.group(1))
+            blocks.append(
+                f"<h{level}>{_markdown_inline_to_html(heading.group(2).strip())}</h{level}>"
+            )
+            index += 1
+            continue
+        if re.match(r"^\s*---+\s*$", line):
+            blocks.append("<hr>")
+            index += 1
+            continue
+        if _is_markdown_table(lines, index):
+            table_html, index = _markdown_table_to_html(lines, index)
+            blocks.append(table_html)
+            continue
+        if re.match(r"^\s*[-*]\s+", line):
+            items = []
+            while index < len(lines) and re.match(r"^\s*[-*]\s+", lines[index]):
+                items.append(re.sub(r"^\s*[-*]\s+", "", lines[index]))
+                index += 1
+            blocks.append(
+                "<ul>"
+                + "".join(
+                    f"<li>{_markdown_inline_to_html(item)}</li>" for item in items
+                )
+                + "</ul>"
+            )
+            continue
+        if re.match(r"^\s*\d+\.\s+", line):
+            items = []
+            while index < len(lines) and re.match(r"^\s*\d+\.\s+", lines[index]):
+                items.append(re.sub(r"^\s*\d+\.\s+", "", lines[index]))
+                index += 1
+            blocks.append(
+                "<ol>"
+                + "".join(
+                    f"<li>{_markdown_inline_to_html(item)}</li>" for item in items
+                )
+                + "</ol>"
+            )
+            continue
+        paragraph = []
+        while (
+            index < len(lines)
+            and lines[index].strip()
+            and not re.match(r"^(#{1,6})\s+(.+)$", lines[index])
+            and not _is_markdown_table(lines, index)
+            and not re.match(r"^\s*[-*]\s+", lines[index])
+            and not re.match(r"^\s*\d+\.\s+", lines[index])
+            and not re.match(r"^\s*---+\s*$", lines[index])
+        ):
+            paragraph.append(lines[index])
+            index += 1
+        blocks.append(
+            "<p>"
+            + "<br>".join(_markdown_inline_to_html(item) for item in paragraph)
+            + "</p>"
+        )
+    return "\n".join(blocks) or "<p></p>"
+
+
+def _is_markdown_table(lines: list[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and "|" in lines[index]
+        and re.match(
+            r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$",
+            lines[index + 1],
+        )
+        is not None
+    )
+
+
+def _markdown_table_to_html(lines: list[str], index: int) -> tuple[str, int]:
+    header = _split_markdown_table_row(lines[index])
+    index += 2
+    rows: list[list[str]] = []
+    while index < len(lines) and "|" in lines[index] and lines[index].strip():
+        rows.append(_split_markdown_table_row(lines[index]))
+        index += 1
+    header_html = "".join(
+        f"<th>{_markdown_inline_to_html(cell)}</th>" for cell in header
+    )
+    row_html = "".join(
+        "<tr>"
+        + "".join(
+            f"<td>{_markdown_inline_to_html(row[cell_index] if cell_index < len(row) else '')}</td>"
+            for cell_index, _ in enumerate(header)
+        )
+        + "</tr>"
+        for row in rows
+    )
+    return (
+        f"<table><thead><tr>{header_html}</tr></thead><tbody>{row_html}</tbody></table>",
+        index,
+    )
+
+
+def _split_markdown_table_row(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def _markdown_inline_to_html(value: str) -> str:
+    escaped = html.escape(value, quote=True)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
+    return re.sub(
+        r"(https?://[^\s<]+[^<.,;:!?)\]\s])",
+        r'<a href="\1" rel="noreferrer">\1</a>',
+        escaped,
+    )
+
+
+def _sanitize_report_html(value: str) -> str:
+    return _markdown_to_html(_strip_active_report_markup(value))
+
+
+def _strip_active_report_markup(value: str) -> str:
+    clean = value or ""
+    blocked = "|".join(re.escape(tag) for tag in REPORT_BLOCKED_HTML_TAGS)
+    clean = re.sub(
+        rf"(?is)<\s*({blocked})\b.*?<\s*/\s*\1\s*>",
+        "",
+        clean,
+    )
+    clean = re.sub(rf"(?is)<\s*(?:{blocked})\b[^>]*(?:/?>)", "", clean)
+    clean = re.sub(r"(?is)<[^>]+>", "", clean)
+    clean = re.sub(
+        r"(?is)\b(?:srcdoc|src|href|xlink:href)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        "",
+        clean,
+    )
+    clean = re.sub(
+        r"(?is)\bon[a-z0-9_-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        "",
+        clean,
+    )
+    clean = re.sub(r"(?i)\b(?:javascript|data|blob|file)\s*:", "", clean)
+    return clean
+
+
+def _link_evidence_refs(body: str, evidence_refs: list[str]) -> str:
+    linked = body
+    for ref in _list_of_strings(evidence_refs):
+        safe_ref = html.escape(ref, quote=True)
+        label = f"[{safe_ref}]"
+        target = f"evidence-{safe_ref}"
+        anchor = (
+            f'<a href="#{target}" data-evidence-ref="{safe_ref}">'
+            f"{label}</a>"
+        )
+        linked = linked.replace(label, anchor)
+    return linked
+
+
+def _uploaded_content_type(content_type: str | None, filename: str) -> str:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized in UPLOAD_ALLOWED_CONTENT_TYPES:
+        return normalized
+    if normalized not in UPLOAD_GENERIC_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail="unsupported_upload_type")
+    lower_name = filename.lower()
+    if lower_name.endswith(".pdf"):
+        return "application/pdf"
+    if lower_name.endswith(".md"):
+        return "text/markdown"
+    if lower_name.endswith(".csv"):
+        return "text/csv"
+    if lower_name.endswith(".txt"):
+        return "text/plain"
+    raise HTTPException(status_code=415, detail="unsupported_upload_type")
+
+
+def _extract_uploaded_document_text(
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+) -> str:
+    if content_type == "application/pdf":
+        return _extract_pdf_text(data)
+    if content_type in {"text/plain", "text/markdown", "text/csv"}:
+        return _decode_text_upload(data)
+    raise HTTPException(status_code=415, detail="unsupported_upload_type")
+
+
+def _decode_text_upload(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid_pdf_upload") from exc
+
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text.strip():
+            pages.append(page_text.strip())
+    return "\n\n".join(pages)
+
+
+def _reject_browser_supplied_object_key_fields(fields: Mapping[str, Any]) -> None:
+    forbidden = sorted(field for field in OBJECT_KEY_FORBIDDEN_FIELDS if field in fields)
+    if forbidden:
+        raise HTTPException(status_code=400, detail="object_key_server_generated")
+
+
+async def _reject_browser_supplied_object_key_request(
+    request: Request,
+    *,
+    extra_fields: Mapping[str, Any] | None = None,
+) -> None:
+    _reject_browser_supplied_object_key_fields(request.query_params)
+    if extra_fields:
+        _reject_browser_supplied_object_key_fields(extra_fields)
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    if content_type in {"multipart/form-data", "application/x-www-form-urlencoded"}:
+        try:
+            form_data = await request.form()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid_form_payload") from exc
+        _reject_browser_supplied_object_key_fields(form_data)
+        return
+
+    if content_type == "application/json":
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, Mapping):
+            _reject_browser_supplied_object_key_fields(payload)
+
+
+def _assert_browser_safe(payload: Any) -> Any:
+    encoded = json.dumps(payload, ensure_ascii=False)
+    leaked = [needle for needle in FORBIDDEN_BROWSER_SUBSTRINGS if needle in encoded]
+    if leaked:
+        raise HTTPException(status_code=500, detail="browser_payload_leak")
+    return payload

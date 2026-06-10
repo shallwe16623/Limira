@@ -1,0 +1,1500 @@
+import io
+import json
+import os
+import sys
+import zipfile
+import asyncio
+import hashlib
+import sqlite3
+import types
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+import httpx
+from fastapi import FastAPI, HTTPException
+
+
+ROOT = Path(__file__).resolve().parents[3]
+LIMIRA_BACKEND = ROOT / "apps/limira-web/backend"
+sys.path.insert(0, str(LIMIRA_BACKEND))
+
+from limira_backend.routers import limira  # noqa: E402
+
+
+PLAN_NAMED_OBJECT_KEY_ALIASES = (
+    "archive_object_key",
+    "archiveObjectKey",
+    "pdf_object_key",
+    "pdfObjectKey",
+)
+
+
+def _latest_auth_link_token(outbox_path: Path, query_key: str) -> str:
+    records = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
+    for record in reversed(records):
+        for word in str(record.get("body") or "").split():
+            parsed = urlsplit(word.strip())
+            values = parse_qs(parsed.query).get(query_key)
+            if values:
+                return values[0]
+    raise AssertionError(f"missing {query_key} token in auth email outbox")
+
+
+class FakeArchiveClient:
+    def __init__(self, archive_bytes: bytes | None = None):
+        self.archive_bytes = archive_bytes or _archive_zip()
+        self.calls = []
+
+    async def download_archive(self, task, user):
+        self.calls.append({"task": task, "user": user})
+        return self.archive_bytes
+
+
+class FakeResearchClient:
+    def __init__(
+        self,
+        *,
+        runner_task_id="runner-task-a",
+        events=None,
+        status_payload=None,
+        stream_exception=None,
+    ):
+        self.runner_task_id = runner_task_id
+        self.events = events or []
+        self.status_payload = status_payload or {
+            "task_id": runner_task_id,
+            "status": "completed",
+            "archive_status": "ready",
+        }
+        self.stream_exception = stream_exception
+        self.create_calls = []
+        self.stream_calls = []
+        self.status_calls = []
+
+    async def create_research_task(self, *, query, scenario, user):
+        self.create_calls.append(
+            {
+                "query": query,
+                "scenario": scenario,
+                "user": user,
+            }
+        )
+        return {
+            "task_id": self.runner_task_id,
+            "status": "queued",
+            "stream_url": f"/limira-runner/tasks/{self.runner_task_id}/events",
+            "task_url": f"/limira-runner/tasks/{self.runner_task_id}",
+        }
+
+    async def stream_events(self, *, task, user):
+        self.stream_calls.append({"task": task, "user": user})
+        if self.stream_exception:
+            raise self.stream_exception
+        for event in self.events:
+            yield event
+
+    async def get_task_status(self, *, task, user):
+        self.status_calls.append({"task": task, "user": user})
+        return dict(self.status_payload)
+
+
+@pytest.mark.asyncio
+async def test_create_research_uses_limira_namespace_and_rejects_body_user_id():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+
+    payload = await limira.create_research_task(
+        {"query": "track sanctions", "scenario": "sanctions"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+
+    assert payload["task_url"].startswith("/api/limira/tasks/")
+    assert payload["events_url"].startswith("/api/limira/tasks/")
+    assert payload["artifacts_url"].startswith("/api/limira/tasks/")
+    assert payload["scenario"] == "sanctions"
+    assert payload["query"] == "track sanctions"
+    assert research.create_calls == [
+        {
+            "query": "track sanctions",
+            "scenario": "sanctions",
+            "user": user,
+        }
+    ]
+    task = repo.get_task(payload["task_id"])
+    assert task.runner_task_id == "runner-task-a"
+    _assert_no_browser_leak(payload)
+
+    with pytest.raises(HTTPException) as rejected:
+        await limira.create_research_task(
+            {"query": "track sanctions", "user_id": "attacker"},
+            request=None,
+            user=user,
+            repo=repo,
+            research_client=research,
+        )
+    assert rejected.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_research_rejects_body_user_spoofing_on_actual_http_surface():
+    app, repo, _storage = _limira_asgi_app()
+    research = FakeResearchClient()
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limira.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        for forbidden_field in ("user_id", "owner_user_id"):
+            response = await client.post(
+                "/api/limira/research",
+                json={
+                    "query": "attempt request body identity spoofing",
+                    forbidden_field: "attacker",
+                },
+            )
+
+            assert response.status_code == 400
+            assert response.json() == {"detail": "user_id_not_allowed"}
+
+    assert repo.tasks == {}
+    assert research.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_limira_native_auth_drives_browser_facing_api_without_legacy_auth_proxy(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        unauthenticated = await client.get("/api/limira/scenarios")
+        assert unauthenticated.status_code == 401
+        assert unauthenticated.json() == {"detail": "not_authenticated"}
+
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            json={
+                "email": "analyst@example.test",
+                "name": "Analyst",
+                "password": "correct-password",
+            },
+        )
+        assert signup.status_code == 201
+        signup_payload = signup.json()
+        assert signup_payload["email"] == "analyst@example.test"
+        assert signup_payload["name"] == "Analyst"
+        assert signup_payload["role"] == "user"
+        assert signup_payload["email_verified"] is False
+        assert signup_payload["email_verification_required"] is True
+        assert signup_payload["email_delivery"] == "outbox"
+        assert "token" not in signup_payload
+        assert "limira_session=" not in signup.headers.get("set-cookie", "")
+
+        unverified_signin = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "analyst@example.test", "password": "correct-password"},
+        )
+        assert unverified_signin.status_code == 403
+        assert unverified_signin.json() == {"detail": "email_not_verified"}
+
+        verify_token = _latest_auth_link_token(outbox_path, "verify_email_token")
+        verified = await client.post(
+            "/api/limira/auth/verify-email",
+            json={"token": verify_token},
+        )
+        assert verified.status_code == 200
+        verified_payload = verified.json()
+        assert verified_payload["email"] == "analyst@example.test"
+        assert verified_payload["email_verified"] is True
+        assert verified_payload["token_type"] == "bearer"
+        token = verified_payload["token"]
+        assert token
+        assert "limira_session=" in verified.headers.get("set-cookie", "")
+
+        session = await client.get(
+            "/api/limira/auth/session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert session.status_code == 200
+        assert session.json() == {
+            "id": signup_payload["id"],
+            "email": "analyst@example.test",
+            "name": "Analyst",
+            "role": "user",
+            "email_verified": True,
+            "account_type": "personal",
+            "organization_id": None,
+            "organization_role": None,
+            "daily_research_limit": 1,
+        }
+
+        scenarios = await client.get(
+            "/api/limira/scenarios",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert scenarios.status_code == 200
+        assert scenarios.json()["count"] == 3
+
+        rejected = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "analyst@example.test", "password": "wrong-password"},
+        )
+        assert rejected.status_code == 401
+        assert rejected.json() == {"detail": "invalid_credentials"}
+
+        signin = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "analyst@example.test", "password": "correct-password"},
+        )
+        assert signin.status_code == 200
+        assert signin.json()["email"] == "analyst@example.test"
+        assert signin.json()["email_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_limira_native_auth_password_reset_uses_email_token(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            json={
+                "email": "reset@example.test",
+                "name": "Reset User",
+                "password": "old-password",
+            },
+        )
+        assert signup.status_code == 201
+
+        verify_token = _latest_auth_link_token(outbox_path, "verify_email_token")
+        verified = await client.post("/api/limira/auth/verify-email", json={"token": verify_token})
+        assert verified.status_code == 200
+
+        requested = await client.post(
+            "/api/limira/auth/password-reset/request",
+            json={"email": "reset@example.test"},
+        )
+        assert requested.status_code == 200
+        assert requested.json() == {"ok": True}
+
+        reset_token = _latest_auth_link_token(outbox_path, "reset_password_token")
+        reset = await client.post(
+            "/api/limira/auth/password-reset/confirm",
+            json={"token": reset_token, "password": "new-password"},
+        )
+        assert reset.status_code == 200
+        reset_payload = reset.json()
+        assert reset_payload["email"] == "reset@example.test"
+        assert reset_payload["email_verified"] is True
+        assert reset_payload["token"]
+        assert "limira_session=" in reset.headers.get("set-cookie", "")
+
+        reused = await client.post(
+            "/api/limira/auth/password-reset/confirm",
+            json={"token": reset_token, "password": "another-password"},
+        )
+        assert reused.status_code == 400
+        assert reused.json() == {"detail": "invalid_or_expired_auth_token"}
+
+        old_password = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "reset@example.test", "password": "old-password"},
+        )
+        assert old_password.status_code == 401
+
+        new_password = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "reset@example.test", "password": "new-password"},
+        )
+        assert new_password.status_code == 200
+        assert new_password.json()["email"] == "reset@example.test"
+
+
+@pytest.mark.asyncio
+async def test_limira_enterprise_auth_lists_units_and_allows_org_admin_member_management(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+
+    organization = limira._limira_auth_create_organization(
+        name="Example Intelligence Unit",
+        slug="example-unit",
+    )
+    admin = limira._limira_auth_insert_user(
+        email="unit-admin@example.test",
+        password="enterprise-password",
+        name="Unit Admin",
+        account_type="enterprise",
+        organization_id=organization.id,
+        organization_role="admin",
+        email_verified_at=1,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        organizations = await client.get("/api/limira/auth/organizations")
+        assert organizations.status_code == 200
+        assert organizations.json()["organizations"] == [
+            {
+                "id": organization.id,
+                "name": "Example Intelligence Unit",
+                "slug": "example-unit",
+                "billing_mode": "metered",
+            }
+        ]
+
+        personal_signin = await client.post(
+            "/api/limira/auth/signin",
+            json={
+                "email": "unit-admin@example.test",
+                "password": "enterprise-password",
+            },
+        )
+        assert personal_signin.status_code == 403
+        assert personal_signin.json() == {"detail": "enterprise_login_required"}
+
+        signin = await client.post(
+            "/api/limira/auth/enterprise/signin",
+            json={
+                "organization_id": organization.id,
+                "email": "unit-admin@example.test",
+                "password": "enterprise-password",
+            },
+        )
+        assert signin.status_code == 200
+        payload = signin.json()
+        assert payload["id"] == admin.id
+        assert payload["account_type"] == "enterprise"
+        assert payload["organization_id"] == organization.id
+        assert payload["organization_role"] == "admin"
+        assert payload["organization"]["billing_mode"] == "metered"
+        token = payload["token"]
+
+        members = await client.get(
+            "/api/limira/enterprise/members",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert members.status_code == 200
+        assert members.json()["count"] == 1
+        assert members.json()["members"][0]["email"] == "unit-admin@example.test"
+
+        created = await client.post(
+            "/api/limira/enterprise/members",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "email": "analyst-unit@example.test",
+                "name": "Unit Analyst",
+                "password": "member-password",
+                "organization_role": "member",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["member"]["account_type"] == "enterprise"
+        assert created.json()["member"]["organization_id"] == organization.id
+        assert created.json()["member"]["organization_role"] == "member"
+
+        usage = await client.get(
+            "/api/limira/enterprise/usage",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert usage.status_code == 200
+        assert usage.json()["organization"]["id"] == organization.id
+        assert usage.json()["usage"]["totals"] == {}
+
+
+@pytest.mark.asyncio
+async def test_personal_auth_research_is_limited_to_one_task_per_utc_day(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async def task_repository_override():
+        return repo
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    app.dependency_overrides[limira.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            json={
+                "email": "quota@example.test",
+                "name": "Quota User",
+                "password": "quota-password",
+            },
+        )
+        assert signup.status_code == 201
+        verify_token = _latest_auth_link_token(outbox_path, "verify_email_token")
+        verified = await client.post(
+            "/api/limira/auth/verify-email",
+            json={"token": verify_token},
+        )
+        assert verified.status_code == 200
+        token = verified.json()["token"]
+
+        first = await client.post(
+            "/api/limira/research",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"query": "first personal quota task"},
+        )
+        assert first.status_code == 202
+
+        second = await client.post(
+            "/api/limira/research",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"query": "second personal quota task"},
+        )
+        assert second.status_code == 429
+        assert second.json() == {"detail": "personal_daily_quota_exceeded"}
+
+    assert len(research.create_calls) == 1
+    with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
+        usage_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM limira_auth_usage_events
+            WHERE account_type = 'personal'
+                AND event_type = 'research_task'
+            """
+        ).fetchone()[0]
+    assert usage_count == 1
+
+
+@pytest.mark.asyncio
+async def test_enterprise_auth_research_records_metered_usage_without_daily_limit(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+
+    organization = limira._limira_auth_create_organization(
+        name="Metered Research Unit",
+        slug="metered-unit",
+    )
+    limira._limira_auth_insert_user(
+        email="metered@example.test",
+        password="metered-password",
+        name="Metered User",
+        account_type="enterprise",
+        organization_id=organization.id,
+        organization_role="member",
+        email_verified_at=1,
+    )
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async def task_repository_override():
+        return repo
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    app.dependency_overrides[limira.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signin = await client.post(
+            "/api/limira/auth/enterprise/signin",
+            json={
+                "organization_id": organization.id,
+                "email": "metered@example.test",
+                "password": "metered-password",
+            },
+        )
+        assert signin.status_code == 200
+        token = signin.json()["token"]
+
+        for query in ("first enterprise task", "second enterprise task"):
+            response = await client.post(
+                "/api/limira/research",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"query": query},
+            )
+            assert response.status_code == 202
+
+    assert len(research.create_calls) == 2
+    with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
+        usage = connection.execute(
+            """
+            SELECT organization_id, account_type, event_type, COUNT(*), SUM(quantity)
+            FROM limira_auth_usage_events
+            GROUP BY organization_id, account_type, event_type
+            """
+        ).fetchone()
+    assert usage == (
+        organization.id,
+        "enterprise",
+        "research_task",
+        2,
+        2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_limira_auth_email_links_use_forwarded_public_origin(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    outbox_path = tmp_path / "auth-outbox.jsonl"
+    monkeypatch.setenv(limira.LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV, str(outbox_path))
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://internal-backend.test",
+    ) as client:
+        signup = await client.post(
+            "/api/limira/auth/signup",
+            headers={
+                "x-forwarded-host": "limira-public.example",
+                "x-forwarded-proto": "https",
+            },
+            json={
+                "email": "forwarded@example.test",
+                "name": "Forwarded User",
+                "password": "correct-password",
+            },
+        )
+        assert signup.status_code == 201
+
+    outbox = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
+    body = outbox[-1]["body"]
+    assert "https://limira-public.example/limira?verify_email_token=" in body
+    assert "internal-backend.test" not in body
+    assert "127.0.0.1" not in body
+
+
+@pytest.mark.asyncio
+async def test_limira_google_oauth_config_and_start_are_env_gated(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.delenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, raising=False)
+    monkeypatch.delenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, raising=False)
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        disabled = await client.get("/api/limira/auth/google/config")
+        assert disabled.status_code == 200
+        assert disabled.json() == {"enabled": False}
+
+        disabled_start = await client.get("/api/limira/auth/google/start")
+        assert disabled_start.status_code == 404
+        assert disabled_start.json() == {"detail": "google_oauth_not_configured"}
+
+        monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, "google-client-id")
+        monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, "google-secret")
+        monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV, "https://google.example/auth")
+
+        enabled = await client.get("/api/limira/auth/google/config")
+        assert enabled.status_code == 200
+        assert enabled.json() == {"enabled": True}
+
+        start = await client.get("/api/limira/auth/google/start", follow_redirects=False)
+        assert start.status_code == 303
+        location = start.headers["location"]
+        parsed = urlsplit(location)
+        params = parse_qs(parsed.query)
+        assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://google.example/auth"
+        assert params["client_id"] == ["google-client-id"]
+        assert params["response_type"] == ["code"]
+        assert params["scope"] == ["openid email profile"]
+        assert params["redirect_uri"] == ["http://limira.test/api/limira/auth/google/callback"]
+        assert params["state"][0]
+        assert limira.LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME in start.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_limira_google_oauth_callback_creates_verified_session_user(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, "google-client-id")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, "google-secret")
+
+    async def fake_google_userinfo_from_code(*, code, request, env=os.environ):
+        assert code == "google-code"
+        return {
+            "google_sub": "google-user-123",
+            "email": "google@example.test",
+            "name": "Google User",
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_limira_google_userinfo_from_code",
+        fake_google_userinfo_from_code,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        start = await client.get("/api/limira/auth/google/start", follow_redirects=False)
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+
+        callback = await client.get(
+            "/api/limira/auth/google/callback",
+            params={"code": "google-code", "state": state},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "http://limira.test/limira?google_auth=success"
+        assert "limira_session=" in callback.headers.get("set-cookie", "")
+
+        session = await client.get("/api/limira/auth/session")
+        assert session.status_code == 200
+        assert session.json()["email"] == "google@example.test"
+        assert session.json()["name"] == "Google User"
+        assert session.json()["role"] == "user"
+        assert session.json()["email_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_limira_wechat_oauth_config_and_start_are_env_gated(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.delenv(limira.LIMIRA_WECHAT_OAUTH_APP_ID_ENV, raising=False)
+    monkeypatch.delenv(limira.LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV, raising=False)
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        disabled = await client.get("/api/limira/auth/wechat/config")
+        assert disabled.status_code == 200
+        assert disabled.json() == {"enabled": False}
+
+        disabled_start = await client.get("/api/limira/auth/wechat/start")
+        assert disabled_start.status_code == 404
+        assert disabled_start.json() == {"detail": "wechat_oauth_not_configured"}
+
+        monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_ID_ENV, "wechat-app-id")
+        monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV, "wechat-secret")
+        monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_AUTH_URL_ENV, "https://wechat.example/connect")
+
+        enabled = await client.get("/api/limira/auth/wechat/config")
+        assert enabled.status_code == 200
+        assert enabled.json() == {"enabled": True}
+
+        start = await client.get("/api/limira/auth/wechat/start", follow_redirects=False)
+        assert start.status_code == 303
+        location = start.headers["location"]
+        parsed = urlsplit(location)
+        params = parse_qs(parsed.query)
+        assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://wechat.example/connect"
+        assert parsed.fragment == "wechat_redirect"
+        assert params["appid"] == ["wechat-app-id"]
+        assert params["response_type"] == ["code"]
+        assert params["scope"] == ["snsapi_login"]
+        assert params["redirect_uri"] == ["http://limira.test/api/limira/auth/wechat/callback"]
+        assert params["state"][0]
+        assert limira.LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME in start.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_limira_wechat_oauth_callback_creates_verified_session_user(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_ID_ENV, "wechat-app-id")
+    monkeypatch.setenv(limira.LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV, "wechat-secret")
+
+    async def fake_wechat_userinfo_from_code(*, code, env=os.environ):
+        assert code == "wechat-code"
+        return {
+            "wechat_sub": "wechat-unionid-123",
+            "openid": "wechat-openid-123",
+            "unionid": "wechat-unionid-123",
+            "name": "微信测试用户",
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_limira_wechat_userinfo_from_code",
+        fake_wechat_userinfo_from_code,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        start = await client.get("/api/limira/auth/wechat/start", follow_redirects=False)
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+
+        callback = await client.get(
+            "/api/limira/auth/wechat/callback",
+            params={"code": "wechat-code", "state": state},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == "http://limira.test/limira?wechat_auth=success"
+        assert "limira_session=" in callback.headers.get("set-cookie", "")
+
+        session = await client.get("/api/limira/auth/session")
+        assert session.status_code == 200
+        session_payload = session.json()
+        assert session_payload["email"].endswith("@auth.limira.local")
+        assert session_payload["name"] == "微信测试用户"
+        assert session_payload["role"] == "user"
+        assert session_payload["email_verified"] is True
+
+        second_start = await client.get("/api/limira/auth/wechat/start", follow_redirects=False)
+        second_state = parse_qs(urlsplit(second_start.headers["location"]).query)["state"][0]
+        second_callback = await client.get(
+            "/api/limira/auth/wechat/callback",
+            params={"code": "wechat-code", "state": second_state},
+            follow_redirects=False,
+        )
+        assert second_callback.status_code == 303
+        assert "limira_session=" in second_callback.headers.get("set-cookie", "")
+
+        with sqlite3.connect(tmp_path / "limira_auth.sqlite3") as connection:
+            user_count = connection.execute("SELECT COUNT(*) FROM limira_auth_users").fetchone()[0]
+            identity_count = connection.execute("SELECT COUNT(*) FROM limira_auth_identities").fetchone()[0]
+        assert user_count == 1
+        assert identity_count == 1
+
+
+@pytest.mark.asyncio
+async def test_limira_native_auth_migrates_existing_legacy_sqlite_user_once(
+    tmp_path,
+    monkeypatch,
+):
+    auth_path = tmp_path / "limira_auth.sqlite3"
+    legacy_path = tmp_path / "legacy_auth.sqlite3"
+    password_hash = limira._limira_hash_password("existing-password")
+    with sqlite3.connect(legacy_path) as connection:
+        connection.execute(
+            "CREATE TABLE auth (id TEXT PRIMARY KEY, email TEXT, password TEXT, active INTEGER)"
+        )
+        connection.execute('CREATE TABLE "user" (id TEXT PRIMARY KEY, email TEXT, name TEXT, role TEXT)')
+        connection.execute(
+            "INSERT INTO auth (id, email, password, active) VALUES (?, ?, ?, 1)",
+            ("existing-user", "existing@example.test", password_hash),
+        )
+        connection.execute(
+            'INSERT INTO "user" (id, email, name, role) VALUES (?, ?, ?, ?)',
+            ("existing-user", "existing@example.test", "Existing User", "admin"),
+        )
+
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(auth_path))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(legacy_path))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        signin = await client.post(
+            "/api/limira/auth/signin",
+            json={"email": "existing@example.test", "password": "existing-password"},
+        )
+        assert signin.status_code == 200
+        assert signin.json()["id"] == "existing-user"
+        assert signin.json()["name"] == "Existing User"
+        assert signin.json()["role"] == "admin"
+
+    assert auth_path.exists()
+    with sqlite3.connect(auth_path) as connection:
+        migrated = connection.execute(
+            "SELECT email, name, role FROM limira_auth_users WHERE id = ?",
+            ("existing-user",),
+        ).fetchone()
+    assert migrated == ("existing@example.test", "Existing User", "admin")
+
+
+@pytest.mark.asyncio
+async def test_demo_scenarios_are_browser_safe_and_artifact_oriented():
+    payload = await limira.list_demo_scenarios(user=limira.LimiraUser("user-a"))
+
+    scenario_ids = {scenario["id"] for scenario in payload["scenarios"]}
+    assert scenario_ids == {
+        "sanctions_export_controls",
+        "geopolitical_risk_assessment",
+        "critical_minerals_competition",
+    }
+    assert payload["count"] == 3
+    _assert_no_browser_leak(payload)
+
+    payload_text = json.dumps(payload)
+    assert "Artifact requirements" not in payload_text
+    assert "record_research_artifact" not in payload_text
+    assert "runner" not in payload_text.lower()
+
+    for scenario_id in scenario_ids:
+        runner_query = limira._runner_query_for_scenario("base query", scenario_id)
+        assert "base query" in runner_query
+        assert "record_research_artifact" in runner_query
+        assert "EVID-001" in runner_query
+        assert "map_feature" in runner_query
+        assert "[EVID-001]" in runner_query
+        assert "report_section" in runner_query
+
+    assert limira._runner_query_for_scenario("base query", "legacy-scenario") == "base query"
+
+
+@pytest.mark.asyncio
+async def test_create_research_with_known_demo_scenario_enriches_runner_query_only():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+    scenario_id = "critical_minerals_competition"
+
+    payload = await limira.create_research_task(
+        {"query": "Analyze nickel supply chain risk", "scenario": scenario_id},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+
+    assert payload["scenario"] == scenario_id
+    assert payload["query"] == "Analyze nickel supply chain risk"
+    _assert_no_browser_leak(payload)
+    assert "record_research_artifact" not in json.dumps(payload)
+
+    assert len(research.create_calls) == 1
+    runner_call = research.create_calls[0]
+    assert runner_call["scenario"] == scenario_id
+    assert runner_call["user"] == user
+    assert runner_call["query"] != payload["query"]
+    assert "Critical minerals competition" in runner_call["query"]
+    assert "Analyze nickel supply chain risk" in runner_call["query"]
+    assert "record_research_artifact" in runner_call["query"]
+    assert "EVID-001" in runner_call["query"]
+    assert "map_feature" in runner_call["query"]
+    assert "[EVID-001]" in runner_call["query"]
+
+    task = repo.get_task(payload["task_id"])
+    assert task.query == "Analyze nickel supply chain risk"
+    assert task.scenario == scenario_id
+
+
+@pytest.mark.asyncio
+async def test_create_research_records_failed_web_task_when_runner_start_fails():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+
+    async def fail_create_research_task(*_args, **_kwargs):
+        raise HTTPException(status_code=503, detail="runner_unavailable")
+
+    research.create_research_task = fail_create_research_task
+
+    with pytest.raises(HTTPException) as failed:
+        await limira.create_research_task(
+            {"query": "runner fails after web task is allocated"},
+            request=None,
+            user=user,
+            repo=repo,
+            research_client=research,
+        )
+
+    assert failed.value.status_code == 503
+    assert len(repo.tasks) == 1
+    task = next(iter(repo.tasks.values()))
+    assert task.owner_user_id == "user-a"
+    assert task.status == "failed"
+    assert task.archive_status == "failed"
+    assert task.error == "runner_unavailable"
+    assert task.runner_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_create_research_hides_internal_runner_start_error_details_and_headers_from_browser_and_task_state():
+    app, repo, _storage = _limira_asgi_app()
+    internal_detail = (
+        "runner create failed at http://10.20.30.40:8091/limira-runner/research "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-researchstartinternal123456"
+    )
+
+    class FailingResearchClient(FakeResearchClient):
+        async def create_research_task(self, *, query, scenario, user):
+            self.create_calls.append(
+                {
+                    "query": query,
+                    "scenario": scenario,
+                    "user": user,
+                }
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=internal_detail,
+                headers={
+                    "X-Limira-Runner-Service-Token": "server-only-token-123",
+                    "Authorization": "Bearer research-start-token-123",
+                    "Set-Cookie": "limira_session=research-start-cookie-123",
+                    "X-API-Key": "sk-researchheader123456",
+                },
+            )
+
+    research = FailingResearchClient()
+
+    async def research_client_override():
+        return research
+
+    app.dependency_overrides[limira.get_research_client] = research_client_override
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/research",
+            json={"query": "runner start internal detail"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "runner_research_start_failed"
+    assert len(repo.tasks) == 1
+    task = next(iter(repo.tasks.values()))
+    assert task.owner_user_id == "user-a"
+    assert task.status == "failed"
+    assert task.archive_status == "failed"
+    assert task.error == "runner_research_start_failed"
+    assert task.runner_task_id is None
+    for header in (
+        "x-limira-runner-service-token",
+        "authorization",
+        "set-cookie",
+        "x-api-key",
+    ):
+        assert header not in response.headers
+    serialized = json.dumps(
+        {
+            "response": response.json(),
+            "headers": dict(response.headers),
+            "task": task.public_dict(),
+            "repo_error": task.error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limira/users/hash",
+        "sk-researchstartinternal123456",
+        "server-only-token-123",
+        "research-start-token-123",
+        "research-start-cookie-123",
+        "sk-researchheader123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(response.json())
+    _assert_no_browser_leak(task.public_dict())
+
+
+@pytest.mark.asyncio
+async def test_user_isolation_for_task_status_and_archive_download():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    research = FakeResearchClient()
+    user_a = limira.LimiraUser("user-a")
+    user_b = limira.LimiraUser("user-b")
+
+    created = await limira.create_research_task(
+        {"query": "red sea shipping risk"},
+        request=None,
+        user=user_a,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.tasks[task_id].archive_status = "ready"
+    repo.tasks[task_id].runner_task_id = "runner-task-a"
+
+    with pytest.raises(HTTPException) as forbidden_status:
+        await limira.get_task(task_id, user=user_b, repo=repo)
+    assert forbidden_status.value.status_code == 404
+
+    with pytest.raises(HTTPException) as forbidden_archive:
+        await limira.download_task_archive(
+            task_id,
+            user=user_b,
+            repo=repo,
+            object_storage=storage,
+        )
+    assert forbidden_archive.value.status_code == 404
+
+    response = await limira.download_task_archive(
+        task_id,
+        user=user_a,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.media_type == "application/zip"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist()[:4] == list(
+        limira.ARCHIVE_MEMBER_ORDER
+    )
+    archive_key = repo.tasks[task_id].archive_object_key
+    assert archive_key in storage.objects
+    assert "/tasks/" in archive_key
+    assert "/archives/" in archive_key
+    assert (
+        repo.tasks[task_id].archive_zip_sha256
+        == storage.objects[archive_key]["sha256"]
+    )
+    assert storage.objects[archive_key]["content_type"] == "application/zip"
+    assert storage.objects[archive_key]["metadata"]["task_id"] == task_id
+    assert storage.objects[archive_key]["metadata"]["owner_user_id"] == "user-a"
+    _assert_public_archive_hides_internal_identifiers(response.body)
+    second_response = await limira.download_task_archive(
+        task_id,
+        user=user_a,
+        repo=repo,
+        object_storage=storage,
+    )
+    assert second_response.body == response.body
+    assert len(storage.objects) == 1
+    _assert_no_browser_leak(response.body.decode("latin1"))
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_mismatched_persisted_archive_object():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-archive-mismatch",
+        owner_user_id=user.id,
+        query="archive mismatch",
+        scenario=None,
+        runner_task_id="runner-archive-mismatch",
+    )
+    task.archive_status = "ready"
+
+    first_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_key = task.archive_object_key
+    assert archive_key in storage.objects
+    first_sha = task.archive_zip_sha256
+    assert first_sha == hashlib.sha256(first_response.body).hexdigest()
+
+    tampered_archive = _archive_zip()
+    tampered_sha = hashlib.sha256(tampered_archive).hexdigest()
+    assert tampered_sha != first_sha
+    storage.objects[archive_key]["data"] = tampered_archive
+    storage.objects[archive_key]["sha256"] = tampered_sha
+
+    second_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert second_response.body != tampered_archive
+    assert task.archive_object_key == archive_key
+    assert task.archive_zip_sha256 == hashlib.sha256(second_response.body).hexdigest()
+    assert storage.objects[archive_key]["sha256"] == task.archive_zip_sha256
+    members = _archive_member_texts(second_response.body)
+    metadata = json.loads(members["metadata.json"])
+    assert metadata["task"]["task_id"] == task.task_id
+    assert "archive mismatch" in members["report.md"]
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_invalid_persisted_archive_object():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-archive-invalid-object",
+        owner_user_id=user.id,
+        query="archive invalid object",
+        scenario=None,
+        runner_task_id="runner-archive-invalid-object",
+    )
+    task.archive_status = "ready"
+
+    first_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_key = task.archive_object_key
+    assert archive_key in storage.objects
+    corrupt_archive = b"not a zip archive"
+    corrupt_sha = hashlib.sha256(corrupt_archive).hexdigest()
+    assert corrupt_sha != hashlib.sha256(first_response.body).hexdigest()
+    storage.objects[archive_key]["data"] = corrupt_archive
+    storage.objects[archive_key]["sha256"] = corrupt_sha
+
+    second_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert second_response.body != corrupt_archive
+    assert task.archive_object_key == archive_key
+    assert task.archive_zip_sha256 == hashlib.sha256(second_response.body).hexdigest()
+    assert zipfile.ZipFile(io.BytesIO(second_response.body)).namelist()[:4] == list(
+        limira.ARCHIVE_MEMBER_ORDER
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_invalid_persisted_archive_object_key():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-archive-invalid-key",
+        owner_user_id=user.id,
+        query="archive invalid key",
+        scenario=None,
+        runner_task_id="runner-archive-invalid-key",
+    )
+    task.archive_status = "ready"
+    task.archive_object_key = "../bad.zip"
+    task.archive_zip_sha256 = "0" * 64
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert task.archive_object_key != "../bad.zip"
+    assert task.archive_object_key in storage.objects
+    assert ".." not in task.archive_object_key.split("/")
+    assert "/tasks/task-archive-invalid-key/archives/" in task.archive_object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    assert storage.objects[task.archive_object_key]["sha256"] == task.archive_zip_sha256
+    assert zipfile.ZipFile(io.BytesIO(response.body)).namelist()[:4] == list(
+        limira.ARCHIVE_MEMBER_ORDER
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_regenerates_invalid_persisted_archive_object_key():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task_id = "task-postgres-archive-invalid-key"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres archive invalid key",
+        scenario=None,
+        runner_task_id="runner-postgres-archive-invalid-key",
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key="../bad.zip",
+        archive_zip_sha256="0" * 64,
+    )
+
+    response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] != "../bad.zip"
+    assert persisted["archive_object_key"] in storage.objects
+    assert ".." not in persisted["archive_object_key"].split("/")
+    assert f"/tasks/{task_id}/archives/" in persisted["archive_object_key"]
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    assert storage.objects[persisted["archive_object_key"]]["sha256"] == persisted["archive_zip_sha256"]
+    metadata = json.loads(_archive_member_texts(response.body)["metadata.json"])
+    assert metadata["task"]["task_id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_archive_proxy_scrubs_allowed_text_members_before_download():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-secret-archive",
+        owner_user_id=user.id,
+        query="archive secrets",
+        scenario=None,
+        runner_task_id="runner-secret-archive",
+    )
+    task.archive_status = "ready"
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "summary": "Authorization: Bearer runner-token-123456",
+            "url": "https://search.test?q=x&token=archive-token-123456",
+        },
+    )
+    repo.record_generated_report(
+        report_id="report-secret",
+        task_id=task.task_id,
+        report_type="final",
+        markdown=(
+            "# report\n"
+            "OPENAI_API_KEY=sk-archiveopenai123456\n"
+            "RUNNER_SERVICE_TOKEN=archive-runner-token-123456\n"
+            "https://api.test/resource?api_key=archive-query-secret-123456"
+        ),
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=["EVID-001"],
+        creator_user_id=user.id,
+        metadata={
+            "cookie": "legacy_session=session-secret-123456",
+            "deepseek": "DEEPSEEK_API_KEY=sk-tracedeepseek123456",
+        },
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.media_type == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(response.body)) as scrubbed_archive:
+        assert scrubbed_archive.namelist()[:4] == list(limira.ARCHIVE_MEMBER_ORDER)
+        combined = "\n".join(
+            scrubbed_archive.read(member).decode("utf-8")
+            for member in scrubbed_archive.namelist()
+        )
+        metadata = json.loads(scrubbed_archive.read("metadata.json"))
+        trace = json.loads(scrubbed_archive.read("trace.json"))
+
+    assert limira.LIMIRA_SECRET_REDACTION in combined
+    _assert_no_raw_secret(combined)
+    assert metadata["reports"][0]["report_id"] == "report-secret"
+    assert trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-001"
+    assert task.archive_object_key in storage.objects
+    _assert_no_raw_secret(storage.objects[task.archive_object_key]["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_archive_download_hides_internal_model_summary_identifiers():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-summary-archive",
+        owner_user_id=user.id,
+        query="archive internal state",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        model_summary=_internal_model_summary(task.task_id),
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    _assert_archive_hides_internal_model_summary_identifiers(response.body)
+    assert task.archive_object_key in storage.objects
+
+
+@pytest.mark.asyncio
+async def test_archive_download_repairs_reused_persisted_model_summary_identifiers():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-summary-archive-reuse",
+        owner_user_id=user.id,
+        query="archive internal state reuse",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    raw_archive = _archive_zip_with_raw_model_summary(
+        task_id=task.task_id,
+        owner_user_id=user.id,
+    )
+    raw_members = _archive_member_texts(raw_archive)
+    assert "runner_task_id" in raw_members["metadata.json"]
+    assert "limira/users/hash" in raw_members["trace.json"]
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    _assert_archive_hides_internal_model_summary_identifiers(response.body)
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+    _assert_archive_hides_internal_model_summary_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_repairs_reused_persisted_model_summary_identifiers():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task_id = "task-postgres-summary-archive-reuse"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres archive internal state reuse",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    raw_archive = _archive_zip_with_raw_model_summary(
+        task_id=task_id,
+        owner_user_id=user.id,
+    )

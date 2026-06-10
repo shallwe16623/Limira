@@ -1,0 +1,1500 @@
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_writes_debug_artifacts_when_debug_dir_is_configured(
+    monkeypatch,
+    tmp_path,
+):
+    debug_dir = tmp_path / "limira-pdf-debug"
+    monkeypatch.setenv("LIMIRA_PDF_DEBUG_DIR", str(debug_dir))
+    app, repo, _storage = _limira_asgi_app()
+    pdf_exporter = app.state.test_pdf_exporter
+    repo.create_task(
+        task_id="task-debug-pdf",
+        owner_user_id="user-a",
+        query="debug pdf",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/tasks/task-debug-pdf/reports/pdf",
+            json={
+                "report_id": "debug-report",
+                "markdown": "Debug PDF body [EVID-001]",
+                "evidence_refs": ["EVID-001"],
+            },
+        )
+
+    assert response.status_code == 201
+    html_files = list(debug_dir.glob("*.html"))
+    pdf_files = list(debug_dir.glob("*.pdf"))
+    manifest_files = list(debug_dir.glob("*.json"))
+    assert len(html_files) == 1
+    assert len(pdf_files) == 1
+    assert len(manifest_files) == 1
+    assert "Debug PDF body" in html_files[0].read_text(encoding="utf-8")
+    assert pdf_files[0].read_bytes() == pdf_exporter.pdf_bytes
+    manifest = json.loads(manifest_files[0].read_text(encoding="utf-8"))
+    assert manifest["task_id"] == "task-debug-pdf"
+    assert manifest["report_id"] == "debug-report"
+    assert manifest["pdf_bytes"] == len(pdf_exporter.pdf_bytes)
+    report = repo.get_user_report(
+        task_id="task-debug-pdf",
+        report_id="debug-report",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.metadata["pdf_debug"]["pdf_path"] == str(pdf_files[0])
+
+
+@pytest.mark.asyncio
+async def test_pdf_download_clears_invalid_persisted_pdf_object_key():
+    app, repo, _storage = _limira_asgi_app()
+    repo.create_task(
+        task_id="task-invalid-pdf-key",
+        owner_user_id="user-a",
+        query="invalid pdf key",
+        scenario=None,
+        runner_task_id="runner-invalid-pdf-key",
+    )
+    report = repo.record_generated_report(
+        report_id="report-invalid-key",
+        task_id="task-invalid-pdf-key",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key="../bad.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": "bad-sha",
+            "pdf_size_bytes": 123,
+            "source": "cache",
+        },
+    )
+
+    public_report = report.public_dict()
+    assert public_report["pdf_url"] is None
+    assert public_report["pdf_sha256"] is None
+    assert public_report["pdf_size_bytes"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get(
+            "/api/limira/tasks/task-invalid-pdf-key/reports/report-invalid-key/pdf"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-invalid-pdf-key",
+        report_id="report-invalid-key",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    public_refreshed = refreshed.public_dict()
+    assert public_refreshed["pdf_url"] is None
+    assert public_refreshed["pdf_sha256"] is None
+    assert public_refreshed["pdf_size_bytes"] is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
+@pytest.mark.asyncio
+async def test_pdf_download_clears_missing_persisted_pdf_object():
+    app, repo, _storage = _limira_asgi_app()
+    repo.create_task(
+        task_id="task-missing-pdf",
+        owner_user_id="user-a",
+        query="missing pdf",
+        scenario=None,
+        runner_task_id="runner-missing-pdf",
+    )
+    expected_sha = hashlib.sha256(b"expected pdf bytes").hexdigest()
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-missing-pdf",
+        filename="report-missing.pdf",
+        object_id="report-missing",
+    )
+    report = repo.record_generated_report(
+        report_id="report-missing",
+        task_id="task-missing-pdf",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": expected_sha,
+            "pdf_size_bytes": 18,
+            "source": "cache",
+        },
+    )
+
+    assert report.public_dict()["pdf_url"].endswith("/report-missing/pdf")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get(
+            "/api/limira/tasks/task-missing-pdf/reports/report-missing/pdf"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-missing-pdf",
+        report_id="report-missing",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    public_refreshed = refreshed.public_dict()
+    assert public_refreshed["pdf_url"] is None
+    assert public_refreshed["pdf_sha256"] is None
+    assert public_refreshed["pdf_size_bytes"] is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
+@pytest.mark.asyncio
+async def test_pdf_download_clears_mismatched_persisted_pdf_object():
+    app, repo, storage = _limira_asgi_app()
+    repo.create_task(
+        task_id="task-mismatch-pdf",
+        owner_user_id="user-a",
+        query="mismatch pdf",
+        scenario=None,
+        runner_task_id="runner-mismatch-pdf",
+    )
+    expected_sha = hashlib.sha256(b"expected pdf bytes").hexdigest()
+    mismatched_bytes = b"not the expected pdf bytes"
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-mismatch-pdf",
+        filename="report-mismatch.pdf",
+        object_id="report-mismatch",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=mismatched_bytes,
+        content_type="application/pdf",
+        metadata={"report_id": "report-mismatch"},
+    )
+    repo.record_generated_report(
+        report_id="report-mismatch",
+        task_id="task-mismatch-pdf",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": expected_sha,
+            "pdf_size_bytes": len(b"expected pdf bytes"),
+            "source": "cache",
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get(
+            "/api/limira/tasks/task-mismatch-pdf/reports/report-mismatch/pdf"
+        )
+
+    assert response.status_code == 404
+    assert response.content != mismatched_bytes
+    refreshed = repo.get_user_report(
+        task_id="task-mismatch-pdf",
+        report_id="report-mismatch",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
+@pytest.mark.asyncio
+async def test_pdf_download_clears_missing_persisted_pdf_checksum():
+    app, repo, storage = _limira_asgi_app()
+    repo.create_task(
+        task_id="task-missing-pdf-sha",
+        owner_user_id="user-a",
+        query="missing pdf sha",
+        scenario=None,
+        runner_task_id="runner-missing-pdf-sha",
+    )
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-missing-pdf-sha",
+        filename="report-missing-sha.pdf",
+        object_id="report-missing-sha",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=b"%PDF-1.7\nmissing sha\n%%EOF",
+        content_type="application/pdf",
+        metadata={"report_id": "report-missing-sha"},
+    )
+    report = repo.record_generated_report(
+        report_id="report-missing-sha",
+        task_id="task-missing-pdf-sha",
+        report_type="final",
+        markdown="Cached report",
+        html="<p>Cached report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=[],
+        creator_user_id="user-a",
+        metadata={"source": "cache"},
+    )
+
+    assert report.public_dict()["pdf_url"] is None
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get(
+            "/api/limira/tasks/task-missing-pdf-sha/reports/report-missing-sha/pdf"
+        )
+
+    assert response.status_code == 404
+    refreshed = repo.get_user_report(
+        task_id="task-missing-pdf-sha",
+        report_id="report-missing-sha",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.metadata == {"source": "cache"}
+
+
+def test_report_html_renderer_strips_active_markup_from_markdown():
+    rendered_html = limira._render_report_html(
+        markdown=(
+            "# Final Report\n\n"
+            "Finding **important** [EVID-001]\n\n"
+            "| Item | Status |\n"
+            "| --- | --- |\n"
+            "| BYD | not listed |\n\n"
+            "- Verify official list\n"
+            "- Monitor updates\n\n"
+            '<img src="https://example.test/leak?token=RUNNER_SERVICE_TOKEN" onerror=alert(1)>\n'
+            "<svg onload=alert(2)><text>bad</text></svg>\n"
+            '<iframe srcdoc="<script>bad()</script>"></iframe>\n'
+            '<meta http-equiv="refresh" content="0;url=https://example.test">\n'
+            '<a href="javascript:alert(3)">bad link</a>\n'
+            '<a href="data:text/html,bad">data link</a>\n'
+            '<a href="blob:https://example.test/bad">blob link</a>\n'
+            '<a href="file:///etc/passwd">file link</a>'
+        ),
+        evidence_refs=["EVID-001"],
+    )
+
+    lower_html = rendered_html.lower()
+    assert "<h1>Final Report</h1>" in rendered_html
+    assert "<strong>important</strong>" in rendered_html
+    assert "<table>" in rendered_html
+    assert "<th>Item</th>" in rendered_html
+    assert "<td>BYD</td>" in rendered_html
+    assert "<ul>" in rendered_html
+    assert "<li>Verify official list</li>" in rendered_html
+    assert 'data-evidence-ref="EVID-001"' in rendered_html
+    assert "content-security-policy" in lower_html
+    for forbidden in [
+        "<img",
+        "onerror",
+        "<svg",
+        "onload",
+        "<iframe",
+        "srcdoc",
+        "refresh",
+        "<script",
+        "javascript:",
+        "data:",
+        "blob:",
+        "file:",
+        "https://example.test",
+        "runner_service_token",
+    ]:
+        assert forbidden not in lower_html
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_scrubs_report_secrets_before_persistence_and_export():
+    app, repo, storage = _limira_asgi_app()
+    pdf_exporter = app.state.test_pdf_exporter
+    repo.create_task(
+        task_id="task-secret-report",
+        owner_user_id="user-a",
+        query="report secrets",
+        scenario=None,
+        runner_task_id="runner-secret-report",
+    )
+
+    markdown = (
+        "Finding [EVID-001]\n\n"
+        "Authorization: Bearer report-bearer-secret-123456\n"
+        "OPENAI_API_KEY=sk-reportopenai123456\n"
+        "SERPER_API_KEY=serper-secret-123456\n"
+        "Cookie: session=report-cookie-secret-123456\n"
+        "https://example.test/path?token=report-url-token-123456"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/tasks/task-secret-report/reports/pdf",
+            json={
+                "report_id": "report-secret",
+                "report_type": "OPENAI_API_KEY=sk-reportopenai123456",
+                "markdown": markdown,
+                "evidence_refs": ["EVID-001", "JINA_API_KEY=nested-jina-secret-123456"],
+            },
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    _assert_no_raw_secret(payload)
+    report = repo.get_user_report(
+        task_id="task-secret-report",
+        report_id="report-secret",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert limira.LIMIRA_SECRET_REDACTION in report.markdown
+    assert limira.LIMIRA_SECRET_REDACTION in report.html
+    assert "REDACTED" in report.report_type
+    assert limira.LIMIRA_SECRET_REDACTION in report.evidence_refs
+    assert report.pdf_object_key in storage.objects
+    stored = storage.objects[report.pdf_object_key]
+    _assert_no_raw_secret(report.markdown)
+    _assert_no_raw_secret(report.html)
+    _assert_no_raw_secret(report.metadata)
+    _assert_no_raw_secret(report.evidence_refs)
+    _assert_no_raw_secret(stored["metadata"])
+    assert len(pdf_exporter.html_inputs) == 1
+    _assert_no_raw_secret(pdf_exporter.html_inputs[0])
+
+
+def test_limira_secret_scrubber_redacts_nested_payloads_and_urls():
+    news_url = (
+        "https://www.scmp.com/news/china/diplomacy/article/3356419/"
+        "us-adds-alibaba-byd-and-other-chinese-tech-champions-military-company-list"
+    )
+    payload = {
+        "headers": {
+            "Authorization": "Bearer report-bearer-secret-123456",
+            "Cookie": "session=report-cookie-secret-123456",
+            "OPENAI_API_KEY=sk-headerkeysecret123456": "header key secret",
+        },
+        "nested": [
+            "OPENAI_API_KEY=sk-reportopenai123456",
+            {
+                "news_url": news_url,
+                "news_result": json.dumps({"title": "SCMP result", "url": news_url}),
+                "safe": "https://example.test/path?token=report-url-token-123456",
+                "userinfo_url": (
+                    "https://user:password-secret-123456@example.test/path?topic=byd"
+                ),
+                "jina_api_key": "nested-jina-secret-123456",
+                "Authorization: Bearer nested-key-secret-123456": "nested key secret",
+            },
+        ],
+        "jwt": "eyJtrace.secret.payload",
+    }
+
+    scrubbed = limira.scrub_limira_secrets(payload)
+
+    _assert_no_raw_secret(scrubbed)
+    text = json.dumps(scrubbed, ensure_ascii=False)
+    assert text.count(limira.LIMIRA_SECRET_REDACTION) >= 5
+    assert "Authorization" in scrubbed["headers"]
+    assert scrubbed["headers"]["Authorization"] == limira.LIMIRA_SECRET_REDACTION
+    serialized = json.dumps(scrubbed, ensure_ascii=False)
+    assert "sk-headerkeysecret123456" not in serialized
+    assert "nested-key-secret-123456" not in serialized
+    assert "password-secret-123456" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "Authorization: Bearer" not in serialized
+    assert scrubbed["nested"][1]["news_url"] == news_url
+    assert news_url in scrubbed["nested"][1]["news_result"]
+    assert scrubbed["nested"][1]["userinfo_url"] == (
+        "https://example.test/path?topic=byd"
+    )
+    assert scrubbed["nested"][1]["safe"].startswith("https://example.test/path?")
+    assert "report-url-token-123456" not in scrubbed["nested"][1]["safe"]
+    assert "topic=byd" in scrubbed["nested"][1]["userinfo_url"]
+    assert limira.LIMIRA_SECRET_REDACTION in scrubbed["headers"]
+    assert any(
+        str(key).startswith(limira.LIMIRA_SECRET_REDACTION)
+        for key in scrubbed["nested"][1]
+    )
+
+
+def test_playwright_pdf_exporter_builds_local_runtime_launch_env(monkeypatch, tmp_path):
+    runtime_path = tmp_path / "playwright-runtime"
+    usr_lib = runtime_path / "usr/lib/x86_64-linux-gnu"
+    lib = runtime_path / "lib/x86_64-linux-gnu"
+    runtime_fonts = runtime_path / "usr/share/fonts"
+    usr_lib.mkdir(parents=True)
+    lib.mkdir(parents=True)
+    runtime_fonts.mkdir(parents=True)
+    fonts_conf = runtime_path / "fonts.conf"
+    fonts_conf.write_text(
+        "<fontconfig><dir>/stale/renamed/project/fonts</dir></fontconfig>",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv(limira.LIMIRA_PLAYWRIGHT_RUNTIME_PATH_ENV, str(runtime_path))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
+    monkeypatch.delenv("FONTCONFIG_FILE", raising=False)
+    monkeypatch.delenv("FONTCONFIG_PATH", raising=False)
+
+    launch_env = limira._playwright_chromium_launch_env()
+
+    assert launch_env is not None
+    assert launch_env["LD_LIBRARY_PATH"].split(os.pathsep) == [
+        str(usr_lib),
+        str(lib),
+        "/existing/lib",
+    ]
+    generated_fonts_conf = Path(launch_env["FONTCONFIG_FILE"])
+    assert generated_fonts_conf == runtime_path / "limira-fonts.conf"
+    generated_fonts_conf_text = generated_fonts_conf.read_text(encoding="utf-8")
+    assert str(runtime_fonts) in generated_fonts_conf_text
+    assert "/stale/renamed/project/fonts" not in generated_fonts_conf_text
+    assert launch_env["FONTCONFIG_PATH"] == str(runtime_path)
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_blocks_browser_resource_requests(monkeypatch):
+    calls = {"launch_args": None, "launch_env": None, "closed": False}
+
+    class FakeRoute:
+        def __init__(self):
+            self.aborted = False
+
+        async def abort(self):
+            self.aborted = True
+
+    class FakePage:
+        def __init__(self, visible_text="report"):
+            self.routes = []
+            self.set_content_calls = []
+            self.evaluate_calls = []
+            self.emulate_media_calls = []
+            self.pdf_calls = []
+            self.visible_text = visible_text
+
+        async def route(self, pattern, handler):
+            self.routes.append((pattern, handler))
+
+        async def set_content(self, html_content, wait_until):
+            self.set_content_calls.append(
+                {"html_content": html_content, "wait_until": wait_until}
+            )
+
+        async def evaluate(self, expression):
+            self.evaluate_calls.append(expression)
+            return self.visible_text
+
+        async def emulate_media(self, **kwargs):
+            self.emulate_media_calls.append(kwargs)
+
+        async def pdf(self, **kwargs):
+            self.pdf_calls.append(kwargs)
+            return b"%PDF-1.7\nfake\n%%EOF"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_page(self):
+            return self.page
+
+        async def close(self):
+            calls["closed"] = True
+
+    class FakeChromium:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def launch(self, **kwargs):
+            calls["launch_args"] = kwargs["args"]
+            calls["launch_env"] = kwargs.get("env")
+            return self.browser
+
+    class FakePlaywrightContext:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=self.chromium)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    page = FakePage()
+    browser = FakeBrowser(page)
+    chromium = FakeChromium(browser)
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext(chromium)
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+
+    pdf_bytes = await limira.PlaywrightLimiraPdfExporter().render_pdf(
+        "<!doctype html><html><body>report</body></html>"
+    )
+
+    assert pdf_bytes.startswith(b"%PDF")
+    assert calls["launch_args"] == ["--no-sandbox"]
+    if calls["launch_env"] is not None:
+        assert calls["launch_env"]["LD_LIBRARY_PATH"]
+    assert calls["closed"] is True
+    assert page.set_content_calls == [
+        {
+            "html_content": "<!doctype html><html><body>report</body></html>",
+            "wait_until": "load",
+        }
+    ]
+    assert page.evaluate_calls == ["() => document.body ? document.body.textContent : ''"]
+    assert page.emulate_media_calls == [{"media": "print"}]
+    assert page.pdf_calls == [{"format": "A4", "print_background": True}]
+    assert len(page.routes) == 1
+    pattern, handler = page.routes[0]
+    assert pattern == "**/*"
+    route = FakeRoute()
+    await handler(route)
+    assert route.aborted is True
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_rejects_blank_rendered_body(monkeypatch):
+    calls = {"closed": False}
+
+    class FakePage:
+        def __init__(self):
+            self.pdf_called = False
+
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def set_content(self, _html_content, **_kwargs):
+            return None
+
+        async def evaluate(self, _expression):
+            return "   "
+
+        async def emulate_media(self, **_kwargs):
+            return None
+
+        async def pdf(self, **_kwargs):
+            self.pdf_called = True
+            return b"%PDF-1.7\nfake\n%%EOF"
+
+    class FakeBrowser:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_page(self):
+            return self.page
+
+        async def close(self):
+            calls["closed"] = True
+
+    class FakeChromium:
+        def __init__(self, browser):
+            self.browser = browser
+
+        async def launch(self, **_kwargs):
+            return self.browser
+
+    class FakePlaywrightContext:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=self.chromium)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    page = FakePage()
+    browser = FakeBrowser(page)
+    chromium = FakeChromium(browser)
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext(chromium)
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+
+    with pytest.raises(RuntimeError, match="limira_pdf_blank_rendered_body"):
+        await limira.PlaywrightLimiraPdfExporter().render_pdf(
+            "<!doctype html><html><body></body></html>"
+        )
+
+    assert page.pdf_called is False
+    assert calls["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_rejects_blank_rendered_pdf(monkeypatch):
+    calls = {"closed": False}
+    blank_pdf_bytes = (
+        b"%PDF-1.4\n"
+        b"1 0 obj\n"
+        b"<</Length 300>> stream\n"
+        b"compressed paint state without text or fonts\n"
+        b"endstream\n"
+        b"endobj\n"
+        b"2 0 obj\n"
+        b"<</Type /Page /Contents 1 0 R>>\n"
+        b"endobj\n"
+        b"%%EOF"
+    )
+
+    class FakePage:
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def set_content(self, _html_content, **_kwargs):
+            return None
+
+        async def evaluate(self, _expression):
+            return "Visible report text"
+
+        async def emulate_media(self, **_kwargs):
+            return None
+
+        async def pdf(self, **_kwargs):
+            return blank_pdf_bytes
+
+    class FakeBrowser:
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            calls["closed"] = True
+
+    class FakeChromium:
+        async def launch(self, **_kwargs):
+            return FakeBrowser()
+
+    class FakePlaywrightContext:
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=FakeChromium())
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext()
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+
+    with pytest.raises(RuntimeError, match="limira_pdf_blank_rendered_pdf"):
+        await limira.PlaywrightLimiraPdfExporter().render_pdf(
+            "<!doctype html><html><body><h1>Visible report text</h1><p>中文正文</p></body></html>"
+        )
+
+    assert calls["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_playwright_pdf_exporter_raises_when_browser_launch_fails(monkeypatch):
+    class FakeChromium:
+        async def launch(self, **_kwargs):
+            raise RuntimeError("missing browser deps")
+
+    class FakePlaywrightContext:
+        async def __aenter__(self):
+            return types.SimpleNamespace(chromium=FakeChromium())
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async_api_module = types.ModuleType("playwright.async_api")
+    async_api_module.async_playwright = lambda: FakePlaywrightContext()
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api_module)
+
+    with pytest.raises(RuntimeError, match="missing browser deps"):
+        await limira.PlaywrightLimiraPdfExporter().render_pdf(
+            "<!doctype html><html><body><h1>Report title</h1><p>中文正文</p></body></html>"
+        )
+
+
+def test_postgres_repository_sql_targets_limira_task_and_artifact_tables():
+    sql = limira.PostgresLimiraTaskRepository.sql_contract().lower()
+
+    for table in (
+        "limira_research_tasks",
+        "limira_artifact_events",
+        "limira_artifact_trace_events",
+        "limira_task_event_logs",
+        "limira_evidence_items",
+        "limira_entities",
+        "limira_entity_relations",
+        "limira_timeline_events",
+        "limira_generated_reports",
+        "limira_uploaded_documents",
+    ):
+        assert table in sql
+
+    for artifact_type in (
+        "evidence",
+        "entity",
+        "relation",
+        "timeline_event",
+        "map_feature",
+        "verification",
+        "report_section",
+    ):
+        assert artifact_type in limira.ARTIFACT_BUCKETS
+
+    assert "select artifact_type, payload" in sql
+    assert "insert into limira_artifact_trace_events" in sql
+    assert "from limira_artifact_trace_events" in sql
+    assert "insert into limira_task_event_logs" in sql
+    assert "from limira_task_event_logs" in sql
+    assert "on conflict" in sql
+    assert "on conflict (task_id, artifact_type, local_artifact_id)" in sql
+    assert "on conflict (task_id, evidence_id)" in sql
+    assert "on conflict (task_id, entity_id)" in sql
+    assert "on conflict (task_id, relation_id)" in sql
+    assert "on conflict (task_id, timeline_event_id)" in sql
+    assert "on conflict (task_id, report_id)" in sql
+    assert "on conflict (artifact_id)" not in sql
+    assert "on conflict (evidence_id)" not in sql
+    assert "cast(:published_at as timestamptz)" in sql
+    assert "cast(:event_time as timestamptz)" in sql
+    assert "cast(:event_time_end as timestamptz)" in sql
+    assert "st_geomfromgeojson(:geometry_geojson)" in sql
+    assert "st_geomfromtext(:geometry_wkt)" in sql
+    assert "pdf_object_key" in sql
+    assert "from limira_generated_reports" in sql
+    assert "order by created_at desc" in sql
+    assert "returning" in sql
+    assert "insert into limira_uploaded_documents" in sql
+    assert "object_key" in sql
+    assert "extracted_text" in sql
+    assert "embedding" in sql
+    assert "cast(:embedding as vector)" in sql
+    assert "embedding <=> cast(:query_embedding as vector)" in sql
+    assert "embedding is not null" in sql
+    assert "archive_object_key" in sql
+    assert "archive_zip_sha256" in sql
+
+
+def test_postgres_repository_preserves_task_local_artifact_refs_by_task():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    for task_id, owner in (("task-a", "user-a"), ("task-b", "user-b")):
+        repo.create_task(
+            task_id=task_id,
+            owner_user_id=owner,
+            query=f"{task_id} query",
+            scenario=None,
+            runner_task_id=f"runner-{task_id}",
+        )
+
+    for task_id, suffix in (("task-a", "A"), ("task-b", "B")):
+        repo.record_artifact(
+            task_id,
+            "evidence",
+            {"evidence_id": "EVID-001", "title": f"Evidence {suffix}"},
+        )
+        repo.record_artifact(
+            task_id,
+            "entity",
+            {
+                "entity_id": "ENT-001",
+                "entity_type": "country",
+                "display_name": f"Entity {suffix}",
+            },
+        )
+        repo.record_artifact(
+            task_id,
+            "relation",
+            {"relation_id": "REL-001", "relation_type": "mentions"},
+        )
+        repo.record_artifact(
+            task_id,
+            "report_section",
+            {"section_id": "REPORT-001", "markdown": f"Report {suffix}"},
+        )
+
+    task_a_artifacts = repo.get_artifacts("task-a")
+    task_b_artifacts = repo.get_artifacts("task-b")
+
+    assert task_a_artifacts["evidence"][0]["title"] == "Evidence A"
+    assert task_b_artifacts["evidence"][0]["title"] == "Evidence B"
+    assert task_a_artifacts["entities"][0]["display_name"] == "Entity A"
+    assert task_b_artifacts["entities"][0]["display_name"] == "Entity B"
+    assert task_a_artifacts["report_sections"][0]["markdown"] == "Report A"
+    assert task_b_artifacts["report_sections"][0]["markdown"] == "Report B"
+    assert ("task-a", "evidence", "EVID-001") in engine.artifact_events
+    assert ("task-b", "evidence", "EVID-001") in engine.artifact_events
+
+
+def test_postgres_repository_records_artifact_trace_events_and_warnings():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-trace",
+        owner_user_id="user-a",
+        query="trace artifact events",
+        scenario=None,
+        runner_task_id="runner-trace",
+    )
+
+    repo.record_artifact(
+        "task-trace",
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "Evidence A",
+            "source_event_type": "record_research_artifact",
+        },
+    )
+    repo.record_artifact_trace_event(
+        "task-trace",
+        {
+            "type": "artifact_warning",
+            "artifact_type": "relation",
+            "payload": {
+                "warning": "invalid_artifact_payload",
+                "artifact_type": "relation",
+                "source_event_type": "record_research_artifact",
+            },
+            "source_event_type": "record_research_artifact",
+        },
+    )
+
+    trace_events = repo.get_artifact_trace_events("task-trace")
+
+    assert [event["type"] for event in trace_events] == [
+        "evidence_collected",
+        "artifact_warning",
+    ]
+    assert trace_events[0]["artifact_type"] == "evidence"
+    assert trace_events[0]["bucket"] == "evidence"
+    assert trace_events[0]["local_artifact_id"] == "EVID-001"
+    assert trace_events[0]["source_event_type"] == "record_research_artifact"
+    assert trace_events[0]["payload"]["title"] == "Evidence A"
+    assert trace_events[1]["artifact_type"] == "relation"
+    assert trace_events[1]["payload"]["warning"] == "invalid_artifact_payload"
+    assert engine.artifact_trace_events[0]["task_id"] == "task-trace"
+
+
+def test_postgres_repository_artifact_params_include_temporal_and_geometry_fields():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-geo",
+        owner_user_id="user-a",
+        query="geo query",
+        scenario=None,
+        runner_task_id="runner-geo",
+    )
+    repo.record_artifact(
+        "task-geo",
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "dated source",
+            "published_at": "2026-01-02T03:04:05Z",
+        },
+    )
+    repo.record_artifact(
+        "task-geo",
+        "timeline_event",
+        {
+            "event_id": "TIME-001",
+            "title": "port disruption",
+            "event_time": "2026-02-01T00:00:00Z",
+            "event_time_end": "2026-02-02T00:00:00Z",
+            "geometry": {"type": "Point", "coordinates": [32.55, 29.97]},
+        },
+    )
+    repo.record_artifact(
+        "task-geo",
+        "map_feature",
+        {
+            "feature_id": "MAP-001",
+            "title": "shipping lane",
+            "geometry": "LINESTRING(32.5 29.9, 33.0 30.1)",
+        },
+    )
+    repo.record_artifact(
+        "task-geo",
+        "entity",
+        {
+            "entity_id": "ENT-001",
+            "entity_type": "location",
+            "display_name": "Suez Canal",
+            "lat": 29.97,
+            "lon": 32.55,
+        },
+    )
+
+    evidence_params = engine.typed_inserts["limira_evidence_items"][0]
+    timeline_params = engine.typed_inserts["limira_timeline_events"][0]
+    map_params = engine.typed_inserts["limira_timeline_events"][1]
+    entity_params = engine.typed_inserts["limira_entities"][0]
+
+    assert evidence_params["published_at"] == "2026-01-02T03:04:05Z"
+    assert timeline_params["event_time"] == "2026-02-01T00:00:00Z"
+    assert timeline_params["event_time_end"] == "2026-02-02T00:00:00Z"
+    assert json.loads(timeline_params["geometry_geojson"]) == {
+        "type": "Point",
+        "coordinates": [32.55, 29.97],
+    }
+    assert map_params["geometry_wkt"] == "LINESTRING(32.5 29.9, 33.0 30.1)"
+    assert json.loads(entity_params["geometry_geojson"]) == {
+        "type": "Point",
+        "coordinates": [32.55, 29.97],
+    }
+
+
+def test_postgres_repository_records_uploaded_documents_to_task_scoped_table():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-doc",
+        owner_user_id="user-a",
+        query="document query",
+        scenario=None,
+        runner_task_id="runner-doc",
+    )
+
+    document = repo.record_uploaded_document(
+        document_id="doc-001",
+        owner_user_id="user-a",
+        task_id="task-doc",
+        original_filename="brief.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/tasks/task-doc/uploads/doc-001.txt",
+        extracted_text="brief text",
+        language=None,
+        metadata={"sha256": "abc123"},
+        embedding=[0.1, 0.2, 0.3],
+    )
+
+    assert document.document_id == "doc-001"
+    assert document.task_id == "task-doc"
+    assert document.owner_user_id == "user-a"
+    assert document.object_key.endswith("/uploads/doc-001.txt")
+    assert document.extracted_text == "brief text"
+    assert document.embedding == [0.1, 0.2, 0.3]
+    assert document.metadata == {"sha256": "abc123"}
+    assert engine.uploaded_documents["doc-001"]["minio_bucket"] == "limira-artifacts"
+    assert engine.uploaded_documents["doc-001"]["embedding"] == "[0.1,0.2,0.3]"
+
+    owned = repo.get_user_document("doc-001", "user-a")
+    assert owned is not None
+    assert owned.original_filename == "brief.txt"
+    assert owned.embedding == [0.1, 0.2, 0.3]
+    assert repo.get_user_document("doc-001", "user-b") is None
+    assert [document.document_id for document in repo.list_user_documents(owner_user_id="user-a")] == [
+        "doc-001"
+    ]
+    assert [
+        document.document_id
+        for document in repo.list_user_documents(owner_user_id="user-a", task_id="task-doc")
+    ] == ["doc-001"]
+    assert repo.list_user_documents(owner_user_id="user-a", task_id="task-other") == []
+    assert repo.list_user_documents(owner_user_id="user-b") == []
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_missing_persisted_document_object():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    expected_bytes = b"expected postgres document bytes"
+    object_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="missing-postgres.txt",
+        object_id="doc-postgres-missing",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-postgres-missing",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="missing-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="missing postgres document",
+        language=None,
+        metadata={"sha256": hashlib.sha256(expected_bytes).hexdigest()},
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_uploaded_document(
+            "doc-postgres-missing",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-missing", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata["download_unavailable"] == "document_object_missing"
+    assert "sha256" not in refreshed.metadata
+    persisted = json.loads(engine.uploaded_documents["doc-postgres-missing"]["metadata"])
+    assert persisted["download_unavailable"] == "document_object_missing"
+    assert "sha256" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_mismatched_persisted_document_object():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    expected_bytes = b"expected postgres document bytes"
+    stale_bytes = b"stale postgres document bytes"
+    object_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="mismatch-postgres.txt",
+        object_id="doc-postgres-mismatch",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=stale_bytes,
+        content_type="text/plain",
+        metadata={"document_id": "doc-postgres-mismatch"},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-postgres-mismatch",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="mismatch-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="mismatch postgres document",
+        language=None,
+        metadata={"sha256": hashlib.sha256(expected_bytes).hexdigest()},
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_uploaded_document(
+            "doc-postgres-mismatch",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-mismatch", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata["download_unavailable"] == "document_sha_mismatch"
+    assert "sha256" not in refreshed.metadata
+    persisted = json.loads(engine.uploaded_documents["doc-postgres-mismatch"]["metadata"])
+    assert persisted["download_unavailable"] == "document_sha_mismatch"
+    assert "sha256" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_invalid_persisted_document_object_key():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    expected_bytes = b"expected postgres invalid-key document bytes"
+    repo.record_uploaded_document(
+        document_id="doc-postgres-invalid-key",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="invalid-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(expected_bytes),
+        minio_bucket=storage.bucket,
+        object_key="../invalid-postgres.txt",
+        extracted_text="invalid postgres document",
+        language=None,
+        metadata={
+            "source": "legacy",
+            "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+        },
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_uploaded_document(
+            "doc-postgres-invalid-key",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-invalid-key", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "invalid_document_object_key",
+    }
+    persisted = json.loads(engine.uploaded_documents["doc-postgres-invalid-key"]["metadata"])
+    assert persisted == {
+        "source": "legacy",
+        "download_unavailable": "invalid_document_object_key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_postgres_upload_download_clears_malformed_persisted_document_checksum():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    object_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="uploads",
+        filename="malformed-postgres.txt",
+        object_id="doc-postgres-malformed-sha",
+    )
+    await storage.put_object(
+        object_key=object_key,
+        data=b"postgres document bytes",
+        content_type="text/plain",
+        metadata={"document_id": "doc-postgres-malformed-sha"},
+    )
+    repo.record_uploaded_document(
+        document_id="doc-postgres-malformed-sha",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="malformed-postgres.txt",
+        content_type="text/plain",
+        byte_size=len(b"postgres document bytes"),
+        minio_bucket=storage.bucket,
+        object_key=object_key,
+        extracted_text="malformed postgres document",
+        language=None,
+        metadata={"source": "legacy", "sha256": "not-a-valid-sha"},
+        embedding=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_uploaded_document(
+            "doc-postgres-malformed-sha",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_document("doc-postgres-malformed-sha", "user-a")
+    assert refreshed is not None
+    assert refreshed.public_dict()["download_url"] is None
+    assert refreshed.metadata == {
+        "source": "legacy",
+        "download_unavailable": "document_sha_malformed",
+    }
+    persisted = json.loads(
+        engine.uploaded_documents["doc-postgres-malformed-sha"]["metadata"]
+    )
+    assert persisted == {
+        "source": "legacy",
+        "download_unavailable": "document_sha_malformed",
+    }
+
+
+def test_postgres_repository_searches_uploaded_documents_by_vector():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-doc",
+        owner_user_id="user-a",
+        query="document query",
+        scenario=None,
+        runner_task_id="runner-doc",
+    )
+    for document_id, owner, task_id, filename, text, embedding in (
+        (
+            "doc-far",
+            "user-a",
+            "task-doc",
+            "lexical-lithium.txt",
+            "Lithium lithium.",
+            [0.0, 1.0],
+        ),
+        ("doc-near", "user-a", "task-doc", "nickel.txt", "Nickel memo.", [1.0, 0.0]),
+        ("doc-other-task", "user-a", None, "other.txt", "Nickel other.", [1.0, 0.0]),
+        (
+            "doc-foreign",
+            "user-b",
+            "task-doc",
+            "foreign.txt",
+            "Nickel foreign.",
+            [1.0, 0.0],
+        ),
+    ):
+        repo.record_uploaded_document(
+            document_id=document_id,
+            owner_user_id=owner,
+            task_id=task_id,
+            original_filename=filename,
+            content_type="text/plain",
+            byte_size=len(text),
+            minio_bucket="limira-artifacts",
+            object_key=f"limira/users/hash/uploads/{document_id}.txt",
+            extracted_text=text,
+            language=None,
+            metadata={},
+            embedding=embedding,
+        )
+
+    results = repo.search_user_documents(
+        owner_user_id="user-a",
+        task_id="task-doc",
+        query="lithium",
+        limit=2,
+        query_embedding=[1.0, 0.0],
+    )
+
+    assert [result.document.document_id for result in results] == [
+        "doc-near",
+        "doc-far",
+    ]
+    assert results[0].score > results[1].score
+    assert engine.vector_search_calls == [
+        {
+            "owner_user_id": "user-a",
+            "task_id": "task-doc",
+            "query_embedding": "[1,0]",
+            "limit": 2,
+        }
+    ]
+
+
+def test_postgres_repository_records_generated_report_pdf_metadata():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-report",
+        owner_user_id="user-a",
+        query="report query",
+        scenario=None,
+        runner_task_id="runner-report",
+    )
+
+    report = repo.record_generated_report(
+        report_id="report-001",
+        task_id="task-report",
+        report_type="final",
+        markdown="Final report [EVID-001]",
+        html="<p>Final report [EVID-001]</p>",
+        pdf_object_key="limira/users/hash/tasks/task-report/reports/report-001.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={"pdf_sha256": "abc123", "pdf_size_bytes": 123},
+    )
+
+    assert report.report_id == "report-001"
+    assert report.task_id == "task-report"
+    assert report.pdf_object_key.endswith("/reports/report-001.pdf")
+    assert report.evidence_refs == ["EVID-001"]
+    assert report.metadata == {"pdf_sha256": "abc123", "pdf_size_bytes": 123}
+    assert engine.generated_reports[("task-report", "report-001")]["pdf_object_key"].endswith(
+        "/reports/report-001.pdf"
+    )
+
+    owned = repo.get_user_report(
+        task_id="task-report",
+        report_id="report-001",
+        owner_user_id="user-a",
+    )
+    assert owned is not None
+    assert owned.markdown == "Final report [EVID-001]"
+    assert repo.get_user_report(
+        task_id="task-report",
+        report_id="report-001",
+        owner_user_id="user-b",
+    ) is None
+    reports = repo.list_task_reports(task_id="task-report")
+    assert [item.report_id for item in reports] == ["report-001"]
+    assert reports[0].markdown == "Final report [EVID-001]"
+
+
+@pytest.mark.asyncio
+async def test_postgres_report_pdf_download_requires_same_task_report_binding():
+    app, _memory_repo, storage = _limira_asgi_app()
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    repo.create_task(
+        task_id="task-owned-a",
+        owner_user_id="user-a",
+        query="same owner task a",
+        scenario=None,
+        runner_task_id="runner-task-owned-a",
+    )
+    repo.create_task(
+        task_id="task-owned-b",
+        owner_user_id="user-a",
+        query="same owner task b",
+        scenario=None,
+        runner_task_id="runner-task-owned-b",
+    )
+    pdf_bytes = b"%PDF-1.7\nsame owner report\n%%EOF"
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-owned-b",
+        filename="report-shared.pdf",
+        object_id="report-shared",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=pdf_bytes,
+        content_type="application/pdf",
+        metadata={"task_id": "task-owned-b", "report_id": "report-shared"},
+    )
+    repo.record_generated_report(
+        report_id="report-shared",
+        task_id="task-owned-b",
+        report_type="final",
+        markdown="Same owner report",
+        html="<p>Same owner report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=[],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+            "pdf_size_bytes": len(pdf_bytes),
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        wrong_task_response = await client.get(
+            "/api/limira/tasks/task-owned-a/reports/report-shared/pdf"
+        )
+        correct_task_response = await client.get(
+            "/api/limira/tasks/task-owned-b/reports/report-shared/pdf"
+        )
+
+    assert wrong_task_response.status_code == 404
+    assert wrong_task_response.json()["detail"] == "report_not_found"
+    assert wrong_task_response.content != pdf_bytes
+    _assert_no_browser_leak(wrong_task_response.json())
+    assert correct_task_response.status_code == 200
+    assert correct_task_response.content == pdf_bytes
+    assert correct_task_response.headers["content-type"].startswith("application/pdf")
+    assert correct_task_response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_invalid_persisted_pdf_object_key():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-invalid-pdf-key",
+        owner_user_id="user-a",
+        query="postgres invalid pdf key",
+        scenario=None,
+        runner_task_id="runner-postgres-invalid-pdf-key",
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-invalid-key",
+        task_id="task-postgres-invalid-pdf-key",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key="../bad.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": "bad-sha",
+            "pdf_size_bytes": 456,
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_task_report_pdf(
+            "task-postgres-invalid-pdf-key",
+            "report-postgres-invalid-key",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404

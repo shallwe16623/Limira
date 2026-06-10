@@ -1,0 +1,1500 @@
+    assert exc.value.detail == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-invalid-pdf-key",
+        report_id="report-postgres-invalid-key",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    public_refreshed = refreshed.public_dict()
+    assert public_refreshed["pdf_url"] is None
+    assert public_refreshed["pdf_sha256"] is None
+    assert public_refreshed["pdf_size_bytes"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-invalid-pdf-key", "report-postgres-invalid-key")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_missing_persisted_pdf_object():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-missing-pdf",
+        owner_user_id="user-a",
+        query="postgres missing pdf",
+        scenario=None,
+        runner_task_id="runner-postgres-missing-pdf",
+    )
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-postgres-missing-pdf",
+        filename="report-postgres-missing.pdf",
+        object_id="report-postgres-missing",
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-missing",
+        task_id="task-postgres-missing-pdf",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": hashlib.sha256(b"expected pdf bytes").hexdigest(),
+            "pdf_size_bytes": 18,
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_task_report_pdf(
+            "task-postgres-missing-pdf",
+            "report-postgres-missing",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-missing-pdf",
+        report_id="report-postgres-missing",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-missing-pdf", "report-postgres-missing")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_mismatched_persisted_pdf_object():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-mismatch-pdf",
+        owner_user_id="user-a",
+        query="postgres mismatch pdf",
+        scenario=None,
+        runner_task_id="runner-postgres-mismatch-pdf",
+    )
+    expected_sha = hashlib.sha256(b"expected pdf bytes").hexdigest()
+    mismatched_bytes = b"not the expected pdf bytes"
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-postgres-mismatch-pdf",
+        filename="report-postgres-mismatch.pdf",
+        object_id="report-postgres-mismatch",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=mismatched_bytes,
+        content_type="application/pdf",
+        metadata={"report_id": "report-postgres-mismatch"},
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-mismatch",
+        task_id="task-postgres-mismatch-pdf",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": expected_sha,
+            "pdf_size_bytes": len(b"expected pdf bytes"),
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_task_report_pdf(
+            "task-postgres-mismatch-pdf",
+            "report-postgres-mismatch",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-mismatch-pdf",
+        report_id="report-postgres-mismatch",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-mismatch-pdf", "report-postgres-mismatch")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_pdf_download_clears_blank_persisted_pdf_object():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    repo.create_task(
+        task_id="task-postgres-blank-pdf",
+        owner_user_id="user-a",
+        query="postgres blank pdf",
+        scenario=None,
+        runner_task_id="runner-postgres-blank-pdf",
+    )
+    blank_pdf_bytes = (
+        b"%PDF-1.4\n"
+        b"3 0 obj\n"
+        b"<</Length 0>> stream\n"
+        b"endstream\n"
+        b"endobj\n"
+        b"%%EOF"
+    )
+    pdf_key = limira.build_limira_object_key(
+        owner_user_id="user-a",
+        category="reports",
+        task_id="task-postgres-blank-pdf",
+        filename="report-postgres-blank.pdf",
+        object_id="report-postgres-blank",
+    )
+    await storage.put_object(
+        object_key=pdf_key,
+        data=blank_pdf_bytes,
+        content_type="application/pdf",
+        metadata={"report_id": "report-postgres-blank"},
+    )
+    repo.record_generated_report(
+        report_id="report-postgres-blank",
+        task_id="task-postgres-blank-pdf",
+        report_type="final",
+        markdown="Postgres report",
+        html="<p>Postgres report</p>",
+        pdf_object_key=pdf_key,
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={
+            "pdf_bucket": "limira",
+            "pdf_sha256": hashlib.sha256(blank_pdf_bytes).hexdigest(),
+            "pdf_size_bytes": len(blank_pdf_bytes),
+            "source": "postgres-cache",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await limira.download_task_report_pdf(
+            "task-postgres-blank-pdf",
+            "report-postgres-blank",
+            user=limira.LimiraUser("user-a"),
+            repo=repo,
+            object_storage=storage,
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "report_pdf_not_found"
+    refreshed = repo.get_user_report(
+        task_id="task-postgres-blank-pdf",
+        report_id="report-postgres-blank",
+        owner_user_id="user-a",
+    )
+    assert refreshed is not None
+    assert refreshed.pdf_object_key is None
+    assert refreshed.public_dict()["pdf_url"] is None
+    assert refreshed.metadata == {"source": "postgres-cache"}
+    persisted = engine.generated_reports[
+        ("task-postgres-blank-pdf", "report-postgres-blank")
+    ]
+    assert persisted["pdf_object_key"] is None
+
+
+def test_postgres_repository_invalidates_archive_metadata_on_task_scoped_writes():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    repo.create_task(
+        task_id="task-archive-invalidated",
+        owner_user_id="user-a",
+        query="archive invalidation",
+        scenario=None,
+        runner_task_id="runner-archive-invalidated",
+    )
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_status="ready",
+        archive_object_key="limira/users/hash/tasks/task-archive-invalidated/archives/a.zip",
+        archive_zip_sha256="sha-a",
+    )
+    repo.record_generated_report(
+        report_id="report-invalidates",
+        task_id="task-archive-invalidated",
+        report_type="final",
+        markdown="new report",
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=[],
+        creator_user_id="user-a",
+        metadata={},
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_object_key"] is None
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] is None
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_object_key="limira/users/hash/tasks/task-archive-invalidated/archives/b.zip",
+        archive_zip_sha256="sha-b",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-invalidates",
+        owner_user_id="user-a",
+        task_id="task-archive-invalidated",
+        original_filename="brief.txt",
+        content_type="text/plain",
+        byte_size=5,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/tasks/task-archive-invalidated/uploads/doc.txt",
+        extracted_text="brief",
+        language=None,
+        metadata={},
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_object_key"] is None
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] is None
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_object_key="limira/users/hash/tasks/task-archive-invalidated/archives/c.zip",
+        archive_zip_sha256="sha-c",
+    )
+    repo.record_artifact(
+        "task-archive-invalidated",
+        "evidence",
+        {
+            "evidence_id": "EVID-INVALIDATES",
+            "summary": "new evidence",
+            "source_url": "https://example.test/source",
+        },
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_object_key"] is None
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] is None
+
+    repo.update_task(
+        "task-archive-invalidated",
+        archive_object_key="limira/users/hash/tasks/task-archive-invalidated/archives/d.zip",
+        archive_zip_sha256="sha-d",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-unlinked-does-not-invalidate",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="unlinked.txt",
+        content_type="text/plain",
+        byte_size=8,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/uploads/doc-unlinked.txt",
+        extracted_text="unlinked",
+        language=None,
+        metadata={},
+    )
+    assert (
+        engine.tasks["task-archive-invalidated"]["archive_object_key"]
+        == "limira/users/hash/tasks/task-archive-invalidated/archives/d.zip"
+    )
+    assert engine.tasks["task-archive-invalidated"]["archive_zip_sha256"] == "sha-d"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_streams_runner_events_and_populates_artifacts():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-runnersecret123456",
+        "Authorization: Bearer runner-secret-123456",
+        "RUNNER_SERVICE_TOKEN=runner-service-secret-123456",
+        "OPENAI_API_KEY=sk-artifactkeysecret123456",
+        "Authorization: Bearer artifact-key-secret-123456",
+    ]
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {"status": "running"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "evidence_collected",
+                "payload": {
+                    "title": "Export control notice",
+                    "summary": f"Policy update {raw_secret_values[0]}",
+                    "source_url": (
+                        "https://example.test/source?token=runner-query-secret-123456"
+                    ),
+                    raw_secret_values[3]: "secret-bearing evidence key",
+                    "nested": {
+                        raw_secret_values[4]: "secret-bearing nested key",
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "entity_extracted",
+                "payload": {
+                    "entity_id": "ENT-001",
+                    "name": "United States",
+                    "entity_type": "country",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "title": "Assessment",
+                        raw_secret_values[4]: "secret-bearing report key",
+                        "markdown": (
+                            "Finding references [EVID-001]\n\n"
+                            f"{raw_secret_values[1]}\n{raw_secret_values[2]}"
+                        ),
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.8,
+                    "notes": raw_secret_values[2],
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "relation_extracted",
+                "payload": "not-a-dict",
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "semiconductor export controls"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "status",
+        "evidence_collected",
+        "entity_extracted",
+        "record_research_artifact",
+        "relation_extracted",
+        "artifact_warning",
+        "status",
+    ]
+    assert all(event["task_id"] == task_id for event in events)
+    assert events[-1]["payload"]["status"] == "completed"
+    assert events[-1]["payload"]["status_source"] == "runner"
+    _assert_no_browser_leak(events)
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_events
+    assert "runner-query-secret-123456" not in serialized_events
+    assert limira.LIMIRA_SECRET_REDACTION in serialized_events
+
+    task = repo.get_task(task_id)
+    assert task.status == "completed"
+    assert task.archive_status == "ready"
+    assert research.stream_calls[0]["task"].runner_task_id == "runner-task-a"
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["evidence"][0]["title"] == "Export control notice"
+    assert limira.LIMIRA_SECRET_REDACTION in artifacts["evidence"][0]["summary"]
+    assert "%5BREDACTED%5D" in artifacts["evidence"][0]["source_url"]
+    assert "runner-query-secret-123456" not in artifacts["evidence"][0]["source_url"]
+    assert artifacts["entities"][0]["entity_id"] == "ENT-001"
+    assert artifacts["report_sections"][0]["evidence_refs"] == ["EVID-001"]
+    assert artifacts["report_sections"][0]["confidence"] == 0.8
+    assert artifacts["relations"] == []
+    _assert_no_browser_leak(artifacts)
+    serialized_artifacts = json.dumps(artifacts, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_artifacts
+    assert "runner-query-secret-123456" not in serialized_artifacts
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    serialized_members = json.dumps(members, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_members
+    assert "runner-query-secret-123456" not in serialized_members
+    assert limira.LIMIRA_SECRET_REDACTION in members["report.md"]
+    assert limira.LIMIRA_SECRET_REDACTION in members["trace.json"]
+    trace = json.loads(members["trace.json"])
+    assert [event["type"] for event in trace["artifact_events"]] == [
+        "evidence_collected",
+        "entity_extracted",
+        "report_section_generated",
+        "artifact_warning",
+    ]
+    assert trace["artifact_events"][2]["source_event_type"] == (
+        "record_research_artifact"
+    )
+    assert trace["artifact_events"][2]["local_artifact_id"] == "REPORT-001"
+    assert trace["artifact_warnings"][0]["payload"]["warning"] == (
+        "invalid_artifact_payload"
+    )
+    assert trace["artifact_warnings"][0]["payload"]["source_event_type"] == (
+        "relation_extracted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_scrubs_runner_status_and_error_payloads_before_browser_runtime_and_task_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    user = limira.LimiraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-statussecret123456",
+        "Authorization: Bearer status-secret-123456",
+        "RUNNER_SERVICE_TOKEN=status-runner-token-123456",
+        "OPENAI_API_KEY=sk-timestampsecret123456",
+        "Authorization: Bearer timestamp-secret-123456",
+        "OPENAI_API_KEY=sk-statuskeysecret123456",
+        "Authorization: Bearer error-key-secret-123456",
+    ]
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "timestamp": f"{raw_secret_values[3]} {raw_secret_values[4]}",
+                "payload": {
+                    "status": "running",
+                    "error": f"{raw_secret_values[0]} {raw_secret_values[1]}",
+                    raw_secret_values[5]: "secret-bearing status key",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "error",
+                "timestamp": f"{raw_secret_values[4]} {raw_secret_values[3]}",
+                "payload": {
+                    "error": f"runner failed {raw_secret_values[2]}",
+                    raw_secret_values[6]: "secret-bearing error key",
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "status secret scrub"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+
+    assert [event["type"] for event in events] == ["status", "error"]
+    assert all(event["task_id"] == task_id for event in events)
+    assert limira.LIMIRA_SECRET_REDACTION in events[0]["timestamp"]
+    assert limira.LIMIRA_SECRET_REDACTION in events[1]["timestamp"]
+    assert limira.LIMIRA_SECRET_REDACTION in runtime_snapshot["last_event"]["timestamp"]
+    serialized = json.dumps(
+        {
+            "events": events,
+            "runtime": runtime_snapshot,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+        },
+        ensure_ascii=False,
+    )
+    for secret in raw_secret_values:
+        assert secret not in serialized
+    assert limira.LIMIRA_SECRET_REDACTION in serialized
+    assert task_payload["status"] == "failed"
+    assert task_payload["error"].startswith("runner failed")
+    assert runtime_snapshot["error"].startswith("runner failed")
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_shapes_runner_status_and_error_internal_details_before_browser_runtime_and_task_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    user = limira.LimiraUser("user-a")
+    internal_error = (
+        "runner status failed at http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-streamstatusinternal123456"
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {
+                    "status": "running",
+                    "archive_status": "pending",
+                    "error": internal_error,
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "error",
+                "payload": {"error": internal_error},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "status internal detail shaping"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+
+    assert [event["type"] for event in events] == ["status", "error"]
+    assert events[0]["payload"]["error"] == "runner_task_failed"
+    assert events[1]["payload"]["error"] == "runner_task_failed"
+    assert repo.get_task(task_id).error == "runner_task_failed"
+    assert runtime_snapshot["error"] == "runner_task_failed"
+    assert runtime_snapshot["last_event"]["payload"]["error"] == "runner_task_failed"
+    assert task_payload["error"] == "runner_task_failed"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "runtime": runtime_snapshot,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limira/users/hash",
+        "sk-streamstatusinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_shapes_non_status_runner_event_internal_error_fields_before_browser_runtime_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    user = limira.LimiraUser("user-a")
+    internal_detail = (
+        "progress failed at http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-progressinternal123456"
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "progress",
+                "payload": {
+                    "status": "failed",
+                    "archive_status": "failed",
+                    "error": internal_detail,
+                    "warning": internal_detail,
+                    "reason": internal_detail,
+                    "data": {
+                        "error": internal_detail,
+                        "warning": internal_detail,
+                        "reason": internal_detail,
+                    },
+                },
+            }
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "progress internal detail shaping"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+
+    assert [event["type"] for event in events] == ["progress"]
+    payload = events[0]["payload"]
+    assert payload["error"] == "runner_task_failed"
+    assert payload["warning"] == "runner_status_warning"
+    assert payload["reason"] == "runner_stream_conflict"
+    assert payload["data"]["error"] == "runner_task_failed"
+    assert payload["data"]["warning"] == "runner_status_warning"
+    assert payload["data"]["reason"] == "runner_stream_conflict"
+    assert repo.get_task(task_id).error == "runner_task_failed"
+    assert runtime_snapshot["error"] == "runner_task_failed"
+    assert runtime_snapshot["last_warning"] == "runner_status_warning"
+    assert runtime_snapshot["last_event"]["payload"]["error"] == "runner_task_failed"
+    assert runtime_snapshot["last_event"]["payload"]["data"]["error"] == (
+        "runner_task_failed"
+    )
+    assert task_payload["error"] == "runner_task_failed"
+    serialized = json.dumps(
+        {
+            "events": events,
+            "runtime": runtime_snapshot,
+            "task": task_payload,
+            "repo_error": repo.get_task(task_id).error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limira/users/hash",
+        "sk-progressinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_runner_status_scrubs_persisted_terminal_task_error_and_archive_metadata():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    user = limira.LimiraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-authoritativestatus123456",
+        "Authorization: Bearer authoritative-secret-123456",
+        "RUNNER_SERVICE_TOKEN=authoritative-runner-token-123456",
+    ]
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "failed",
+            "archive_status": "failed",
+            "error": " ".join(raw_secret_values),
+        },
+    )
+
+    created = await limira.create_research_task(
+        {"query": "authoritative secret scrub"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    first_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    first_events = _parse_sse_chunks(
+        [chunk async for chunk in first_response.body_iterator]
+    )
+    task = repo.get_task(task_id)
+    assert task.status == "failed"
+    assert task.error
+    assert limira.LIMIRA_SECRET_REDACTION in task.error
+
+    terminal_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    terminal_events = _parse_sse_chunks(
+        [chunk async for chunk in terminal_response.body_iterator]
+    )
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+
+    repo.update_task(task_id, archive_status="ready")
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_members = _archive_member_texts(archive_response.body)
+
+    serialized = json.dumps(
+        {
+            "first_events": first_events,
+            "terminal_events": terminal_events,
+            "task": task_payload,
+            "archive": archive_members,
+            "repo_error": task.error,
+        },
+        ensure_ascii=False,
+    )
+    for secret in raw_secret_values:
+        assert secret not in serialized
+    assert limira.LIMIRA_SECRET_REDACTION in serialized
+    assert terminal_events == [
+        {
+            "task_id": task_id,
+            "type": "status",
+            "payload": {
+                "status": "failed",
+                "archive_status": "failed",
+                "terminal": True,
+                "error": task.error,
+            },
+        }
+    ]
+    assert task_payload["error"] == task.error
+    assert limira.LIMIRA_SECRET_REDACTION in archive_members["metadata.json"]
+    assert limira.LIMIRA_SECRET_REDACTION in archive_members["trace.json"]
+    _assert_no_browser_leak(first_events)
+    _assert_no_browser_leak(terminal_events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_runner_status_hides_internal_error_details_from_browser_state():
+    repo = limira.InMemoryLimiraTaskRepository()
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    user = limira.LimiraUser("user-a")
+    internal_error = (
+        "runner failed GET http://10.20.30.40:8091/internal/tasks/runner-task-a "
+        "for limira/users/hash/tasks/task-a/uploads/doc.txt "
+        "OPENAI_API_KEY=sk-authoritativeinternal123456"
+    )
+    research = FakeResearchClient(
+        events=[],
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "failed",
+            "archive_status": "failed",
+            "error": internal_error,
+        },
+    )
+
+    created = await limira.create_research_task(
+        {"query": "authoritative internal error"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    first_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    first_events = _parse_sse_chunks(
+        [chunk async for chunk in first_response.body_iterator]
+    )
+    task = repo.get_task(task_id)
+    task_payload = await limira.get_task(task_id, user=user, repo=repo)
+
+    terminal_response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+    )
+    terminal_events = _parse_sse_chunks(
+        [chunk async for chunk in terminal_response.body_iterator]
+    )
+
+    assert task is not None
+    assert task.error == "runner_task_failed"
+    assert task_payload["error"] == "runner_task_failed"
+    assert terminal_events[-1]["payload"]["error"] == "runner_task_failed"
+    serialized = json.dumps(
+        {
+            "events": first_events,
+            "terminal_events": terminal_events,
+            "task": task_payload,
+            "repo_error": task.error,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "http://10.20.30.40:8091",
+        "limira/users/hash",
+        "sk-authoritativeinternal123456",
+        "OPENAI_API_KEY",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(first_events)
+    _assert_no_browser_leak(terminal_events)
+    _assert_no_browser_leak(task_payload)
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_persists_final_summary_show_text_as_report_section():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-finalopenai123456",
+        "Bearer final-bearer-token-123456",
+        "RUNNER_SERVICE_TOKEN=final-runner-token-123456",
+    ]
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {
+                        "text": (
+                            "# Final answer\n\n"
+                            "BYD is not on the active list. [EVID-001]\n\n"
+                            + "\n".join(raw_secret_values)
+                        )
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "start_of_agent",
+        "tool_call",
+        "report_section_generated",
+        "end_of_agent",
+        "status",
+    ]
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_events
+    assert limira.LIMIRA_SECRET_REDACTION in serialized_events
+    assert limira.LIMIRA_SECRET_REDACTION in json.dumps(
+        events[1]["payload"]["tool_input"],
+        ensure_ascii=False,
+    )
+    report_event = events[2]
+    assert report_event["payload"]["title"] == "最终回答"
+    assert report_event["payload"]["evidence_refs"] == ["EVID-001"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(report_event, ensure_ascii=False)
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert len(artifacts["report_sections"]) == 1
+    assert artifacts["report_sections"][0]["markdown"].startswith("# Final answer")
+    assert artifacts["report_sections"][0]["source_event_type"] == "final_summary_show_text"
+    assert limira.LIMIRA_SECRET_REDACTION in artifacts["report_sections"][0]["markdown"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(artifacts, ensure_ascii=False)
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert "# Final answer" in members["report.md"]
+    assert limira.LIMIRA_SECRET_REDACTION in members["report.md"]
+    assert limira.LIMIRA_SECRET_REDACTION in members["trace.json"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(members, ensure_ascii=False)
+    trace = json.loads(members["trace.json"])
+    assert trace["artifact_events"][0]["type"] == "report_section_generated"
+    assert trace["artifact_events"][0]["source_event_type"] == "final_summary_show_text"
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_unwraps_json_wrapped_final_summary_report_text():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    report_body = (
+        "## 研究结论\n\n"
+        "**比亚迪(BYD Company Limited) 目前已在已生效的1260H清单上。** "
+        "[EVID-001]"
+    )
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-001",
+            "title": "比亚迪(BYD) Section 1260H 清单状态研究报告",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {"text": wrapped_report},
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    assert '"content"' not in serialized_events
+    assert wrapped_report not in serialized_events
+    assert events[1]["payload"]["tool_input"]["text"] == report_body
+    assert events[2]["payload"]["title"] == (
+        "比亚迪(BYD) Section 1260H 清单状态研究报告"
+    )
+    assert events[2]["payload"]["markdown"] == report_body
+    assert events[2]["payload"]["evidence_refs"] == ["EVID-001"]
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["report_sections"][0]["title"] == (
+        "比亚迪(BYD) Section 1260H 清单状态研究报告"
+    )
+    assert artifacts["report_sections"][0]["markdown"] == report_body
+    assert '"content"' not in json.dumps(artifacts, ensure_ascii=False)
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert report_body in members["report.md"]
+    assert wrapped_report not in json.dumps(members, ensure_ascii=False)
+    assert '"content"' not in members["trace.json"]
+
+
+@pytest.mark.asyncio
+async def test_artifacts_api_unwraps_legacy_json_wrapped_report_section_text():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-legacy-json-report",
+        owner_user_id=user.id,
+        query="BYD 1260H",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    report_body = "## 研究结论\n\n旧数据应只显示正文。 [EVID-001]"
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-099",
+            "title": "旧报告标题",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-099",
+            "markdown": wrapped_report,
+            "source_event_type": "record_research_artifact",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    artifacts = await limira.get_task_artifacts(task.task_id, user=user, repo=repo)
+
+    section = artifacts["report_sections"][0]
+    assert section["title"] == "旧报告标题"
+    assert section["markdown"] == report_body
+    serialized_artifacts = json.dumps(artifacts, ensure_ascii=False)
+    assert wrapped_report not in serialized_artifacts
+    assert '"content"' not in serialized_artifacts
+
+    archive_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert report_body in members["report.md"]
+    assert wrapped_report not in json.dumps(members, ensure_ascii=False)
+    assert '"content"' not in members["trace.json"]
+
+
+@pytest.mark.asyncio
+async def test_archive_download_unwraps_json_wrapped_report_members_from_persisted_archive():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-legacy-json-archive",
+        owner_user_id=user.id,
+        query="BYD 1260H",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    report_body = "## 研究结论\n\n历史 archive 应只下载正文。 [EVID-001]"
+    wrapped_report = json.dumps(
+        {
+            "id": "REPORT-007",
+            "title": "历史 archive 标题",
+            "content": report_body,
+        },
+        ensure_ascii=False,
+    )
+    raw_archive = _archive_zip_with_json_wrapped_report(
+        task_id=task.task_id,
+        owner_user_id=user.id,
+        report_text=wrapped_report,
+    )
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    assert members["report.md"] == report_body
+    assert "历史 archive 应只下载正文。" in members["report.html"]
+    assert "研究结论" in members["report.html"]
+    assert wrapped_report not in json.dumps(members, ensure_ascii=False)
+    assert '"content"' not in members["trace.json"]
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+
+
+@pytest.mark.asyncio
+async def test_postgres_event_proxy_persists_final_summary_show_text_as_report_section():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    raw_secret_values = [
+        "OPENAI_API_KEY=sk-finalpgopenai123456",
+        "Bearer final-pg-bearer-token-123456",
+        "RUNNER_SERVICE_TOKEN=final-pg-runner-token-123456",
+    ]
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {
+                        "text": (
+                            "# Final answer\n\n"
+                            "BYD is not on the active list. [EVID-001]\n\n"
+                            + "\n".join(raw_secret_values)
+                        )
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "start_of_agent",
+        "tool_call",
+        "report_section_generated",
+        "end_of_agent",
+        "status",
+    ]
+    report_event = events[2]
+    assert report_event["payload"]["title"] == "最终回答"
+    assert report_event["payload"]["evidence_refs"] == ["EVID-001"]
+    serialized_events = json.dumps(events, ensure_ascii=False)
+    for secret in raw_secret_values:
+        assert secret not in serialized_events
+    assert limira.LIMIRA_SECRET_REDACTION in serialized_events
+    _assert_no_browser_leak(events)
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert len(artifacts["report_sections"]) == 1
+    report_section = artifacts["report_sections"][0]
+    assert report_section["section_id"] == "REPORT-001"
+    assert report_section["markdown"].startswith("# Final answer")
+    assert report_section["source_event_type"] == "final_summary_show_text"
+    assert limira.LIMIRA_SECRET_REDACTION in report_section["markdown"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(artifacts, ensure_ascii=False)
+
+    persisted_report = engine.generated_reports[(task_id, "REPORT-001")]
+    assert persisted_report["creator_user_id"] == "user-a"
+    assert persisted_report["markdown"] == report_section["markdown"]
+    assert persisted_report["evidence_refs"] == ["EVID-001"]
+    assert json.loads(persisted_report["metadata"])["source_event_type"] == (
+        "final_summary_show_text"
+    )
+
+    reports = repo.list_task_reports(task_id=task_id)
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].markdown == report_section["markdown"]
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert "# Final answer" in members["report.md"]
+    assert limira.LIMIRA_SECRET_REDACTION in members["report.md"]
+    assert limira.LIMIRA_SECRET_REDACTION in members["trace.json"]
+    for secret in raw_secret_values:
+        assert secret not in json.dumps(members, ensure_ascii=False)
+    trace = json.loads(members["trace.json"])
+    assert trace["artifact_events"][0]["type"] == "report_section_generated"
+    assert trace["artifact_events"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+    assert trace["artifact_events"][0]["local_artifact_id"] == "REPORT-001"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert repo.get_task(task_id).archive_object_key in storage.objects
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
+async def test_record_research_artifact_tool_call_reaches_artifacts_and_archive_trace():
+    from pipeline_helpers import filter_message
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    artifact_event = filter_message(
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_name": "record_research_artifact",
+                "tool_input": {
+                    "artifact_type": "evidence",
+                    "payload": {
+                        "title": "Port authority bulletin",
+                        "source_url": "https://example.test/port",
+                        "summary": "New inspection rule published",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.9,
+                    "notes": "MCP tool path",
+                },
+            },
+        }
+    )
+    research = FakeResearchClient(events=[artifact_event])
+
+    created = await limira.create_research_task(
+        {"query": "port inspection OSINT"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert events[0]["type"] == "evidence_collected"
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["evidence"][0]["title"] == "Port authority bulletin"
+    assert artifacts["evidence"][0]["notes"] == "MCP tool path"
+    assert repo.get_task(task_id).archive_status == "ready"
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+
+    assert trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-001"
+    assert trace["artifacts"]["evidence"][0]["title"] == "Port authority bulletin"
+    assert trace["artifacts"]["evidence"][0]["source_event_type"] == (
+        "record_research_artifact"
+    )
+    assert trace["artifact_events"][0]["type"] == "evidence_collected"
+    assert trace["artifact_events"][0]["artifact_type"] == "evidence"
+    assert trace["artifact_events"][0]["bucket"] == "evidence"
+    assert trace["artifact_events"][0]["local_artifact_id"] == "EVID-001"
+    assert trace["artifact_events"][0]["source_event_type"] == (
+        "record_research_artifact"
+    )
+    assert trace["artifact_events"][0]["payload"]["title"] == (
+        "Port authority bulletin"
+    )
+    assert trace["artifact_warnings"] == []
+    assert repo.get_task(task_id).archive_object_key in storage.objects
+    _assert_no_browser_leak(trace)
+
+
+@pytest.mark.asyncio
+async def test_tool_evidence_ledger_events_reach_artifacts_and_archive_trace():
+    from limira_tools.limira_evidence import ToolEvidenceLedger
+    from pipeline_helpers import expand_stream_message
+
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    ledger = ToolEvidenceLedger(task_id="runner-task-a")
+    runner_events = []
+    runner_events.extend(
+        expand_stream_message(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": "call-search",
+                    "tool_name": "google_search",
+                    "tool_input": {"q": "BYD 1260H"},
+                },
+            },
+            evidence_ledger=ledger,
+        )
+    )
+    runner_events.extend(
+        expand_stream_message(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": "call-search",
+                    "tool_name": "google_search",
+                    "tool_input": {
+                        "result": json.dumps(
+                            {
+                                "organic": [
+                                    {
+                                        "title": "DoD 1260H List",
+                                        "link": "https://example.test/dod-1260h.pdf",
+                                        "snippet": "Official list entry summary.",
+                                    }
+                                ],
+                                "searchParameters": {"q": "BYD 1260H"},
+                            }
+                        )
+                    },
+                },
+            },
+            evidence_ledger=ledger,
+        )
+    )
+    research = FakeResearchClient(events=runner_events)
+
+    created = await limira.create_research_task(
+        {"query": "BYD 1260H"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    evidence_event = next(
+        event for event in events if event["type"] == "evidence_collected"
+    )
+    assert evidence_event["payload"]["source_event_type"] == "tool_evidence_ledger"
+    assert evidence_event["payload"]["source_type"] == "web_search_result"

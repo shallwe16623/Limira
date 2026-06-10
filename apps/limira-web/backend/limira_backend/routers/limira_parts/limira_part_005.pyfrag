@@ -1,0 +1,1500 @@
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
+
+
+async def _record_stream_event(
+    repo: LimiraTaskRepository,
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    _record_task_event_log(repo, task_id, event)
+    await _record_runtime_event(runtime_state, task_id, event)
+
+
+def _record_task_event_log(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    try:
+        repo.record_task_event_log(
+            task_id,
+            _assert_browser_safe(event),
+            source="runner_stream",
+        )
+    except Exception:
+        log.warning(
+            "Failed to persist limira task event log",
+            extra={"task_id": task_id},
+            exc_info=True,
+        )
+
+
+async def _record_runtime_event(
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    event_type = str(event.get("type") or "runner_event")
+    payload = event.get("payload")
+    fields: dict[str, Any] = {
+        "last_event_type": event_type,
+        "last_event": event,
+    }
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        archive_status = payload.get("archive_status")
+        data = payload.get("data")
+        if not status and isinstance(data, dict):
+            status = data.get("status")
+        if not archive_status and isinstance(data, dict):
+            archive_status = data.get("archive_status")
+        if status:
+            fields["status"] = str(status)
+        if archive_status:
+            fields["archive_status"] = str(archive_status)
+        if payload.get("terminal") is not None:
+            fields["terminal"] = bool(payload.get("terminal"))
+        if status in FINAL_TASK_STATUSES:
+            fields["terminal"] = True
+        if payload.get("warning"):
+            fields["last_warning"] = str(payload["warning"])
+        if payload.get("error"):
+            fields["error"] = str(payload["error"])
+    if event_type == "error":
+        fields["status"] = "failed"
+        fields["archive_status"] = "failed"
+        fields["terminal"] = True
+        if isinstance(payload, dict) and payload.get("error"):
+            fields["error"] = str(payload["error"])
+        elif payload:
+            fields["error"] = str(payload)
+    await runtime_state.update_task_runtime(task_id, fields)
+
+
+async def _mark_terminal_reattach_closed(
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+) -> None:
+    runtime_snapshot = await runtime_state.get_task_runtime(task_id)
+    if (
+        runtime_snapshot.get("stream_state") == "open"
+        and runtime_snapshot.get("stream_id")
+    ):
+        return
+    await _mark_runtime_stream_closed(
+        runtime_state,
+        task_id,
+        "terminal_reattach",
+    )
+
+
+async def _mark_runtime_stream_closed(
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+    reason: str,
+    *,
+    stream_id: str | None = None,
+) -> None:
+    fields = {
+        "stream_close_reason": reason,
+    }
+    if stream_id is not None:
+        await runtime_state.close_stream(task_id, stream_id=stream_id, fields=fields)
+        return
+    await runtime_state.update_task_runtime(task_id, {"stream_state": "closed", **fields})
+
+
+def _stream_close_reason_from_event(event: dict[str, Any], default: str) -> str:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return default
+    status = payload.get("status")
+    if status in FINAL_TASK_STATUSES:
+        return f"terminal_{status}"
+    return default
+
+
+def _normalize_runner_event(task: LimiraTask, event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or event.get("event") or "runner_event")
+    payload = event.get("payload") if "payload" in event else dict(event)
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload.pop("task_id", None)
+        payload.pop("stream_url", None)
+        payload.pop("task_url", None)
+    normalized: dict[str, Any] = {
+        "task_id": task.task_id,
+        "type": event_type,
+        "payload": payload,
+    }
+    if event.get("timestamp"):
+        normalized["timestamp"] = event["timestamp"]
+    return normalized
+
+
+def _apply_task_status_from_event(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    event: dict[str, Any],
+) -> str | None:
+    event_type = event.get("type")
+    payload = event.get("payload")
+    status = None
+    archive_status = None
+    if event_type == "error":
+        status = "failed"
+    elif isinstance(payload, dict):
+        status = payload.get("status")
+        archive_status = payload.get("archive_status")
+        data = payload.get("data")
+        if not status and isinstance(data, dict):
+            status = data.get("status")
+        if not archive_status and isinstance(data, dict):
+            archive_status = data.get("archive_status")
+
+    if status in {"queued", "running", "completed", "failed", "cancelled"}:
+        updates: dict[str, Any] = {"status": status}
+        if archive_status in {"pending", "ready", "failed"}:
+            updates["archive_status"] = archive_status
+        elif status == "completed":
+            updates["archive_status"] = "ready"
+        elif status in {"failed", "cancelled"}:
+            updates["archive_status"] = "failed"
+        if isinstance(payload, dict) and payload.get("error"):
+            updates["error"] = _public_error_text(
+                payload["error"],
+                fallback="runner_task_failed",
+            )
+        repo.update_task(task_id, **updates)
+        return str(status)
+    return None
+
+
+def _record_artifact_from_event(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    event: dict[str, Any],
+) -> dict[str, Any] | None:
+    if event.get("type") == "artifact_warning":
+        repo.record_artifact_trace_event(
+            task.task_id,
+            _artifact_trace_event_from_warning(event),
+        )
+        return None
+
+    artifact_type, artifact_payload, metadata = _artifact_parts_from_event(event)
+    if not artifact_type:
+        return None
+
+    if artifact_type not in ARTIFACT_BUCKETS:
+        return _record_and_return_artifact_warning(
+            repo,
+            task,
+            _artifact_warning(task.task_id, event, "unsupported_artifact_type"),
+        )
+    if not isinstance(artifact_payload, dict):
+        return _record_and_return_artifact_warning(
+            repo,
+            task,
+            _artifact_warning(task.task_id, event, "invalid_artifact_payload"),
+        )
+
+    artifact = dict(artifact_payload)
+    artifact.setdefault("artifact_type", artifact_type)
+    artifact.setdefault("source_event_type", event.get("type"))
+    if artifact_type == "report_section":
+        artifact = _normalize_report_section_artifact(artifact)
+    if metadata.get("evidence_refs") is not None:
+        artifact.setdefault("evidence_refs", metadata["evidence_refs"])
+    if metadata.get("confidence") is not None:
+        artifact.setdefault("confidence", metadata["confidence"])
+    if metadata.get("notes") is not None:
+        artifact.setdefault("notes", metadata["notes"])
+    _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
+    repo.record_artifact(task.task_id, artifact_type, artifact)
+    return None
+
+
+def _record_final_show_text_report_from_event(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    event: dict[str, Any],
+    *,
+    current_agent_name: str | None,
+) -> dict[str, Any] | None:
+    if current_agent_name != "Final Summary" or event.get("type") != "tool_call":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("tool_name") != "show_text":
+        return None
+    tool_input = payload.get("tool_input")
+    markdown = _show_text_markdown(tool_input)
+    if not markdown:
+        return None
+    scrubbed_markdown = str(scrub_limira_secrets(markdown)).strip()
+    if not scrubbed_markdown:
+        return None
+    artifacts = repo.get_artifacts(task.task_id)
+    for section in artifacts.get("report_sections", []):
+        if (
+            section.get("source_event_type") == "final_summary_show_text"
+            and str(section.get("markdown") or "").strip() == scrubbed_markdown
+        ):
+            return None
+    artifact = {
+        "artifact_type": "report_section",
+        "title": _report_title_from_value(tool_input, fallback="最终回答"),
+        "markdown": scrubbed_markdown,
+        "source_event_type": "final_summary_show_text",
+        "evidence_refs": _evidence_refs_from_markdown(scrubbed_markdown),
+    }
+    _ensure_artifact_id(repo, task.task_id, "report_section", artifact)
+    repo.record_artifact(task.task_id, "report_section", artifact)
+    return {
+        "task_id": task.task_id,
+        "type": "report_section_generated",
+        "payload": artifact,
+    }
+
+
+def _scrub_final_show_text_event(
+    event: dict[str, Any],
+    *,
+    current_agent_name: str | None,
+) -> dict[str, Any]:
+    if current_agent_name != "Final Summary" or event.get("type") != "tool_call":
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("tool_name") != "show_text":
+        return event
+    scrubbed_event = dict(event)
+    scrubbed_payload = dict(payload)
+    scrubbed_tool_input = scrub_limira_secrets(payload.get("tool_input"))
+    scrubbed_markdown = _show_text_markdown(scrubbed_tool_input)
+    scrubbed_title = _report_title_from_value(scrubbed_tool_input)
+    if scrubbed_markdown:
+        if isinstance(scrubbed_tool_input, Mapping):
+            scrubbed_tool_input = dict(scrubbed_tool_input)
+            scrubbed_tool_input["text"] = scrubbed_markdown
+        else:
+            scrubbed_tool_input = {"text": scrubbed_markdown}
+        if scrubbed_title:
+            scrubbed_tool_input.setdefault("title", scrubbed_title)
+    scrubbed_payload["tool_input"] = scrubbed_tool_input
+    scrubbed_event["payload"] = scrubbed_payload
+    return scrubbed_event
+
+
+def _scrub_runner_artifact_event(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or "")
+    if event_type not in {
+        *ARTIFACT_EVENT_TYPES.keys(),
+        "artifact",
+        "artifact_recorded",
+        "record_research_artifact",
+        "artifact_warning",
+    }:
+        return event
+    scrubbed_event = dict(event)
+    scrubbed_event["payload"] = scrub_limira_secrets(event.get("payload"))
+    return scrubbed_event
+
+
+def _scrub_runner_event(event: dict[str, Any], *, task_id: str) -> dict[str, Any]:
+    event_type = str(event.get("type") or "runner_event")
+    scrubbed_value = scrub_limira_secrets(event)
+    scrubbed_event = dict(scrubbed_value) if isinstance(scrubbed_value, dict) else {}
+    scrubbed_event["task_id"] = task_id
+    scrubbed_event["type"] = str(scrub_limira_secrets(event_type))
+    scrubbed_event = _shape_runner_event_public_errors(scrubbed_event)
+    return scrubbed_event
+
+
+def _shape_runner_event_public_errors(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return event
+    shaped_event = dict(event)
+    shaped_payload = dict(payload)
+    if shaped_payload.get("error"):
+        shaped_payload["error"] = _public_error_text(
+            shaped_payload["error"],
+            fallback="runner_task_failed",
+        )
+    if shaped_payload.get("warning"):
+        shaped_payload["warning"] = _public_error_text(
+            shaped_payload["warning"],
+            fallback="runner_status_warning",
+        )
+    if shaped_payload.get("reason"):
+        shaped_payload["reason"] = _public_reason_text(shaped_payload["reason"])
+    data = shaped_payload.get("data")
+    if isinstance(data, dict):
+        shaped_data = dict(data)
+        if shaped_data.get("error"):
+            shaped_data["error"] = _public_error_text(
+                shaped_data["error"],
+                fallback="runner_task_failed",
+            )
+        if shaped_data.get("warning"):
+            shaped_data["warning"] = _public_error_text(
+                shaped_data["warning"],
+                fallback="runner_status_warning",
+            )
+        if shaped_data.get("reason"):
+            shaped_data["reason"] = _public_reason_text(shaped_data["reason"])
+        shaped_payload["data"] = shaped_data
+    shaped_event["payload"] = shaped_payload
+    return shaped_event
+
+
+def _show_text_markdown(tool_input: Any) -> str:
+    value: Any = ""
+    if isinstance(tool_input, dict):
+        value = tool_input.get("text") or ""
+        result = tool_input.get("result")
+        if not value and isinstance(result, dict):
+            value = result.get("text") or result
+    elif isinstance(tool_input, str):
+        value = tool_input
+    return _report_markdown_from_value(value)
+
+
+REPORT_TEXT_FIELDS = ("markdown", "content", "text", "summary")
+REPORT_TITLE_FIELDS = ("title", "report_title", "name")
+REPORT_ID_FIELDS = ("section_id", "report_id", "id")
+
+
+def _report_wrapper_mapping(value: Any) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def _report_markdown_from_value(value: Any) -> str:
+    wrapper = _report_wrapper_mapping(value)
+    if wrapper is not None:
+        for field in REPORT_TEXT_FIELDS:
+            if field not in wrapper:
+                continue
+            markdown = _report_markdown_from_value(wrapper.get(field))
+            if markdown:
+                return markdown
+        if "payload" in wrapper:
+            markdown = _report_markdown_from_value(wrapper.get("payload"))
+            if markdown:
+                return markdown
+        return ""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _report_field_from_value(value: Any, fields: tuple[str, ...]) -> str | None:
+    wrapper = _report_wrapper_mapping(value)
+    if wrapper is None:
+        return None
+    for field in fields:
+        raw = wrapper.get(field)
+        if raw is None or isinstance(raw, (Mapping, list, tuple, set)):
+            continue
+        text = str(raw).strip()
+        if text:
+            return text
+    for field in (*REPORT_TEXT_FIELDS, "payload", "result"):
+        nested = wrapper.get(field)
+        if nested is None or nested is value:
+            continue
+        text = _report_field_from_value(nested, fields)
+        if text:
+            return text
+    return None
+
+
+def _report_title_from_value(value: Any, *, fallback: str | None = None) -> str | None:
+    return _report_field_from_value(value, REPORT_TITLE_FIELDS) or fallback
+
+
+def _report_section_id_from_value(value: Any) -> str | None:
+    candidate = _report_field_from_value(value, REPORT_ID_FIELDS)
+    if candidate and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", candidate):
+        return candidate
+    return None
+
+
+def _normalize_report_section_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(artifact)
+    source = (
+        normalized.get("markdown")
+        or normalized.get("content")
+        or normalized.get("text")
+        or normalized.get("summary")
+        or normalized
+    )
+    markdown = _report_markdown_from_value(source)
+    if markdown:
+        normalized["markdown"] = markdown
+        for field in ("content", "text", "summary"):
+            if field in normalized and _report_wrapper_mapping(normalized[field]) is not None:
+                normalized[field] = markdown
+    title = _report_title_from_value(source)
+    if title and not normalized.get("title"):
+        normalized["title"] = title
+    section_id = _report_section_id_from_value(source)
+    if section_id and not normalized.get("section_id"):
+        normalized["section_id"] = section_id
+    return normalized
+
+
+def _normalize_report_section_artifacts(
+    artifacts: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    normalized = _normalize_artifact_buckets(artifacts)
+    normalized["report_sections"] = [
+        _normalize_report_section_artifact(section)
+        for section in normalized.get("report_sections", [])
+    ]
+    return normalized
+
+
+def _normalize_report_section_trace_events(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized_events: list[dict[str, Any]] = []
+    for event in events:
+        normalized_event = dict(event)
+        payload = normalized_event.get("payload")
+        if (
+            normalized_event.get("artifact_type") == "report_section"
+            and isinstance(payload, dict)
+        ):
+            normalized_event["payload"] = _normalize_report_section_artifact(payload)
+        normalized_events.append(normalized_event)
+    return normalized_events
+
+
+def _public_artifacts(artifacts: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    scrubbed = scrub_limira_secrets(artifacts)
+    return _normalize_report_section_artifacts(scrubbed if isinstance(scrubbed, Mapping) else {})
+
+
+def _evidence_refs_from_markdown(markdown: str) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\[(EVID-\d{3,})\]", markdown):
+        ref = match.group(1)
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+    return refs
+
+
+def _record_and_return_artifact_warning(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    warning: dict[str, Any],
+) -> dict[str, Any]:
+    repo.record_artifact_trace_event(
+        task.task_id,
+        _artifact_trace_event_from_warning(warning),
+    )
+    return warning
+
+
+def _artifact_parts_from_event(
+    event: dict[str, Any],
+) -> tuple[str | None, Any, dict[str, Any]]:
+    event_type = str(event.get("type") or "")
+    payload = event.get("payload")
+    if event_type in ARTIFACT_EVENT_TYPES:
+        return ARTIFACT_EVENT_TYPES[event_type], payload, {}
+
+    if event_type not in {"artifact", "artifact_recorded", "record_research_artifact"}:
+        return None, None, {}
+    if not isinstance(payload, dict):
+        return "unknown", payload, {}
+
+    artifact_type = payload.get("artifact_type")
+    return (
+        str(artifact_type) if artifact_type else "unknown",
+        payload.get("payload"),
+        {
+            "evidence_refs": payload.get("evidence_refs"),
+            "confidence": payload.get("confidence"),
+            "notes": payload.get("notes"),
+        },
+    )
+
+
+def _ensure_artifact_id(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    artifact_type: str,
+    artifact: dict[str, Any],
+) -> None:
+    artifacts = repo.get_artifacts(task_id)
+    bucket = ARTIFACT_BUCKETS[artifact_type]
+    index = len(artifacts[bucket]) + 1
+    if artifact_type == "evidence":
+        artifact.setdefault("evidence_id", f"EVID-{index:03d}")
+    elif artifact_type == "entity":
+        artifact.setdefault("entity_id", f"ENT-{index:03d}")
+    elif artifact_type == "relation":
+        artifact.setdefault("relation_id", f"REL-{index:03d}")
+    elif artifact_type == "timeline_event":
+        artifact.setdefault("event_id", f"TIME-{index:03d}")
+    elif artifact_type == "map_feature":
+        artifact.setdefault("feature_id", f"MAP-{index:03d}")
+    elif artifact_type == "report_section":
+        artifact.setdefault("section_id", f"REPORT-{index:03d}")
+    elif artifact_type == "verification":
+        artifact.setdefault("verification_id", f"VERIFY-{index:03d}")
+
+
+def _artifact_warning(
+    task_id: str,
+    event: dict[str, Any],
+    warning: str,
+) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "type": "artifact_warning",
+        "payload": {
+            "warning": warning,
+            "source_event_type": event.get("type"),
+        },
+    }
+
+
+def _artifact_trace_event_from_artifact(
+    artifact_type: str,
+    bucket: str,
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    local_artifact_id = _artifact_primary_id(artifact_type, artifact)
+    source_event_type = artifact.get("source_event_type")
+    return {
+        "type": ARTIFACT_TYPE_EVENTS.get(artifact_type, "artifact_recorded"),
+        "artifact_type": artifact_type,
+        "bucket": bucket,
+        "local_artifact_id": local_artifact_id,
+        "source_event_type": str(source_event_type) if source_event_type else None,
+        "payload": dict(artifact),
+    }
+
+
+def _artifact_trace_event_from_warning(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {"warning": "invalid_artifact_warning", "payload": payload}
+    return {
+        "type": "artifact_warning",
+        "artifact_type": payload.get("artifact_type"),
+        "bucket": None,
+        "local_artifact_id": None,
+        "source_event_type": payload.get("source_event_type"),
+        "payload": dict(payload),
+    }
+
+
+def _sse_bytes(event: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+async def _iter_sse_json(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
+    data_lines: list[str] = []
+    async for line in response.aiter_lines():
+        if not line:
+            if data_lines:
+                yield _parse_sse_data("\n".join(data_lines))
+                data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line.removeprefix("data:").strip())
+    if data_lines:
+        yield _parse_sse_data("\n".join(data_lines))
+
+
+async def _runner_error_detail(response: httpx.Response) -> str:
+    try:
+        body = await response.aread()
+        parsed = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        return f"runner_http_{response.status_code}"
+    if isinstance(parsed, dict):
+        return str(parsed.get("error") or parsed.get("detail") or f"runner_http_{response.status_code}")
+    return f"runner_http_{response.status_code}"
+
+
+def _parse_sse_data(data: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        return {"type": "message", "payload": {"message": data}}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"type": "message", "payload": {"message": parsed}}
+
+
+def _runner_task_id_from_payload(payload: dict[str, Any]) -> str:
+    runner_task_id = payload.get("task_id") or payload.get("id")
+    if not runner_task_id:
+        raise HTTPException(status_code=502, detail="runner_task_id_missing")
+    return str(runner_task_id)
+
+
+def _empty_artifact_buckets() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "evidence": [],
+        "entities": [],
+        "relations": [],
+        "timeline_events": [],
+        "map_features": [],
+        "verifications": [],
+        "report_sections": [],
+    }
+
+
+def _normalize_artifact_buckets(value: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    buckets = _empty_artifact_buckets()
+    for bucket in buckets:
+        items = value.get(bucket)
+        if isinstance(items, list):
+            buckets[bucket] = [dict(item) for item in items if isinstance(item, dict)]
+    return buckets
+
+
+def _task_from_row(row: dict[str, Any]) -> LimiraTask:
+    return LimiraTask(
+        task_id=str(row["task_id"]),
+        owner_user_id=str(row["owner_user_id"]),
+        query=str(row["query"]),
+        status=str(row.get("status") or "queued"),
+        archive_status=str(row.get("archive_status") or "pending"),
+        runner_task_id=_optional_string(row.get("runner_task_id")),
+        archive_object_key=_optional_string(row.get("archive_object_key")),
+        archive_zip_sha256=_optional_string(row.get("archive_zip_sha256")),
+        scenario=_optional_string(row.get("scenario")),
+        error=_optional_string(row.get("error")),
+        model_summary=_json_loads(row.get("model_summary")) or {},
+    )
+
+
+def _uploaded_document_from_row(row: dict[str, Any]) -> LimiraUploadedDocument:
+    return LimiraUploadedDocument(
+        document_id=str(row["document_id"]),
+        owner_user_id=str(row["owner_user_id"]),
+        task_id=_optional_string(row.get("task_id")),
+        original_filename=str(row.get("original_filename") or ""),
+        content_type=_optional_string(row.get("content_type")),
+        byte_size=int(row.get("byte_size") or 0),
+        minio_bucket=str(row.get("minio_bucket") or ""),
+        object_key=str(row.get("object_key") or ""),
+        extracted_text=_optional_string(row.get("extracted_text")),
+        language=_optional_string(row.get("language")),
+        metadata=_json_loads(row.get("metadata")) or {},
+        embedding=_embedding_from_value(row.get("embedding")),
+    )
+
+
+def _generated_report_from_row(row: dict[str, Any]) -> LimiraGeneratedReport:
+    return LimiraGeneratedReport(
+        report_id=str(row["report_id"]),
+        task_id=str(row["task_id"]),
+        report_type=str(row.get("report_type") or "final"),
+        markdown=str(row.get("markdown") or ""),
+        html=_optional_string(row.get("html")),
+        pdf_object_key=_optional_string(row.get("pdf_object_key")),
+        evidence_refs=_list_of_strings(row.get("evidence_refs")),
+        creator_user_id=str(row.get("creator_user_id") or "limira"),
+        metadata=_json_loads(row.get("metadata")) or {},
+    )
+
+
+def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
+    key_by_type = {
+        "evidence": "evidence_id",
+        "entity": "entity_id",
+        "relation": "relation_id",
+        "timeline_event": "event_id",
+        "map_feature": "feature_id",
+        "verification": "verification_id",
+        "report_section": "section_id",
+    }
+    key = key_by_type.get(artifact_type)
+    value = artifact.get(key) if key else None
+    if value:
+        return str(value)
+    return f"{artifact_type}-{uuid.uuid4()}"
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
+def _json_loads(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _embedding_dimensions_from_env(value: Any) -> int:
+    try:
+        dimensions = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("limira_upload_embedding_dimensions_invalid") from exc
+    if dimensions <= 0:
+        raise RuntimeError("limira_upload_embedding_dimensions_invalid")
+    return dimensions
+
+
+async def _uploaded_document_embedding(
+    extracted_text: str | None,
+    *,
+    config: LimiraUploadEmbeddingConfig,
+    provider: LimiraUploadEmbeddingProvider,
+) -> tuple[list[float] | None, dict[str, Any]]:
+    metadata: dict[str, Any] = {
+        "embedding": {
+            "enabled": config.enabled,
+            "provider": config.provider,
+            "model": config.model,
+            "dimensions": config.dimensions,
+        }
+    }
+    if not config.enabled:
+        metadata["embedding"]["status"] = "disabled"
+        return None, metadata
+
+    text = (extracted_text or "").strip()
+    if not text:
+        metadata["embedding"]["status"] = "skipped_empty_text"
+        return None, metadata
+
+    try:
+        raw_embedding = await provider.embed_upload_text(text, config=config)
+        embedding = [float(value) for value in raw_embedding]
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="upload_embedding_failed") from exc
+
+    if len(embedding) != config.dimensions:
+        raise HTTPException(status_code=500, detail="upload_embedding_dimension_mismatch")
+    metadata["embedding"]["status"] = "stored"
+    return embedding, metadata
+
+
+async def _uploaded_document_search_embedding(
+    query: str,
+    *,
+    config: LimiraUploadEmbeddingConfig,
+    provider: LimiraUploadEmbeddingProvider,
+) -> list[float] | None:
+    if not config.enabled:
+        return None
+    try:
+        raw_embedding = await provider.embed_upload_text(query, config=config)
+        embedding = [float(value) for value in raw_embedding]
+    except Exception:
+        log.warning(
+            "Limira upload search embedding unavailable; falling back to lexical search",
+            extra={"embedding_provider": config.provider},
+        )
+        return None
+    if len(embedding) != config.dimensions:
+        raise HTTPException(
+            status_code=500,
+            detail="upload_search_embedding_dimension_mismatch",
+        )
+    return embedding
+
+
+def _embedding_from_value(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("[") and stripped.endswith("]"):
+            stripped = stripped[1:-1]
+        parts = [part.strip() for part in stripped.split(",") if part.strip()]
+        return [float(part) for part in parts] if parts else None
+    if isinstance(value, (list, tuple)):
+        return [float(part) for part in value]
+    return None
+
+
+def _vector_param(value: list[float] | None) -> str | None:
+    if value is None:
+        return None
+    return "[" + ",".join(f"{float(part):.12g}" for part in value) + "]"
+
+
+def _search_terms(query: str) -> list[str]:
+    seen: set[str] = set()
+    terms: list[str] = []
+    for match in SEARCH_TOKEN_PATTERN.findall(query.lower()):
+        term = match.strip("._-")
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+    return terms
+
+
+def _rank_uploaded_documents(
+    documents: list[LimiraUploadedDocument],
+    query: str,
+    limit: int,
+) -> list[LimiraUploadedDocumentSearchResult]:
+    terms = _search_terms(query)
+    if not terms:
+        return []
+    results = [
+        result
+        for result in (
+            _uploaded_document_search_result(document, terms)
+            for document in documents
+        )
+        if result is not None
+    ]
+    results.sort(
+        key=lambda result: (
+            -result.score,
+            result.document.original_filename.lower(),
+            result.document.document_id,
+        )
+    )
+    return results[:limit]
+
+
+def _rank_uploaded_documents_by_embedding(
+    documents: list[LimiraUploadedDocument],
+    query: str,
+    query_embedding: list[float],
+    limit: int,
+) -> list[LimiraUploadedDocumentSearchResult]:
+    results = [
+        result
+        for result in (
+            _uploaded_document_vector_search_result(
+                document,
+                query,
+                _cosine_similarity(query_embedding, document.embedding),
+            )
+            for document in documents
+            if document.embedding is not None
+        )
+        if result is not None
+    ]
+    results.sort(
+        key=lambda result: (
+            -result.score,
+            result.document.original_filename.lower(),
+            result.document.document_id,
+        )
+    )
+    return results[:limit]
+
+
+def _cosine_similarity(
+    left: list[float],
+    right: list[float] | None,
+) -> float | None:
+    if right is None or len(left) != len(right):
+        return None
+    dot = sum(
+        float(left_value) * float(right_value)
+        for left_value, right_value in zip(left, right)
+    )
+    left_norm = sum(float(value) * float(value) for value in left) ** 0.5
+    right_norm = sum(float(value) * float(value) for value in right) ** 0.5
+    if left_norm == 0.0 or right_norm == 0.0:
+        return None
+    return dot / (left_norm * right_norm)
+
+
+def _uploaded_document_vector_search_result(
+    document: LimiraUploadedDocument,
+    query: str,
+    score: float | None,
+) -> LimiraUploadedDocumentSearchResult | None:
+    if score is None:
+        return None
+    terms = _search_terms(query)
+    matched_terms = [
+        term
+        for term in terms
+        if term in (document.extracted_text or "").lower()
+        or term in (document.original_filename or "").lower()
+    ]
+    return LimiraUploadedDocumentSearchResult(
+        document=document,
+        score=score,
+        snippet=_uploaded_document_search_snippet(
+            document.extracted_text or "",
+            document.original_filename or "",
+            matched_terms or terms,
+        ),
+        matched_terms=matched_terms,
+    )
+
+
+def _uploaded_document_search_result(
+    document: LimiraUploadedDocument,
+    terms: list[str],
+) -> LimiraUploadedDocumentSearchResult | None:
+    haystack_text = document.extracted_text or ""
+    filename = document.original_filename or ""
+    text_lower = haystack_text.lower()
+    filename_lower = filename.lower()
+    matched_terms = [
+        term for term in terms if term in text_lower or term in filename_lower
+    ]
+    if not matched_terms:
+        return None
+
+    score = 0.0
+    for term in matched_terms:
+        score += text_lower.count(term)
+        score += filename_lower.count(term) * 2
+    return LimiraUploadedDocumentSearchResult(
+        document=document,
+        score=score,
+        snippet=_uploaded_document_search_snippet(haystack_text, filename, matched_terms),
+        matched_terms=matched_terms,
+    )
+
+
+def _uploaded_document_search_snippet(
+    text: str,
+    filename: str,
+    terms: list[str],
+) -> str:
+    source = text.strip() or filename
+    if not source:
+        return ""
+    source_lower = source.lower()
+    first_index = min(
+        (source_lower.find(term) for term in terms if source_lower.find(term) >= 0),
+        default=0,
+    )
+    start = max(first_index - 60, 0)
+    end = min(start + 180, len(source))
+    snippet = source[start:end].strip()
+    if start > 0:
+        snippet = f"...{snippet}"
+    if end < len(source):
+        snippet = f"{snippet}..."
+    return _browser_safe_text(snippet)
+
+
+def _browser_safe_text(value: str) -> str:
+    scrubbed = str(scrub_limira_secrets(value))
+    for needle in FORBIDDEN_BROWSER_SUBSTRINGS:
+        scrubbed = scrubbed.replace(needle, LIMIRA_SECRET_REDACTION)
+    return scrubbed
+
+
+def _runtime_mapping(fields: dict[str, Any]) -> dict[str, str]:
+    return {
+        field: json.dumps(value, ensure_ascii=False)
+        for field, value in fields.items()
+        if value is not None
+    }
+
+
+def _flatten_runtime_mapping(mapping: dict[str, str]) -> list[str]:
+    flattened: list[str] = []
+    for field, value in mapping.items():
+        flattened.extend([field, value])
+    return flattened
+
+
+def _runtime_hash_from_redis(raw_state: Any) -> dict[str, Any]:
+    if not raw_state:
+        return {}
+    items = raw_state.items() if hasattr(raw_state, "items") else []
+    return {
+        _decode_redis_text(field): _json_loads(_decode_redis_text(value))
+        for field, value in items
+    }
+
+
+def _decode_redis_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _runtime_state_ttl_seconds(value: Any) -> int:
+    if value in (None, ""):
+        return 86_400
+    try:
+        ttl_seconds = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("limira_runtime_state_ttl_seconds_invalid") from None
+    if ttl_seconds <= 0:
+        raise RuntimeError("limira_runtime_state_ttl_seconds_invalid")
+    return ttl_seconds
+
+
+def _list_of_strings(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item is not None]
+    return [str(value)]
+
+
+def scrub_limira_secrets(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        scrubbed: dict[Any, Any] = {}
+        for key, item in value.items():
+            scrubbed_key = _scrub_mapping_key(key)
+            if _is_secret_field_name(key):
+                scrubbed[scrubbed_key] = LIMIRA_SECRET_REDACTION
+            else:
+                scrubbed[scrubbed_key] = scrub_limira_secrets(item)
+        return scrubbed
+    if isinstance(value, list):
+        return [scrub_limira_secrets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(scrub_limira_secrets(item) for item in value)
+    if isinstance(value, set):
+        return {scrub_limira_secrets(item) for item in value}
+    if isinstance(value, bytes):
+        try:
+            return _scrub_secret_text(value.decode("utf-8")).encode("utf-8")
+        except UnicodeDecodeError:
+            return value
+    if isinstance(value, str):
+        return _scrub_secret_text(value)
+    return value
+
+
+def _scrub_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(scrub_limira_secrets(str(value)))
+
+
+def _public_error_text(value: Any, *, fallback: str) -> str | None:
+    scrubbed = _scrub_optional_text(value)
+    if scrubbed is None:
+        return None
+    if any(pattern.search(scrubbed) for pattern in INTERNAL_ERROR_TEXT_PATTERNS):
+        return fallback
+    return scrubbed
+
+
+def _public_reason_text(value: Any) -> str | None:
+    return _public_error_text(value, fallback="runner_stream_conflict")
+
+
+def _public_model_summary(value: Any) -> Any:
+    scrubbed = scrub_limira_secrets(value)
+    return _public_metadata_value(scrubbed)
+
+
+def _public_metadata_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        public: dict[Any, Any] = {}
+        for key, item in value.items():
+            public_key = _public_metadata_key(key)
+            if public_key is None:
+                continue
+            public[public_key] = _public_metadata_value(item)
+        return public
+    if isinstance(value, list):
+        return [_public_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_metadata_value(item) for item in value]
+    if isinstance(value, set):
+        return [_public_metadata_value(item) for item in sorted(value, key=str)]
+    if isinstance(value, bytes):
+        try:
+            return _public_metadata_value(value.decode("utf-8"))
+        except UnicodeDecodeError:
+            return LIMIRA_SECRET_REDACTION
+    if isinstance(value, str):
+        return _public_error_text(
+            value,
+            fallback="limira_internal_value_redacted",
+        )
+    return value
+
+
+def _public_metadata_key(key: Any) -> str | None:
+    key_text = str(key)
+    if _is_internal_metadata_field_name(key_text):
+        return None
+    public_key = _public_error_text(
+        key_text,
+        fallback="limira_internal_field_redacted",
+    )
+    if not public_key or public_key == "limira_internal_field_redacted":
+        return None
+    return public_key
+
+
+def _is_internal_metadata_field_name(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_")
+    return bool(
+        re.search(
+            r"(?:^|_)(?:object_key|minio_object_key|pdf_object_key|"
+            r"archive_object_key|runner_task_id|runner_url|service_token)(?:$|_)",
+            normalized,
+        )
+    )
+
+
+def _scrub_mapping_key(key: Any) -> Any:
+    scrubbed_key = scrub_limira_secrets(key)
+    try:
+        hash(scrubbed_key)
+    except TypeError:
+        return _scrub_secret_text(str(key))
+    return scrubbed_key
+
+
+def _is_secret_field_name(value: Any) -> bool:
+    return bool(SECRET_FIELD_PATTERN.search(str(value)))
+
+
+def _scrub_secret_text(value: str) -> str:
+    protected_urls: list[str] = []
+
+    def protect_url(match: re.Match[str]) -> str:
+        protected_urls.append(_scrub_url_text(match.group(0)))
+        return f"__LIMIRA_URL_{len(protected_urls) - 1}__"
+
+    redacted = URL_PATTERN.sub(protect_url, value)
+    redacted = _scrub_non_url_secret_text(redacted)
+    for index, url in enumerate(protected_urls):
+        redacted = redacted.replace(f"__LIMIRA_URL_{index}__", url)
+    return redacted
+
+
+def _scrub_url_text(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return LIMIRA_SECRET_REDACTION
+
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return value
+
+    hostname = parts.hostname
+    if not hostname:
+        return value
+    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return LIMIRA_SECRET_REDACTION
+    if port is not None:
+        host = f"{host}:{port}"
+
+    query = urlencode(
+        [
+            (
+                key,
+                LIMIRA_SECRET_REDACTION
+                if _is_sensitive_url_query_key(key)
+                else _scrub_non_url_secret_text(value),
+            )
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ],
+        doseq=True,
+    )
+    return urlunsplit((parts.scheme, host, parts.path, query, parts.fragment))
+
+
+def _is_sensitive_url_query_key(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_")
+    return normalized in SENSITIVE_URL_QUERY_KEYS or _is_secret_field_name(normalized)
+
+
+def _scrub_non_url_secret_text(value: str) -> str:
+    redacted = value
+    for pattern in SECRET_TEXT_PATTERNS:
+        if pattern.groups:
+            redacted = pattern.sub(
+                lambda match: f"{match.group(1)}{LIMIRA_SECRET_REDACTION}",
+                redacted,
+            )
+        else:
+            redacted = pattern.sub(LIMIRA_SECRET_REDACTION, redacted)
+    return redacted
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _temporal_value(artifact: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = artifact.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _geometry_params(artifact: dict[str, Any]) -> dict[str, str | None]:
+    geometry = (
+        artifact.get("geometry")
+        or artifact.get("geojson")
+        or artifact.get("wkt")
+        or artifact.get("point")
+    )
+
+    if isinstance(geometry, str):
+        stripped = geometry.strip()
+        if stripped.startswith("{"):
+            return {"geometry_geojson": stripped, "geometry_wkt": None}
+        if stripped:
+            return {"geometry_geojson": None, "geometry_wkt": stripped}
+
+    if isinstance(geometry, dict):
+        if geometry.get("type") and geometry.get("coordinates") is not None:
+            return {
+                "geometry_geojson": _json_dumps(geometry),
+                "geometry_wkt": None,
+            }
+        coordinate_pair = _coordinate_pair(geometry)
+        if coordinate_pair:
+            return {
+                "geometry_geojson": _json_dumps(
+                    {"type": "Point", "coordinates": coordinate_pair}
+                ),
+                "geometry_wkt": None,
+            }
+
+    if isinstance(geometry, (list, tuple)):
+        coordinate_pair = _coordinate_pair({"coordinates": geometry})
+        if coordinate_pair:
+            return {
+                "geometry_geojson": _json_dumps(
+                    {"type": "Point", "coordinates": coordinate_pair}
+                ),
+                "geometry_wkt": None,
+            }
+
+    coordinate_pair = _coordinate_pair(artifact)
+    if not coordinate_pair and isinstance(artifact.get("location"), dict):
+        coordinate_pair = _coordinate_pair(artifact["location"])
+    if coordinate_pair:
+        return {
+            "geometry_geojson": _json_dumps(
+                {"type": "Point", "coordinates": coordinate_pair}
+            ),
+            "geometry_wkt": None,
+        }
+
+    return {"geometry_geojson": None, "geometry_wkt": None}
+
+
+def _coordinate_pair(value: dict[str, Any]) -> list[float] | None:
+    coordinates = value.get("coordinates")
+    if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+        lon, lat = coordinates[0], coordinates[1]
+    else:
+        lon = value.get("lon", value.get("lng", value.get("longitude")))
+        lat = value.get("lat", value.get("latitude"))
+    try:
+        if lon is None or lat is None:
+            return None
+        return [float(lon), float(lat)]
+    except (TypeError, ValueError):
+        return None
+
+
+def _location_text(value: Any) -> str | None:
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return None
+    return str(value)
+
+
+def _sql_text(sql: str) -> Any:
+    try:
+        from sqlalchemy import text
+    except ImportError:
+        return sql
+
+    return text(sql)
+
+
+def _is_postgres_database_url(database_url: str) -> bool:
+    return database_url.startswith(("postgresql://", "postgresql+", "postgres://"))
+
+
+def _allowed_entity_types() -> set[str]:
+    return {
+        "country",
+        "agency",
+        "company",
+        "person",
+        "policy",
+        "bill",
+        "sanction_target",
+        "technology",
+        "project",
+        "location",
+        "event",
+    }
+
+
+def _allowed_relation_types() -> set[str]:
+    return {
+        "sanctions",
+        "regulates",
+        "affects_industry",
+        "owns",
+        "partners_with",
+        "located_in",
+        "supply_chain_dependency",
+        "mentions",
+        "conflicts_with",
+    }
+
+
+def build_limira_object_key(
+    *,
+    owner_user_id: str,
+    category: str,
+    task_id: str | None = None,
+    filename: str | None = None,
+    extension: str | None = None,
+    object_id: str | None = None,
+    key_prefix: str | None = None,
+) -> str:
+    normalized_category = category.strip().lower()
+    if normalized_category not in OBJECT_KEY_CATEGORIES:
+        raise ValueError(f"unsupported_limira_object_category:{category}")
+    owner_digest = hashlib.sha256(owner_user_id.encode("utf-8")).hexdigest()[:24]
+    prefix = _safe_object_segment(
+        key_prefix if key_prefix is not None else os.getenv(LIMIRA_OBJECT_KEY_PREFIX_ENV, "limira"),
+        fallback="limira",
+    )
+    object_segment = _safe_object_segment(object_id or uuid.uuid4().hex, fallback=uuid.uuid4().hex)
+    suffix = _safe_object_extension(filename=filename, extension=extension)
+    parts = [prefix, "users", owner_digest]
+    if task_id:
+        parts.extend(["tasks", _safe_object_segment(task_id, fallback="task")])
+    parts.extend([normalized_category, f"{object_segment}{suffix}"])
+    return "/".join(parts)
+
+
+def _stored_object(
+    *,
+    object_key: str,
+    bucket: str,
+    data: bytes,
+    content_type: str,
+    metadata: Mapping[str, Any] | None,
+) -> LimiraStoredObject:
+    object_key = validate_limira_object_key(object_key)
+    data_bytes = bytes(data)
+    return LimiraStoredObject(
+        object_key=object_key,
+        bucket=bucket,
+        content_type=content_type or "application/octet-stream",
+        size_bytes=len(data_bytes),
+        sha256=hashlib.sha256(data_bytes).hexdigest(),
+        metadata=_object_metadata(metadata or {}),
+    )
+
+
+def validate_limira_object_key(object_key: str) -> str:
+    if not isinstance(object_key, str):
+        raise ValueError("invalid_limira_object_key")
+    object_key = object_key.strip()
+    if not object_key or object_key.startswith("/") or "\\" in object_key:
+        raise ValueError("invalid_limira_object_key")
+    segments = object_key.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise ValueError("invalid_limira_object_key")
+    if any(segment.endswith(OBJECT_METADATA_SIDECAR_SUFFIX) for segment in segments):
+        raise ValueError("invalid_limira_object_key")
+    return object_key
+
+
+def _is_valid_limira_object_key(object_key: str | None) -> bool:
+    if not object_key:
+        return False
+    try:
+        validate_limira_object_key(object_key)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_valid_report_pdf_metadata(
+    object_key: str | None,
+    pdf_sha256: Any,
+) -> bool:
+    return (
+        _is_valid_limira_object_key(object_key)
+        and isinstance(pdf_sha256, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", pdf_sha256.strip()) is not None
+    )
+
+
+def _is_valid_uploaded_document_download_metadata(
+    object_key: str | None,
+    sha256: Any,
+    download_unavailable: Any,
+) -> bool:
+    return (
+        not download_unavailable
+        and _is_valid_limira_object_key(object_key)
+        and isinstance(sha256, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", sha256.strip()) is not None
+    )
+
+
+def _object_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:

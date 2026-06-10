@@ -1,0 +1,1500 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import html
+import hmac
+import ipaddress
+import io
+import json
+import logging
+import os
+import re
+import secrets
+import sqlite3
+import smtplib
+import time
+import uuid
+import zipfile
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import asdict, dataclass
+from email.message import EmailMessage
+from typing import Any, Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import httpx
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.responses import RedirectResponse, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
+
+try:
+    import bcrypt as _bcrypt
+except Exception:  # pragma: no cover - depends on optional runtime package
+    _bcrypt = None
+
+
+ARCHIVE_MEMBER_ORDER = ("metadata.json", "report.html", "report.md", "trace.json")
+ARCHIVE_SNAPSHOT_DIR = "evidence_snapshots"
+ARCHIVE_SNAPSHOT_MANIFEST = f"{ARCHIVE_SNAPSHOT_DIR}/manifest.json"
+ARCHIVE_SNAPSHOT_MEMBER_PATTERN = re.compile(
+    rf"^{ARCHIVE_SNAPSHOT_DIR}/[A-Za-z0-9._-]+\.html$"
+)
+ARCHIVE_JSON_MEMBERS = {"metadata.json", "trace.json", ARCHIVE_SNAPSHOT_MANIFEST}
+ARCHIVE_MEMBER_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+ARCHIVE_SNAPSHOT_TIMEOUT_ENV = "LIMIRA_ARCHIVE_SNAPSHOT_TIMEOUT_SECONDS"
+ARCHIVE_SNAPSHOT_MAX_BYTES_ENV = "LIMIRA_ARCHIVE_SNAPSHOT_MAX_BYTES"
+ARCHIVE_SNAPSHOT_MAX_PAGES_ENV = "LIMIRA_ARCHIVE_SNAPSHOT_MAX_PAGES"
+LIMIRA_SECRET_REDACTION = "[REDACTED]"
+FORBIDDEN_BROWSER_SUBSTRINGS = {
+    "/limira-runner/",
+    "limira-runner:8091",
+    "localhost:8091",
+    "RUNNER_SERVICE_TOKEN",
+}
+FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+ARTIFACT_BUCKETS = {
+    "evidence": "evidence",
+    "entity": "entities",
+    "relation": "relations",
+    "timeline_event": "timeline_events",
+    "map_feature": "map_features",
+    "verification": "verifications",
+    "report_section": "report_sections",
+}
+ARTIFACT_EVENT_TYPES = {
+    "evidence_collected": "evidence",
+    "entity_extracted": "entity",
+    "relation_extracted": "relation",
+    "timeline_event_added": "timeline_event",
+    "map_feature_added": "map_feature",
+    "verification_result": "verification",
+    "report_section_generated": "report_section",
+}
+ARTIFACT_TYPE_EVENTS = {
+    artifact_type: event_type
+    for event_type, artifact_type in ARTIFACT_EVENT_TYPES.items()
+}
+LIMIRA_REPOSITORY_BACKEND_ENV = "LIMIRA_REPOSITORY_BACKEND"
+LIMIRA_DATABASE_URL_ENV = "LIMIRA_DATABASE_URL"
+LIMIRA_SQLITE_DATABASE_PATH_ENV = "LIMIRA_SQLITE_DATABASE_PATH"
+LIMIRA_ALLOW_IN_MEMORY_REPOSITORY_ENV = "LIMIRA_ALLOW_IN_MEMORY_REPOSITORY"
+LIMIRA_RUNTIME_STATE_BACKEND_ENV = "LIMIRA_RUNTIME_STATE_BACKEND"
+LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE_ENV = "LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE"
+LIMIRA_RUNTIME_STATE_KEY_PREFIX_ENV = "LIMIRA_RUNTIME_STATE_KEY_PREFIX"
+LIMIRA_RUNTIME_STATE_TTL_SECONDS_ENV = "LIMIRA_RUNTIME_STATE_TTL_SECONDS"
+LIMIRA_OBJECT_STORAGE_BACKEND_ENV = "LIMIRA_OBJECT_STORAGE_BACKEND"
+LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE_ENV = "LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE"
+LIMIRA_OBJECT_STORAGE_PATH_ENV = "LIMIRA_OBJECT_STORAGE_PATH"
+LIMIRA_OBJECT_BUCKET_ENV = "LIMIRA_OBJECT_BUCKET"
+LIMIRA_OBJECT_KEY_PREFIX_ENV = "LIMIRA_OBJECT_KEY_PREFIX"
+LIMIRA_OBJECT_STORAGE_ENDPOINT_ENV = "S3_ENDPOINT_URL"
+LIMIRA_OBJECT_ACCESS_KEY_ENV = "AWS_ACCESS_KEY_ID"
+LIMIRA_OBJECT_SECRET_KEY_ENV = "AWS_SECRET_ACCESS_KEY"
+LIMIRA_OBJECT_REGION_ENV = "AWS_REGION"
+LIMIRA_UPLOAD_EMBEDDINGS_ENABLED_ENV = "LIMIRA_UPLOAD_EMBEDDINGS_ENABLED"
+LIMIRA_EMBEDDING_PROVIDER_ENV = "LIMIRA_EMBEDDING_PROVIDER"
+LIMIRA_EMBEDDING_MODEL_ENV = "LIMIRA_EMBEDDING_MODEL"
+LIMIRA_EMBEDDING_DIMENSIONS_ENV = "LIMIRA_EMBEDDING_DIMENSIONS"
+LIMIRA_PDF_DEBUG_DIR_ENV = "LIMIRA_PDF_DEBUG_DIR"
+LIMIRA_PLAYWRIGHT_RUNTIME_PATH_ENV = "LIMIRA_PLAYWRIGHT_RUNTIME_PATH"
+LIMIRA_AUTH_SQLITE_PATH_ENV = "LIMIRA_AUTH_SQLITE_PATH"
+LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV = "LIMIRA_LEGACY_AUTH_SQLITE_PATH"
+LIMIRA_AUTH_SECRET_ENV = "LIMIRA_AUTH_SECRET"
+LIMIRA_AUTH_TOKEN_TTL_SECONDS_ENV = "LIMIRA_AUTH_TOKEN_TTL_SECONDS"
+LIMIRA_AUTH_COOKIE_SECURE_ENV = "LIMIRA_AUTH_COOKIE_SECURE"
+LIMIRA_PUBLIC_BASE_URL_ENV = "LIMIRA_PUBLIC_BASE_URL"
+LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV = "LIMIRA_AUTH_EMAIL_OUTBOX_PATH"
+LIMIRA_AUTH_EMAIL_VERIFY_TTL_SECONDS_ENV = "LIMIRA_AUTH_EMAIL_VERIFY_TTL_SECONDS"
+LIMIRA_AUTH_PASSWORD_RESET_TTL_SECONDS_ENV = "LIMIRA_AUTH_PASSWORD_RESET_TTL_SECONDS"
+LIMIRA_SMTP_HOST_ENV = "LIMIRA_SMTP_HOST"
+LIMIRA_SMTP_PORT_ENV = "LIMIRA_SMTP_PORT"
+LIMIRA_SMTP_USERNAME_ENV = "LIMIRA_SMTP_USERNAME"
+LIMIRA_SMTP_PASSWORD_ENV = "LIMIRA_SMTP_PASSWORD"
+LIMIRA_SMTP_FROM_ENV = "LIMIRA_SMTP_FROM"
+LIMIRA_SMTP_TLS_ENV = "LIMIRA_SMTP_TLS"
+LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV = "LIMIRA_GOOGLE_OAUTH_CLIENT_ID"
+LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV = "LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET"
+LIMIRA_GOOGLE_OAUTH_REDIRECT_URI_ENV = "LIMIRA_GOOGLE_OAUTH_REDIRECT_URI"
+LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV = "LIMIRA_GOOGLE_OAUTH_AUTH_URL"
+LIMIRA_GOOGLE_OAUTH_TOKEN_URL_ENV = "LIMIRA_GOOGLE_OAUTH_TOKEN_URL"
+LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL_ENV = "LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL"
+LIMIRA_WECHAT_OAUTH_APP_ID_ENV = "LIMIRA_WECHAT_OAUTH_APP_ID"
+LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV = "LIMIRA_WECHAT_OAUTH_APP_SECRET"
+LIMIRA_WECHAT_OAUTH_REDIRECT_URI_ENV = "LIMIRA_WECHAT_OAUTH_REDIRECT_URI"
+LIMIRA_WECHAT_OAUTH_AUTH_URL_ENV = "LIMIRA_WECHAT_OAUTH_AUTH_URL"
+LIMIRA_WECHAT_OAUTH_TOKEN_URL_ENV = "LIMIRA_WECHAT_OAUTH_TOKEN_URL"
+LIMIRA_WECHAT_OAUTH_USERINFO_URL_ENV = "LIMIRA_WECHAT_OAUTH_USERINFO_URL"
+LIMIRA_AUTH_COOKIE_NAME = "limira_session"
+LIMIRA_GOOGLE_OAUTH_STATE_COOKIE_NAME = "limira_google_oauth_state"
+LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME = "limira_wechat_oauth_state"
+LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
+LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS = 60 * 60 * 24
+LIMIRA_AUTH_DEFAULT_PASSWORD_RESET_TTL_SECONDS = 60 * 60
+LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS = 10 * 60
+LIMIRA_WECHAT_OAUTH_STATE_TTL_SECONDS = 10 * 60
+LIMIRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+OBJECT_KEY_FORBIDDEN_FIELDS = {
+    "archive_object_key",
+    "archiveObjectKey",
+    "object_key",
+    "objectKey",
+    "pdf_object_key",
+    "pdfObjectKey",
+    "s3_key",
+    "s3Key",
+    "minio_object_key",
+    "minioObjectKey",
+}
+OBJECT_KEY_CATEGORIES = {"uploads", "reports", "archives", "media"}
+OBJECT_METADATA_SIDECAR_SUFFIX = ".metadata.json"
+UPLOAD_ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+}
+UPLOAD_GENERIC_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "binary/octet-stream",
+}
+OBJECT_KEY_ALLOWED_EXTENSIONS = {
+    ".bin",
+    ".csv",
+    ".html",
+    ".json",
+    ".md",
+    ".pdf",
+    ".txt",
+    ".zip",
+}
+REPORT_BLOCKED_HTML_TAGS = (
+    "base",
+    "button",
+    "canvas",
+    "embed",
+    "form",
+    "iframe",
+    "img",
+    "input",
+    "link",
+    "math",
+    "meta",
+    "object",
+    "script",
+    "select",
+    "source",
+    "style",
+    "svg",
+    "textarea",
+    "track",
+    "video",
+)
+REPORT_CSP = (
+    "default-src 'none'; "
+    "script-src 'none'; "
+    "style-src 'unsafe-inline'; "
+    "connect-src 'none'; "
+    "img-src 'none'; "
+    "font-src 'none'; "
+    "media-src 'none'; "
+    "object-src 'none'; "
+    "frame-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'"
+)
+SEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)(authorization|cookie|set-cookie|api[_-]?key|secret|token|password|"
+    r"runner_service_token|serper|jina|e2b|openai|deepseek)"
+)
+SECRET_TEXT_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/\-=]+"),
+    re.compile(r"(?i)\b(?:Authorization|Cookie|Set-Cookie)\s*[:=]\s*[^\n\r<>{}\[\]]+"),
+    re.compile(
+        r"(?i)\b(?:RUNNER_SERVICE_TOKEN|SERPER_API_KEY|JINA_API_KEY|E2B_API_KEY|"
+        r"OPENAI_API_KEY|DEEPSEEK_API_KEY|[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))"
+        r"\s*[:=]\s*['\"]?[^'\"\s,;&<>]+"
+    ),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{6,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){1,2}\b"),
+    re.compile(
+        r"(?i)([?&](?:api[_-]?key|apikey|key|token|access_token|id_token|"
+        r"refresh_token|auth|authorization|cookie|secret|password|runner_service_token|"
+        r"serper_api_key|jina_api_key|e2b_api_key|openai_api_key|deepseek_api_key)=)"
+        r"[^&#\s<>'\"]+"
+    ),
+)
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+SENSITIVE_URL_QUERY_KEYS = {
+    "api_key",
+    "apikey",
+    "key",
+    "token",
+    "access_token",
+    "id_token",
+    "refresh_token",
+    "auth",
+    "authorization",
+    "cookie",
+    "secret",
+    "password",
+    "runner_service_token",
+    "serper_api_key",
+    "jina_api_key",
+    "e2b_api_key",
+    "openai_api_key",
+    "deepseek_api_key",
+}
+INTERNAL_ERROR_TEXT_PATTERNS = (
+    re.compile(r"(?i)\bhttps?://"),
+    re.compile(r"/limira-runner/"),
+    re.compile(r"\blimira/users/"),
+    re.compile(
+        r"(?i)\b(?:object_key|minio_object_key|pdf_object_key|archive_object_key)\b"
+    ),
+    re.compile(r"(?i)\btraceback\b|File \"[^\"]+\", line \d+"),
+)
+INTERNAL_ARCHIVE_TASK_FIELDS = {
+    "owner_user_id",
+    "runner_task_id",
+    "object_key",
+    "archive_object_key",
+    "pdf_object_key",
+}
+
+router = APIRouter()
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LimiraDemoScenario:
+    scenario_id: str
+    title: str
+    description: str
+    default_query: str
+    focus_areas: tuple[str, ...]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.scenario_id,
+            "title": self.title,
+            "description": self.description,
+            "default_query": self.default_query,
+            "focus_areas": list(self.focus_areas),
+        }
+
+    def runner_query(self, query: str) -> str:
+        focus = "\n".join(f"- {item}" for item in self.focus_areas)
+        return (
+            f"limira built-in demo scenario: {self.title} ({self.scenario_id}).\n"
+            f"Scenario objective: {self.description}\n\n"
+            f"Focus areas:\n{focus}\n\n"
+            "Artifact requirements:\n"
+            "- Use record_research_artifact for source-backed evidence records, "
+            "entities, relations, timeline events, map features, verification "
+            "notes, and report sections.\n"
+            "- Use task-local references such as EVID-001, ENT-001, TL-001, "
+            "MAP-001, and REPORT-001 when creating artifacts.\n"
+            "- Each evidence artifact should include a title, URL, source, "
+            "summary, confidence, and published_at when available.\n"
+            "- If a trustworthy location exists, create map_feature artifacts "
+            "with GeoJSON Point, LineString, or Polygon geometry; otherwise add "
+            "a report_section that states why the map remains empty.\n"
+            "- Report sections must cite evidence_refs such as [EVID-001] so "
+            "the limira report and archive can link back to evidence.\n"
+            "- Treat unsupported or low-confidence claims as verification "
+            "artifacts instead of silently omitting them.\n\n"
+            f"User research question:\n{query}"
+        )
+
+
+LIMIRA_DEMO_SCENARIOS: dict[str, LimiraDemoScenario] = {
+    scenario.scenario_id: scenario
+    for scenario in (
+        LimiraDemoScenario(
+            scenario_id="sanctions_export_controls",
+            title="Sanctions and export controls",
+            description=(
+                "Track sanctions, export-control, entity-list, and licensing "
+                "changes affecting a company, sector, or supply chain."
+            ),
+            default_query=(
+                "Track recent export control changes affecting semiconductor "
+                "supply chains and identify entities, jurisdictions, and dates."
+            ),
+            focus_areas=(
+                "Official sanctions, export-control, entity-list, and licensing notices",
+                "Affected companies, intermediaries, jurisdictions, and supply-chain links",
+                "Effective dates, enforcement milestones, and compliance deadlines",
+                "Source-backed confidence grading for conflicting or unclear claims",
+            ),
+        ),
+        LimiraDemoScenario(
+            scenario_id="geopolitical_risk_assessment",
+            title="Geopolitical risk assessment",
+            description=(
+                "Assess current political, security, regulatory, and trade risks "
+                "for a target country, corridor, investment, or operation."
+            ),
+            default_query=(
+                "Assess geopolitical risk for a logistics route crossing the Red "
+                "Sea and identify current incidents, actors, and risk indicators."
+            ),
+            focus_areas=(
+                "Recent official advisories, incidents, sanctions, and regulatory actions",
+                "State and non-state actors, alliances, chokepoints, and exposed assets",
+                "Timeline of risk escalation, de-escalation, and announced mitigations",
+                "Geographic hotspots or a clear map-empty rationale when coordinates are unreliable",
+            ),
+        ),
+        LimiraDemoScenario(
+            scenario_id="critical_minerals_competition",
+            title="Critical minerals competition",
+            description=(
+                "Map international competition over critical minerals, including "
+                "projects, offtake deals, processing capacity, policy moves, and "
+                "strategic chokepoints."
+            ),
+            default_query=(
+                "Analyze recent international competition over lithium and nickel "
+                "supply chains, including projects, policy moves, and chokepoints."
+            ),
+            focus_areas=(
+                "Mine, refinery, processing, and transport assets with verifiable locations",
+                "Government policy moves, investment screening, subsidies, and trade restrictions",
+                "Companies, state-backed investors, offtake agreements, and supply-chain dependencies",
+                "Evidence-backed timeline and map artifacts for projects and chokepoints",
+            ),
+        ),
+    )
+}
+
+
+class ResearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=20_000)
+    scenario: str | None = Field(default=None, max_length=120)
+
+
+class ReportPdfRequest(BaseModel):
+    report_id: str | None = Field(default=None, max_length=120)
+    report_type: str = Field(default="final", max_length=80)
+    markdown: str = Field(min_length=1, max_length=2_000_000)
+    html: str | None = Field(default=None, max_length=2_000_000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=2_000)
+
+
+class LimiraAuthSigninRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=4096)
+
+
+class LimiraAuthSignupRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=4096)
+    name: str | None = Field(default=None, max_length=320)
+
+
+class LimiraAuthVerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=512)
+
+
+class LimiraAuthResendVerificationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class LimiraAuthPasswordResetRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class LimiraAuthPasswordResetConfirmRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=512)
+    password: str = Field(min_length=1, max_length=4096)
+
+
+class LimiraEnterpriseSigninRequest(BaseModel):
+    organization_id: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=4096)
+
+
+class LimiraEnterpriseMemberCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=4096)
+    name: str | None = Field(default=None, max_length=320)
+    organization_role: str = Field(default="member", max_length=40)
+
+
+class LimiraEnterpriseOrganizationCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    slug: str | None = Field(default=None, max_length=120)
+
+
+@dataclass(frozen=True)
+class LimiraUser:
+    id: str
+    role: str = "user"
+    email: str | None = None
+    name: str | None = None
+    email_verified_at: int | None = None
+    account_type: str = "personal"
+    organization_id: str | None = None
+    organization_role: str | None = None
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+
+@dataclass(frozen=True)
+class LimiraAuthRecord:
+    id: str
+    email: str
+    name: str
+    role: str
+    password_hash: str
+    active: bool = True
+    email_verified_at: int | None = None
+    account_type: str = "personal"
+    organization_id: str | None = None
+    organization_role: str | None = None
+
+
+@dataclass(frozen=True)
+class LimiraAuthOrganization:
+    id: str
+    name: str
+    slug: str | None = None
+    active: bool = True
+    billing_mode: str = "metered"
+
+
+@dataclass
+class LimiraTask:
+    task_id: str
+    owner_user_id: str
+    query: str
+    status: str = "queued"
+    archive_status: str = "pending"
+    runner_task_id: str | None = None
+    archive_object_key: str | None = None
+    archive_zip_sha256: str | None = None
+    scenario: str | None = None
+    error: str | None = None
+    model_summary: dict[str, Any] | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "query": self.query,
+            "status": self.status,
+            "archive_status": self.archive_status,
+            "scenario": self.scenario,
+            "error": _public_error_text(self.error, fallback="limira_task_failed"),
+            "model_summary": _public_model_summary(self.model_summary or {}),
+            "download_url": f"/api/limira/tasks/{self.task_id}/archive.zip"
+            if self.archive_status == "ready"
+            else None,
+            "events_url": f"/api/limira/tasks/{self.task_id}/events",
+            "artifacts_url": f"/api/limira/tasks/{self.task_id}/artifacts",
+        }
+
+
+@dataclass
+class LimiraUploadedDocument:
+    document_id: str
+    owner_user_id: str
+    task_id: str | None
+    original_filename: str
+    content_type: str | None
+    byte_size: int
+    minio_bucket: str
+    object_key: str
+    extracted_text: str | None = None
+    language: str | None = None
+    metadata: dict[str, Any] | None = None
+    embedding: list[float] | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        download_available = _is_valid_uploaded_document_download_metadata(
+            self.object_key,
+            (self.metadata or {}).get("sha256"),
+            (self.metadata or {}).get("download_unavailable"),
+        )
+        return {
+            "document_id": self.document_id,
+            "task_id": self.task_id,
+            "filename": self.original_filename,
+            "content_type": self.content_type,
+            "byte_size": self.byte_size,
+            "language": self.language,
+            "extracted_text_chars": len(self.extracted_text or ""),
+            "download_url": f"/api/limira/uploads/{self.document_id}/download"
+            if download_available
+            else None,
+        }
+
+
+@dataclass(frozen=True)
+class LimiraUploadedDocumentSearchResult:
+    document: LimiraUploadedDocument
+    score: float
+    snippet: str
+    matched_terms: list[str]
+
+    def public_dict(self) -> dict[str, Any]:
+        payload = self.document.public_dict()
+        payload.update(
+            {
+                "score": round(self.score, 3),
+                "snippet": self.snippet,
+                "matched_terms": list(self.matched_terms),
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class LimiraUploadEmbeddingConfig:
+    enabled: bool
+    provider: str
+    model: str
+    dimensions: int
+
+
+@dataclass
+class LimiraGeneratedReport:
+    report_id: str
+    task_id: str
+    report_type: str
+    markdown: str
+    html: str | None
+    pdf_object_key: str | None
+    evidence_refs: list[str]
+    creator_user_id: str
+    metadata: dict[str, Any] | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        metadata = self.metadata or {}
+        has_valid_pdf_object = _is_valid_report_pdf_metadata(
+            self.pdf_object_key,
+            metadata.get("pdf_sha256"),
+        )
+        return {
+            "report_id": self.report_id,
+            "task_id": self.task_id,
+            "report_type": self.report_type,
+            "evidence_refs": list(self.evidence_refs),
+            "markdown_chars": len(self.markdown or ""),
+            "html_chars": len(self.html or ""),
+            "pdf_size_bytes": metadata.get("pdf_size_bytes")
+            if has_valid_pdf_object
+            else None,
+            "pdf_sha256": metadata.get("pdf_sha256") if has_valid_pdf_object else None,
+            "pdf_url": f"/api/limira/tasks/{self.task_id}/reports/{self.report_id}/pdf"
+            if has_valid_pdf_object
+            else None,
+        }
+
+
+class RunnerStreamConflict(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class LimiraTaskRepository(Protocol):
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        owner_user_id: str,
+        query: str,
+        scenario: str | None,
+        runner_task_id: str | None,
+    ) -> LimiraTask: ...
+
+    def get_task(self, task_id: str) -> LimiraTask | None: ...
+
+    def get_user_task(self, task_id: str, owner_user_id: str) -> LimiraTask | None: ...
+
+    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimiraTask]: ...
+
+    def update_task(self, task_id: str, **updates: Any) -> LimiraTask: ...
+
+    def record_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+    ) -> None: ...
+
+    def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]: ...
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None: ...
+
+    def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]: ...
+
+    def record_task_event_log(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        source: str = "runner_stream",
+    ) -> None: ...
+
+    def list_task_event_logs(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]: ...
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
+    ) -> LimiraUploadedDocument: ...
+
+    def get_user_document(
+        self,
+        document_id: str,
+        owner_user_id: str,
+    ) -> LimiraUploadedDocument | None: ...
+
+    def list_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        task_id: str | None = None,
+    ) -> list[LimiraUploadedDocument]: ...
+
+    def search_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+        task_id: str | None = None,
+        query_embedding: list[float] | None = None,
+    ) -> list[LimiraUploadedDocumentSearchResult]: ...
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimiraGeneratedReport: ...
+
+    def get_user_report(
+        self,
+        *,
+        task_id: str,
+        report_id: str,
+        owner_user_id: str,
+    ) -> LimiraGeneratedReport | None: ...
+
+    def list_task_reports(
+        self,
+        *,
+        task_id: str,
+    ) -> list[LimiraGeneratedReport]: ...
+
+
+class RunnerResearchClientProtocol(Protocol):
+    async def create_research_task(
+        self,
+        *,
+        query: str,
+        scenario: str | None,
+        user: LimiraUser,
+    ) -> dict[str, Any]: ...
+
+    def stream_events(
+        self,
+        *,
+        task: LimiraTask,
+        user: LimiraUser,
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
+    async def get_task_status(
+        self,
+        *,
+        task: LimiraTask,
+        user: LimiraUser,
+    ) -> dict[str, Any]: ...
+
+
+class LimiraRuntimeState(Protocol):
+    async def get_task_runtime(
+        self,
+        task_id: str,
+    ) -> dict[str, Any]: ...
+
+    async def try_open_stream(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool: ...
+
+    async def update_task_runtime(
+        self,
+        task_id: str,
+        fields: dict[str, Any],
+    ) -> None: ...
+
+    async def close_stream(
+        self,
+        task_id: str,
+        *,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class LimiraStoredObject:
+    object_key: str
+    bucket: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    metadata: dict[str, str]
+
+
+@dataclass(frozen=True)
+class EvidencePageSnapshot:
+    url: str
+    final_url: str
+    status_code: int
+    content_type: str
+    html: str
+    truncated: bool = False
+
+
+class LimiraObjectStorage(Protocol):
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimiraStoredObject: ...
+
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes: ...
+
+
+class LimiraUploadEmbeddingProvider(Protocol):
+    async def embed_upload_text(
+        self,
+        text: str,
+        *,
+        config: LimiraUploadEmbeddingConfig,
+    ) -> list[float]: ...
+
+
+class LimiraPdfExporter(Protocol):
+    async def render_pdf(self, html_content: str) -> bytes: ...
+
+
+class InMemoryLimiraTaskRepository:
+    def __init__(self) -> None:
+        self.tasks: dict[str, LimiraTask] = {}
+        self.artifacts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self.artifact_trace_events: dict[str, list[dict[str, Any]]] = {}
+        self.task_event_logs: dict[str, list[dict[str, Any]]] = {}
+        self.uploaded_documents: dict[str, LimiraUploadedDocument] = {}
+        self.generated_reports: dict[tuple[str, str], LimiraGeneratedReport] = {}
+
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        owner_user_id: str,
+        query: str,
+        scenario: str | None,
+        runner_task_id: str | None,
+    ) -> LimiraTask:
+        task = LimiraTask(
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            query=query,
+            scenario=scenario,
+            runner_task_id=runner_task_id,
+        )
+        self.tasks[task_id] = task
+        self.artifacts[task_id] = _empty_artifact_buckets()
+        self.artifact_trace_events[task_id] = []
+        self.task_event_logs[task_id] = []
+        return task
+
+    def get_task(self, task_id: str) -> LimiraTask | None:
+        return self.tasks.get(task_id)
+
+    def get_user_task(self, task_id: str, owner_user_id: str) -> LimiraTask | None:
+        task = self.get_task(task_id)
+        if not task or task.owner_user_id != owner_user_id:
+            return None
+        return task
+
+    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimiraTask]:
+        tasks = [
+            task
+            for task in reversed(list(self.tasks.values()))
+            if task.owner_user_id == owner_user_id
+        ]
+        return tasks[:limit]
+
+    def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
+        task = self.get_task(task_id)
+        if not task:
+            raise KeyError(task_id)
+        for field_name, value in updates.items():
+            if hasattr(task, field_name):
+                setattr(task, field_name, value)
+        return task
+
+    def _invalidate_archive_metadata(self, task_id: str | None) -> None:
+        if not task_id:
+            return
+        task = self.get_task(task_id)
+        if not task or (task.archive_object_key is None and task.archive_zip_sha256 is None):
+            return
+        task.archive_object_key = None
+        task.archive_zip_sha256 = None
+
+    def record_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+    ) -> None:
+        task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
+        bucket = ARTIFACT_BUCKETS[artifact_type]
+        task_artifacts[bucket].append(artifact)
+        self.record_artifact_trace_event(
+            task_id,
+            _artifact_trace_event_from_artifact(artifact_type, bucket, artifact),
+        )
+        self._invalidate_archive_metadata(task_id)
+
+    def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
+        task_artifacts = self.artifacts.setdefault(task_id, _empty_artifact_buckets())
+        return {bucket: list(items) for bucket, items in task_artifacts.items()}
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        self.artifact_trace_events.setdefault(task_id, []).append(dict(event))
+        self._invalidate_archive_metadata(task_id)
+
+    def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]:
+        return [dict(event) for event in self.artifact_trace_events.get(task_id, [])]
+
+    def record_task_event_log(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        source: str = "runner_stream",
+    ) -> None:
+        event_type = str(event.get("type") or "runner_event")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        self.task_event_logs.setdefault(task_id, []).append(
+            {
+                "event_log_id": str(uuid.uuid4()),
+                "task_id": task_id,
+                "event_type": event_type,
+                "source": source,
+                "payload": scrub_limira_secrets(payload),
+                "created_at": time.time(),
+            }
+        )
+
+    def list_task_event_logs(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(event)
+            for event in self.task_event_logs.get(task_id, [])[-max(1, limit):]
+        ]
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
+    ) -> LimiraUploadedDocument:
+        document = LimiraUploadedDocument(
+            document_id=document_id,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            original_filename=original_filename,
+            content_type=content_type,
+            byte_size=byte_size,
+            minio_bucket=minio_bucket,
+            object_key=object_key,
+            extracted_text=extracted_text,
+            language=language,
+            metadata=dict(metadata or {}),
+            embedding=list(embedding) if embedding is not None else None,
+        )
+        self.uploaded_documents[document_id] = document
+        self._invalidate_archive_metadata(task_id)
+        return document
+
+    def get_user_document(
+        self,
+        document_id: str,
+        owner_user_id: str,
+    ) -> LimiraUploadedDocument | None:
+        document = self.uploaded_documents.get(document_id)
+        if not document or document.owner_user_id != owner_user_id:
+            return None
+        return document
+
+    def list_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        task_id: str | None = None,
+    ) -> list[LimiraUploadedDocument]:
+        documents = [
+            document
+            for document in self.uploaded_documents.values()
+            if document.owner_user_id == owner_user_id
+            and (task_id is None or document.task_id == task_id)
+        ]
+        return sorted(documents, key=lambda document: document.document_id)
+
+    def search_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+        task_id: str | None = None,
+        query_embedding: list[float] | None = None,
+    ) -> list[LimiraUploadedDocumentSearchResult]:
+        documents = self.list_user_documents(
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+        )
+        if query_embedding is not None:
+            vector_results = _rank_uploaded_documents_by_embedding(
+                documents,
+                query,
+                query_embedding,
+                limit,
+            )
+            if vector_results:
+                return vector_results
+        return _rank_uploaded_documents(documents, query, limit)
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimiraGeneratedReport:
+        report = LimiraGeneratedReport(
+            report_id=report_id,
+            task_id=task_id,
+            report_type=report_type,
+            markdown=markdown,
+            html=html,
+            pdf_object_key=pdf_object_key,
+            evidence_refs=list(evidence_refs),
+            creator_user_id=creator_user_id,
+            metadata=dict(metadata or {}),
+        )
+        self.generated_reports[(task_id, report_id)] = report
+        self._invalidate_archive_metadata(task_id)
+        return report
+
+    def get_user_report(
+        self,
+        *,
+        task_id: str,
+        report_id: str,
+        owner_user_id: str,
+    ) -> LimiraGeneratedReport | None:
+        task = self.get_user_task(task_id, owner_user_id)
+        if not task:
+            return None
+        return self.generated_reports.get((task_id, report_id))
+
+    def list_task_reports(
+        self,
+        *,
+        task_id: str,
+    ) -> list[LimiraGeneratedReport]:
+        reports = [
+            report
+            for (report_task_id, _report_id), report in self.generated_reports.items()
+            if report_task_id == task_id
+        ]
+        return sorted(
+            reports,
+            key=lambda report: (report.report_type != "final", report.report_id),
+        )
+
+
+class SQLiteLimiraTaskRepository(InMemoryLimiraTaskRepository):
+    def __init__(self, database_path: str) -> None:
+        super().__init__()
+        self.database_path = os.path.abspath(os.path.expanduser(database_path))
+        os.makedirs(os.path.dirname(self.database_path), exist_ok=True)
+        self._init_db()
+        self._load_state()
+
+    def _init_db(self) -> None:
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS limira_repository_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.database_path, timeout=30)
+
+    def _load_state(self) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM limira_repository_state WHERE state_key = ?",
+                ("state",),
+            ).fetchone()
+        if not row:
+            return
+        try:
+            state = json.loads(row[0])
+        except json.JSONDecodeError:
+            log.warning("Ignoring invalid limira SQLite repository state")
+            return
+
+        self.tasks = {
+            str(task_id): LimiraTask(**payload)
+            for task_id, payload in (state.get("tasks") or {}).items()
+            if isinstance(payload, dict)
+        }
+        self.artifacts = {
+            str(task_id): _normalize_artifact_buckets(payload)
+            for task_id, payload in (state.get("artifacts") or {}).items()
+            if isinstance(payload, dict)
+        }
+        self.artifact_trace_events = {
+            str(task_id): [dict(event) for event in events if isinstance(event, dict)]
+            for task_id, events in (state.get("artifact_trace_events") or {}).items()
+            if isinstance(events, list)
+        }
+        self.task_event_logs = {
+            str(task_id): [dict(event) for event in events if isinstance(event, dict)]
+            for task_id, events in (state.get("task_event_logs") or {}).items()
+            if isinstance(events, list)
+        }
+        self.uploaded_documents = {
+            str(document_id): LimiraUploadedDocument(**payload)
+            for document_id, payload in (state.get("uploaded_documents") or {}).items()
+            if isinstance(payload, dict)
+        }
+        self.generated_reports = {}
+        for payload in state.get("generated_reports") or []:
+            if not isinstance(payload, dict):
+                continue
+            report = LimiraGeneratedReport(**payload)
+            self.generated_reports[(report.task_id, report.report_id)] = report
+
+    def _persist_state(self) -> None:
+        state = {
+            "tasks": {
+                task_id: asdict(task)
+                for task_id, task in self.tasks.items()
+            },
+            "artifacts": self.artifacts,
+            "artifact_trace_events": self.artifact_trace_events,
+            "task_event_logs": self.task_event_logs,
+            "uploaded_documents": {
+                document_id: asdict(document)
+                for document_id, document in self.uploaded_documents.items()
+            },
+            "generated_reports": [
+                asdict(report)
+                for report in self.generated_reports.values()
+            ],
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO limira_repository_state (state_key, state_json, updated_at)
+                VALUES (?, ?, CAST(strftime('%s', 'now') AS REAL))
+                ON CONFLICT(state_key) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                ("state", json.dumps(state, ensure_ascii=False)),
+            )
+
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        owner_user_id: str,
+        query: str,
+        scenario: str | None,
+        runner_task_id: str | None,
+    ) -> LimiraTask:
+        task = super().create_task(
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            query=query,
+            scenario=scenario,
+            runner_task_id=runner_task_id,
+        )
+        self._persist_state()
+        return task
+
+    def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
+        task = super().update_task(task_id, **updates)
+        self._persist_state()
+        return task
+
+    def record_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+    ) -> None:
+        super().record_artifact(task_id, artifact_type, artifact)
+        self._persist_state()
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        super().record_artifact_trace_event(task_id, event)
+        self._persist_state()
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
+    ) -> LimiraUploadedDocument:
+        document = super().record_uploaded_document(
+            document_id=document_id,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            original_filename=original_filename,
+            content_type=content_type,
+            byte_size=byte_size,
+            minio_bucket=minio_bucket,
+            object_key=object_key,
+            extracted_text=extracted_text,
+            language=language,
+            metadata=metadata,
+            embedding=embedding,
+        )
+        self._persist_state()
+        return document
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimiraGeneratedReport:
+        report = super().record_generated_report(
+            report_id=report_id,
+            task_id=task_id,
+            report_type=report_type,
+            markdown=markdown,
+            html=html,
+            pdf_object_key=pdf_object_key,
+            evidence_refs=evidence_refs,
+            creator_user_id=creator_user_id,
+            metadata=metadata,
+        )
+        self._persist_state()
+        return report
+
+
+class InMemoryLimiraRuntimeState:
+    def __init__(self) -> None:
+        self.task_runtime: dict[str, dict[str, Any]] = {}
+
+    async def get_task_runtime(
+        self,
+        task_id: str,
+    ) -> dict[str, Any]:
+        return dict(self.task_runtime.get(task_id, {}))
+
+    async def try_open_stream(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        task_state = self.task_runtime.setdefault(task_id, {})
+        if task_state.get("stream_state") == "open":
+            return False
+        task_state.update(
+            {
+                **fields,
+                "owner_user_id": owner_user_id,
+                "stream_id": stream_id,
+                "stream_state": "open",
+            }
+        )
+        return True
+
+    async def update_task_runtime(
+        self,
+        task_id: str,
+        fields: dict[str, Any],
+    ) -> None:
+        task_state = self.task_runtime.setdefault(task_id, {})
+        task_state.update(fields)
+
+    async def close_stream(
+        self,
+        task_id: str,
+        *,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        task_state = self.task_runtime.setdefault(task_id, {})
+        if task_state.get("stream_id") not in {None, stream_id}:
+            return False
+        task_state.update(fields)
+        task_state["stream_state"] = "closed"
+        return True
+
+
+class RedisLimiraRuntimeState:
+    TRY_OPEN_STREAM_SCRIPT = """
+    -- limira_try_open_stream
+    local stream_state = redis.call("HGET", KEYS[1], "stream_state")
+    if stream_state == '"open"' then
+        return 0
+    end
+    for index = 2, #ARGV, 2 do
+        redis.call("HSET", KEYS[1], ARGV[index], ARGV[index + 1])
+    end
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+    return 1
+    """
+
+    CLOSE_STREAM_SCRIPT = """
+    -- limira_close_stream
+    local current_stream_id = redis.call("HGET", KEYS[1], "stream_id")
+    if current_stream_id and current_stream_id ~= ARGV[2] then
+        return 0
+    end
+    for index = 3, #ARGV, 2 do
+        redis.call("HSET", KEYS[1], ARGV[index], ARGV[index + 1])
+    end
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+    return 1
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        key_prefix: str = "limira:runtime",
+        ttl_seconds: int = 86_400,
+    ) -> None:
+        if redis_client is None:
+            raise RuntimeError("limira_redis_runtime_state_missing")
+        self.redis_client = redis_client
+        self.key_prefix = key_prefix.rstrip(":")
+        self.ttl_seconds = ttl_seconds
+
+    async def get_task_runtime(
+        self,
+        task_id: str,
+    ) -> dict[str, Any]:
+        key = self.task_key(task_id)
+        raw_state = await _maybe_await(self.redis_client.hgetall(key))
+        return _runtime_hash_from_redis(raw_state)
+
+    async def try_open_stream(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        key = self.task_key(task_id)
+        mapping = _runtime_mapping(
+            {
+                **fields,
+                "owner_user_id": owner_user_id,
+                "stream_id": stream_id,
+                "stream_state": "open",
+            }
+        )
+        result = await _maybe_await(
+            self.redis_client.eval(
+                self.TRY_OPEN_STREAM_SCRIPT,
+                1,
+                key,
+                self.ttl_seconds,
+                *_flatten_runtime_mapping(mapping),
+            )
+        )
+        return bool(result)
+
+    async def update_task_runtime(
+        self,
+        task_id: str,
+        fields: dict[str, Any],
+    ) -> None:
+        key = self.task_key(task_id)
+        mapping = _runtime_mapping(fields)
+        if not mapping:
+            return
+        await _maybe_await(self.redis_client.hset(key, mapping=mapping))
+        await _maybe_await(self.redis_client.expire(key, self.ttl_seconds))
+
+    async def close_stream(
+        self,
+        task_id: str,
+        *,
+        stream_id: str,
+        fields: dict[str, Any],
+    ) -> bool:
+        key = self.task_key(task_id)
+        mapping = _runtime_mapping({"stream_state": "closed", **fields})
+        result = await _maybe_await(
+            self.redis_client.eval(
+                self.CLOSE_STREAM_SCRIPT,
+                1,
+                key,
+                self.ttl_seconds,
+                json.dumps(stream_id, ensure_ascii=False),
+                *_flatten_runtime_mapping(mapping),
+            )
+        )
+        return bool(result)
+
+    def task_key(self, task_id: str) -> str:
+        return f"{self.key_prefix}:task:{task_id}"
+
+
+class InMemoryLimiraObjectStorage:
+    def __init__(self, *, bucket: str = "limira-memory") -> None:
+        self.bucket = bucket
+        self.objects: dict[str, dict[str, Any]] = {}
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimiraStoredObject:
+        object_key = validate_limira_object_key(object_key)
+        stored = _stored_object(
+            object_key=object_key,
+            bucket=self.bucket,
+            data=data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        self.objects[stored.object_key] = {
+            "data": bytes(data),
+            "content_type": content_type,
+            "metadata": stored.metadata,
+            "sha256": stored.sha256,
+        }
+        return stored
+
+    async def get_object(
+        self,
+        *,

@@ -1,0 +1,1500 @@
+    html_content: str,
+    pdf_bytes: bytes,
+) -> dict[str, str] | None:
+    debug_dir = str(os.getenv(LIMIRA_PDF_DEBUG_DIR_ENV) or "").strip()
+    if not debug_dir:
+        return None
+    os.makedirs(debug_dir, exist_ok=True)
+    prefix = "-".join(
+        [
+            _safe_object_segment(task_id, fallback="task"),
+            _safe_object_segment(report_id, fallback="report"),
+            uuid.uuid4().hex[:12],
+        ]
+    )
+    html_path = os.path.join(debug_dir, f"{prefix}.html")
+    pdf_path = os.path.join(debug_dir, f"{prefix}.pdf")
+    manifest_path = os.path.join(debug_dir, f"{prefix}.json")
+    with open(html_path, "w", encoding="utf-8") as handle:
+        handle.write(html_content)
+    with open(pdf_path, "wb") as handle:
+        handle.write(pdf_bytes)
+    manifest = {
+        "task_id": task_id,
+        "report_id": report_id,
+        "html_path": html_path,
+        "pdf_path": pdf_path,
+        "html_bytes": len(html_content.encode("utf-8")),
+        "pdf_bytes": len(pdf_bytes),
+        "pdf_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+    }
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    log.info(
+        "Saved limira PDF debug artifacts",
+        extra={
+            "task_id": task_id,
+            "report_id": report_id,
+            "html_path": html_path,
+            "pdf_path": pdf_path,
+        },
+    )
+    return {
+        "html_path": html_path,
+        "pdf_path": pdf_path,
+        "manifest_path": manifest_path,
+    }
+
+
+def _mark_uploaded_document_download_unavailable(
+    document: LimiraUploadedDocument,
+    *,
+    repo: LimiraTaskRepository,
+    reason: str,
+) -> None:
+    metadata = scrub_limira_secrets(
+        {
+            **_drop_uploaded_document_download_metadata(document.metadata or {}),
+            "download_unavailable": reason,
+        }
+    )
+    repo.record_uploaded_document(
+        document_id=document.document_id,
+        owner_user_id=document.owner_user_id,
+        task_id=document.task_id,
+        original_filename=document.original_filename,
+        content_type=document.content_type,
+        byte_size=document.byte_size,
+        minio_bucket=document.minio_bucket,
+        object_key=document.object_key,
+        extracted_text=document.extracted_text,
+        language=document.language,
+        metadata=metadata,
+        embedding=document.embedding,
+    )
+    document.metadata = metadata
+
+
+def _drop_uploaded_document_download_metadata(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in metadata.items()
+        if str(key) not in {"sha256", "download_unavailable"}
+    }
+
+
+def _uploaded_document_download_metadata_failure_reason(
+    document: LimiraUploadedDocument,
+) -> str | None:
+    metadata = document.metadata or {}
+    if metadata.get("download_unavailable"):
+        return "document_download_unavailable"
+    if not _is_valid_limira_object_key(document.object_key):
+        return "invalid_document_object_key"
+    expected_sha = metadata.get("sha256")
+    if not isinstance(expected_sha, str) or not expected_sha.strip():
+        return "document_sha_missing"
+    if re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha.strip()) is None:
+        return "document_sha_malformed"
+    return None
+
+
+def _uploaded_document_reuse_failure_reason(
+    document_bytes: bytes,
+    document: LimiraUploadedDocument,
+) -> str | None:
+    expected_sha = (document.metadata or {}).get("sha256")
+    if not isinstance(expected_sha, str) or not expected_sha.strip():
+        return "document_sha_missing"
+    expected_sha = expected_sha.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+        return "document_sha_malformed"
+    actual_sha = hashlib.sha256(document_bytes).hexdigest()
+    if actual_sha != expected_sha:
+        return "document_sha_mismatch"
+    return None
+
+
+def _persisted_report_pdf_reuse_failure_reason(
+    pdf_bytes: bytes,
+    *,
+    report: LimiraGeneratedReport,
+) -> str | None:
+    metadata = report.metadata or {}
+    expected_sha = metadata.get("pdf_sha256")
+    if not isinstance(expected_sha, str) or not expected_sha.strip():
+        return "pdf_sha_missing"
+    expected_sha = expected_sha.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+        return "pdf_sha_malformed"
+    actual_sha = hashlib.sha256(pdf_bytes).hexdigest()
+    if actual_sha != expected_sha:
+        return "pdf_sha_mismatch"
+    if _persisted_report_pdf_appears_blank(pdf_bytes):
+        return "pdf_blank"
+    return None
+
+
+def _persisted_report_pdf_appears_blank(pdf_bytes: bytes) -> bool:
+    if not pdf_bytes.strip().startswith(b"%PDF-"):
+        return False
+    stream_lengths = [
+        int(match.group(1))
+        for match in re.finditer(rb"/Length\s+(\d+)\s*>>\s*stream", pdf_bytes)
+    ]
+    if bool(stream_lengths) and all(length == 0 for length in stream_lengths):
+        return True
+    if (
+        b"/Type /Page" in pdf_bytes
+        and b"/Font" not in pdf_bytes
+        and re.search(rb"\b(?:Tj|TJ)\b", pdf_bytes) is None
+    ):
+        return True
+    return False
+
+
+def _drop_report_pdf_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in metadata.items()
+        if str(key) != "pdf_bucket" and not str(key).startswith("pdf_")
+    }
+
+
+def _build_persisted_archive_zip(
+    task: LimiraTask,
+    repo: LimiraTaskRepository,
+    *,
+    page_snapshots: Mapping[str, EvidencePageSnapshot] | None = None,
+) -> bytes:
+    artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
+    artifact_events = _normalize_report_section_trace_events(
+        repo.get_artifact_trace_events(task.task_id)
+    )
+    artifact_warnings = [
+        event for event in artifact_events if event.get("type") == "artifact_warning"
+    ]
+    reports = repo.list_task_reports(task_id=task.task_id)
+    documents = repo.list_user_documents(
+        owner_user_id=task.owner_user_id,
+        task_id=task.task_id,
+    )
+    task_event_logs = repo.list_task_event_logs(task.task_id, limit=500)
+    report = _select_archive_report(reports)
+    evidence_refs = _archive_evidence_refs(report, artifacts)
+    report_markdown = _archive_report_markdown(task, report, artifacts)
+    report_html = _render_report_html(
+        markdown=report_markdown,
+        evidence_refs=evidence_refs,
+    )
+    public_model_summary = _public_model_summary(task.model_summary or {})
+    snapshot_manifest, snapshot_members = _build_evidence_snapshot_members(
+        artifacts,
+        task_event_logs,
+        page_snapshots or {},
+    )
+    metadata = {
+        "task": {
+            "task_id": task.task_id,
+            "owner_user_id": task.owner_user_id,
+            "query": task.query,
+            "status": task.status,
+            "archive_status": task.archive_status,
+            "scenario": task.scenario,
+            "error": task.error,
+            "model_summary": public_model_summary,
+        },
+        "artifact_counts": {
+            bucket: len(items)
+            for bucket, items in artifacts.items()
+        },
+        "artifact_event_count": len(artifact_events),
+        "artifact_warning_count": len(artifact_warnings),
+        "reports": [report.public_dict() for report in reports],
+        "uploaded_documents": [document.public_dict() for document in documents],
+        "evidence_snapshots": snapshot_manifest,
+    }
+    trace = {
+        "task": metadata["task"],
+        "artifacts": artifacts,
+        "artifact_events": artifact_events,
+        "artifact_warnings": artifact_warnings,
+        "reports": [report.public_dict() for report in reports],
+        "uploaded_documents": [document.public_dict() for document in documents],
+        "task_event_logs": task_event_logs,
+        "evidence_snapshots": snapshot_manifest,
+    }
+    members = {
+        "metadata.json": _archive_json_text(metadata, member_name="metadata.json"),
+        "report.html": str(scrub_limira_secrets(report_html)),
+        "report.md": str(scrub_limira_secrets(report_markdown)),
+        "trace.json": _archive_json_text(trace, member_name="trace.json"),
+    }
+    members.update(snapshot_members)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member_name in _archive_member_write_order(members):
+            _write_archive_member(archive, member_name, members[member_name])
+    return output.getvalue()
+
+
+def _select_archive_report(
+    reports: list[LimiraGeneratedReport],
+) -> LimiraGeneratedReport | None:
+    for report in reports:
+        if report.report_type == "final":
+            return report
+    return reports[0] if reports else None
+
+
+def _archive_evidence_refs(
+    report: LimiraGeneratedReport | None,
+    artifacts: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    refs: list[str] = []
+    refs.extend(report.evidence_refs if report else [])
+    for evidence in artifacts.get("evidence", []):
+        evidence_id = evidence.get("evidence_id") or evidence.get("id")
+        if evidence_id:
+            refs.append(str(evidence_id))
+    return list(dict.fromkeys(refs))
+
+
+def _archive_report_markdown(
+    task: LimiraTask,
+    report: LimiraGeneratedReport | None,
+    artifacts: dict[str, list[dict[str, Any]]],
+) -> str:
+    if report and report.markdown.strip():
+        return _report_markdown_from_value(report.markdown)
+    report_sections = artifacts.get("report_sections", [])
+    if report_sections:
+        sections = []
+        for section in report_sections:
+            title = str(section.get("title") or section.get("section_id") or "Section")
+            body = _report_markdown_from_value(
+                section.get("markdown") or section.get("content") or section
+            )
+            sections.append(f"## {title}\n\n{body}".strip())
+        return "# limira report\n\n" + "\n\n".join(sections)
+    return (
+        "# limira report\n\n"
+        f"Query: {task.query}\n\n"
+        "No generated report content has been recorded yet."
+    )
+
+
+def _build_evidence_snapshot_members(
+    artifacts: dict[str, list[dict[str, Any]]],
+    task_event_logs: list[dict[str, Any]],
+    page_snapshots: Mapping[str, EvidencePageSnapshot],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    manifest: list[dict[str, Any]] = []
+    members: dict[str, str] = {}
+    used_names: set[str] = set()
+    for index, evidence in enumerate(artifacts.get("evidence", []), start=1):
+        evidence_id = str(
+            evidence.get("evidence_id")
+            or evidence.get("ref_id")
+            or evidence.get("id")
+            or f"EVID-{index:03d}"
+        )
+        page_member_name, summary_member_name = _unique_snapshot_member_names(
+            evidence_id,
+            index,
+            used_names,
+        )
+        url = _evidence_url(evidence)
+        page_snapshot = (
+            page_snapshots.get(_normalize_snapshot_url(url) or "") if url else None
+        )
+        snapshot_text, snapshot_source = _evidence_snapshot_text(
+            evidence,
+            url=url,
+            task_event_logs=task_event_logs,
+        )
+        page_snapshot_available = page_snapshot is not None and bool(
+            page_snapshot.html.strip()
+        )
+        entry = {
+            "evidence_id": evidence_id,
+            "title": _evidence_title(evidence, evidence_id),
+            "url": url,
+            "member_name": page_member_name,
+            "page_member_name": page_member_name,
+            "summary_member_name": summary_member_name,
+            "page_snapshot_available": page_snapshot_available,
+            "page_snapshot_source": (
+                "fetched_url" if page_snapshot_available else "unavailable"
+            ),
+            "summary_source": snapshot_source,
+        }
+        if page_snapshot is not None:
+            entry["page_status_code"] = page_snapshot.status_code
+            entry["page_final_url"] = page_snapshot.final_url
+            entry["page_content_type"] = page_snapshot.content_type
+            entry["page_truncated"] = page_snapshot.truncated
+        manifest.append(entry)
+        members[page_member_name] = _render_evidence_page_snapshot_html(
+            evidence,
+            manifest_entry=entry,
+            page_snapshot=page_snapshot,
+        )
+        members[summary_member_name] = _render_evidence_summary_snapshot_html(
+            evidence,
+            manifest_entry=entry,
+            snapshot_text=snapshot_text,
+        )
+    if manifest:
+        members[ARCHIVE_SNAPSHOT_MANIFEST] = _archive_json_text(
+            {"snapshots": manifest},
+            member_name=ARCHIVE_SNAPSHOT_MANIFEST,
+        )
+    return manifest, members
+
+
+def _expected_archive_snapshot_member_names(
+    task: LimiraTask,
+    repo: LimiraTaskRepository,
+) -> list[str]:
+    artifacts = _normalize_report_section_artifacts(repo.get_artifacts(task.task_id))
+    manifest, _members = _build_evidence_snapshot_members(artifacts, [], {})
+    if not manifest:
+        return []
+    expected = [ARCHIVE_SNAPSHOT_MANIFEST]
+    for entry in manifest:
+        expected.append(str(entry["page_member_name"]))
+        expected.append(str(entry["summary_member_name"]))
+    return expected
+
+
+def _unique_snapshot_member_names(
+    evidence_id: str,
+    index: int,
+    used_names: set[str],
+) -> tuple[str, str]:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", evidence_id).strip(".-_")
+    if not stem:
+        stem = f"EVID-{index:03d}"
+    stem = stem[:72]
+
+    def unique(kind: str) -> str:
+        candidate = f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem}-{kind}.html"
+        suffix = 2
+        while candidate in used_names:
+            candidate = (
+                f"{ARCHIVE_SNAPSHOT_DIR}/{index:03d}-{stem}-{kind}-{suffix}.html"
+            )
+            suffix += 1
+        used_names.add(candidate)
+        return candidate
+
+    return unique("page"), unique("summary")
+
+
+def _evidence_url(evidence: Mapping[str, Any]) -> str | None:
+    for key in ("url", "source_url", "link", "href"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return str(scrub_limira_secrets(value.strip()))
+    return None
+
+
+def _evidence_title(evidence: Mapping[str, Any], fallback: str) -> str:
+    for key in ("title", "source", "name"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return str(scrub_limira_secrets(value.strip()))
+    return fallback
+
+
+def _evidence_snapshot_text(
+    evidence: Mapping[str, Any],
+    *,
+    url: str | None,
+    task_event_logs: list[dict[str, Any]],
+) -> tuple[str, str]:
+    if url:
+        event_text = _snapshot_text_from_task_event_logs(task_event_logs, url)
+        if event_text:
+            return event_text, "task_event_log"
+    for key in ("content", "text", "quote", "extracted_info", "summary", "description"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return str(scrub_limira_secrets(value.strip())), "evidence_artifact"
+    return "No captured page text was available for this evidence item.", "placeholder"
+
+
+def _snapshot_text_from_task_event_logs(
+    task_event_logs: list[dict[str, Any]],
+    url: str,
+) -> str | None:
+    normalized_url = _normalize_snapshot_url(url)
+    if not normalized_url:
+        return None
+    for event in task_event_logs:
+        for payload in _iter_snapshot_mappings(event):
+            if not _mapping_contains_snapshot_url(payload, normalized_url):
+                continue
+            text = _snapshot_text_from_mapping(payload)
+            if text:
+                return str(scrub_limira_secrets(text.strip()))[:200_000]
+    return None
+
+
+def _iter_snapshot_mappings(value: Any) -> list[Mapping[str, Any]]:
+    mappings: list[Mapping[str, Any]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for nested in item.values():
+                visit(nested)
+            mappings.append(item)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+        elif isinstance(item, str):
+            stripped = item.strip()
+            if not stripped or stripped[0] not in "{[":
+                return
+            try:
+                visit(json.loads(stripped))
+            except json.JSONDecodeError:
+                return
+
+    visit(value)
+    return mappings
+
+
+def _mapping_contains_snapshot_url(
+    payload: Mapping[str, Any],
+    normalized_url: str,
+) -> bool:
+    for key in ("url", "source_url", "link", "href"):
+        value = payload.get(key)
+        if isinstance(value, str) and _normalize_snapshot_url(value) == normalized_url:
+            return True
+    return False
+
+
+def _snapshot_text_from_mapping(payload: Mapping[str, Any]) -> str | None:
+    for key in (
+        "extracted_info",
+        "content",
+        "text",
+        "markdown",
+        "summary",
+        "description",
+        "quote",
+        "result",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+async def _fetch_evidence_page_snapshots(
+    artifacts: dict[str, list[dict[str, Any]]],
+) -> dict[str, EvidencePageSnapshot]:
+    urls: list[str] = []
+    for evidence in artifacts.get("evidence", []):
+        url = _evidence_url(evidence)
+        normalized_url = _normalize_snapshot_url(url)
+        if not normalized_url or normalized_url in urls:
+            continue
+        if not _snapshot_url_fetch_allowed(normalized_url):
+            continue
+        urls.append(normalized_url)
+
+    max_pages = _env_int(ARCHIVE_SNAPSHOT_MAX_PAGES_ENV, default=8, minimum=0)
+    if max_pages <= 0:
+        return {}
+    urls = urls[:max_pages]
+    if not urls:
+        return {}
+
+    timeout_seconds = _env_float(
+        ARCHIVE_SNAPSHOT_TIMEOUT_ENV,
+        default=3.0,
+        minimum=0.1,
+    )
+    max_bytes = _env_int(
+        ARCHIVE_SNAPSHOT_MAX_BYTES_ENV,
+        default=2_000_000,
+        minimum=10_000,
+    )
+    snapshots: dict[str, EvidencePageSnapshot] = {}
+    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 1.5))
+    headers = {
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        "User-Agent": "Limira Evidence Snapshot/1.0",
+    }
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        for url in urls:
+            snapshot = await _fetch_single_evidence_page_snapshot(
+                client,
+                url,
+                max_bytes=max_bytes,
+            )
+            if snapshot is not None:
+                snapshots[url] = snapshot
+    return snapshots
+
+
+async def _fetch_single_evidence_page_snapshot(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+) -> EvidencePageSnapshot | None:
+    try:
+        async with client.stream("GET", url) as response:
+            content_type = str(response.headers.get("content-type") or "")
+            if not _snapshot_content_type_is_html(content_type):
+                return None
+            buffer = bytearray()
+            truncated = False
+            async for chunk in response.aiter_bytes():
+                if not chunk:
+                    continue
+                remaining = max_bytes - len(buffer)
+                if remaining <= 0:
+                    truncated = True
+                    break
+                if len(chunk) > remaining:
+                    buffer.extend(chunk[:remaining])
+                    truncated = True
+                    break
+                buffer.extend(chunk)
+            encoding = response.encoding or "utf-8"
+            html_text = bytes(buffer).decode(encoding, errors="replace")
+            if not html_text.strip():
+                return None
+            return EvidencePageSnapshot(
+                url=url,
+                final_url=str(response.url),
+                status_code=response.status_code,
+                content_type=content_type,
+                html=html_text,
+                truncated=truncated,
+            )
+    except Exception:
+        log.info(
+            "Failed to fetch limira evidence page snapshot",
+            extra={"url_host": urlsplit(url).netloc},
+            exc_info=True,
+        )
+        return None
+
+
+def _snapshot_url_fetch_allowed(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in {"http", "https"}:
+        return False
+    if parts.username or parts.password:
+        return False
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in {"localhost", "0.0.0.0"}:
+        return False
+    if host.endswith((".local", ".test", ".invalid", ".localhost")):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _snapshot_content_type_is_html(content_type: str) -> bool:
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    return content_type in {
+        "",
+        "text/html",
+        "application/xhtml+xml",
+    }
+
+
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    try:
+        value = int(str(os.getenv(name) or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _env_float(name: str, *, default: float, minimum: float) -> float:
+    try:
+        value = float(str(os.getenv(name) or "").strip() or default)
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _normalize_snapshot_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parts = urlsplit(str(value).strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        return None
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path.rstrip("/"),
+            parts.query,
+            "",
+        )
+    )
+
+
+def _render_evidence_page_snapshot_html(
+    evidence: Mapping[str, Any],
+    *,
+    manifest_entry: Mapping[str, Any],
+    page_snapshot: EvidencePageSnapshot | None,
+) -> str:
+    title = str(
+        manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence"
+    )
+    url = str(manifest_entry.get("url") or "")
+    if page_snapshot is None or not page_snapshot.html.strip():
+        return _render_snapshot_unavailable_html(evidence, manifest_entry=manifest_entry)
+    return _staticize_archived_webpage_html(
+        page_snapshot.html,
+        title=title,
+        url=url,
+        final_url=page_snapshot.final_url,
+        status_code=page_snapshot.status_code,
+        content_type=page_snapshot.content_type,
+        truncated=page_snapshot.truncated,
+    )
+
+
+def _render_snapshot_unavailable_html(
+    evidence: Mapping[str, Any],
+    *,
+    manifest_entry: Mapping[str, Any],
+) -> str:
+    title = str(
+        manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence"
+    )
+    url = str(manifest_entry.get("url") or "")
+    summary = str(evidence.get("summary") or evidence.get("description") or "")
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{html.escape(title)} - page snapshot unavailable</title>\n"
+        "</head>\n"
+        "<body>\n"
+        f"<h1>{html.escape(title)}</h1>\n"
+        "<p>网页原始 HTML 快照不可用；请查看同目录的 summary 文件。</p>\n"
+        f"<p>URL: {html.escape(url)}</p>\n"
+        f"<p>{html.escape(str(scrub_limira_secrets(summary)))}</p>\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _staticize_archived_webpage_html(
+    raw_html: str,
+    *,
+    title: str,
+    url: str,
+    final_url: str,
+    status_code: int,
+    content_type: str,
+    truncated: bool,
+) -> str:
+    document = str(scrub_limira_secrets(raw_html))
+    already_archived = 'data-limira-evidence-snapshot="metadata"' in document
+    document = _remove_active_html_blocks(document)
+    document = _remove_active_html_attributes(document)
+    document = _neutralize_active_html_urls(document)
+    if already_archived:
+        return document
+    document = _inject_snapshot_head(document, title=title)
+    banner = _archived_snapshot_banner(
+        title=title,
+        url=url,
+        final_url=final_url,
+        status_code=status_code,
+        content_type=content_type,
+        truncated=truncated,
+    )
+    document = _inject_snapshot_body_banner(document, banner)
+    return document
+
+
+def _remove_active_html_blocks(document: str) -> str:
+    document = re.sub(
+        r"(?is)<script\b[^>]*>.*?</script\s*>",
+        "<!-- Limira removed active script from archived snapshot -->",
+        document,
+    )
+    document = re.sub(
+        r"(?is)<(?:iframe|object|embed)\b[^>]*>.*?</(?:iframe|object|embed)\s*>",
+        "<!-- Limira removed active embedded content from archived snapshot -->",
+        document,
+    )
+    document = re.sub(
+        r"(?is)<meta\b[^>]*http-equiv\s*=\s*['\"]?refresh[^>]*>",
+        "",
+        document,
+    )
+    return document
+
+
+def _remove_active_html_attributes(document: str) -> str:
+    return re.sub(
+        r"\s+on[a-zA-Z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        "",
+        document,
+    )
+
+
+def _neutralize_active_html_urls(document: str) -> str:
+    return re.sub(
+        r"(?is)\b(href|src|action|formaction)\s*=\s*([\"'])\s*(?:javascript|data):[^\"']*\2",
+        r'\1="#"',
+        document,
+    )
+
+
+def _inject_snapshot_head(document: str, *, title: str) -> str:
+    head_injection = (
+        '<meta charset="utf-8">\n'
+        '<meta http-equiv="Content-Security-Policy" '
+        'content="default-src \'none\'; img-src data: blob:; '
+        'style-src \'unsafe-inline\'; font-src data:; media-src data: blob:; '
+        'base-uri \'none\'; form-action \'none\'">\n'
+        f"<title>{html.escape(title)}</title>\n"
+    )
+    if re.search(r"(?is)<head\b[^>]*>", document):
+        return re.sub(
+            r"(?is)(<head\b[^>]*>)",
+            r"\1\n" + head_injection,
+            document,
+            count=1,
+        )
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n'
+        "<head>\n"
+        f"{head_injection}"
+        "</head>\n"
+        "<body>\n"
+        f"{document}\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _archived_snapshot_banner(
+    *,
+    title: str,
+    url: str,
+    final_url: str,
+    status_code: int,
+    content_type: str,
+    truncated: bool,
+) -> str:
+    return (
+        '<aside data-limira-evidence-snapshot="metadata" '
+        'style="font-family:Arial,sans-serif;line-height:1.45;'
+        'border:1px solid #d0d7de;background:#f6f8fa;color:#17202a;'
+        'padding:12px;margin:0 0 16px 0;">'
+        "<strong>Limira archived webpage snapshot</strong>"
+        f"<div>Title: {html.escape(title)}</div>"
+        f"<div>Original URL: {html.escape(url)}</div>"
+        f"<div>Fetched URL: {html.escape(final_url)}</div>"
+        f"<div>Status: {html.escape(str(status_code))}</div>"
+        f"<div>Content-Type: {html.escape(content_type)}</div>"
+        f"<div>Truncated: {html.escape(str(bool(truncated)).lower())}</div>"
+        "</aside>\n"
+    )
+
+
+def _inject_snapshot_body_banner(document: str, banner: str) -> str:
+    if re.search(r"(?is)<body\b[^>]*>", document):
+        return re.sub(
+            r"(?is)(<body\b[^>]*>)",
+            r"\1\n" + banner,
+            document,
+            count=1,
+        )
+    return banner + document
+
+
+def _render_evidence_summary_snapshot_html(
+    evidence: Mapping[str, Any],
+    *,
+    manifest_entry: Mapping[str, Any],
+    snapshot_text: str,
+) -> str:
+    title = str(
+        manifest_entry.get("title") or manifest_entry.get("evidence_id") or "Evidence"
+    )
+    url = str(manifest_entry.get("url") or "")
+    summary = str(evidence.get("summary") or evidence.get("description") or "")
+    source = str(evidence.get("source") or "")
+    published_at = str(evidence.get("published_at") or evidence.get("date") or "")
+    confidence = evidence.get("confidence")
+    confidence_text = "" if confidence is None else str(confidence)
+    body = str(scrub_limira_secrets(snapshot_text))
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{html.escape(title)}</title>\n"
+        "<style>"
+        "body{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.6;color:#17202a;}"
+        "dt{font-weight:700;margin-top:12px;}dd{margin:4px 0 0 0;word-break:break-word;}"
+        "pre{white-space:pre-wrap;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:16px;}"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n"
+        f"<h1>{html.escape(title)}</h1>\n"
+        "<dl>\n"
+        f"<dt>Evidence ID</dt><dd>{html.escape(str(manifest_entry.get('evidence_id') or ''))}</dd>\n"
+        f"<dt>URL</dt><dd>{html.escape(url)}</dd>\n"
+        f"<dt>Source</dt><dd>{html.escape(source)}</dd>\n"
+        f"<dt>Published At</dt><dd>{html.escape(published_at)}</dd>\n"
+        f"<dt>Confidence</dt><dd>{html.escape(confidence_text)}</dd>\n"
+        f"<dt>Summary Source</dt><dd>{html.escape(str(manifest_entry.get('summary_source') or ''))}</dd>\n"
+        f"<dt>Page Snapshot</dt><dd>{html.escape(str(manifest_entry.get('page_member_name') or ''))}</dd>\n"
+        "</dl>\n"
+        f"<h2>Summary</h2>\n<p>{html.escape(summary)}</p>\n"
+        f"<h2>Captured Text</h2>\n<pre>{html.escape(body)}</pre>\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _archive_json_text(value: Any, *, member_name: str | None = None) -> str:
+    value = _normalize_archive_json_payload(value, member_name=member_name)
+    scrubbed = scrub_limira_secrets(value)
+    if member_name is not None:
+        scrubbed = _public_archive_member_payload(member_name, scrubbed)
+    scrubbed = json.loads(json.dumps(scrubbed, ensure_ascii=False, default=str))
+    return json.dumps(scrubbed, ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def _normalize_archive_json_payload(value: Any, *, member_name: str | None) -> Any:
+    if member_name != "trace.json" or not isinstance(value, Mapping):
+        return value
+    trace = dict(value)
+    artifacts = trace.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        trace["artifacts"] = _normalize_report_section_artifacts(artifacts)
+    artifact_events = trace.get("artifact_events")
+    if isinstance(artifact_events, list):
+        trace["artifact_events"] = _normalize_report_section_trace_events(
+            [dict(event) for event in artifact_events if isinstance(event, dict)]
+        )
+    return trace
+
+
+def _public_archive_member_payload(member_name: str, payload: Any) -> Any:
+    if member_name not in {"metadata.json", "trace.json"}:
+        return payload
+    if not isinstance(payload, Mapping):
+        return payload
+    public_payload = dict(payload)
+    task_payload = public_payload.get("task")
+    if isinstance(task_payload, Mapping):
+        public_task = {
+            str(key): item
+            for key, item in task_payload.items()
+            if str(key) not in INTERNAL_ARCHIVE_TASK_FIELDS
+        }
+        if "model_summary" in public_task:
+            public_task["model_summary"] = _public_model_summary(
+                public_task.get("model_summary") or {}
+            )
+        if public_task.get("error"):
+            public_task["error"] = _public_error_text(
+                public_task.get("error"),
+                fallback="limira_task_failed",
+            )
+        public_payload["task"] = public_task
+    return public_payload
+
+
+def validate_archive_zip(archive_bytes: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            names = archive.namelist()
+            if not _archive_member_order_is_valid(names):
+                raise HTTPException(status_code=502, detail="invalid_archive_members")
+            if any(name.startswith("/") or ".." in name.split("/") for name in names):
+                raise HTTPException(status_code=502, detail="unsafe_archive_member")
+            if any(not _is_allowed_archive_member_name(name) for name in names):
+                raise HTTPException(status_code=502, detail="invalid_archive_members")
+            for member_name in names:
+                text = _decode_archive_text_member(archive.read(member_name))
+                if _is_archive_json_member(member_name):
+                    _parse_archive_json_member(text)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
+
+
+def _archive_member_write_order(members: Mapping[str, Any]) -> list[str]:
+    core = [name for name in ARCHIVE_MEMBER_ORDER if name in members]
+    snapshot_manifest = (
+        [ARCHIVE_SNAPSHOT_MANIFEST] if ARCHIVE_SNAPSHOT_MANIFEST in members else []
+    )
+    snapshot_members = sorted(
+        name
+        for name in members
+        if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name)
+    )
+    return [*core, *snapshot_manifest, *snapshot_members]
+
+
+def _archive_member_order_is_valid(names: list[str]) -> bool:
+    core = list(ARCHIVE_MEMBER_ORDER)
+    if names[: len(core)] != core:
+        return False
+    extra = names[len(core):]
+    if not extra:
+        return True
+    snapshot_members = [
+        name for name in extra if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name)
+    ]
+    if not snapshot_members or ARCHIVE_SNAPSHOT_MANIFEST not in extra:
+        return False
+    return extra == [ARCHIVE_SNAPSHOT_MANIFEST, *sorted(snapshot_members)]
+
+
+def _is_allowed_archive_member_name(name: str) -> bool:
+    return (
+        name in ARCHIVE_MEMBER_ORDER
+        or name == ARCHIVE_SNAPSHOT_MANIFEST
+        or bool(ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(name))
+    )
+
+
+def _is_archive_json_member(member_name: str) -> bool:
+    return member_name in ARCHIVE_JSON_MEMBERS
+
+
+def _scrub_archive_zip(archive_bytes: bytes) -> bytes:
+    output = io.BytesIO()
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as source:
+            names = source.namelist()
+            raw_members = {
+                member_name: source.read(member_name)
+                for member_name in names
+            }
+            try:
+                report_markdown = _scrub_archive_member_text(
+                    "report.md",
+                    raw_members["report.md"],
+                )
+            except UnicodeDecodeError:
+                report_markdown = _archive_member_decode_failure_text("report.md")
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as target:
+                for member_name in names:
+                    raw_member = raw_members[member_name]
+                    try:
+                        if member_name == "report.md":
+                            scrubbed = report_markdown
+                        elif member_name == "report.html":
+                            scrubbed = str(
+                                scrub_limira_secrets(
+                                    _render_report_html(
+                                        markdown=report_markdown,
+                                        evidence_refs=_evidence_refs_from_markdown(
+                                            report_markdown
+                                        ),
+                                    )
+                                )
+                            )
+                        else:
+                            scrubbed = _scrub_archive_member_text(member_name, raw_member)
+                        _write_archive_member(
+                            target,
+                            member_name,
+                            scrubbed.encode("utf-8"),
+                        )
+                    except UnicodeDecodeError:
+                        if _is_archive_json_member(member_name):
+                            raise HTTPException(
+                                status_code=502,
+                                detail="invalid_archive_member_encoding",
+                            )
+                        fallback = _archive_member_decode_failure_text(member_name)
+                        _write_archive_member(
+                            target,
+                            member_name,
+                            fallback.encode("utf-8"),
+                        )
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=502, detail="invalid_archive_zip") from exc
+    return output.getvalue()
+
+
+def _write_archive_member(
+    archive: zipfile.ZipFile,
+    member_name: str,
+    data: str | bytes,
+) -> None:
+    member = zipfile.ZipInfo(member_name, date_time=ARCHIVE_MEMBER_TIMESTAMP)
+    member.compress_type = zipfile.ZIP_DEFLATED
+    archive.writestr(member, data)
+
+
+def _scrub_archive_member_text(member_name: str, raw_member: bytes) -> str:
+    try:
+        text = raw_member.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if _is_archive_json_member(member_name):
+            raise HTTPException(
+                status_code=502,
+                detail="invalid_archive_member_encoding",
+            ) from exc
+        raise
+    if _is_archive_json_member(member_name):
+        payload = _parse_archive_json_member(text)
+        return _archive_json_text(payload, member_name=member_name)
+    if ARCHIVE_SNAPSHOT_MEMBER_PATTERN.match(member_name):
+        return _staticize_archived_webpage_html(
+            text,
+            title=member_name,
+            url="",
+            final_url="",
+            status_code=0,
+            content_type="text/html",
+            truncated=False,
+        )
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return _scrub_secret_text(text)
+    if member_name == "report.md":
+        return str(scrub_limira_secrets(_report_markdown_from_value(payload)))
+    return _archive_json_text(payload, member_name=member_name)
+
+
+def _decode_archive_text_member(raw_member: bytes) -> str:
+    try:
+        return raw_member.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="invalid_archive_member_encoding",
+        ) from exc
+
+
+def _parse_archive_json_member(text: str) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="invalid_archive_member_json",
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise HTTPException(status_code=502, detail="invalid_archive_member_json")
+    return payload
+
+
+def _archive_member_decode_failure_text(member_name: str) -> str:
+    if member_name in ARCHIVE_JSON_MEMBERS:
+        return _archive_json_text(
+            {"archive_member_error": "invalid_text_encoding"},
+            member_name=member_name,
+        )
+    if member_name == "report.html":
+        return "<!doctype html><main>Archive member could not be decoded.</main>"
+    return "# limira report\n\nArchive member could not be decoded."
+
+
+def _get_owned_task(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    user: LimiraUser,
+) -> LimiraTask:
+    task = repo.get_user_task(task_id, user.id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    return task
+
+
+def _get_owned_document(
+    repo: LimiraTaskRepository,
+    document_id: str,
+    user: LimiraUser,
+) -> LimiraUploadedDocument:
+    document = repo.get_user_document(document_id, user.id)
+    if not document:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    return document
+
+
+def _get_owned_report(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    report_id: str,
+    user: LimiraUser,
+) -> LimiraGeneratedReport:
+    report = repo.get_user_report(
+        task_id=task_id,
+        report_id=report_id,
+        owner_user_id=user.id,
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="report_not_found")
+    return report
+
+
+async def _limira_event_stream(
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    research_client: RunnerResearchClientProtocol,
+    runtime_state: LimiraRuntimeState,
+) -> AsyncIterator[bytes]:
+    current = repo.get_task(task.task_id) or task
+    if current.status in FINAL_TASK_STATUSES:
+        terminal_event = _terminal_status_event(current)
+        await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
+        await _mark_terminal_reattach_closed(
+            runtime_state,
+            task.task_id,
+        )
+        yield _sse_bytes(_assert_browser_safe(terminal_event))
+        return
+
+    stream_id = str(uuid.uuid4())
+    opened = await runtime_state.try_open_stream(
+        task.task_id,
+        owner_user_id=user.id,
+        stream_id=stream_id,
+        fields={
+            "status": "running",
+            "archive_status": current.archive_status,
+        },
+    )
+    if not opened:
+        runtime_snapshot = await runtime_state.get_task_runtime(task.task_id)
+        active_event = _active_stream_status_event(current, runtime_snapshot)
+        _record_task_event_log(repo, task.task_id, active_event)
+        yield _sse_bytes(_assert_browser_safe(active_event))
+        return
+
+    current = repo.update_task(task.task_id, status="running")
+    await runtime_state.update_task_runtime(
+        task.task_id,
+        {
+            "owner_user_id": user.id,
+            "status": current.status,
+            "archive_status": current.archive_status,
+            "stream_id": stream_id,
+            "stream_state": "open",
+        },
+    )
+    saw_terminal_status = False
+    stream_close_reason = "stream_exhausted"
+    current_agent_name: str | None = None
+
+    try:
+        async for runner_event in research_client.stream_events(task=task, user=user):
+            event = _normalize_runner_event(task, runner_event)
+            event_payload = event.get("payload")
+            if event.get("type") == "start_of_agent" and isinstance(event_payload, dict):
+                current_agent_name = str(event_payload.get("agent_name") or "")
+            elif event.get("type") == "end_of_agent":
+                current_agent_name = None
+            event = _scrub_final_show_text_event(
+                event,
+                current_agent_name=current_agent_name,
+            )
+            event = _scrub_runner_artifact_event(event)
+            event = _scrub_runner_event(event, task_id=task.task_id)
+            applied_status = _apply_task_status_from_event(repo, task.task_id, event)
+            saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
+            if applied_status in FINAL_TASK_STATUSES and isinstance(
+                event.get("payload"), dict
+            ):
+                event["payload"]["terminal"] = True
+            warning = _record_artifact_from_event(repo, task, event)
+            final_report_event = _record_final_show_text_report_from_event(
+                repo,
+                task,
+                event,
+                current_agent_name=current_agent_name,
+            )
+            await _record_stream_event(repo, runtime_state, task.task_id, event)
+            if applied_status in FINAL_TASK_STATUSES:
+                await runtime_state.update_task_runtime(
+                    task.task_id,
+                    {"terminal": True},
+                )
+
+            yield _sse_bytes(_assert_browser_safe(event))
+            if warning:
+                await _record_stream_event(repo, runtime_state, task.task_id, warning)
+                yield _sse_bytes(_assert_browser_safe(warning))
+            if final_report_event:
+                await _record_stream_event(repo, runtime_state, task.task_id, final_report_event)
+                yield _sse_bytes(_assert_browser_safe(final_report_event))
+            if applied_status in FINAL_TASK_STATUSES:
+                stream_close_reason = f"terminal_{applied_status}"
+                break
+
+        if not saw_terminal_status:
+            status_event = await _authoritative_runner_status_event(
+                repo,
+                task,
+                user,
+                research_client,
+            )
+            if status_event:
+                await _record_stream_event(repo, runtime_state, task.task_id, status_event)
+                stream_close_reason = _stream_close_reason_from_event(
+                    status_event,
+                    stream_close_reason,
+                )
+                yield _sse_bytes(_assert_browser_safe(status_event))
+    except RunnerStreamConflict as exc:
+        stream_close_reason = "runner_stream_conflict"
+        status_event = await _authoritative_runner_status_event(
+            repo,
+            task,
+            user,
+            research_client,
+            reason=exc.reason,
+        )
+        if status_event:
+            await _record_stream_event(repo, runtime_state, task.task_id, status_event)
+            stream_close_reason = _stream_close_reason_from_event(
+                status_event,
+                stream_close_reason,
+            )
+            yield _sse_bytes(_assert_browser_safe(status_event))
+    except asyncio.CancelledError:
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            stream_close_reason = f"terminal_{current.status}"
+            await runtime_state.update_task_runtime(
+                task.task_id,
+                {
+                    "status": current.status,
+                    "archive_status": current.archive_status,
+                    "terminal": True,
+                    "error": current.error,
+                },
+            )
+            return
+        stream_close_reason = "event_stream_cancelled"
+        repo.update_task(
+            task.task_id,
+            status="cancelled",
+            archive_status="failed",
+            error="event_stream_cancelled",
+        )
+        await runtime_state.update_task_runtime(
+            task.task_id,
+            {
+                "status": "cancelled",
+                "archive_status": "failed",
+                "terminal": True,
+                "error": "event_stream_cancelled",
+            },
+        )
+        return
+    except HTTPException as exc:
+        stream_close_reason = "http_exception"
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            terminal_event = _terminal_status_event(current)
+            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
+            yield _sse_bytes(_assert_browser_safe(terminal_event))
+            return
+        public_error = _public_error_text(
+            exc.detail,
+            fallback="limira_event_proxy_failed",
+        )
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error=public_error,
+        )
+        error_event = {
+            "task_id": task.task_id,
+            "type": "error",
+            "payload": {"error": public_error},
+        }
+        await _record_stream_event(repo, runtime_state, task.task_id, error_event)
+        yield _sse_bytes(_assert_browser_safe(error_event))
+    except Exception as exc:
+        stream_close_reason = "limira_event_proxy_failed"
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            terminal_event = _terminal_status_event(current)
+            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
+            yield _sse_bytes(_assert_browser_safe(terminal_event))
+            return
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error="limira_event_proxy_failed",
+        )
+        error_event = {
+            "task_id": task.task_id,
+            "type": "error",
+            "payload": {"error": "limira_event_proxy_failed"},
+        }
+        await _record_stream_event(repo, runtime_state, task.task_id, error_event)
+        yield _sse_bytes(_assert_browser_safe(error_event))
+    finally:
+        await _mark_runtime_stream_closed(
+            runtime_state,
+            task.task_id,
+            stream_close_reason,
+            stream_id=stream_id,
+        )
+
+
+async def _authoritative_runner_status_event(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    user: LimiraUser,
+    research_client: RunnerResearchClientProtocol,
+    *,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    try:
+        runner_status = await research_client.get_task_status(task=task, user=user)
+    except HTTPException as exc:
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            return _terminal_status_event(current, reason=reason)
+        warning = _public_error_text(
+            exc.detail,
+            fallback="runner_status_warning",
+        )
+        public_reason = _public_reason_text(reason)
+        return {
+            "task_id": task.task_id,
+            "type": "status",
+            "payload": {
+                "status": current.status if current else task.status,
+                "archive_status": current.archive_status if current else task.archive_status,
+                "status_source": "limira",
+                "warning": warning,
+                **({"reason": public_reason} if public_reason else {}),
+            },
+        }
+
+    current = _apply_authoritative_runner_status(
+        repo,
+        task.task_id,
+        scrub_limira_secrets(runner_status),
+    )
+    payload: dict[str, Any] = {
+        "status": current.status,
+        "archive_status": current.archive_status,
+        "terminal": current.status in FINAL_TASK_STATUSES,
+        "status_source": "runner",
+    }
+    if reason:
+        payload["reason"] = _public_reason_text(reason)
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
+
+
+def _apply_authoritative_runner_status(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    runner_status: dict[str, Any],
+) -> LimiraTask:
+    current = repo.get_task(task_id)
+    if not current:
+        raise KeyError(task_id)
+
+    status = runner_status.get("status")
+    if status not in {"queued", "running", "completed", "failed", "cancelled"}:
+        return current
+
+    updates: dict[str, Any] = {"status": status}
+    archive_status = runner_status.get("archive_status")
+    if archive_status in {"pending", "ready", "failed"}:
+        updates["archive_status"] = archive_status
+    elif status == "completed":
+        updates["archive_status"] = "ready"
+    elif status in {"failed", "cancelled"}:
+        updates["archive_status"] = "failed"
+    if runner_status.get("error"):
+        updates["error"] = _public_error_text(
+            runner_status["error"],
+            fallback="runner_task_failed",
+        )
+    return repo.update_task(task_id, **updates)
+
+
+def _terminal_status_event(task: LimiraTask, *, reason: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": task.status,
+        "archive_status": task.archive_status,
+        "terminal": True,
+    }
+    if task.error:
+        payload["error"] = _public_error_text(
+            task.error,
+            fallback="limira_task_failed",
+        )
+    if reason:
+        payload["reason"] = _public_reason_text(reason)
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
+
+
+def _active_stream_status_event(
+    task: LimiraTask,
+    runtime_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    status = runtime_snapshot.get("status") or task.status
+    archive_status = runtime_snapshot.get("archive_status") or task.archive_status
+    payload: dict[str, Any] = {
+        "status": status,
+        "archive_status": archive_status,
+        "stream_state": runtime_snapshot.get("stream_state") or "open",
+        "status_source": "limira_runtime_state",
+        "reason": "stream_already_open",
+    }
+    if runtime_snapshot.get("terminal") is not None:
+        payload["terminal"] = bool(runtime_snapshot["terminal"])
+    return {

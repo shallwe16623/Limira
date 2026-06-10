@@ -1,0 +1,781 @@
+        ("/uploads/{document_id}/download", "GET"),
+        ("/tasks/{task_id}/reports/pdf", "POST"),
+        ("/tasks/{task_id}/reports/{report_id}/pdf", "GET"),
+        ("/enterprise/members", "GET"),
+        ("/enterprise/members", "POST"),
+        ("/enterprise/usage", "GET"),
+        ("/admin/organizations", "POST"),
+        ("/admin/tasks/{task_id}", "GET"),
+        ("/admin/tasks/{task_id}/event-logs", "GET"),
+        ("/admin/tasks/{task_id}/archive.zip", "GET"),
+    }
+    actual = {
+        (route.path, method)
+        for route in limira.router.routes
+        for method in getattr(route, "methods", set())
+        if method in {"GET", "POST"}
+    }
+
+    assert route_contract <= actual
+    for path, _method in actual:
+        assert "/limira-runner/" not in path
+
+
+def _archive_zip(*, extra_member: bool = False, secret_members: bool = False) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        if secret_members:
+            archive.writestr(
+                "metadata.json",
+                json.dumps(
+                    {
+                        "Authorization": "Bearer runner-token-123456",
+                        "cookie": "legacy_session=session-secret-123456",
+                        "url": "https://search.test?q=x&token=archive-token-123456",
+                    }
+                ),
+            )
+            archive.writestr(
+                "report.html",
+                "<!doctype html><main>OPENAI_API_KEY=sk-archiveopenai123456</main>",
+            )
+            archive.writestr(
+                "report.md",
+                "# report\nRUNNER_SERVICE_TOKEN=archive-runner-token-123456\n"
+                "https://api.test/resource?api_key=archive-query-secret-123456",
+            )
+            archive.writestr(
+                "trace.json",
+                json.dumps(
+                    {
+                        "headers": {"Cookie": "trace-cookie-secret-123456"},
+                        "deepseek": "DEEPSEEK_API_KEY=sk-tracedeepseek123456",
+                        "jwt": "eyJtrace.secret.payload",
+                    }
+                ),
+            )
+        else:
+            archive.writestr("metadata.json", "{}")
+            archive.writestr("report.html", "<!doctype html><main></main>")
+            archive.writestr("report.md", "# report")
+            archive.writestr("trace.json", "{}")
+        if extra_member:
+            archive.writestr(".env", "RUNNER_SERVICE_TOKEN=secret")
+    return buffer.getvalue()
+
+
+def _archive_zip_with_json_wrapped_report(
+    *,
+    task_id: str,
+    owner_user_id: str,
+    report_text: str,
+) -> bytes:
+    trace = {
+        "task": {
+            "task_id": task_id,
+            "owner_user_id": owner_user_id,
+            "query": "BYD 1260H",
+            "status": "completed",
+            "archive_status": "ready",
+            "scenario": None,
+            "error": None,
+            "model_summary": {},
+        },
+        "artifacts": {
+            "report_sections": [
+                {
+                    "section_id": "REPORT-007",
+                    "markdown": report_text,
+                    "source_event_type": "record_research_artifact",
+                }
+            ]
+        },
+        "artifact_events": [
+            {
+                "type": "report_section_generated",
+                "artifact_type": "report_section",
+                "bucket": "report_sections",
+                "local_artifact_id": "REPORT-007",
+                "source_event_type": "record_research_artifact",
+                "payload": {
+                    "section_id": "REPORT-007",
+                    "markdown": report_text,
+                },
+            }
+        ],
+        "artifact_warnings": [],
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", json.dumps({"task": trace["task"]}))
+        archive.writestr("report.html", f"<!doctype html><main>{report_text}</main>")
+        archive.writestr("report.md", report_text)
+        archive.writestr("trace.json", json.dumps(trace, ensure_ascii=False))
+    return buffer.getvalue()
+
+
+def _archive_zip_with_raw_model_summary(
+    *,
+    task_id: str,
+    owner_user_id: str,
+    runner_task_id: str = "runner-task-secret",
+) -> bytes:
+    task_payload = {
+        "task_id": task_id,
+        "owner_user_id": owner_user_id,
+        "query": "archive internal state reuse",
+        "status": "completed",
+        "archive_status": "ready",
+        "scenario": None,
+        "error": None,
+        "model_summary": _internal_model_summary(
+            task_id,
+            runner_task_id=runner_task_id,
+        ),
+    }
+    metadata = {
+        "task": task_payload,
+        "artifact_counts": {},
+        "artifact_event_count": 0,
+        "artifact_warning_count": 0,
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    trace = {
+        "task": dict(task_payload),
+        "artifacts": {},
+        "artifact_events": [],
+        "artifact_warnings": [],
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    members = {
+        "metadata.json": json.dumps(metadata, ensure_ascii=False),
+        "report.html": "<!doctype html><main>safe report</main>",
+        "report.md": "# safe report",
+        "trace.json": json.dumps(trace, ensure_ascii=False),
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for member_name in ("metadata.json", "report.html", "report.md", "trace.json"):
+            archive.writestr(member_name, members[member_name])
+    return buffer.getvalue()
+
+
+def _archive_zip_with_undecodable_report_member() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", "{}")
+        archive.writestr(
+            "report.html",
+            b"\xff\xfeOPENAI_API_KEY=sk-binarysecret123456",
+        )
+        archive.writestr("report.md", "# stale report")
+        archive.writestr("trace.json", "{}")
+    return buffer.getvalue()
+
+
+def _archive_zip_with_invalid_json_metadata_members(task_id: str) -> bytes:
+    buffer = io.BytesIO()
+    internal_metadata = (
+        "runner_task_id=runner-invalid-json-123\n"
+        "url=http://10.20.30.40:8091/limira-runner/tasks/runner-invalid-json-123\n"
+        f"object_key=limira/users/hash/tasks/{task_id}/archives/archive.zip\n"
+    )
+    internal_trace = (
+        "archive_object_key="
+        f"limira/users/hash/tasks/{task_id}/archives/archive.zip\n"
+        "runner_task_id=runner-invalid-json-123\n"
+    )
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", internal_metadata)
+        archive.writestr("report.html", "<!doctype html><main>safe report</main>")
+        archive.writestr("report.md", "# safe report")
+        archive.writestr("trace.json", internal_trace)
+    return buffer.getvalue()
+
+
+def _archive_member_texts(archive_bytes: bytes) -> dict[str, str]:
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        return {
+            member_name: archive.read(member_name).decode("utf-8")
+            for member_name in archive.namelist()
+        }
+
+
+def _internal_model_summary(
+    task_id: str,
+    *,
+    runner_task_id: str = "runner-task-secret",
+) -> dict[str, object]:
+    return {
+        "provider": "deepseek",
+        "runner_task_id": runner_task_id,
+        "object_key": f"limira/users/hash/tasks/{task_id}/uploads/doc.txt",
+        "endpoint": f"http://10.20.30.40:8091/limira-runner/tasks/{runner_task_id}",
+        "nested": {
+            "archive_object_key": (
+                f"limira/users/hash/tasks/{task_id}/archives/archive.zip"
+            ),
+            "safe": "kept",
+            "warning": f"limira/users/hash/tasks/{task_id}/uploads/doc.txt",
+        },
+    }
+
+
+def _assert_archive_hides_internal_model_summary_identifiers(
+    archive_bytes: bytes,
+) -> tuple[dict[str, object], dict[str, object]]:
+    members = _archive_member_texts(archive_bytes)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    _assert_public_archive_hides_internal_identifiers(archive_bytes)
+
+    for task_payload in (metadata["task"], trace["task"]):
+        model_summary = task_payload["model_summary"]
+        assert model_summary["provider"] == "deepseek"
+        assert model_summary["nested"]["safe"] == "kept"
+        assert model_summary["endpoint"] == "limira_internal_value_redacted"
+        assert model_summary["nested"]["warning"] == "limira_internal_value_redacted"
+
+    serialized = json.dumps(
+        {
+            "metadata": metadata,
+            "trace": trace,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "owner_user_id",
+        "runner_task_id",
+        "runner-task-secret",
+        "object_key",
+        "archive_object_key",
+        "limira/users/hash",
+        "http://10.20.30.40:8091",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(serialized)
+    return metadata, trace
+
+
+def _assert_public_archive_hides_internal_identifiers(archive_bytes: bytes) -> None:
+    members = _archive_member_texts(archive_bytes)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+
+    for task_payload in (metadata.get("task") or {}, trace.get("task") or {}):
+        for internal_field in (
+            "owner_user_id",
+            "runner_task_id",
+            "object_key",
+            "archive_object_key",
+            "pdf_object_key",
+        ):
+            assert internal_field not in task_payload
+
+    serialized = json.dumps(
+        {
+            "metadata": metadata,
+            "trace": trace,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "owner_user_id",
+        "runner_task_id",
+        "object_key",
+        "archive_object_key",
+        "pdf_object_key",
+        "limira/users/",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized
+
+
+def _assert_archive_hides_invalid_json_member_identifiers(archive_bytes: bytes) -> None:
+    members = _archive_member_texts(archive_bytes)
+    json.loads(members["metadata.json"])
+    json.loads(members["trace.json"])
+    serialized = json.dumps(members, ensure_ascii=False)
+    for leaked in (
+        "/limira-runner/",
+        "runner_task_id",
+        "runner-invalid-json-123",
+        "object_key",
+        "archive_object_key",
+        "limira/users/",
+        "http://10.20.30.40:8091",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(serialized)
+
+
+def _parse_sse_chunks(chunks):
+    text = b"".join(
+        chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+        for chunk in chunks
+    ).decode("utf-8")
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def _assert_no_browser_leak(payload):
+    text = str(payload)
+    for forbidden in limira.FORBIDDEN_BROWSER_SUBSTRINGS:
+        assert forbidden not in text
+
+
+def _assert_admin_browser_payload_hides_raw_identities(
+    payload,
+    *,
+    owner_user_id,
+    admin_user_id,
+):
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for leaked in (
+        "owner_user_id",
+        owner_user_id,
+        admin_user_id,
+        "runner_task_id",
+        "object_key",
+        "archive_object_key",
+        "pdf_object_key",
+        "limira/users/",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(payload)
+
+
+def _assert_no_raw_secret(payload):
+    text = (
+        payload.decode("utf-8", errors="ignore")
+        if isinstance(payload, bytes)
+        else json.dumps(payload, ensure_ascii=False)
+        if isinstance(payload, (dict, list))
+        else str(payload)
+    )
+    for forbidden in [
+        "runner-token-123456",
+        "session-secret-123456",
+        "archive-token-123456",
+        "sk-archiveopenai123456",
+        "archive-runner-token-123456",
+        "archive-query-secret-123456",
+        "trace-cookie-secret-123456",
+        "sk-tracedeepseek123456",
+        "eyJtrace.secret.payload",
+        "report-bearer-secret-123456",
+        "sk-reportopenai123456",
+        "serper-secret-123456",
+        "report-cookie-secret-123456",
+        "report-url-token-123456",
+        "nested-jina-secret-123456",
+    ]:
+        assert forbidden not in text
+
+
+def _limira_asgi_app():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = FakePdfExporter()
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+    app.state.test_pdf_exporter = pdf_exporter
+
+    async def current_user_override():
+        return limira.LimiraUser("user-a")
+
+    async def task_repository_override():
+        return repo
+
+    async def object_storage_override():
+        return storage
+
+    async def pdf_exporter_override():
+        return pdf_exporter
+
+    app.dependency_overrides[limira.get_current_limira_user] = current_user_override
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    app.dependency_overrides[limira.get_object_storage] = object_storage_override
+    app.dependency_overrides[limira.get_pdf_exporter] = pdf_exporter_override
+    return app, repo, storage
+
+
+class FakeRedisClient:
+    def __init__(self):
+        self.hashes = {}
+        self.hset_calls = []
+        self.expire_calls = []
+        self.eval_calls = []
+
+    async def hset(self, key, *, mapping):
+        self.hset_calls.append({"key": key, "mapping": dict(mapping)})
+        self.hashes.setdefault(key, {}).update(mapping)
+        return len(mapping)
+
+    async def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    async def expire(self, key, seconds):
+        self.expire_calls.append({"key": key, "seconds": seconds})
+        return True
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        self.eval_calls.append(
+            {
+                "script": script,
+                "numkeys": numkeys,
+                "keys_and_args": keys_and_args,
+            }
+        )
+        assert numkeys == 1
+        key = keys_and_args[0]
+        ttl_seconds = int(keys_and_args[1])
+        if "limira_try_open_stream" in script:
+            runtime_hash = self.hashes.setdefault(key, {})
+            if runtime_hash.get("stream_state") == json.dumps("open"):
+                return 0
+            mapping = _pairs_to_mapping(keys_and_args[2:])
+            runtime_hash.update(mapping)
+            await self.expire(key, ttl_seconds)
+            return 1
+        if "limira_close_stream" in script:
+            runtime_hash = self.hashes.setdefault(key, {})
+            expected_stream_id = keys_and_args[2]
+            current_stream_id = runtime_hash.get("stream_id")
+            if current_stream_id and current_stream_id != expected_stream_id:
+                return 0
+            mapping = _pairs_to_mapping(keys_and_args[3:])
+            runtime_hash.update(mapping)
+            await self.expire(key, ttl_seconds)
+            return 1
+        raise AssertionError(f"unexpected redis eval script: {script}")
+
+
+class FakeS3Client:
+    def __init__(self):
+        self.put_calls = []
+        self.get_calls = []
+        self.objects = {}
+
+    def put_object(self, **kwargs):
+        self.put_calls.append(dict(kwargs))
+        self.objects[(kwargs["Bucket"], kwargs["Key"])] = bytes(kwargs["Body"])
+        return {"ETag": '"fake"'}
+
+    def get_object(self, **kwargs):
+        self.get_calls.append(dict(kwargs))
+        data = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        return {"Body": FakeS3Body(data)}
+
+
+class FakeS3Body:
+    def __init__(self, data):
+        self.data = bytes(data)
+
+    def read(self):
+        return self.data
+
+
+class FakePdfExporter:
+    def __init__(self):
+        self.pdf_bytes = b"%PDF-1.7\nfake limira report\n%%EOF"
+        self.html_inputs = []
+
+    async def render_pdf(self, html_content):
+        self.html_inputs.append(html_content)
+        return self.pdf_bytes
+
+
+class FakeUploadEmbeddingProvider:
+    def __init__(self, embedding):
+        self.embedding = list(embedding)
+        self.calls = []
+
+    async def embed_upload_text(self, text, *, config):
+        self.calls.append({"text": text, "config": config})
+        return list(self.embedding)
+
+
+class FakeFailingUploadEmbeddingProvider:
+    def __init__(self, error):
+        self.error = error
+        self.calls = []
+
+    async def embed_upload_text(self, text, *, config):
+        self.calls.append({"text": text, "config": config})
+        raise self.error
+
+
+def _pairs_to_mapping(values):
+    assert len(values) % 2 == 0
+    return {values[index]: values[index + 1] for index in range(0, len(values), 2)}
+
+
+class FakeLimiraPostgresEngine:
+    def __init__(self):
+        self.tasks = {}
+        self.artifact_events = {}
+        self.artifact_trace_events = []
+        self.task_event_logs = []
+        self.uploaded_documents = {}
+        self.vector_search_calls = []
+        self.generated_reports = {}
+        self.typed_inserts = {
+            "limira_evidence_items": [],
+            "limira_entities": [],
+            "limira_entity_relations": [],
+            "limira_timeline_events": [],
+            "limira_generated_reports": [],
+        }
+
+    def begin(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, params):
+        sql = str(statement).lower()
+        if "insert into limira_research_tasks" in sql:
+            row = {
+                "task_id": params["task_id"],
+                "owner_user_id": params["owner_user_id"],
+                "query": params["query"],
+                "status": "queued",
+                "archive_status": "pending",
+                "runner_task_id": params["runner_task_id"],
+                "archive_object_key": None,
+                "archive_zip_sha256": None,
+                "scenario": params["scenario"],
+                "error": None,
+                "model_summary": {},
+            }
+            self.tasks[params["task_id"]] = row
+            return FakeLimiraPostgresResult([row])
+
+        if "select owner_user_id from limira_research_tasks" in sql:
+            row = self.tasks.get(params["task_id"])
+            return FakeLimiraPostgresResult(
+                [{"owner_user_id": row["owner_user_id"]}] if row else []
+            )
+
+        if "update limira_research_tasks" in sql:
+            row = self.tasks.get(params["task_id"])
+            if not row:
+                return FakeLimiraPostgresResult([])
+            for key, value in params.items():
+                if key != "task_id":
+                    row[key] = value
+            return FakeLimiraPostgresResult([row])
+
+        if "from limira_research_tasks" in sql and "limit :limit" in sql:
+            rows = [
+                row
+                for row in reversed(list(self.tasks.values()))
+                if row["owner_user_id"] == params["owner_user_id"]
+            ]
+            return FakeLimiraPostgresResult(rows[: params["limit"]])
+
+        if "from limira_research_tasks" in sql:
+            row = self.tasks.get(params["task_id"])
+            if row and params.get("owner_user_id") and row["owner_user_id"] != params["owner_user_id"]:
+                row = None
+            return FakeLimiraPostgresResult([row] if row else [])
+
+        if "insert into limira_artifact_events" in sql:
+            key = (
+                params["task_id"],
+                params["artifact_type"],
+                params["local_artifact_id"],
+            )
+            self.artifact_events[key] = {
+                "artifact_type": params["artifact_type"],
+                "payload": params["payload"],
+            }
+            return FakeLimiraPostgresResult([])
+
+        if "insert into limira_artifact_trace_events" in sql:
+            self.artifact_trace_events.append(
+                {
+                    "task_id": params["task_id"],
+                    "event_type": params["event_type"],
+                    "artifact_type": params["artifact_type"],
+                    "bucket": params["bucket"],
+                    "local_artifact_id": params["local_artifact_id"],
+                    "payload": params["payload"],
+                    "source_event_type": params["source_event_type"],
+                }
+            )
+            return FakeLimiraPostgresResult([])
+
+        if "from limira_artifact_trace_events" in sql:
+            rows = [
+                {
+                    "event_type": row["event_type"],
+                    "artifact_type": row["artifact_type"],
+                    "bucket": row["bucket"],
+                    "local_artifact_id": row["local_artifact_id"],
+                    "payload": row["payload"],
+                    "source_event_type": row["source_event_type"],
+                }
+                for row in self.artifact_trace_events
+                if row["task_id"] == params["task_id"]
+            ]
+            return FakeLimiraPostgresResult(rows)
+
+        if "from limira_artifact_events" in sql:
+            rows = [
+                row
+                for (task_id, _artifact_type, _local_id), row in self.artifact_events.items()
+                if task_id == params["task_id"]
+            ]
+            return FakeLimiraPostgresResult(rows)
+
+        if "insert into limira_task_event_logs" in sql:
+            self.task_event_logs.append(
+                {
+                    "event_log_id": f"event-log-{len(self.task_event_logs) + 1}",
+                    "task_id": params["task_id"],
+                    "event_type": params["event_type"],
+                    "source": params["source"],
+                    "payload": params["payload"],
+                    "created_at": f"2026-06-09T00:00:{len(self.task_event_logs):02d}+00:00",
+                }
+            )
+            return FakeLimiraPostgresResult([])
+
+        if "from limira_task_event_logs" in sql:
+            rows = [
+                row
+                for row in reversed(self.task_event_logs)
+                if row["task_id"] == params["task_id"]
+            ][: params["limit"]]
+            return FakeLimiraPostgresResult(rows)
+
+        if "insert into limira_uploaded_documents" in sql:
+            row = {
+                "document_id": params["document_id"],
+                "task_id": params["task_id"],
+                "owner_user_id": params["owner_user_id"],
+                "original_filename": params["original_filename"],
+                "content_type": params["content_type"],
+                "byte_size": params["byte_size"],
+                "minio_bucket": params["minio_bucket"],
+                "object_key": params["object_key"],
+                "extracted_text": params["extracted_text"],
+                "language": params["language"],
+                "embedding": params["embedding"],
+                "metadata": params["metadata"],
+            }
+            self.uploaded_documents[params["document_id"]] = row
+            return FakeLimiraPostgresResult([row])
+
+        if "from limira_uploaded_documents" in sql:
+            if "embedding <=>" in sql:
+                self.vector_search_calls.append(dict(params))
+                query_embedding = limira._embedding_from_value(params["query_embedding"])
+                rows = []
+                for row in self.uploaded_documents.values():
+                    if row["owner_user_id"] != params["owner_user_id"]:
+                        continue
+                    if (
+                        params.get("task_id") is not None
+                        and row["task_id"] != params["task_id"]
+                    ):
+                        continue
+                    row_embedding = limira._embedding_from_value(row.get("embedding"))
+                    score = limira._cosine_similarity(
+                        query_embedding or [],
+                        row_embedding,
+                    )
+                    if score is None:
+                        continue
+                    result_row = dict(row)
+                    result_row["limira_search_score"] = score
+                    rows.append(result_row)
+                rows.sort(
+                    key=lambda row: (
+                        -row["limira_search_score"],
+                        row["original_filename"].lower(),
+                        row["document_id"],
+                    )
+                )
+                return FakeLimiraPostgresResult(rows[: params["limit"]])
+
+            if "document_id = :document_id" in sql:
+                row = self.uploaded_documents.get(params["document_id"])
+                if row and row["owner_user_id"] != params["owner_user_id"]:
+                    row = None
+                return FakeLimiraPostgresResult([row] if row else [])
+
+            rows = [
+                row
+                for row in self.uploaded_documents.values()
+                if row["owner_user_id"] == params["owner_user_id"]
+                and (params.get("task_id") is None or row["task_id"] == params["task_id"])
+            ]
+            return FakeLimiraPostgresResult(rows)
+
+        if "insert into limira_generated_reports" in sql:
+            row = {
+                "report_id": params["report_id"],
+                "task_id": params["task_id"],
+                "report_type": params.get("report_type") or "section",
+                "markdown": params["markdown"],
+                "html": params["html"],
+                "pdf_object_key": params.get("pdf_object_key"),
+                "evidence_refs": params["evidence_refs"],
+                "creator_user_id": params["creator_user_id"],
+                "metadata": params["metadata"],
+            }
+            self.generated_reports[(params["task_id"], params["report_id"])] = row
+            self.typed_inserts["limira_generated_reports"].append(dict(params))
+            return FakeLimiraPostgresResult([row] if "returning" in sql else [])
+
+        if "from limira_generated_reports" in sql and "report_id = :report_id" in sql:
+            task = self.tasks.get(params["task_id"])
+            row = self.generated_reports.get((params["task_id"], params["report_id"]))
+            if not task or task["owner_user_id"] != params["owner_user_id"]:
+                row = None
+            return FakeLimiraPostgresResult([row] if row else [])
+
+        if "from limira_generated_reports" in sql:
+            rows = [
+                row
+                for (task_id, _report_id), row in self.generated_reports.items()
+                if task_id == params["task_id"]
+            ]
+            return FakeLimiraPostgresResult(rows)
+
+        for table in self.typed_inserts:
+            if f"insert into {table}" in sql:
+                self.typed_inserts[table].append(dict(params))
+                return FakeLimiraPostgresResult([])
+
+        return FakeLimiraPostgresResult([])
+
+
+class FakeLimiraPostgresResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self.rows[0] if self.rows else None
+
+    def all(self):
+        return list(self.rows)

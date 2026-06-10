@@ -1,0 +1,1500 @@
+        object_key: str,
+    ) -> bytes:
+        object_key = validate_limira_object_key(object_key)
+        try:
+            return bytes(self.objects[object_key]["data"])
+        except KeyError as exc:
+            raise FileNotFoundError(object_key) from exc
+
+
+class FileSystemLimiraObjectStorage:
+    def __init__(self, *, root_path: str, bucket: str = "limira-local") -> None:
+        if not root_path:
+            raise RuntimeError("limira_filesystem_object_storage_path_missing")
+        self.root_path = os.path.abspath(os.path.expanduser(root_path))
+        self.bucket = bucket or "limira-local"
+        os.makedirs(self.root_path, exist_ok=True)
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimiraStoredObject:
+        stored = _stored_object(
+            object_key=object_key,
+            bucket=self.bucket,
+            data=data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        object_path = self._object_path(stored.object_key)
+        os.makedirs(os.path.dirname(object_path), exist_ok=True)
+        with open(object_path, "wb") as file:
+            file.write(bytes(data))
+        with open(f"{object_path}.metadata.json", "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "object_key": stored.object_key,
+                    "bucket": stored.bucket,
+                    "content_type": stored.content_type,
+                    "size_bytes": stored.size_bytes,
+                    "sha256": stored.sha256,
+                    "metadata": stored.metadata,
+                },
+                file,
+                ensure_ascii=False,
+            )
+        return stored
+
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes:
+        object_path = self._object_path(object_key)
+        try:
+            with open(object_path, "rb") as file:
+                return file.read()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(object_key) from exc
+
+    def _object_path(self, object_key: str) -> str:
+        safe_object_key = validate_limira_object_key(object_key)
+        object_path = os.path.abspath(os.path.join(self.root_path, *safe_object_key.split("/")))
+        if object_path != self.root_path and not object_path.startswith(f"{self.root_path}{os.sep}"):
+            raise ValueError("invalid_limira_object_key")
+        return object_path
+
+
+class S3LimiraObjectStorage:
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        endpoint_url: str,
+        access_key_id: str,
+        secret_access_key: str,
+        region_name: str | None = None,
+        s3_client: Any | None = None,
+    ) -> None:
+        if not bucket:
+            raise RuntimeError("limira_object_bucket_missing")
+        if not endpoint_url:
+            raise RuntimeError("limira_s3_endpoint_url_missing")
+        if not access_key_id or not secret_access_key:
+            raise RuntimeError("limira_s3_credentials_missing")
+        self.bucket = bucket
+        self.endpoint_url = endpoint_url
+        self.access_key_id = access_key_id
+        self.secret_access_key = secret_access_key
+        self.region_name = region_name
+        self.s3_client = s3_client or self._create_s3_client()
+
+    def _create_s3_client(self) -> Any:
+        try:
+            import boto3
+        except Exception as exc:  # pragma: no cover - depends on runtime image
+            raise RuntimeError("limira_s3_client_dependency_missing") from exc
+        client_kwargs = {
+            "endpoint_url": self.endpoint_url,
+            "aws_access_key_id": self.access_key_id,
+            "aws_secret_access_key": self.secret_access_key,
+        }
+        if self.region_name:
+            client_kwargs["region_name"] = self.region_name
+        return boto3.client("s3", **client_kwargs)
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> LimiraStoredObject:
+        stored = _stored_object(
+            object_key=object_key,
+            bucket=self.bucket,
+            data=data,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        await _maybe_await(
+            self.s3_client.put_object(
+                Bucket=self.bucket,
+                Key=stored.object_key,
+                Body=bytes(data),
+                ContentType=stored.content_type,
+                Metadata=stored.metadata,
+            )
+        )
+        return stored
+
+    async def get_object(
+        self,
+        *,
+        object_key: str,
+    ) -> bytes:
+        object_key = validate_limira_object_key(object_key)
+        try:
+            response = await _maybe_await(
+                self.s3_client.get_object(Bucket=self.bucket, Key=object_key)
+            )
+            body = response["Body"]
+            data = await _maybe_await(body.read())
+            return bytes(data)
+        except Exception as exc:
+            raise FileNotFoundError(object_key) from exc
+
+
+class DisabledLimiraUploadEmbeddingProvider:
+    async def embed_upload_text(
+        self,
+        text: str,
+        *,
+        config: LimiraUploadEmbeddingConfig,
+    ) -> list[float]:
+        raise RuntimeError("limira_upload_embedding_provider_unconfigured")
+
+
+async def _abort_playwright_route(route: Any) -> None:
+    await route.abort()
+
+
+def _playwright_fontconfig_file(runtime_path: str) -> str | None:
+    font_dirs = [
+        os.path.join(runtime_path, "usr", "share", "fonts"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "fonts"),
+    ]
+    font_dirs = [
+        os.path.abspath(font_dir) for font_dir in font_dirs if os.path.isdir(font_dir)
+    ]
+    if not font_dirs:
+        return None
+
+    cache_dir = os.path.join(runtime_path, "font-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    dir_entries = "".join(
+        f"  <dir>{html.escape(font_dir, quote=False)}</dir>\n"
+        for font_dir in font_dirs
+    )
+    content = (
+        "<?xml version=\"1.0\"?>\n"
+        "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
+        "<fontconfig>\n"
+        f"{dir_entries}"
+        f"  <cachedir>{html.escape(cache_dir, quote=False)}</cachedir>\n"
+        "  <config></config>\n"
+        "</fontconfig>\n"
+    )
+    fontconfig_file = os.path.join(runtime_path, "limira-fonts.conf")
+    try:
+        existing = ""
+        if os.path.isfile(fontconfig_file):
+            with open(fontconfig_file, encoding="utf-8") as handle:
+                existing = handle.read()
+        if existing != content:
+            with open(fontconfig_file, "w", encoding="utf-8") as handle:
+                handle.write(content)
+    except OSError:
+        return None
+    return fontconfig_file
+
+
+def _playwright_chromium_launch_env() -> dict[str, str] | None:
+    configured_path = str(os.getenv(LIMIRA_PLAYWRIGHT_RUNTIME_PATH_ENV) or "").strip()
+    runtime_path = configured_path or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".playwright-local-libs")
+    )
+    if not os.path.isdir(runtime_path):
+        return None
+
+    env = dict(os.environ)
+    library_dirs = [
+        os.path.join(runtime_path, "usr", "lib", "x86_64-linux-gnu"),
+        os.path.join(runtime_path, "lib", "x86_64-linux-gnu"),
+    ]
+    existing_library_path = str(env.get("LD_LIBRARY_PATH") or "").strip()
+    library_path_parts = [
+        library_dir for library_dir in library_dirs if os.path.isdir(library_dir)
+    ]
+    if existing_library_path:
+        library_path_parts.append(existing_library_path)
+    if library_path_parts:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path_parts)
+
+    fontconfig_file = _playwright_fontconfig_file(runtime_path)
+    if fontconfig_file and os.path.isfile(fontconfig_file):
+        env["FONTCONFIG_FILE"] = fontconfig_file
+    env["FONTCONFIG_PATH"] = runtime_path
+    return env
+
+
+class PlaywrightLimiraPdfExporter:
+    async def render_pdf(self, html_content: str) -> bytes:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:  # pragma: no cover - depends on runtime image
+            raise RuntimeError("limira_pdf_playwright_dependency_missing") from exc
+
+        async with async_playwright() as playwright:
+            launch_kwargs: dict[str, Any] = {"args": ["--no-sandbox"]}
+            launch_env = _playwright_chromium_launch_env()
+            if launch_env is not None:
+                launch_kwargs["env"] = launch_env
+            browser = await playwright.chromium.launch(**launch_kwargs)
+            try:
+                page = await browser.new_page()
+                await page.route("**/*", _abort_playwright_route)
+                await page.set_content(html_content, wait_until="load")
+                visible_text = await page.evaluate(
+                    "() => document.body ? document.body.textContent : ''"
+                )
+                if not str(visible_text or "").strip():
+                    raise RuntimeError("limira_pdf_blank_rendered_body")
+                await page.emulate_media(media="print")
+                pdf_bytes = await page.pdf(format="A4", print_background=True)
+                if _persisted_report_pdf_appears_blank(pdf_bytes):
+                    raise RuntimeError("limira_pdf_blank_rendered_pdf")
+            finally:
+                await browser.close()
+        return bytes(pdf_bytes)
+
+
+class PostgresLimiraTaskRepository:
+    POSTGRES_ARTIFACT_TABLES = {
+        "limira_research_tasks",
+        "limira_artifact_events",
+        "limira_artifact_trace_events",
+        "limira_task_event_logs",
+        "limira_evidence_items",
+        "limira_entities",
+        "limira_entity_relations",
+        "limira_timeline_events",
+        "limira_generated_reports",
+        "limira_uploaded_documents",
+        "limira_media_assets",
+    }
+    TASK_COLUMNS = """
+        task_id,
+        owner_user_id,
+        query,
+        status,
+        archive_status,
+        runner_task_id,
+        archive_object_key,
+        archive_zip_sha256,
+        scenario,
+        error,
+        model_summary
+    """
+    DOCUMENT_COLUMNS = """
+        document_id,
+        task_id,
+        owner_user_id,
+        original_filename,
+        content_type,
+        byte_size,
+        minio_bucket,
+        object_key,
+        extracted_text,
+        language,
+        embedding,
+        metadata
+    """
+    REPORT_COLUMNS = """
+        report_id,
+        task_id,
+        report_type,
+        markdown,
+        html,
+        pdf_object_key,
+        evidence_refs,
+        creator_user_id,
+        metadata
+    """
+    INSERT_TASK_SQL = f"""
+        INSERT INTO limira_research_tasks (
+            task_id,
+            owner_user_id,
+            query,
+            status,
+            archive_status,
+            runner_task_id,
+            scenario,
+            model_summary,
+            metadata
+        )
+        VALUES (
+            :task_id,
+            :owner_user_id,
+            :query,
+            'queued',
+            'pending',
+            :runner_task_id,
+            :scenario,
+            CAST(:model_summary AS jsonb),
+            CAST(:metadata AS jsonb)
+        )
+        RETURNING {TASK_COLUMNS}
+    """
+    SELECT_TASK_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limira_research_tasks
+        WHERE task_id = :task_id
+    """
+    SELECT_USER_TASK_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limira_research_tasks
+        WHERE task_id = :task_id
+          AND owner_user_id = :owner_user_id
+    """
+    SELECT_USER_TASKS_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limira_research_tasks
+        WHERE owner_user_id = :owner_user_id
+        ORDER BY created_at DESC, task_id DESC
+        LIMIT :limit
+    """
+    INSERT_ARTIFACT_EVENT_SQL = """
+        INSERT INTO limira_artifact_events (
+            task_id,
+            local_artifact_id,
+            artifact_type,
+            bucket,
+            payload,
+            evidence_refs,
+            confidence,
+            notes,
+            source_event_type
+        )
+        VALUES (
+            :task_id,
+            :local_artifact_id,
+            :artifact_type,
+            :bucket,
+            CAST(:payload AS jsonb),
+            :evidence_refs,
+            :confidence,
+            :notes,
+            :source_event_type
+        )
+        ON CONFLICT (task_id, artifact_type, local_artifact_id) DO UPDATE SET
+            payload = EXCLUDED.payload,
+            evidence_refs = EXCLUDED.evidence_refs,
+            confidence = EXCLUDED.confidence,
+            notes = EXCLUDED.notes,
+            source_event_type = EXCLUDED.source_event_type
+    """
+    SELECT_ARTIFACT_EVENTS_SQL = """
+        SELECT artifact_type, payload
+        FROM limira_artifact_events
+        WHERE task_id = :task_id
+        ORDER BY created_at ASC, local_artifact_id ASC
+    """
+    INSERT_ARTIFACT_TRACE_EVENT_SQL = """
+        INSERT INTO limira_artifact_trace_events (
+            task_id,
+            event_type,
+            artifact_type,
+            bucket,
+            local_artifact_id,
+            payload,
+            source_event_type
+        )
+        VALUES (
+            :task_id,
+            :event_type,
+            :artifact_type,
+            :bucket,
+            :local_artifact_id,
+            CAST(:payload AS jsonb),
+            :source_event_type
+        )
+    """
+    SELECT_ARTIFACT_TRACE_EVENTS_SQL = """
+        SELECT
+            event_type,
+            artifact_type,
+            bucket,
+            local_artifact_id,
+            payload,
+            source_event_type
+        FROM limira_artifact_trace_events
+        WHERE task_id = :task_id
+        ORDER BY created_at ASC, trace_event_id ASC
+    """
+    INSERT_TASK_EVENT_LOG_SQL = """
+        INSERT INTO limira_task_event_logs (
+            task_id,
+            event_type,
+            source,
+            payload
+        )
+        VALUES (
+            :task_id,
+            :event_type,
+            :source,
+            CAST(:payload AS jsonb)
+        )
+    """
+    SELECT_TASK_EVENT_LOGS_SQL = """
+        SELECT event_log_id, task_id, event_type, source, payload, created_at
+        FROM limira_task_event_logs
+        WHERE task_id = :task_id
+        ORDER BY created_at DESC, event_log_id DESC
+        LIMIT :limit
+    """
+    INSERT_EVIDENCE_SQL = """
+        INSERT INTO limira_evidence_items (
+            evidence_id,
+            task_id,
+            source_url,
+            source_title,
+            publisher,
+            published_at,
+            original_text,
+            translated_text,
+            summary,
+            language,
+            credibility,
+            confidence,
+            cross_verification,
+            conflict_notes,
+            tool_name,
+            model_name,
+            human_confirmed,
+            metadata
+        )
+        VALUES (
+            :evidence_id,
+            :task_id,
+            :source_url,
+            :source_title,
+            :publisher,
+            CAST(:published_at AS timestamptz),
+            :original_text,
+            :translated_text,
+            :summary,
+            :language,
+            :credibility,
+            :confidence,
+            CAST(:cross_verification AS jsonb),
+            :conflict_notes,
+            :tool_name,
+            :model_name,
+            :human_confirmed,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, evidence_id) DO UPDATE SET
+            source_url = EXCLUDED.source_url,
+            source_title = EXCLUDED.source_title,
+            publisher = EXCLUDED.publisher,
+            published_at = EXCLUDED.published_at,
+            original_text = EXCLUDED.original_text,
+            translated_text = EXCLUDED.translated_text,
+            summary = EXCLUDED.summary,
+            language = EXCLUDED.language,
+            credibility = EXCLUDED.credibility,
+            confidence = EXCLUDED.confidence,
+            cross_verification = EXCLUDED.cross_verification,
+            conflict_notes = EXCLUDED.conflict_notes,
+            tool_name = EXCLUDED.tool_name,
+            model_name = EXCLUDED.model_name,
+            human_confirmed = EXCLUDED.human_confirmed,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_ENTITY_SQL = """
+        INSERT INTO limira_entities (
+            entity_id,
+            task_id,
+            entity_type,
+            display_name,
+            canonical_name,
+            country_code,
+            geometry,
+            confidence,
+            metadata
+        )
+        VALUES (
+            :entity_id,
+            :task_id,
+            :entity_type,
+            :display_name,
+            :canonical_name,
+            :country_code,
+            CASE
+                WHEN :geometry_geojson IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromGeoJSON(:geometry_geojson), 4326)
+                WHEN :geometry_wkt IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromText(:geometry_wkt), 4326)
+                ELSE NULL
+            END,
+            :confidence,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, entity_id) DO UPDATE SET
+            entity_type = EXCLUDED.entity_type,
+            display_name = EXCLUDED.display_name,
+            canonical_name = EXCLUDED.canonical_name,
+            country_code = EXCLUDED.country_code,
+            geometry = EXCLUDED.geometry,
+            confidence = EXCLUDED.confidence,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_RELATION_SQL = """
+        INSERT INTO limira_entity_relations (
+            relation_id,
+            task_id,
+            source_entity_id,
+            target_entity_id,
+            relation_type,
+            evidence_refs,
+            confidence,
+            metadata
+        )
+        VALUES (
+            :relation_id,
+            :task_id,
+            :source_entity_id,
+            :target_entity_id,
+            :relation_type,
+            :evidence_refs,
+            :confidence,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, relation_id) DO UPDATE SET
+            source_entity_id = EXCLUDED.source_entity_id,
+            target_entity_id = EXCLUDED.target_entity_id,
+            relation_type = EXCLUDED.relation_type,
+            evidence_refs = EXCLUDED.evidence_refs,
+            confidence = EXCLUDED.confidence,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_TIMELINE_SQL = """
+        INSERT INTO limira_timeline_events (
+            timeline_event_id,
+            task_id,
+            event_title,
+            event_type,
+            event_time,
+            event_time_end,
+            location_name,
+            geometry,
+            risk_level,
+            confidence,
+            evidence_refs,
+            metadata
+        )
+        VALUES (
+            :timeline_event_id,
+            :task_id,
+            :event_title,
+            :event_type,
+            CAST(:event_time AS timestamptz),
+            CAST(:event_time_end AS timestamptz),
+            :location_name,
+            CASE
+                WHEN :geometry_geojson IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromGeoJSON(:geometry_geojson), 4326)
+                WHEN :geometry_wkt IS NOT NULL
+                    THEN ST_SetSRID(ST_GeomFromText(:geometry_wkt), 4326)
+                ELSE NULL
+            END,
+            :risk_level,
+            :confidence,
+            :evidence_refs,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, timeline_event_id) DO UPDATE SET
+            event_title = EXCLUDED.event_title,
+            event_type = EXCLUDED.event_type,
+            event_time = EXCLUDED.event_time,
+            event_time_end = EXCLUDED.event_time_end,
+            location_name = EXCLUDED.location_name,
+            geometry = EXCLUDED.geometry,
+            risk_level = EXCLUDED.risk_level,
+            confidence = EXCLUDED.confidence,
+            evidence_refs = EXCLUDED.evidence_refs,
+            metadata = EXCLUDED.metadata
+    """
+    INSERT_REPORT_SECTION_SQL = """
+        INSERT INTO limira_generated_reports (
+            report_id,
+            task_id,
+            report_type,
+            markdown,
+            html,
+            evidence_refs,
+            creator_user_id,
+            metadata
+        )
+        VALUES (
+            :report_id,
+            :task_id,
+            'section',
+            :markdown,
+            :html,
+            :evidence_refs,
+            :creator_user_id,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, report_id) DO UPDATE SET
+            markdown = EXCLUDED.markdown,
+            html = EXCLUDED.html,
+            evidence_refs = EXCLUDED.evidence_refs,
+            creator_user_id = EXCLUDED.creator_user_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = now()
+    """
+    UPSERT_GENERATED_REPORT_SQL = f"""
+        INSERT INTO limira_generated_reports (
+            report_id,
+            task_id,
+            report_type,
+            markdown,
+            html,
+            pdf_object_key,
+            evidence_refs,
+            creator_user_id,
+            metadata
+        )
+        VALUES (
+            :report_id,
+            :task_id,
+            :report_type,
+            :markdown,
+            :html,
+            :pdf_object_key,
+            :evidence_refs,
+            :creator_user_id,
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (task_id, report_id) DO UPDATE SET
+            report_type = EXCLUDED.report_type,
+            markdown = EXCLUDED.markdown,
+            html = EXCLUDED.html,
+            pdf_object_key = EXCLUDED.pdf_object_key,
+            evidence_refs = EXCLUDED.evidence_refs,
+            creator_user_id = EXCLUDED.creator_user_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = now()
+        RETURNING {REPORT_COLUMNS}
+    """
+    SELECT_USER_GENERATED_REPORT_SQL = f"""
+        SELECT {REPORT_COLUMNS}
+        FROM limira_generated_reports reports
+        JOIN limira_research_tasks tasks
+          ON tasks.task_id = reports.task_id
+        WHERE reports.task_id = :task_id
+          AND reports.report_id = :report_id
+          AND tasks.owner_user_id = :owner_user_id
+    """
+    SELECT_TASK_GENERATED_REPORTS_SQL = f"""
+        SELECT {REPORT_COLUMNS}
+        FROM limira_generated_reports
+        WHERE task_id = :task_id
+        ORDER BY created_at DESC, report_id ASC
+    """
+    INSERT_UPLOADED_DOCUMENT_SQL = f"""
+        INSERT INTO limira_uploaded_documents (
+            document_id,
+            task_id,
+            owner_user_id,
+            original_filename,
+            content_type,
+            byte_size,
+            minio_bucket,
+            object_key,
+            extracted_text,
+            language,
+            embedding,
+            metadata
+        )
+        VALUES (
+            :document_id,
+            :task_id,
+            :owner_user_id,
+            :original_filename,
+            :content_type,
+            :byte_size,
+            :minio_bucket,
+            :object_key,
+            :extracted_text,
+            :language,
+            CAST(:embedding AS vector),
+            CAST(:metadata AS jsonb)
+        )
+        ON CONFLICT (document_id) DO UPDATE SET
+            task_id = EXCLUDED.task_id,
+            original_filename = EXCLUDED.original_filename,
+            content_type = EXCLUDED.content_type,
+            byte_size = EXCLUDED.byte_size,
+            minio_bucket = EXCLUDED.minio_bucket,
+            object_key = EXCLUDED.object_key,
+            extracted_text = EXCLUDED.extracted_text,
+            language = EXCLUDED.language,
+            embedding = EXCLUDED.embedding,
+            metadata = EXCLUDED.metadata
+        RETURNING {DOCUMENT_COLUMNS}
+    """
+    SELECT_USER_UPLOADED_DOCUMENT_SQL = f"""
+        SELECT {DOCUMENT_COLUMNS}
+        FROM limira_uploaded_documents
+        WHERE document_id = :document_id
+          AND owner_user_id = :owner_user_id
+    """
+    SELECT_USER_UPLOADED_DOCUMENTS_SQL = f"""
+        SELECT {DOCUMENT_COLUMNS}
+        FROM limira_uploaded_documents
+        WHERE owner_user_id = :owner_user_id
+          AND (:task_id IS NULL OR task_id = :task_id)
+        ORDER BY created_at DESC, document_id ASC
+    """
+    SEARCH_USER_UPLOADED_DOCUMENTS_BY_VECTOR_SQL = f"""
+        SELECT
+            {DOCUMENT_COLUMNS},
+            1 - (embedding <=> CAST(:query_embedding AS vector)) AS limira_search_score
+        FROM limira_uploaded_documents
+        WHERE owner_user_id = :owner_user_id
+          AND (:task_id IS NULL OR task_id = :task_id)
+          AND embedding IS NOT NULL
+        ORDER BY embedding <=> CAST(:query_embedding AS vector) ASC,
+                 created_at DESC,
+                 document_id ASC
+        LIMIT :limit
+    """
+
+    def __init__(self, database_url: str, *, engine_factory: Any | None = None) -> None:
+        if not _is_postgres_database_url(database_url):
+            raise RuntimeError("limira_postgres_database_url_required")
+        self.database_url = database_url
+        self._engine_factory = engine_factory
+        self._engine: Any | None = None
+
+    @classmethod
+    def sql_contract(cls) -> str:
+        return "\n".join(
+            value
+            for name, value in cls.__dict__.items()
+            if name.endswith("_SQL") and isinstance(value, str)
+        )
+
+    @property
+    def engine(self) -> Any:
+        if self._engine is None:
+            if self._engine_factory is not None:
+                self._engine = self._engine_factory(self.database_url)
+            else:
+                from sqlalchemy import create_engine
+
+                self._engine = create_engine(self.database_url, pool_pre_ping=True)
+        return self._engine
+
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        owner_user_id: str,
+        query: str,
+        scenario: str | None,
+        runner_task_id: str | None,
+    ) -> LimiraTask:
+        row = self._fetch_one(
+            self.INSERT_TASK_SQL,
+            {
+                "task_id": task_id,
+                "owner_user_id": owner_user_id,
+                "query": query,
+                "runner_task_id": runner_task_id,
+                "scenario": scenario,
+                "model_summary": _json_dumps({}),
+                "metadata": _json_dumps({"repository": "postgres"}),
+            },
+        )
+        if not row:
+            raise RuntimeError("limira_task_insert_failed")
+        return _task_from_row(row)
+
+    def get_task(self, task_id: str) -> LimiraTask | None:
+        row = self._fetch_one(self.SELECT_TASK_SQL, {"task_id": task_id})
+        return _task_from_row(row) if row else None
+
+    def get_user_task(self, task_id: str, owner_user_id: str) -> LimiraTask | None:
+        row = self._fetch_one(
+            self.SELECT_USER_TASK_SQL,
+            {"task_id": task_id, "owner_user_id": owner_user_id},
+        )
+        return _task_from_row(row) if row else None
+
+    def list_user_tasks(self, *, owner_user_id: str, limit: int) -> list[LimiraTask]:
+        rows = self._fetch_all(
+            self.SELECT_USER_TASKS_SQL,
+            {"owner_user_id": owner_user_id, "limit": limit},
+        )
+        return [_task_from_row(row) for row in rows]
+
+    def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
+        allowed = {
+            "status",
+            "archive_status",
+            "runner_task_id",
+            "archive_object_key",
+            "archive_zip_sha256",
+            "scenario",
+            "error",
+            "model_summary",
+        }
+        values = {key: value for key, value in updates.items() if key in allowed}
+        if not values:
+            task = self.get_task(task_id)
+            if not task:
+                raise KeyError(task_id)
+            return task
+
+        assignments: list[str] = []
+        params: dict[str, Any] = {"task_id": task_id}
+        for key, value in values.items():
+            if key == "model_summary":
+                assignments.append(f"{key} = CAST(:{key} AS jsonb)")
+                params[key] = _json_dumps(value or {})
+            else:
+                assignments.append(f"{key} = :{key}")
+                params[key] = value
+
+        status = values.get("status")
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, now())")
+        elif status in FINAL_TASK_STATUSES:
+            assignments.append("completed_at = COALESCE(completed_at, now())")
+
+        sql = f"""
+            UPDATE limira_research_tasks
+            SET {", ".join(assignments)}
+            WHERE task_id = :task_id
+            RETURNING {self.TASK_COLUMNS}
+        """
+        row = self._fetch_one(sql, params)
+        if not row:
+            raise KeyError(task_id)
+        return _task_from_row(row)
+
+    def _invalidate_archive_metadata(self, task_id: str | None) -> None:
+        if not task_id:
+            return
+        try:
+            self.update_task(
+                task_id,
+                archive_object_key=None,
+                archive_zip_sha256=None,
+            )
+        except KeyError:
+            log.warning(
+                "Unable to invalidate limira archive metadata for missing task",
+                extra={"task_id": task_id},
+            )
+
+    def record_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+    ) -> None:
+        artifact_id = _artifact_primary_id(artifact_type, artifact)
+        bucket = ARTIFACT_BUCKETS[artifact_type]
+        event_params = {
+            "task_id": task_id,
+            "local_artifact_id": artifact_id,
+            "artifact_type": artifact_type,
+            "bucket": bucket,
+            "payload": _json_dumps(artifact),
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "notes": _optional_string(artifact.get("notes")),
+            "source_event_type": _optional_string(artifact.get("source_event_type")),
+        }
+        self._execute(self.INSERT_ARTIFACT_EVENT_SQL, event_params)
+        self.record_artifact_trace_event(
+            task_id,
+            _artifact_trace_event_from_artifact(artifact_type, bucket, artifact),
+        )
+        try:
+            self._record_typed_artifact(task_id, artifact_type, artifact, artifact_id)
+        except Exception:
+            log.exception("Failed to persist typed limira artifact %s", artifact_id)
+        self._invalidate_archive_metadata(task_id)
+
+    def get_artifacts(self, task_id: str) -> dict[str, list[dict[str, Any]]]:
+        artifacts = _empty_artifact_buckets()
+        rows = self._fetch_all(self.SELECT_ARTIFACT_EVENTS_SQL, {"task_id": task_id})
+        for row in rows:
+            artifact_type = row.get("artifact_type")
+            if artifact_type not in ARTIFACT_BUCKETS:
+                continue
+            payload = _json_loads(row.get("payload"))
+            if isinstance(payload, dict):
+                artifacts[ARTIFACT_BUCKETS[artifact_type]].append(payload)
+        return artifacts
+
+    def record_artifact_trace_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        self._execute(
+            self.INSERT_ARTIFACT_TRACE_EVENT_SQL,
+            {
+                "task_id": task_id,
+                "event_type": str(event.get("type") or "artifact_event"),
+                "artifact_type": _optional_string(event.get("artifact_type")),
+                "bucket": _optional_string(event.get("bucket")),
+                "local_artifact_id": _optional_string(event.get("local_artifact_id")),
+                "payload": _json_dumps(payload),
+                "source_event_type": _optional_string(event.get("source_event_type")),
+            },
+        )
+        self._invalidate_archive_metadata(task_id)
+
+    def get_artifact_trace_events(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._fetch_all(
+            self.SELECT_ARTIFACT_TRACE_EVENTS_SQL,
+            {"task_id": task_id},
+        )
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            event: dict[str, Any] = {
+                "type": row.get("event_type"),
+                "payload": _json_loads(row.get("payload")),
+            }
+            if row.get("artifact_type"):
+                event["artifact_type"] = row["artifact_type"]
+            if row.get("bucket"):
+                event["bucket"] = row["bucket"]
+            if row.get("local_artifact_id"):
+                event["local_artifact_id"] = row["local_artifact_id"]
+            if row.get("source_event_type"):
+                event["source_event_type"] = row["source_event_type"]
+            events.append(event)
+        return events
+
+    def record_task_event_log(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        source: str = "runner_stream",
+    ) -> None:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        self._execute(
+            self.INSERT_TASK_EVENT_LOG_SQL,
+            {
+                "task_id": task_id,
+                "event_type": str(event.get("type") or "runner_event"),
+                "source": source,
+                "payload": _json_dumps(scrub_limira_secrets(payload)),
+            },
+        )
+
+    def list_task_event_logs(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rows = self._fetch_all(
+            self.SELECT_TASK_EVENT_LOGS_SQL,
+            {"task_id": task_id, "limit": max(1, limit)},
+        )
+        events: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            events.append(
+                {
+                    "event_log_id": row.get("event_log_id"),
+                    "task_id": row.get("task_id"),
+                    "event_type": row.get("event_type"),
+                    "source": row.get("source"),
+                    "payload": _json_loads(row.get("payload")),
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
+        return events
+
+    def record_uploaded_document(
+        self,
+        *,
+        document_id: str,
+        owner_user_id: str,
+        task_id: str | None,
+        original_filename: str,
+        content_type: str | None,
+        byte_size: int,
+        minio_bucket: str,
+        object_key: str,
+        extracted_text: str | None,
+        language: str | None,
+        metadata: Mapping[str, Any] | None,
+        embedding: list[float] | None = None,
+    ) -> LimiraUploadedDocument:
+        row = self._fetch_one(
+            self.INSERT_UPLOADED_DOCUMENT_SQL,
+            {
+                "document_id": document_id,
+                "owner_user_id": owner_user_id,
+                "task_id": task_id,
+                "original_filename": original_filename,
+                "content_type": content_type,
+                "byte_size": byte_size,
+                "minio_bucket": minio_bucket,
+                "object_key": object_key,
+                "extracted_text": extracted_text,
+                "language": language,
+                "embedding": _vector_param(embedding),
+                "metadata": _json_dumps(metadata or {}),
+            },
+        )
+        if not row:
+            raise RuntimeError("limira_uploaded_document_insert_failed")
+        self._invalidate_archive_metadata(task_id)
+        return _uploaded_document_from_row(row)
+
+    def get_user_document(
+        self,
+        document_id: str,
+        owner_user_id: str,
+    ) -> LimiraUploadedDocument | None:
+        row = self._fetch_one(
+            self.SELECT_USER_UPLOADED_DOCUMENT_SQL,
+            {"document_id": document_id, "owner_user_id": owner_user_id},
+        )
+        return _uploaded_document_from_row(row) if row else None
+
+    def list_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        task_id: str | None = None,
+    ) -> list[LimiraUploadedDocument]:
+        rows = self._fetch_all(
+            self.SELECT_USER_UPLOADED_DOCUMENTS_SQL,
+            {"owner_user_id": owner_user_id, "task_id": task_id},
+        )
+        return [_uploaded_document_from_row(row) for row in rows]
+
+    def search_user_documents(
+        self,
+        *,
+        owner_user_id: str,
+        query: str,
+        limit: int,
+        task_id: str | None = None,
+        query_embedding: list[float] | None = None,
+    ) -> list[LimiraUploadedDocumentSearchResult]:
+        if query_embedding is not None:
+            rows = self._fetch_all(
+                self.SEARCH_USER_UPLOADED_DOCUMENTS_BY_VECTOR_SQL,
+                {
+                    "owner_user_id": owner_user_id,
+                    "task_id": task_id,
+                    "query_embedding": _vector_param(query_embedding),
+                    "limit": limit,
+                },
+            )
+            results = [
+                _uploaded_document_vector_search_result(
+                    _uploaded_document_from_row(row),
+                    query,
+                    float(row.get("limira_search_score") or 0.0),
+                )
+                for row in rows
+            ]
+            if results:
+                return results
+        documents = self.list_user_documents(
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+        )
+        return _rank_uploaded_documents(documents, query, limit)
+
+    def record_generated_report(
+        self,
+        *,
+        report_id: str,
+        task_id: str,
+        report_type: str,
+        markdown: str,
+        html: str | None,
+        pdf_object_key: str | None,
+        evidence_refs: list[str],
+        creator_user_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> LimiraGeneratedReport:
+        row = self._fetch_one(
+            self.UPSERT_GENERATED_REPORT_SQL,
+            {
+                "report_id": report_id,
+                "task_id": task_id,
+                "report_type": report_type,
+                "markdown": markdown,
+                "html": html,
+                "pdf_object_key": pdf_object_key,
+                "evidence_refs": _list_of_strings(evidence_refs),
+                "creator_user_id": creator_user_id,
+                "metadata": _json_dumps(metadata or {}),
+            },
+        )
+        if not row:
+            raise RuntimeError("limira_generated_report_insert_failed")
+        self._invalidate_archive_metadata(task_id)
+        return _generated_report_from_row(row)
+
+    def get_user_report(
+        self,
+        *,
+        task_id: str,
+        report_id: str,
+        owner_user_id: str,
+    ) -> LimiraGeneratedReport | None:
+        row = self._fetch_one(
+            self.SELECT_USER_GENERATED_REPORT_SQL,
+            {
+                "task_id": task_id,
+                "report_id": report_id,
+                "owner_user_id": owner_user_id,
+            },
+        )
+        return _generated_report_from_row(row) if row else None
+
+    def list_task_reports(
+        self,
+        *,
+        task_id: str,
+    ) -> list[LimiraGeneratedReport]:
+        rows = self._fetch_all(
+            self.SELECT_TASK_GENERATED_REPORTS_SQL,
+            {"task_id": task_id},
+        )
+        return [_generated_report_from_row(row) for row in rows]
+
+    def _record_typed_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+        artifact_id: str,
+    ) -> None:
+        if artifact_type == "evidence":
+            self._execute(self.INSERT_EVIDENCE_SQL, self._evidence_params(task_id, artifact))
+        elif artifact_type == "entity":
+            self._execute(self.INSERT_ENTITY_SQL, self._entity_params(task_id, artifact))
+        elif artifact_type == "relation":
+            self._execute(self.INSERT_RELATION_SQL, self._relation_params(task_id, artifact))
+        elif artifact_type in {"timeline_event", "map_feature"}:
+            self._execute(
+                self.INSERT_TIMELINE_SQL,
+                self._timeline_params(task_id, artifact_type, artifact, artifact_id),
+            )
+        elif artifact_type == "report_section":
+            self._execute(
+                self.INSERT_REPORT_SECTION_SQL,
+                self._report_section_params(task_id, artifact),
+            )
+
+    def _evidence_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evidence_id": str(artifact["evidence_id"]),
+            "task_id": task_id,
+            "source_url": artifact.get("source_url") or artifact.get("url"),
+            "source_title": artifact.get("source_title") or artifact.get("title"),
+            "publisher": artifact.get("publisher"),
+            "published_at": _temporal_value(
+                artifact,
+                "published_at",
+                "published_time",
+                "published",
+                "published_date",
+            ),
+            "original_text": artifact.get("original_text") or artifact.get("text"),
+            "translated_text": artifact.get("translated_text"),
+            "summary": artifact.get("summary"),
+            "language": artifact.get("language"),
+            "credibility": _optional_float(artifact.get("credibility")),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "cross_verification": _json_dumps(artifact.get("cross_verification") or {}),
+            "conflict_notes": artifact.get("conflict_notes"),
+            "tool_name": artifact.get("tool_name"),
+            "model_name": artifact.get("model_name"),
+            "human_confirmed": bool(artifact.get("human_confirmed", False)),
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _entity_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        entity_type = str(artifact.get("entity_type") or artifact.get("type") or "event")
+        if entity_type not in _allowed_entity_types():
+            entity_type = "event"
+        display_name = (
+            artifact.get("display_name")
+            or artifact.get("name")
+            or artifact.get("title")
+            or artifact["entity_id"]
+        )
+        return {
+            "entity_id": str(artifact["entity_id"]),
+            "task_id": task_id,
+            "entity_type": entity_type,
+            "display_name": str(display_name),
+            "canonical_name": artifact.get("canonical_name"),
+            "country_code": artifact.get("country_code"),
+            **_geometry_params(artifact),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _relation_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        relation_type = str(artifact.get("relation_type") or artifact.get("type") or "mentions")
+        if relation_type not in _allowed_relation_types():
+            relation_type = "mentions"
+        return {
+            "relation_id": str(artifact["relation_id"]),
+            "task_id": task_id,
+            "source_entity_id": artifact.get("source_entity_id"),
+            "target_entity_id": artifact.get("target_entity_id"),
+            "relation_type": relation_type,
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "confidence": _optional_float(artifact.get("confidence")),
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _timeline_params(
+        self,
+        task_id: str,
+        artifact_type: str,
+        artifact: dict[str, Any],
+        artifact_id: str,
+    ) -> dict[str, Any]:
+        risk_level = str(artifact.get("risk_level") or "unknown")
+        if risk_level not in {"unknown", "low", "medium", "high", "critical"}:
+            risk_level = "unknown"
+        return {
+            "timeline_event_id": artifact_id,
+            "task_id": task_id,
+            "event_title": str(
+                artifact.get("event_title")
+                or artifact.get("title")
+                or artifact.get("name")
+                or artifact_id
+            ),
+            "event_type": artifact.get("event_type") or artifact_type,
+            "event_time": _temporal_value(
+                artifact,
+                "event_time",
+                "time",
+                "timestamp",
+                "date",
+            ),
+            "event_time_end": _temporal_value(
+                artifact,
+                "event_time_end",
+                "time_end",
+                "end_time",
+                "end_date",
+            ),
+            "location_name": artifact.get("location_name")
+            or _location_text(artifact.get("location")),
+            **_geometry_params(artifact),
+            "risk_level": risk_level,
+            "confidence": _optional_float(artifact.get("confidence")),
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "metadata": _json_dumps({**artifact, "artifact_type": artifact_type}),
+        }
+
+    def _report_section_params(self, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        owner = self._task_owner_user_id(task_id) or "limira"
+        return {
+            "report_id": str(artifact["section_id"]),
+            "task_id": task_id,
+            "markdown": artifact.get("markdown") or artifact.get("content") or "",
+            "html": artifact.get("html"),
+            "evidence_refs": _list_of_strings(artifact.get("evidence_refs")),
+            "creator_user_id": owner,
+            "metadata": _json_dumps(artifact),
+        }
+
+    def _task_owner_user_id(self, task_id: str) -> str | None:
+        row = self._fetch_one(
+            "SELECT owner_user_id FROM limira_research_tasks WHERE task_id = :task_id",
+            {"task_id": task_id},
+        )
+        return str(row["owner_user_id"]) if row and row.get("owner_user_id") else None
+
+    def _fetch_one(self, sql: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        with self.engine.begin() as connection:
+            row = connection.execute(_sql_text(sql), params).mappings().first()
+        return dict(row) if row else None
+
+    def _fetch_all(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        with self.engine.begin() as connection:
+            rows = connection.execute(_sql_text(sql), params).mappings().all()
+        return [dict(row) for row in rows]
+
+    def _execute(self, sql: str, params: dict[str, Any]) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(_sql_text(sql), params)
+
+
+def _limira_data_dir(env: Any = os.environ) -> str:
+    return os.path.abspath(
+        os.path.expanduser(
+            str(
+                env.get("DATA_DIR")
+                or os.path.join(os.path.dirname(__file__), "..", "..", "data")
+            )
+        )
+    )
+
+
+def _limira_sqlite_database_path(env: Any = os.environ) -> str:
+    raw_path = str(
+        env.get(LIMIRA_SQLITE_DATABASE_PATH_ENV)
+        or env.get(LIMIRA_DATABASE_URL_ENV)
+        or ""
+    ).strip()
+    if raw_path.startswith("sqlite:///"):
+        raw_path = raw_path.removeprefix("sqlite:///")
+    elif raw_path.startswith("sqlite://"):
+        raw_path = raw_path.removeprefix("sqlite://")
+    if raw_path:
+        return os.path.abspath(os.path.expanduser(raw_path))
+    return os.path.join(_limira_data_dir(env), "limira_repository.sqlite3")
+
+
+def _limira_auth_sqlite_path(env: Any = os.environ) -> str:
+    raw_path = str(env.get(LIMIRA_AUTH_SQLITE_PATH_ENV) or "").strip()
+    if raw_path.startswith("sqlite:///"):
+        raw_path = raw_path.removeprefix("sqlite:///")
+    elif raw_path.startswith("sqlite://"):
+        raw_path = raw_path.removeprefix("sqlite://")
+    if raw_path:
+        return os.path.abspath(os.path.expanduser(raw_path))
+    return os.path.join(_limira_data_dir(env), "limira_auth.sqlite3")
+
+
+def _limira_legacy_auth_sqlite_path(env: Any = os.environ) -> str:
+    raw_path = str(env.get(LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV) or "").strip()
+    if raw_path.startswith("sqlite:///"):
+        raw_path = raw_path.removeprefix("sqlite:///")
+    elif raw_path.startswith("sqlite://"):
+        raw_path = raw_path.removeprefix("sqlite://")
+    if raw_path:
+        return os.path.abspath(os.path.expanduser(raw_path))
+    return os.path.join(_limira_data_dir(env), "legacy_auth.sqlite3")
+
+
+def _limira_auth_token_ttl_seconds(env: Any = os.environ) -> int:
+    raw_value = str(env.get(LIMIRA_AUTH_TOKEN_TTL_SECONDS_ENV) or "").strip()
+    if not raw_value:
+        return LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS
+    try:
+        return max(60, int(raw_value))
+    except ValueError:
+        return LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS
+
+
+def _limira_auth_flow_ttl_seconds(
+    env_name: str,
+    default_seconds: int,
+    env: Any = os.environ,
+) -> int:
+    raw_value = str(env.get(env_name) or "").strip()
+    if not raw_value:
+        return default_seconds
+    try:
+        return max(300, int(raw_value))
+    except ValueError:
+        return default_seconds
+
+
+def _limira_auth_secret(env: Any = os.environ) -> bytes:
+    secret = str(env.get(LIMIRA_AUTH_SECRET_ENV) or "").strip()
+    if not secret:
+        secret = "limira-local-development-secret"
+    return secret.encode("utf-8")
+
+
+def _limira_auth_cookie_secure(env: Any = os.environ) -> bool:
+    return str(env.get(LIMIRA_AUTH_COOKIE_SECURE_ENV) or "").strip().lower() in TRUTHY_ENV_VALUES
+
+
+def _limira_auth_email_outbox_path(env: Any = os.environ) -> str:
+    raw_path = str(env.get(LIMIRA_AUTH_EMAIL_OUTBOX_PATH_ENV) or "").strip()
+    if raw_path:
+        return os.path.abspath(os.path.expanduser(raw_path))
+    return os.path.join(_limira_data_dir(env), "limira_auth_email_outbox.jsonl")
+
+
+def _limira_google_oauth_client_id(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV) or "").strip()
+
+
+def _limira_google_oauth_client_secret(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV) or "").strip()
+
+
+def _limira_google_oauth_enabled(env: Any = os.environ) -> bool:
+    return bool(
+        _limira_google_oauth_client_id(env)
+        and _limira_google_oauth_client_secret(env)
+    )
+
+
+def _limira_google_oauth_auth_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV)
+        or "https://accounts.google.com/o/oauth2/v2/auth"
+    ).strip()
+
+
+def _limira_google_oauth_token_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_GOOGLE_OAUTH_TOKEN_URL_ENV)
+        or "https://oauth2.googleapis.com/token"
+    ).strip()
+
+
+def _limira_google_oauth_tokeninfo_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_GOOGLE_OAUTH_TOKENINFO_URL_ENV)
+        or "https://oauth2.googleapis.com/tokeninfo"
+    ).strip()
+
+
+def _limira_wechat_oauth_app_id(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_WECHAT_OAUTH_APP_ID_ENV) or "").strip()
+
+
+def _limira_wechat_oauth_app_secret(env: Any = os.environ) -> str:
+    return str(env.get(LIMIRA_WECHAT_OAUTH_APP_SECRET_ENV) or "").strip()
+
+
+def _limira_wechat_oauth_enabled(env: Any = os.environ) -> bool:
+    return bool(
+        _limira_wechat_oauth_app_id(env)
+        and _limira_wechat_oauth_app_secret(env)
+    )
+
+
+def _limira_wechat_oauth_auth_url(env: Any = os.environ) -> str:
+    return str(
+        env.get(LIMIRA_WECHAT_OAUTH_AUTH_URL_ENV)
+        or "https://open.weixin.qq.com/connect/qrconnect"
+    ).strip()
+
+
+def _limira_wechat_oauth_token_url(env: Any = os.environ) -> str:

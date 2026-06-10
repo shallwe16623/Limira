@@ -1,0 +1,1500 @@
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task_id,
+        filename="archive.zip",
+        object_id=task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    _assert_archive_hides_internal_model_summary_identifiers(response.body)
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] == stored.object_key
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == persisted["archive_zip_sha256"]
+    assert repaired["metadata"]["archive_sha256"] == persisted["archive_zip_sha256"]
+    _assert_archive_hides_internal_model_summary_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_with_undecodable_text_member():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-binary-archive-reuse",
+        owner_user_id=user.id,
+        query="binary archive member",
+        scenario=None,
+        runner_task_id="runner-binary-archive",
+    )
+    raw_archive = _archive_zip_with_undecodable_report_member()
+    with zipfile.ZipFile(io.BytesIO(raw_archive)) as raw_zip:
+        assert b"sk-binarysecret123456" in raw_zip.read("report.html")
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    assert members["metadata.json"]
+    assert "binary archive member" in members["report.md"]
+    combined = "\n".join(members.values())
+    assert "sk-binarysecret123456" not in combined
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_regenerates_reused_archive_with_undecodable_text_member():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task_id = "task-postgres-binary-archive-reuse"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres binary archive member",
+        scenario=None,
+        runner_task_id="runner-postgres-binary-archive",
+    )
+    raw_archive = _archive_zip_with_undecodable_report_member()
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task_id,
+        filename="archive.zip",
+        object_id=task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    combined = "\n".join(_archive_member_texts(response.body).values())
+    assert "postgres binary archive member" in combined
+    assert "sk-binarysecret123456" not in combined
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] == stored.object_key
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == persisted["archive_zip_sha256"]
+    assert repaired["metadata"]["archive_sha256"] == persisted["archive_zip_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_with_invalid_json_metadata_members():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-invalid-json-archive-reuse",
+        owner_user_id=user.id,
+        query="invalid json archive member",
+        scenario=None,
+        runner_task_id="runner-invalid-json-task",
+    )
+    raw_archive = _archive_zip_with_invalid_json_metadata_members(task.task_id)
+    raw_members = _archive_member_texts(raw_archive)
+    assert "runner_task_id=runner-invalid-json-123" in raw_members["metadata.json"]
+    assert "limira/users/hash" in raw_members["trace.json"]
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["task"]["task_id"] == task.task_id
+    assert trace["task"]["task_id"] == task.task_id
+    _assert_archive_hides_invalid_json_member_identifiers(response.body)
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+    _assert_archive_hides_invalid_json_member_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
+async def test_postgres_archive_download_regenerates_reused_archive_with_invalid_json_metadata_members():
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task_id = "task-postgres-invalid-json-archive-reuse"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id=user.id,
+        query="postgres invalid json archive member",
+        scenario=None,
+        runner_task_id="runner-postgres-invalid-json-task",
+    )
+    raw_archive = _archive_zip_with_invalid_json_metadata_members(task_id)
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task_id,
+        filename="archive.zip",
+        object_id=task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    assert json.loads(members["metadata.json"])["task"]["task_id"] == task_id
+    assert json.loads(members["trace.json"])["task"]["task_id"] == task_id
+    _assert_archive_hides_invalid_json_member_identifiers(response.body)
+    persisted = engine.tasks[task_id]
+    assert persisted["archive_object_key"] == stored.object_key
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == persisted["archive_zip_sha256"]
+    assert repaired["metadata"]["archive_sha256"] == persisted["archive_zip_sha256"]
+    _assert_archive_hides_invalid_json_member_identifiers(repaired["data"])
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_after_task_scoped_writes():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-fresh-archive",
+        owner_user_id=user.id,
+        query="fresh archive",
+        scenario=None,
+        runner_task_id="runner-fresh-archive",
+    )
+    task.archive_status = "ready"
+
+    first_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    first_sha = task.archive_zip_sha256
+    first_members = _archive_member_texts(first_response.body)
+    assert "Fresh report" not in first_members["report.md"]
+
+    repo.record_generated_report(
+        report_id="report-fresh",
+        task_id=task.task_id,
+        report_type="final",
+        markdown="Fresh report [EVID-FRESH]",
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=["EVID-FRESH"],
+        creator_user_id=user.id,
+        metadata={},
+    )
+    assert task.archive_object_key is None
+    assert task.archive_zip_sha256 is None
+
+    second_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    second_sha = task.archive_zip_sha256
+    second_members = _archive_member_texts(second_response.body)
+    assert second_sha != first_sha
+    assert "Fresh report [EVID-FRESH]" in second_members["report.md"]
+
+    repo.record_uploaded_document(
+        document_id="doc-fresh",
+        owner_user_id=user.id,
+        task_id=task.task_id,
+        original_filename="brief.txt",
+        content_type="text/plain",
+        byte_size=5,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/tasks/task-fresh-archive/uploads/doc-fresh.txt",
+        extracted_text="brief",
+        language=None,
+        metadata={},
+    )
+    assert task.archive_object_key is None
+    assert task.archive_zip_sha256 is None
+
+    third_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    third_sha = task.archive_zip_sha256
+    third_trace = json.loads(_archive_member_texts(third_response.body)["trace.json"])
+    assert third_sha != second_sha
+    assert third_trace["uploaded_documents"][0]["document_id"] == "doc-fresh"
+
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-NEW",
+            "summary": "new evidence",
+            "source_url": "https://example.test/new",
+        },
+    )
+    assert task.archive_object_key is None
+    assert task.archive_zip_sha256 is None
+
+    fourth_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    fourth_trace = json.loads(_archive_member_texts(fourth_response.body)["trace.json"])
+    assert fourth_trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-NEW"
+    assert task.archive_object_key in storage.objects
+    assert storage.objects[task.archive_object_key]["content_type"] == "application/zip"
+
+
+@pytest.mark.asyncio
+async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    fetched_url = "https://example.test/port"
+
+    async def fake_fetch_evidence_page_snapshots(_artifacts):
+        return {
+            fetched_url: limira.EvidencePageSnapshot(
+                url=fetched_url,
+                final_url="https://example.test/port?print=1",
+                status_code=200,
+                content_type="text/html; charset=utf-8",
+                html=(
+                    "<!doctype html><html><head><title>Original page</title>"
+                    "<script>window.evil=true</script></head>"
+                    '<body onload="steal()">'
+                    "<article id=\"original\">Original archived page body.</article>"
+                    '<a href="javascript:alert(1)">bad link</a>'
+                    "</body></html>"
+                ),
+            )
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_fetch_evidence_page_snapshots",
+        fake_fetch_evidence_page_snapshots,
+    )
+    task = repo.create_task(
+        task_id="task-evidence-snapshots",
+        owner_user_id=user.id,
+        query="snapshot archive",
+        scenario=None,
+        runner_task_id="runner-evidence-snapshots",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "Port authority bulletin",
+            "source": "Example Maritime",
+            "source_url": "https://example.test/port",
+            "published_at": "2026-06-09",
+            "confidence": 0.9,
+            "summary": "New inspection rule published",
+        },
+    )
+    repo.record_task_event_log(
+        task.task_id,
+        {
+            "type": "tool_result",
+            "payload": {
+                "tool_name": "web_fetch",
+                "result": json.dumps(
+                    {
+                        "url": "https://example.test/port/",
+                        "title": "Port authority bulletin",
+                        "extracted_info": (
+                            "Captured page text: terminal policy changed."
+                        ),
+                    }
+                ),
+            },
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    archive_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    members = _archive_member_texts(archive_response.body)
+    assert list(members)[:4] == list(limira.ARCHIVE_MEMBER_ORDER)
+    assert "evidence_snapshots/manifest.json" in members
+    manifest = json.loads(members["evidence_snapshots/manifest.json"])
+    snapshot = manifest["snapshots"][0]
+    assert snapshot["evidence_id"] == "EVID-001"
+    assert snapshot["url"] == "https://example.test/port"
+    assert snapshot["page_snapshot_available"] is True
+    assert snapshot["page_snapshot_source"] == "fetched_url"
+    assert snapshot["summary_source"] == "task_event_log"
+    assert snapshot["page_status_code"] == 200
+    page_html = members[snapshot["page_member_name"]]
+    summary_html = members[snapshot["summary_member_name"]]
+    assert "Limira archived webpage snapshot" in page_html
+    assert "Original archived page body." in page_html
+    assert "https://example.test/port?print=1" in page_html
+    assert "<script" not in page_html.lower()
+    assert "onload=" not in page_html.lower()
+    assert "javascript:alert" not in page_html.lower()
+    assert 'href="#"' in page_html
+    assert "Port authority bulletin" in summary_html
+    assert "https://example.test/port" in summary_html
+    assert "Captured page text: terminal policy changed." in summary_html
+    assert "New inspection rule published" in summary_html
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["evidence_snapshots"] == manifest["snapshots"]
+    assert trace["evidence_snapshots"] == manifest["snapshots"]
+    assert task.archive_object_key in storage.objects
+    assert storage.objects[task.archive_object_key]["data"] == archive_response.body
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_missing_evidence_snapshots():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-missing-snapshot-reuse",
+        owner_user_id=user.id,
+        query="missing snapshot archive",
+        scenario=None,
+        runner_task_id="runner-missing-snapshot",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-REUSE",
+            "title": "Reusable evidence",
+            "source_url": "https://example.test/reuse",
+            "summary": "Snapshot must be regenerated.",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+    raw_archive = _archive_zip()
+    assert "evidence_snapshots/manifest.json" not in _archive_member_texts(raw_archive)
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    manifest = json.loads(members["evidence_snapshots/manifest.json"])
+    assert manifest["snapshots"][0]["evidence_id"] == "EVID-REUSE"
+    snapshot = manifest["snapshots"][0]
+    assert snapshot["page_snapshot_available"] is False
+    page_html = members[snapshot["page_member_name"]]
+    summary_html = members[snapshot["summary_member_name"]]
+    assert "网页原始 HTML 快照不可用" in page_html
+    assert "Reusable evidence" in summary_html
+    assert "Snapshot must be regenerated." in summary_html
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+
+
+@pytest.mark.asyncio
+async def test_untasked_upload_does_not_invalidate_task_archive():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-unlinked-upload",
+        owner_user_id=user.id,
+        query="unlinked upload",
+        scenario=None,
+        runner_task_id="runner-unlinked-upload",
+    )
+    task.archive_status = "ready"
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    archive_key = task.archive_object_key
+    archive_sha = task.archive_zip_sha256
+
+    repo.record_uploaded_document(
+        document_id="doc-unlinked",
+        owner_user_id=user.id,
+        task_id=None,
+        original_filename="unlinked.txt",
+        content_type="text/plain",
+        byte_size=8,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/uploads/doc-unlinked.txt",
+        extracted_text="unlinked",
+        language=None,
+        metadata={},
+    )
+
+    assert task.archive_object_key == archive_key
+    assert task.archive_zip_sha256 == archive_sha
+    second_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    assert second_response.body == response.body
+
+
+@pytest.mark.asyncio
+async def test_admin_access_requires_explicit_admin_route():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+    admin = limira.LimiraUser("admin-user", role="admin")
+
+    created = await limira.create_research_task(
+        {"query": "critical minerals policy"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    repo.tasks[task_id].archive_status = "ready"
+
+    with pytest.raises(HTTPException) as normal_admin_route:
+        await limira.get_task(task_id, user=admin, repo=repo)
+    assert normal_admin_route.value.status_code == 404
+
+    payload = await limira.admin_get_task(task_id, user=admin, repo=repo)
+    assert payload["admin_view"] is True
+    _assert_admin_browser_payload_hides_raw_identities(
+        payload,
+        owner_user_id=user.id,
+        admin_user_id=admin.id,
+    )
+
+    response = await limira.admin_download_task_archive(
+        task_id,
+        user=admin,
+        repo=repo,
+        object_storage=storage,
+    )
+    assert response.media_type == "application/zip"
+    assert repo.tasks[task_id].archive_object_key in storage.objects
+
+
+@pytest.mark.asyncio
+async def test_admin_task_event_logs_are_persisted_for_operations_only():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient(
+        events=[
+            {
+                "event": "start_of_workflow",
+                "data": {"message": "internal-looking user noise"},
+            },
+            {
+                "event": "status",
+                "data": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    user = limira.LimiraUser("user-a")
+    admin = limira.LimiraUser("admin-user", role="admin")
+    created = await limira.create_research_task(
+        {"query": "ops event log boundary"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    response = await limira.get_task_events(
+        created["task_id"],
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    streamed_events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    payload = await limira.admin_get_task_event_logs(
+        created["task_id"],
+        limit=500,
+        user=admin,
+        repo=repo,
+    )
+
+    assert payload["admin_view"] is True
+    _assert_admin_browser_payload_hides_raw_identities(
+        payload,
+        owner_user_id=user.id,
+        admin_user_id=admin.id,
+    )
+    assert payload["task_id"] == created["task_id"]
+    assert payload["count"] == len(payload["events"])
+    assert [event["event_type"] for event in payload["events"]] == [
+        event["type"] for event in streamed_events
+    ]
+    assert all(event["source"] == "runner_stream" for event in payload["events"])
+    assert all(event["task_id"] == created["task_id"] for event in payload["events"])
+
+
+@pytest.mark.asyncio
+async def test_admin_task_route_hides_raw_identities_on_browser_surface():
+    app, repo, _storage = _limira_asgi_app()
+    admin = limira.LimiraUser("admin-user", role="admin")
+
+    async def admin_user_override():
+        return admin
+
+    app.dependency_overrides[limira.get_current_limira_admin] = admin_user_override
+    repo.create_task(
+        task_id="task-admin-json",
+        owner_user_id="user-a",
+        query="admin task browser json",
+        scenario=None,
+        runner_task_id="runner-admin-secret",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get("/api/limira/admin/tasks/task-admin-json")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["task_id"] == "task-admin-json"
+    assert payload["admin_view"] is True
+    _assert_admin_browser_payload_hides_raw_identities(
+        payload,
+        owner_user_id="user-a",
+        admin_user_id=admin.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_admin_archive_download_generates_owner_scoped_archive():
+    app, _memory_repo, storage = _limira_asgi_app()
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    async def admin_user_override():
+        return limira.LimiraUser("admin-user", role="admin")
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    app.dependency_overrides[limira.get_current_limira_admin] = admin_user_override
+
+    task_id = "task-postgres-admin-archive"
+    repo.create_task(
+        task_id=task_id,
+        owner_user_id="user-a",
+        query="admin archive boundary",
+        scenario=None,
+        runner_task_id="runner-postgres-admin-archive",
+    )
+    repo.update_task(task_id, status="completed", archive_status="ready")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get(f"/api/limira/admin/tasks/{task_id}/archive.zip")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/zip")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+    persisted = engine.tasks[task_id]
+    archive_key = persisted["archive_object_key"]
+    owner_digest = hashlib.sha256(b"user-a").hexdigest()[:24]
+    admin_digest = hashlib.sha256(b"admin-user").hexdigest()[:24]
+    assert f"/users/{owner_digest}/tasks/{task_id}/archives/" in archive_key
+    assert admin_digest not in archive_key
+    assert archive_key in storage.objects
+    stored = storage.objects[archive_key]
+    assert stored["content_type"] == "application/zip"
+    assert stored["metadata"]["owner_user_id"] == "user-a"
+    assert stored["metadata"]["generated_by"] == "admin-user"
+    assert persisted["archive_zip_sha256"] == hashlib.sha256(response.content).hexdigest()
+    assert stored["sha256"] == persisted["archive_zip_sha256"]
+
+    members = _archive_member_texts(response.content)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["task"]["task_id"] == task_id
+    assert trace["task"]["task_id"] == task_id
+    _assert_public_archive_hides_internal_identifiers(response.content)
+    assert "admin-user" not in "\n".join(members.values())
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
+async def test_task_payload_hides_internal_model_summary_identifiers():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    admin = limira.LimiraUser("admin-user", role="admin")
+    task = repo.create_task(
+        task_id="task-summary",
+        owner_user_id=user.id,
+        query="summarize internal state",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    repo.update_task(
+        task.task_id,
+        model_summary={
+            "provider": "deepseek",
+            "runner_task_id": "runner-task-secret",
+            "object_key": "limira/users/hash/tasks/task-summary/uploads/doc.txt",
+            "endpoint": (
+                "http://10.20.30.40:8091/limira-runner/tasks/runner-task-secret"
+            ),
+            "nested": {
+                "archive_object_key": (
+                    "limira/users/hash/tasks/task-summary/archives/archive.zip"
+                ),
+                "safe": "kept",
+                "warning": "limira/users/hash/tasks/task-summary/uploads/doc.txt",
+            },
+        },
+    )
+
+    user_payload = await limira.get_task(task.task_id, user=user, repo=repo)
+    admin_payload = await limira.admin_get_task(task.task_id, user=admin, repo=repo)
+
+    for payload in (user_payload, admin_payload):
+        assert payload["model_summary"]["provider"] == "deepseek"
+        assert payload["model_summary"]["nested"]["safe"] == "kept"
+        assert payload["model_summary"]["endpoint"] == "limira_internal_value_redacted"
+        assert payload["model_summary"]["nested"]["warning"] == (
+            "limira_internal_value_redacted"
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for leaked in (
+            "runner_task_id",
+            "runner-task-secret",
+            "object_key",
+            "archive_object_key",
+            "limira/users/hash",
+            "http://10.20.30.40:8091",
+            "/limira-runner/",
+        ):
+            assert leaked not in serialized
+        _assert_no_browser_leak(payload)
+
+
+@pytest.mark.asyncio
+async def test_postgres_task_detail_route_is_owner_scoped_and_hides_internal_identifiers():
+    app, _repo, _storage = _limira_asgi_app()
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+    owned_task = repo.create_task(
+        task_id="task-owned-detail",
+        owner_user_id="user-a",
+        query="summarize internal state",
+        scenario=None,
+        runner_task_id="runner-task-secret",
+    )
+    repo.update_task(
+        owned_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limira/users/user-a/tasks/task-owned-detail/archives/archive.zip"
+        ),
+        archive_zip_sha256="a" * 64,
+        model_summary=_internal_model_summary(
+            owned_task.task_id,
+            runner_task_id="runner-task-secret",
+        ),
+    )
+    foreign_task = repo.create_task(
+        task_id="task-foreign-detail",
+        owner_user_id="user-b",
+        query="foreign internal state",
+        scenario=None,
+        runner_task_id="runner-foreign-secret",
+    )
+    repo.update_task(
+        foreign_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limira/users/user-b/tasks/task-foreign-detail/archives/archive.zip"
+        ),
+        archive_zip_sha256="b" * 64,
+        model_summary=_internal_model_summary(
+            foreign_task.task_id,
+            runner_task_id="runner-foreign-secret",
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        owned_response = await client.get(
+            "/api/limira/tasks/task-owned-detail",
+        )
+        foreign_response = await client.get(
+            "/api/limira/tasks/task-foreign-detail",
+        )
+
+    assert owned_response.status_code == 200
+    payload = owned_response.json()
+    assert payload["task_id"] == "task-owned-detail"
+    assert payload["status"] == "completed"
+    assert payload["archive_status"] == "ready"
+    assert payload["download_url"] == (
+        "/api/limira/tasks/task-owned-detail/archive.zip"
+    )
+    assert "owner_user_id" not in payload
+    assert payload["model_summary"]["provider"] == "deepseek"
+    assert payload["model_summary"]["nested"]["safe"] == "kept"
+    assert payload["model_summary"]["endpoint"] == "limira_internal_value_redacted"
+    assert payload["model_summary"]["nested"]["warning"] == (
+        "limira_internal_value_redacted"
+    )
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for leaked in (
+        "runner_task_id",
+        "runner-task-secret",
+        "runner-foreign-secret",
+        "object_key",
+        "archive_object_key",
+        "archive_zip_sha256",
+        "limira/users/",
+        "http://10.20.30.40:8091",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(payload)
+
+    assert foreign_response.status_code == 404
+    assert foreign_response.json()["detail"] == "task_not_found"
+    serialized_foreign = json.dumps(foreign_response.json(), ensure_ascii=False)
+    for leaked in (
+        "task-foreign-detail",
+        "runner-foreign-secret",
+        "user-b",
+        "limira/users/user-b",
+        "http://10.20.30.40:8091",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized_foreign
+    _assert_no_browser_leak(foreign_response.json())
+
+
+@pytest.mark.asyncio
+async def test_postgres_task_history_route_is_owner_scoped_and_public_serialized():
+    app, _repo, _storage = _limira_asgi_app()
+    engine = FakeLimiraPostgresEngine()
+    repo = limira.PostgresLimiraTaskRepository(
+        "postgresql://limira:test@postgres:5432/limira",
+        engine_factory=lambda _url: engine,
+    )
+
+    async def task_repository_override():
+        return repo
+
+    app.dependency_overrides[limira.get_task_repository] = task_repository_override
+
+    older_task = repo.create_task(
+        task_id="task-history-older",
+        owner_user_id="user-a",
+        query="older user task",
+        scenario="sanctions_export_controls",
+        runner_task_id="runner-history-older-secret",
+    )
+    repo.update_task(
+        older_task.task_id,
+        status="running",
+        model_summary=_internal_model_summary(
+            older_task.task_id,
+            runner_task_id="runner-history-older-secret",
+        ),
+    )
+    foreign_task = repo.create_task(
+        task_id="task-history-foreign",
+        owner_user_id="user-b",
+        query="foreign user task",
+        scenario=None,
+        runner_task_id="runner-history-foreign-secret",
+    )
+    repo.update_task(
+        foreign_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limira/users/user-b/tasks/task-history-foreign/archives/archive.zip"
+        ),
+        archive_zip_sha256="b" * 64,
+        model_summary=_internal_model_summary(
+            foreign_task.task_id,
+            runner_task_id="runner-history-foreign-secret",
+        ),
+    )
+    latest_task = repo.create_task(
+        task_id="task-history-latest",
+        owner_user_id="user-a",
+        query="latest user task",
+        scenario=None,
+        runner_task_id="runner-history-latest-secret",
+    )
+    repo.update_task(
+        latest_task.task_id,
+        status="completed",
+        archive_status="ready",
+        archive_object_key=(
+            "limira/users/user-a/tasks/task-history-latest/archives/archive.zip"
+        ),
+        archive_zip_sha256="a" * 64,
+        model_summary=_internal_model_summary(
+            latest_task.task_id,
+            runner_task_id="runner-history-latest-secret",
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.get("/api/limira/tasks", params={"limit": 10})
+        limited_response = await client.get("/api/limira/tasks", params={"limit": 1})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 2
+    assert [task["task_id"] for task in payload["tasks"]] == [
+        "task-history-latest",
+        "task-history-older",
+    ]
+    assert payload["tasks"][0]["download_url"] == (
+        "/api/limira/tasks/task-history-latest/archive.zip"
+    )
+    assert payload["tasks"][1]["download_url"] is None
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for leaked in (
+        "owner_user_id",
+        "runner_task_id",
+        "runner-history-latest-secret",
+        "runner-history-older-secret",
+        "runner-history-foreign-secret",
+        "task-history-foreign",
+        "user-b",
+        "object_key",
+        "archive_object_key",
+        "archive_zip_sha256",
+        "limira/users/",
+        "http://10.20.30.40:8091",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized
+    _assert_no_browser_leak(payload)
+
+    assert limited_response.status_code == 200
+    assert limited_response.json()["count"] == 1
+    assert limited_response.json()["tasks"][0]["task_id"] == "task-history-latest"
+
+
+@pytest.mark.asyncio
+async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    research = FakeResearchClient()
+    user = limira.LimiraUser("user-a")
+    created = await limira.create_research_task(
+        {"query": "query"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    with pytest.raises(HTTPException) as not_ready:
+        await limira.download_task_archive(
+            task_id,
+            user=user,
+            repo=repo,
+            object_storage=storage,
+        )
+    assert not_ready.value.status_code == 409
+
+    repo.tasks[task_id].archive_status = "ready"
+    with pytest.raises(HTTPException) as invalid_zip:
+        limira.validate_archive_zip(_archive_zip(extra_member=True))
+    assert invalid_zip.value.status_code == 502
+
+
+def test_runner_service_headers_are_server_side_only():
+    headers = limira.runner_service_headers(
+        limira.LimiraUser("user-a", role="admin"),
+        "server-only-token",
+    )
+
+    assert headers == {
+        "X-Limira-User-Id": "user-a",
+        "X-Limira-User-Role": "admin",
+        "X-Limira-Runner-Service-Token": "server-only-token",
+    }
+
+
+def test_limira_repository_factory_requires_explicit_memory_fallback(monkeypatch):
+    monkeypatch.delenv("LIMIRA_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("LIMIRA_REPOSITORY_BACKEND", "postgres")
+
+    with pytest.raises(RuntimeError, match="limira_postgres_database_url_missing"):
+        limira.create_limira_task_repository_from_env()
+
+    monkeypatch.setenv("LIMIRA_DATABASE_URL", "postgresql://limira:test@postgres:5432/limira")
+    repo = limira.create_limira_task_repository_from_env()
+    assert isinstance(repo, limira.PostgresLimiraTaskRepository)
+    assert repo.database_url == "postgresql://limira:test@postgres:5432/limira"
+    assert repo._engine is None
+
+    monkeypatch.setenv("LIMIRA_REPOSITORY_BACKEND", "memory")
+    monkeypatch.delenv("LIMIRA_ALLOW_IN_MEMORY_REPOSITORY", raising=False)
+    with pytest.raises(RuntimeError, match="limira_in_memory_repository_requires_explicit_fallback"):
+        limira.create_limira_task_repository_from_env()
+
+    monkeypatch.setenv("LIMIRA_ALLOW_IN_MEMORY_REPOSITORY", "true")
+    repo = limira.create_limira_task_repository_from_env()
+    assert isinstance(repo, limira.InMemoryLimiraTaskRepository)
+
+
+def test_sqlite_limira_repository_persists_task_artifacts_reports_and_uploads(tmp_path):
+    database_path = tmp_path / "limira.sqlite3"
+    repo = limira.SQLiteLimiraTaskRepository(str(database_path))
+    task = repo.create_task(
+        task_id="task-a",
+        owner_user_id="user-a",
+        query="query",
+        scenario="scenario-a",
+        runner_task_id="runner-a",
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-001",
+            "title": "Source",
+            "summary": "Persistent evidence",
+        },
+    )
+    repo.record_artifact_trace_event(
+        task.task_id,
+        {
+            "type": "artifact_warning",
+            "payload": {"warning": "nonfatal"},
+        },
+    )
+    repo.record_uploaded_document(
+        document_id="doc-a",
+        owner_user_id="user-a",
+        task_id=task.task_id,
+        original_filename="memo.txt",
+        content_type="text/plain",
+        byte_size=12,
+        minio_bucket="bucket",
+        object_key="limira/users/u/tasks/task-a/uploads/doc-a.txt",
+        extracted_text="Persistent memo text",
+        language="en",
+        metadata={"sha256": "abc"},
+        embedding=[1.0, 0.0],
+    )
+    repo.record_generated_report(
+        report_id="report-a",
+        task_id=task.task_id,
+        report_type="final",
+        markdown="## Final\n\nPersistent report",
+        html=None,
+        pdf_object_key="limira/users/u/tasks/task-a/reports/report-a.pdf",
+        evidence_refs=["EVID-001"],
+        creator_user_id="user-a",
+        metadata={"pdf_size_bytes": 123},
+    )
+
+    restored = limira.SQLiteLimiraTaskRepository(str(database_path))
+    restored_task = restored.get_user_task("task-a", "user-a")
+    assert restored_task is not None
+    assert restored_task.status == "completed"
+    assert restored.get_artifacts("task-a")["evidence"][0]["evidence_id"] == "EVID-001"
+    assert restored.get_artifact_trace_events("task-a")[-1]["type"] == "artifact_warning"
+    assert restored.list_user_documents(owner_user_id="user-a", task_id="task-a")[0].document_id == "doc-a"
+    assert restored.search_user_documents(
+        owner_user_id="user-a",
+        task_id="task-a",
+        query="memo",
+        limit=5,
+    )[0].document.document_id == "doc-a"
+    assert restored.get_user_report(
+        task_id="task-a",
+        report_id="report-a",
+        owner_user_id="user-a",
+    ).pdf_object_key.endswith("report-a.pdf")
+
+
+def test_limira_runtime_state_factory_requires_redis_or_explicit_memory(monkeypatch):
+    monkeypatch.setenv("LIMIRA_RUNTIME_STATE_BACKEND", "redis")
+    with pytest.raises(RuntimeError, match="limira_redis_runtime_state_missing"):
+        limira.create_limira_runtime_state_from_env(redis_client=None)
+
+    redis = FakeRedisClient()
+    runtime_state = limira.create_limira_runtime_state_from_env(redis_client=redis)
+    assert isinstance(runtime_state, limira.RedisLimiraRuntimeState)
+    assert runtime_state.redis_client is redis
+
+    monkeypatch.setenv("LIMIRA_RUNTIME_STATE_BACKEND", "memory")
+    monkeypatch.delenv("LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE", raising=False)
+    with pytest.raises(
+        RuntimeError,
+        match="limira_in_memory_runtime_state_requires_explicit_fallback",
+    ):
+        limira.create_limira_runtime_state_from_env(redis_client=None)
+
+    monkeypatch.setenv("LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE", "true")
+    runtime_state = limira.create_limira_runtime_state_from_env(redis_client=None)
+    assert isinstance(runtime_state, limira.InMemoryLimiraRuntimeState)
+
+
+def test_limira_object_storage_factory_requires_s3_or_explicit_memory(monkeypatch):
+    for key in (
+        "LIMIRA_OBJECT_BUCKET",
+        "S3_BUCKET",
+        "MINIO_BUCKET",
+        "S3_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LIMIRA_OBJECT_STORAGE_BACKEND", "s3")
+
+    with pytest.raises(RuntimeError, match="limira_object_bucket_missing"):
+        limira.create_limira_object_storage_from_env(s3_client=FakeS3Client())
+
+    monkeypatch.setenv("LIMIRA_OBJECT_BUCKET", "limira-artifacts")
+    with pytest.raises(RuntimeError, match="limira_s3_endpoint_url_missing"):
+        limira.create_limira_object_storage_from_env(s3_client=FakeS3Client())
+
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://minio:9000")
+    with pytest.raises(RuntimeError, match="limira_s3_credentials_missing"):
+        limira.create_limira_object_storage_from_env(s3_client=FakeS3Client())
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "limira_minio")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "replace-with-local-minio-password")
+    storage = limira.create_limira_object_storage_from_env(s3_client=FakeS3Client())
+    assert isinstance(storage, limira.S3LimiraObjectStorage)
+    assert storage.bucket == "limira-artifacts"
+    assert storage.endpoint_url == "http://minio:9000"
+
+    monkeypatch.setenv("LIMIRA_OBJECT_STORAGE_BACKEND", "memory")
+    monkeypatch.delenv("LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE", raising=False)
+    with pytest.raises(
+        RuntimeError,
+        match="limira_in_memory_object_storage_requires_explicit_fallback",
+    ):
+        limira.create_limira_object_storage_from_env()
+
+    monkeypatch.setenv("LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE", "true")
+    storage = limira.create_limira_object_storage_from_env()
+    assert isinstance(storage, limira.InMemoryLimiraObjectStorage)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_object_storage_persists_objects_across_instances(tmp_path):
+    storage = limira.FileSystemLimiraObjectStorage(root_path=str(tmp_path), bucket="local")
+    stored = await storage.put_object(
+        object_key="limira/users/u/tasks/task-a/reports/report-a.pdf",
+        data=b"%PDF-test",
+        content_type="application/pdf",
+        metadata={"report_id": "report-a"},
+    )
+
+    restored = limira.FileSystemLimiraObjectStorage(root_path=str(tmp_path), bucket="local")
+    assert stored.bucket == "local"
+    assert await restored.get_object(object_key=stored.object_key) == b"%PDF-test"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_object_storage_rejects_unsafe_object_keys(tmp_path):
+    storage = limira.FileSystemLimiraObjectStorage(root_path=str(tmp_path), bucket="local")
+    unsafe_keys = [
+        "",
+        "/absolute/object.txt",
+        "../outside.txt",
+        "limira/users/u/../secret.txt",
+        "limira/users/u/a/../../secret.txt",
+        "limira/users/u/./object.txt",
+        "limira/users/u//object.txt",
+        "limira\\users\\u\\object.txt",
+        "limira/users/u/object.metadata.json",
+        "limira/users/u/object.metadata.json/nested.txt",
+    ]
+
+    for object_key in unsafe_keys:
+        with pytest.raises(ValueError, match="invalid_limira_object_key"):
+            await storage.put_object(
+                object_key=object_key,
+                data=b"unsafe",
+                content_type="text/plain",
+                metadata={"document_id": "doc-a"},
+            )
+        with pytest.raises(ValueError, match="invalid_limira_object_key"):
+            await storage.get_object(object_key=object_key)
+
+    assert [path.name for path in tmp_path.iterdir()] == []
+
+
+@pytest.mark.asyncio
+async def test_object_storage_backends_validate_and_normalize_object_keys(tmp_path):
+    unsafe_keys = [
+        "",
+        "/absolute/object.txt",
+        "../outside.txt",
+        "limira/users/u/../secret.txt",
+        "limira/users/u/a/../../secret.txt",
+        "limira/users/u/./object.txt",
+        "limira/users/u//object.txt",
+        "limira\\users\\u\\object.txt",
+        "limira/users/u/object.metadata.json",
+        "limira/users/u/object.metadata.json/nested.txt",
+    ]
+    safe_key = "limira/users/u/uploads/document.txt"
+    whitespace_key = f"  {safe_key}  "
+
+    memory_storage = limira.InMemoryLimiraObjectStorage(bucket="memory")
+    filesystem_storage = limira.FileSystemLimiraObjectStorage(
+        root_path=str(tmp_path / "objects"),
+        bucket="local",
+    )
+    s3_client = FakeS3Client()
+    s3_storage = limira.S3LimiraObjectStorage(
+        bucket="limira-artifacts",
+        endpoint_url="http://minio:9000",
+        access_key_id="limira_minio",
+        secret_access_key="replace-with-local-minio-password",
+        s3_client=s3_client,
+    )
+
+    for storage in [memory_storage, filesystem_storage, s3_storage]:
+        stored = await storage.put_object(
+            object_key=whitespace_key,
+            data=b"safe-bytes",
+            content_type="text/plain",
+            metadata={"document_id": "doc-a"},
+        )
+        assert stored.object_key == safe_key
+        assert await storage.get_object(object_key=whitespace_key) == b"safe-bytes"
+
+    assert list(memory_storage.objects) == [safe_key]
+    assert s3_client.put_calls[-1]["Key"] == safe_key
+    assert s3_client.get_calls[-1]["Key"] == safe_key
+
+    for storage in [memory_storage, filesystem_storage, s3_storage]:
+        for object_key in unsafe_keys:
+            with pytest.raises(ValueError, match="invalid_limira_object_key"):
+                await storage.put_object(
+                    object_key=object_key,
+                    data=b"unsafe",
+                    content_type="text/plain",
+                    metadata={"document_id": "doc-a"},
+                )
+            with pytest.raises(ValueError, match="invalid_limira_object_key"):
+                await storage.get_object(object_key=object_key)
+
+    assert list(memory_storage.objects) == [safe_key]
+    assert [call["Key"] for call in s3_client.put_calls] == [safe_key]
+    assert [call["Key"] for call in s3_client.get_calls] == [safe_key]
+
+
+def test_limira_upload_embedding_config_defaults_disabled_and_validates_enabled():
+    config = limira.create_limira_upload_embedding_config_from_env({})
+    assert config == limira.LimiraUploadEmbeddingConfig(
+        enabled=False,
+        provider="disabled",
+        model="",
+        dimensions=1536,
+    )
+
+    enabled_env = {
+        "LIMIRA_UPLOAD_EMBEDDINGS_ENABLED": "true",
+        "LIMIRA_EMBEDDING_PROVIDER": "fake",
+        "LIMIRA_EMBEDDING_MODEL": "fake-model",
+        "LIMIRA_EMBEDDING_DIMENSIONS": "1536",
+    }
+    enabled = limira.create_limira_upload_embedding_config_from_env(enabled_env)
+    assert enabled.enabled is True
+    assert enabled.provider == "fake"
+    assert enabled.model == "fake-model"
+    assert enabled.dimensions == 1536
+
+    with pytest.raises(RuntimeError, match="limira_upload_embedding_provider_required"):
+        limira.create_limira_upload_embedding_config_from_env(
+            {"LIMIRA_UPLOAD_EMBEDDINGS_ENABLED": "true"}
+        )
+    with pytest.raises(RuntimeError, match="limira_upload_embedding_model_required"):
+        limira.create_limira_upload_embedding_config_from_env(
+            {
+                "LIMIRA_UPLOAD_EMBEDDINGS_ENABLED": "true",
+                "LIMIRA_EMBEDDING_PROVIDER": "fake",
+            }
+        )
+    with pytest.raises(RuntimeError, match="limira_upload_embedding_dimensions_invalid"):
+        limira.create_limira_upload_embedding_config_from_env(
+            {"LIMIRA_EMBEDDING_DIMENSIONS": "0"}
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="limira_upload_embedding_dimensions_schema_mismatch",
+    ):
+        limira.create_limira_upload_embedding_config_from_env(
+            {
+                "LIMIRA_UPLOAD_EMBEDDINGS_ENABLED": "true",
+                "LIMIRA_EMBEDDING_PROVIDER": "fake",
+                "LIMIRA_EMBEDDING_MODEL": "fake-model",
+                "LIMIRA_EMBEDDING_DIMENSIONS": "3",
+            }
+        )
+
+
+def test_upload_embedding_dependencies_avoid_threadpool_for_default_route_path():
+    assert asyncio.iscoroutinefunction(limira.get_upload_embedding_config)
+    assert asyncio.iscoroutinefunction(limira.get_upload_embedding_provider)
+
+
+def test_limira_object_keys_are_server_generated_owner_scoped_and_safe():
+    key = limira.build_limira_object_key(
+        owner_user_id="analyst@example.com",
+        category="uploads",
+        task_id="../task/alpha",
+        filename="../../secret.env",
+        object_id="../browser-supplied-key",
+        key_prefix="../limira",
+    )
+
+    assert key.startswith("limira/users/")
+    assert "/tasks/task-alpha/uploads/" in key
+    assert key.endswith("browser-supplied-key.bin")
+    assert "analyst@example.com" not in key
+    assert "secret.env" not in key
+    assert ".." not in key
+    assert not key.startswith("/")
+
+    report_key = limira.build_limira_object_key(
+        owner_user_id="analyst@example.com",
+        category="reports",
+        task_id="task-a",
+        extension="html",
+        object_id="report-a",
+    )
+    assert report_key.endswith("/reports/report-a.html")
+
+    with pytest.raises(ValueError, match="unsupported_limira_object_category"):
+        limira.build_limira_object_key(
+            owner_user_id="analyst@example.com",
+            category="secrets",
+        )
+
+
+@pytest.mark.asyncio
+async def test_s3_object_storage_put_uses_server_key_bucket_and_metadata():
+    s3 = FakeS3Client()
+    storage = limira.S3LimiraObjectStorage(
+        bucket="limira-artifacts",
