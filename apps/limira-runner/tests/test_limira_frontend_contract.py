@@ -419,12 +419,15 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "return [];" in app
     assert "function hasConversationActivity()" in app
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
-    assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace' || !conversationView);" in app
-    assert index.index('id="conversationPanel"') < index.index('id="artifactTabs"')
-    assert index.index('id="artifactTabs"') < index.index('id="thinkingPanel"')
+    assert "dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');" in app
+    assert index.index('id="conversationPanel"') < index.index('id="thinkingPanel"')
+    assert index.index('id="thinkingPanel"') < index.index('id="inputContainer"')
+    assert index.index('id="researchForm"') < index.index('id="artifactTabs"')
     assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
     assert ".tabs {\n\tz-index: 8;" in styles
     assert "bottom: 7.15rem;" not in styles
+    assert ".scrollable-canvas.conversation-mode .input-container" in styles
+    assert ".scrollable-canvas.artifact-mode .input-container" in styles
     assert "dom.workspaceContent.scrollTo({ top: 0, behavior: 'smooth' });" in app
     assert "async function downloadArchive()" in app
     assert "downloadPdfButton" not in app

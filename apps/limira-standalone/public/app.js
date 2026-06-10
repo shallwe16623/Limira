@@ -2312,7 +2312,7 @@ function renderTabs() {
 	const conversationView = isConversationView();
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
-	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace' || !conversationView);
+	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');
 	dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());
 	dom.artifactContent.classList.toggle('hidden', conversationView || !surfaceVisible);
 	dom.artifactTabs.classList.toggle('hidden', !surfaceVisible);
