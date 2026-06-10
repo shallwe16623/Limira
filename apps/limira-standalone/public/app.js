@@ -2341,6 +2341,9 @@ function renderTabs() {
 			renderMessages();
 			renderThinking();
 			renderTabs();
+			if (isArtifactView()) {
+				dom.workspaceContent.scrollTo({ top: 0, behavior: 'smooth' });
+			}
 		});
 	}
 	dom.downloadArchiveButton = dom.artifactTabs.querySelector('[data-archive-download]');

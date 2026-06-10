@@ -415,8 +415,11 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "return [];" in app
     assert "function hasConversationActivity()" in app
     assert "dom.thinkingPanel?.classList.toggle('hidden', !conversationView || !hasConversationActivity());" in app
-    assert ".tabs {\n\tposition: absolute;" in styles
-    assert "bottom: 7.15rem;" in styles
+    assert index.index('id="thinkingPanel"') < index.index('id="artifactTabs"')
+    assert index.index('id="artifactTabs"') < index.index('id="artifactContent"')
+    assert ".tabs {\n\tz-index: 8;" in styles
+    assert "bottom: 7.15rem;" not in styles
+    assert "dom.workspaceContent.scrollTo({ top: 0, behavior: 'smooth' });" in app
     assert "async function downloadArchive()" in app
     assert "downloadPdfButton" not in app
     assert "downloadPdfButton" not in index
