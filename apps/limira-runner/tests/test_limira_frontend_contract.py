@@ -516,12 +516,32 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "upsertArtifactThinkingStep(artifacts);" in app
     assert "return artifacts ? artifactCounts(artifacts) : {};" in app
     assert "function artifactCounts(artifacts = state.artifacts)" in app
+    artifact_content_block = app[app.index("function renderEvidence()") : app.index("function renderReport()")]
+    assert "function artifactReadableText(item, options = {})" in artifact_content_block
+    assert "function artifactDetailsText(details)" in artifact_content_block
+    assert "ARTIFACT_TEXT_FIELDS" in artifact_content_block
+    assert "stringifyCompact(" not in artifact_content_block
+    render_evidence_block = app[app.index("function renderEvidence()") : app.index("function openEvidenceSource")]
+    assert "artifactReadableText(item, {" in render_evidence_block
+    assert "renderMarkdown(summary)" in render_evidence_block
+    render_entities_block = app[app.index("function renderEntities()") : app.index("function renderGraph()")]
+    assert "artifactReadableText(item)" in render_entities_block
+    assert "renderMarkdown(body)" in render_entities_block
+    relation_card_block = app[app.index("function relationCard(relation, index)") : app.index("function renderTimeline()")]
+    assert "artifactReadableText(relation)" in relation_card_block
+    assert "renderMarkdown(body)" in relation_card_block
     render_timeline_block = app[app.index("function renderTimeline()") : app.index("function renderMap()")]
     assert "function timelineEventBody(item)" in render_timeline_block
     assert "function timelineEventDate(item)" in render_timeline_block
-    assert "item.event" in render_timeline_block
-    assert "item.key_findings" in render_timeline_block
+    assert "artifactReadableText(item, {" in render_timeline_block
+    assert "'event'" in render_timeline_block
+    assert "'key_findings'" in render_timeline_block
     assert "stringifyCompact(item)" not in render_timeline_block
+    map_features_block = app[app.index("function mapFeatures(artifacts = state.artifacts)") : app.index("function normalizeGeometry(raw)")]
+    assert "summary: artifactReadableText(item)" in map_features_block
+    report_text_block = app[app.index("function reportText(section)") : app.index("const REPORT_TEXT_FIELDS")]
+    assert "artifactReadableText(section)" in report_text_block
+    assert "stringifyCompact(section)" not in report_text_block
     assert "item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message)" in render_messages_block
     assert "item.message.kind === 'report' && messageBelongsToCurrentTask(item.message)" in render_messages_block
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]

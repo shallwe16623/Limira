@@ -3261,7 +3261,9 @@ function evidenceCard(item, index) {
 	const id = item.evidence_id || item.ref_id || item.id || `EVID-${String(index + 1).padStart(3, '0')}`;
 	const title = item.title || item.source || id;
 	const url = safeExternalUrl(item.url || item.source_url || '');
-	const summary = item.summary || item.text || item.description || '';
+	const summary = artifactReadableText(item, {
+		fields: ['summary', 'key_findings', 'snippet', 'text', 'description']
+	});
 	return `<article id="evidence-${safeDomId(id)}" class="artifact-card">
 		<div class="artifact-title">${escapeHtml(title)}</div>
 		<div class="artifact-meta">
@@ -3269,9 +3271,167 @@ function evidenceCard(item, index) {
 			${item.confidence ? `<span>置信度 ${escapeHtml(item.confidence)}</span>` : ''}
 			${item.published_at ? `<span>${escapeHtml(item.published_at)}</span>` : ''}
 		</div>
-		<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>
+		${summary ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>` : ''}
 		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
 	</article>`;
+}
+
+const ARTIFACT_TEXT_FIELDS = [
+	'summary',
+	'description',
+	'text',
+	'content',
+	'event',
+	'key_findings',
+	'findings',
+	'notes',
+	'snippet',
+	'extracted_info',
+	'analysis',
+	'result'
+];
+const ARTIFACT_OMITTED_DETAIL_FIELDS = new Set([
+	'artifact_type',
+	'attributes',
+	'confidence',
+	'date',
+	'end_date',
+	'entity_id',
+	'entity_type',
+	'evidence_id',
+	'evidence_refs',
+	'event_id',
+	'event_title',
+	'geojson',
+	'geometry',
+	'id',
+	'label',
+	'map_feature_id',
+	'name',
+	'occurred_at',
+	'payload',
+	'published_at',
+	'ref_id',
+	'relation_id',
+	'relation_type',
+	'from',
+	'source',
+	'source_entity_id',
+	'source_event_type',
+	'source_id',
+	'source_url',
+	'source_urls',
+	'start_date',
+	'target',
+	'target_entity_id',
+	'target_id',
+	'timestamp',
+	'title',
+	'to',
+	'type',
+	'url'
+]);
+const ARTIFACT_DETAIL_LABELS = {
+	affiliation: '隶属关系',
+	birth_date: '出生日期',
+	location: '地点',
+	party: '党派',
+	political_positions: '政治身份',
+	role: '角色',
+	status: '状态'
+};
+
+function artifactReadableText(item, options = {}) {
+	const payload = artifactPayload(item);
+	const fields = uniqueTextFields([...(options.fields || []), ...ARTIFACT_TEXT_FIELDS]);
+	const direct = firstArtifactText(item, fields);
+	const payloadText = firstArtifactText(payload, fields);
+	const attributeDetails = artifactDetailsText(item?.attributes || payload.attributes);
+	const topLevelDetails = attributeDetails ? '' : artifactDetailsText(item);
+	const payloadDetails = attributeDetails || topLevelDetails ? '' : artifactDetailsText(payload);
+	return [direct, payloadText, attributeDetails, topLevelDetails, payloadDetails]
+		.filter(Boolean)
+		.filter((value, index, values) => values.indexOf(value) === index)
+		.join('\n\n')
+		.trim();
+}
+
+function uniqueTextFields(fields) {
+	return [...new Set(fields.filter(Boolean))];
+}
+
+function artifactPayload(item) {
+	return item?.payload && typeof item.payload === 'object' && !Array.isArray(item.payload)
+		? item.payload
+		: {};
+}
+
+function firstArtifactText(source, fields) {
+	if (!source || typeof source !== 'object') {
+		return '';
+	}
+	for (const field of fields) {
+		const text = artifactValueText(source[field]);
+		if (text) {
+			return text;
+		}
+	}
+	return '';
+}
+
+function artifactValueText(value) {
+	if (value === undefined || value === null) {
+		return '';
+	}
+	if (typeof value === 'string') {
+		return value.trim();
+	}
+	if (typeof value === 'number' || typeof value === 'boolean') {
+		return String(value);
+	}
+	if (Array.isArray(value)) {
+		return value.map(artifactValueInlineText).filter(Boolean).join('；');
+	}
+	if (typeof value === 'object') {
+		return artifactDetailsText(value);
+	}
+	return '';
+}
+
+function artifactDetailsText(details) {
+	if (!details || typeof details !== 'object' || Array.isArray(details)) {
+		return '';
+	}
+	return Object.entries(details)
+		.filter(([key, value]) => !ARTIFACT_OMITTED_DETAIL_FIELDS.has(key) && artifactValueInlineText(value))
+		.map(([key, value]) => `- ${artifactDetailLabel(key)}：${artifactValueInlineText(value)}`)
+		.join('\n');
+}
+
+function artifactValueInlineText(value) {
+	if (value === undefined || value === null) {
+		return '';
+	}
+	if (typeof value === 'string') {
+		return value.trim();
+	}
+	if (typeof value === 'number' || typeof value === 'boolean') {
+		return String(value);
+	}
+	if (Array.isArray(value)) {
+		return value.map(artifactValueInlineText).filter(Boolean).join('；');
+	}
+	if (typeof value === 'object') {
+		return Object.entries(value)
+			.filter(([key, nested]) => !ARTIFACT_OMITTED_DETAIL_FIELDS.has(key) && artifactValueInlineText(nested))
+			.map(([key, nested]) => `${artifactDetailLabel(key)}：${artifactValueInlineText(nested)}`)
+			.join('；');
+	}
+	return '';
+}
+
+function artifactDetailLabel(key) {
+	return ARTIFACT_DETAIL_LABELS[key] || String(key || '').replace(/[_-]+/g, ' ');
 }
 
 function openEvidenceSource({ url, title, summary }) {
@@ -3451,10 +3611,11 @@ function renderEntities() {
 				.map((item, index) => {
 					const label = item.name || item.label || item.entity_id || `实体 ${index + 1}`;
 					const type = item.type || item.entity_type || 'entity';
+					const body = artifactReadableText(item);
 					return `<article class="artifact-card">
 						<div class="artifact-title">${escapeHtml(label)}</div>
 						<div class="artifact-meta"><span>${escapeHtml(type)}</span></div>
-						<div class="artifact-body">${escapeHtml(item.summary || item.description || stringifyCompact(item.payload || item))}</div>
+						${body ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(body)}</div>` : ''}
 					</article>`;
 				})
 				.join('')}</div>`
@@ -3520,10 +3681,11 @@ function graphSvg(nodes, relations) {
 }
 
 function relationCard(relation, index) {
+	const body = artifactReadableText(relation);
 	return `<article class="artifact-card">
 		<div class="artifact-title">${escapeHtml(relation.type || relation.relation_type || `关系 ${index + 1}`)}</div>
 		<div class="artifact-meta"><span>${escapeHtml(relationSource(relation))}</span><span>${escapeHtml(relationTarget(relation))}</span></div>
-		<div class="artifact-body">${escapeHtml(relation.summary || relation.description || stringifyCompact(relation))}</div>
+		${body ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(body)}</div>` : ''}
 	</article>`;
 }
 
@@ -3559,22 +3721,9 @@ function timelineEventDate(item) {
 }
 
 function timelineEventBody(item) {
-	const payload = item?.payload && typeof item.payload === 'object' ? item.payload : {};
-	const value =
-		item.summary ||
-		item.description ||
-		item.event ||
-		item.key_findings ||
-		item.findings ||
-		item.notes ||
-		payload.summary ||
-		payload.description ||
-		payload.event ||
-		payload.key_findings ||
-		payload.findings ||
-		payload.notes ||
-		'';
-	return String(value || '').trim();
+	return artifactReadableText(item, {
+		fields: ['event', 'summary', 'description', 'key_findings', 'findings', 'notes']
+	});
 }
 
 function renderMap() {
@@ -4662,7 +4811,7 @@ function mapFeatures(artifacts = state.artifacts) {
 			if (!geometry) return null;
 			return {
 				title: item.title || item.event_title || item.name || `地图要素 ${index + 1}`,
-				summary: item.summary || item.description || '',
+				summary: artifactReadableText(item),
 				geometry
 			};
 		})
@@ -4728,7 +4877,7 @@ function reportTitle(section, index) {
 function reportText(section) {
 	return (
 		reportTextFromValue(section.markdown || section.content || section.text || section.summary || section, { includeTitle: false }) ||
-		stringifyCompact(section)
+		artifactReadableText(section)
 	);
 }
 
