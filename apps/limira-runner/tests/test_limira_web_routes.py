@@ -1134,6 +1134,7 @@ async def test_user_isolation_for_task_status_and_archive_download():
     assert storage.objects[archive_key]["content_type"] == "application/zip"
     assert storage.objects[archive_key]["metadata"]["task_id"] == task_id
     assert storage.objects[archive_key]["metadata"]["owner_user_id"] == "user-a"
+    _assert_public_archive_hides_internal_identifiers(response.body)
     second_response = await limira.download_task_archive(
         task_id,
         user=user_a,
@@ -2256,8 +2257,8 @@ async def test_postgres_admin_archive_download_generates_owner_scoped_archive():
     metadata = json.loads(members["metadata.json"])
     trace = json.loads(members["trace.json"])
     assert metadata["task"]["task_id"] == task_id
-    assert metadata["task"]["owner_user_id"] == "user-a"
-    assert trace["task"]["owner_user_id"] == "user-a"
+    assert trace["task"]["task_id"] == task_id
+    _assert_public_archive_hides_internal_identifiers(response.content)
     assert "admin-user" not in "\n".join(members.values())
     _assert_no_browser_leak(members)
 
@@ -9165,6 +9166,7 @@ def _assert_archive_hides_internal_model_summary_identifiers(
     members = _archive_member_texts(archive_bytes)
     metadata = json.loads(members["metadata.json"])
     trace = json.loads(members["trace.json"])
+    _assert_public_archive_hides_internal_identifiers(archive_bytes)
 
     for task_payload in (metadata["task"], trace["task"]):
         model_summary = task_payload["model_summary"]
@@ -9181,6 +9183,7 @@ def _assert_archive_hides_internal_model_summary_identifiers(
         ensure_ascii=False,
     )
     for leaked in (
+        "owner_user_id",
         "runner_task_id",
         "runner-task-secret",
         "object_key",
@@ -9192,6 +9195,40 @@ def _assert_archive_hides_internal_model_summary_identifiers(
         assert leaked not in serialized
     _assert_no_browser_leak(serialized)
     return metadata, trace
+
+
+def _assert_public_archive_hides_internal_identifiers(archive_bytes: bytes) -> None:
+    members = _archive_member_texts(archive_bytes)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+
+    for task_payload in (metadata.get("task") or {}, trace.get("task") or {}):
+        for internal_field in (
+            "owner_user_id",
+            "runner_task_id",
+            "object_key",
+            "archive_object_key",
+            "pdf_object_key",
+        ):
+            assert internal_field not in task_payload
+
+    serialized = json.dumps(
+        {
+            "metadata": metadata,
+            "trace": trace,
+        },
+        ensure_ascii=False,
+    )
+    for leaked in (
+        "owner_user_id",
+        "runner_task_id",
+        "object_key",
+        "archive_object_key",
+        "pdf_object_key",
+        "limira/users/",
+        "/limira-runner/",
+    ):
+        assert leaked not in serialized
 
 
 def _assert_archive_hides_invalid_json_member_identifiers(archive_bytes: bytes) -> None:

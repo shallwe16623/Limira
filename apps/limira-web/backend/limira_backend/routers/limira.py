@@ -253,6 +253,13 @@ INTERNAL_ERROR_TEXT_PATTERNS = (
     ),
     re.compile(r"(?i)\btraceback\b|File \"[^\"]+\", line \d+"),
 )
+INTERNAL_ARCHIVE_TASK_FIELDS = {
+    "owner_user_id",
+    "runner_task_id",
+    "object_key",
+    "archive_object_key",
+    "pdf_object_key",
+}
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -6914,10 +6921,19 @@ def _public_archive_member_payload(member_name: str, payload: Any) -> Any:
     public_payload = dict(payload)
     task_payload = public_payload.get("task")
     if isinstance(task_payload, Mapping):
-        public_task = dict(task_payload)
+        public_task = {
+            str(key): item
+            for key, item in task_payload.items()
+            if str(key) not in INTERNAL_ARCHIVE_TASK_FIELDS
+        }
         if "model_summary" in public_task:
             public_task["model_summary"] = _public_model_summary(
                 public_task.get("model_summary") or {}
+            )
+        if public_task.get("error"):
+            public_task["error"] = _public_error_text(
+                public_task.get("error"),
+                fallback="limira_task_failed",
             )
         public_payload["task"] = public_task
     return public_payload
