@@ -1160,10 +1160,12 @@ function handleStreamEvent(payload) {
 				? payload.payload
 				: {};
 	const nested = data.data && typeof data.data === 'object' ? data.data : {};
-	const status = payload.status || data.status || nested.status;
+	const eventData = data.event === eventType && Object.keys(nested).length > 0 ? nested : data;
+	const status = payload.status || data.status || nested.status || eventData.status;
 	updateArchiveState(payload);
 	updateArchiveState(data);
 	updateArchiveState(nested);
+	updateArchiveState(eventData);
 
 	if (status) {
 		state.status = String(status);
@@ -1176,20 +1178,20 @@ function handleStreamEvent(payload) {
 	}
 
 	if (eventType === 'tool_call') {
-		handleToolCall(data);
+		handleToolCall(eventData);
 	} else if (eventType === 'error') {
 		state.status = 'failed';
-		addMessage('error', errorMessage(data.error || payload));
+		addMessage('error', errorMessage(eventData.error || data.error || payload));
 	} else if (eventType === 'end_of_workflow') {
 		state.status = 'completed';
 		addMessage('assistant', '工作流已完成。');
 	} else if (eventType.startsWith('start_of_')) {
-		addMessage('assistant', compactStartMessage(eventType, data));
+		addMessage('assistant', compactStartMessage(eventType, eventData));
 	} else if (artifactEvents.has(eventType)) {
 		addMessage('assistant', `${eventLabel(eventType)}：研究成果已更新。`);
 		void loadArtifacts();
 	} else {
-		const summary = data.message || data.summary || payload.message || eventType;
+		const summary = eventData.message || eventData.summary || data.message || data.summary || payload.message || eventType;
 		addMessage('assistant', `${eventLabel(eventType)}：${stringifyCompact(summary)}`);
 	}
 

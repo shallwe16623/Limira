@@ -1014,6 +1014,89 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_persists_nested_runner_final_summary_show_text_as_report_section():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {
+                    "event": "start_of_agent",
+                    "data": {
+                        "agent_name": "Final Summary",
+                        "agent_id": "agent-final",
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "event": "tool_call",
+                    "data": {
+                        "tool_name": "show_text",
+                        "tool_input": {
+                            "text": "# Nested final answer\n\nUse the final report. [EVID-777]"
+                        },
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {
+                    "event": "end_of_agent",
+                    "data": {
+                        "agent_name": "Final Summary",
+                        "agent_id": "agent-final",
+                    },
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "nested final summary"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "start_of_agent",
+        "tool_call",
+        "report_section_generated",
+        "end_of_agent",
+        "status",
+    ]
+    assert events[0]["payload"]["agent_name"] == "Final Summary"
+    assert events[1]["payload"]["tool_name"] == "show_text"
+    assert "event" not in events[1]["payload"]
+    assert "data" not in events[1]["payload"]
+    assert events[2]["payload"]["markdown"].startswith("# Nested final answer")
+    assert events[2]["payload"]["evidence_refs"] == ["EVID-777"]
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert len(artifacts["report_sections"]) == 1
+    assert artifacts["report_sections"][0]["source_event_type"] == (
+        "final_summary_show_text"
+    )
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_unwraps_json_wrapped_final_summary_report_text():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

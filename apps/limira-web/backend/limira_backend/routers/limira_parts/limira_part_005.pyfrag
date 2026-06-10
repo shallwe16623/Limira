@@ -118,14 +118,27 @@ def _stream_close_reason_from_event(event: dict[str, Any], default: str) -> str:
     return default
 
 
-def _normalize_runner_event(task: LimiraTask, event: dict[str, Any]) -> dict[str, Any]:
-    event_type = str(event.get("type") or event.get("event") or "runner_event")
-    payload = event.get("payload") if "payload" in event else dict(event)
+def _normalize_runner_event_payload(event_type: str, payload: Any) -> Any:
     if isinstance(payload, dict):
         payload = dict(payload)
         payload.pop("task_id", None)
         payload.pop("stream_url", None)
         payload.pop("task_url", None)
+        nested_data = payload.get("data")
+        if payload.get("event") == event_type and isinstance(nested_data, dict):
+            normalized = dict(nested_data)
+            for key, value in payload.items():
+                if key not in {"event", "data"}:
+                    normalized.setdefault(key, value)
+            return normalized
+    return payload
+
+
+def _normalize_runner_event(task: LimiraTask, event: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = event.get("payload") if "payload" in event else dict(event)
+    payload_event = raw_payload.get("event") if isinstance(raw_payload, dict) else None
+    event_type = str(event.get("type") or event.get("event") or payload_event or "runner_event")
+    payload = _normalize_runner_event_payload(event_type, raw_payload)
     normalized: dict[str, Any] = {
         "task_id": task.task_id,
         "type": event_type,

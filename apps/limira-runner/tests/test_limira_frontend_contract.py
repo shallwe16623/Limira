@@ -22,6 +22,7 @@ LIMIRA_STANDALONE_INDEX = LIMIRA_STANDALONE_ROOT / "public" / "index.html"
 LIMIRA_STANDALONE_APP = LIMIRA_STANDALONE_ROOT / "public" / "app.js"
 LIMIRA_BACKEND_ROOT = LIMIRA_WEB_ROOT / "backend" / "limira_backend"
 LIMIRA_BACKEND_ROUTER = LIMIRA_BACKEND_ROOT / "routers" / "limira.py"
+LIMIRA_BACKEND_ROUTER_PARTS = LIMIRA_BACKEND_ROOT / "routers" / "limira_parts"
 LIMIRA_NATIVE_APP = LIMIRA_WEB_ROOT / "backend" / "limira_native.py"
 LEGACY_PY_PACKAGE = "open" + "_" + "web" + "ui"
 LEGACY_APP_DIR = "open-" + "web" + "ui-limira-runner"
@@ -77,7 +78,14 @@ class _RecordingBackendHandler(BaseHTTPRequestHandler):
 
 
 def _backend_artifact_event_types() -> set[str]:
-    module = ast.parse(_read(LIMIRA_BACKEND_ROUTER))
+    if LIMIRA_BACKEND_ROUTER_PARTS.exists():
+        source = "\n".join(
+            part.read_text(encoding="utf-8")
+            for part in sorted(LIMIRA_BACKEND_ROUTER_PARTS.glob("limira_part_*.pyfrag"))
+        )
+    else:
+        source = _read(LIMIRA_BACKEND_ROUTER)
+    module = ast.parse(source)
     for node in module.body:
         if not isinstance(node, ast.Assign):
             continue
@@ -394,7 +402,10 @@ def test_limira_standalone_persists_uploaded_documents_across_workspace_restore(
     assert "uploads: state.uploads" in app
     assert "state.uploads = mergeUploadedDocument(state.uploads, uploaded);" in app
     assert "function mergeUploadedDocument(documents, uploaded)" in app
-    assert "state.uploads = Array.isArray(data.documents) ? data.documents : [];" in app
+    assert "state.cloudFiles = Array.isArray(historyData.documents) ? historyData.documents : [];" in app
+    assert "state.uploads = Array.isArray(taskData.documents) ? taskData.documents : [];" in app
+    assert "state.uploads = reconcileSelectedUploads(state.uploads, state.cloudFiles);" in app
+    assert "function reconcileSelectedUploads(selectedUploads, cloudFiles)" in app
 
 
 def test_limira_standalone_stream_handler_refreshes_all_artifact_events():
@@ -405,6 +416,15 @@ def test_limira_standalone_stream_handler_refreshes_all_artifact_events():
     assert "void loadArtifacts();" in app
     for event_type in _required_frontend_artifact_event_types():
         assert f"'{event_type}'" in app
+
+
+def test_limira_standalone_stream_handler_unwraps_nested_runner_events():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    assert "const nested = data.data && typeof data.data === 'object' ? data.data : {};" in app
+    assert "const eventData = data.event === eventType" in app
+    assert "handleToolCall(eventData);" in app
+    assert "compactStartMessage(eventType, eventData)" in app
 
 
 def test_limira_standalone_graph_and_map_render_without_external_frontend_stack():
