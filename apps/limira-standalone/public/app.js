@@ -19,8 +19,6 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = 'limiraSidebarCollapsed:v1';
 const MAX_STORED_MESSAGES = 100;
 const MAX_THINKING_STEPS = 120;
 const MAX_HISTORY_TASKS = 30;
-const CONVERSATION_NAVIGATOR_MIN_HEIGHT = 1400;
-const CONVERSATION_NAVIGATOR_HIDE_DELAY_MS = 1500;
 const STATUS_LABELS = {
 	ready: '就绪',
 	starting: '启动中',
@@ -137,7 +135,6 @@ const state = {
 	thinkingCollapsedByTaskId: {},
 	conversationNavigatorVisible: false,
 	conversationNavigatorHovered: false,
-	conversationNavigatorHideTimer: null,
 	artifacts: emptyArtifacts(),
 	artifactsByTaskId: {},
 	uploads: [],
@@ -405,7 +402,6 @@ function bindEvents() {
 	});
 	dom.conversationNavigator.addEventListener('mouseleave', () => {
 		state.conversationNavigatorHovered = false;
-		scheduleConversationNavigatorHide();
 	});
 	dom.conversationNavigatorList.addEventListener('click', (event) => {
 		const button = event.target.closest('[data-navigator-message-index]');
@@ -414,12 +410,6 @@ function bindEvents() {
 		}
 		event.preventDefault();
 		scrollToConversationMessage(Number(button.dataset.navigatorMessageIndex));
-	});
-	dom.conversationNavigatorList.addEventListener('mouseover', (event) => {
-		const button = event.target.closest('[data-navigator-message-index]');
-		if (button) {
-			renderConversationNavigatorPreview(button);
-		}
 	});
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
 	dom.researchForm.addEventListener('submit', (event) => {
@@ -1591,11 +1581,12 @@ function conversationMembersForTask(task, fallbackTaskId) {
 }
 
 function conversationHistoryMessages(members) {
-	return members.flatMap(historyMessages);
+	return members.flatMap((member, index) => historyMessages(member, index));
 }
 
 async function hydrateConversationHistory(members) {
-	for (const member of members) {
+	for (let memberIndex = 0; memberIndex < members.length; memberIndex += 1) {
+		const member = members[memberIndex];
 		const taskId = String(member.task_id || '').trim();
 		if (!taskId) {
 			continue;
@@ -1608,7 +1599,13 @@ async function hydrateConversationHistory(members) {
 		});
 		const report = artifacts ? reportMarkdown(artifacts, { includeFinalReport: taskId === state.taskId }) : '';
 		if (report) {
-			upsertReportMessage(report, { taskId });
+			upsertReportMessage(report, {
+				taskId,
+				conversationIndex: memberIndex,
+				insertAfterConversationIndex: memberIndex,
+				insertAfterTaskId: taskId,
+				reportKey: conversationReportKey(taskId, memberIndex)
+			});
 		}
 	}
 	saveWorkspace();
@@ -1763,18 +1760,26 @@ function taskHistoryMeta(task) {
 	return parts.filter(Boolean).join(' · ');
 }
 
-function historyMessages(task) {
+function historyMessages(task, conversationIndex = -1) {
 	const query = String(task.query || '').trim();
 	const taskId = String(task.task_id || state.taskId || '');
+	const base = {
+		time: now(),
+		taskId,
+		conversationIndex
+	};
 	return [
-		query ? { role: 'user', content: query, time: now(), taskId } : null,
+		query ? { ...base, role: 'user', content: query } : null,
 		{
+			...base,
 			role: 'assistant',
-			content: `已载入历史任务：${statusLabel(task.status || state.status)}。`,
-			time: now(),
-			taskId
+			content: `已载入历史任务：${statusLabel(task.status || state.status)}。`
 		}
 	].filter(Boolean);
+}
+
+function conversationReportKey(taskId, conversationIndex) {
+	return `history:${String(taskId || '').trim()}:${conversationIndex}`;
 }
 
 function historyThinkingSteps(task) {
@@ -3083,14 +3088,21 @@ function renderStatus() {
 function renderMessages(options = {}) {
 	const previousScrollTop = dom.workspaceContent?.scrollTop || 0;
 	const artifactView = isArtifactView();
+	const inlineConversationReports = shouldInlineConversationReports();
 	dom.conversationPanel?.classList.toggle('compact', artifactView);
-	const indexedMessages = state.messages.map((message, index) => ({ message, index }));
+	const indexedMessages = orderedConversationIndexedMessages(
+		state.messages.map((message, index) => ({ message, index }))
+	);
 	const messages = artifactView
 		? indexedMessages.filter((item) => item.message.kind !== 'report').slice(-2)
 		: indexedMessages
-			.filter((item) => item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message))
+			.filter((item) => (
+				item.message.kind !== 'report' ||
+				inlineConversationReports ||
+				!messageBelongsToCurrentTask(item.message)
+			))
 			.slice(-80);
-	const reportMessages = artifactView
+	const reportMessages = artifactView || inlineConversationReports
 		? []
 		: indexedMessages
 			.filter((item) => item.message.kind === 'report' && messageBelongsToCurrentTask(item.message))
@@ -3119,6 +3131,75 @@ function renderMessages(options = {}) {
 	}
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
 	scrollConversationToBottom();
+}
+
+function shouldInlineConversationReports() {
+	const reportIndexes = uniqueTaskIds(
+		state.messages
+			.filter((message) => message?.kind === 'report')
+			.map((message) => conversationIndexKey(message))
+	);
+	return reportIndexes.length > 1 || reportTaskIds().filter(isCurrentConversationTaskId).length > 1;
+}
+
+function orderedConversationIndexedMessages(indexedMessages) {
+	if (!shouldInlineConversationReports()) {
+		return indexedMessages;
+	}
+	const nonReports = indexedMessages.filter((item) => item.message?.kind !== 'report');
+	const reports = indexedMessages.filter((item) => item.message?.kind === 'report');
+	const lastNonReportIndexByAnchor = new Map();
+	for (const item of nonReports) {
+		for (const key of messageAnchorKeys(item.message)) {
+			lastNonReportIndexByAnchor.set(key, item.index);
+		}
+	}
+	const reportsByAnchor = new Map();
+	const unanchoredReports = [];
+	for (const item of reports) {
+		const keys = messageAnchorKeys(item.message);
+		const anchor = keys.find((key) => lastNonReportIndexByAnchor.has(key)) || keys[0] || '';
+		if (!anchor) {
+			unanchoredReports.push(item);
+			continue;
+		}
+		reportsByAnchor.set(anchor, [...(reportsByAnchor.get(anchor) || []), item]);
+	}
+	const ordered = [];
+	const emittedReports = new Set();
+	for (const item of nonReports) {
+		ordered.push(item);
+		for (const key of messageAnchorKeys(item.message)) {
+			if (lastNonReportIndexByAnchor.get(key) !== item.index) {
+				continue;
+			}
+			for (const report of reportsByAnchor.get(key) || []) {
+				if (!emittedReports.has(report.index)) {
+					ordered.push(report);
+					emittedReports.add(report.index);
+				}
+			}
+		}
+	}
+	for (const report of [...reports, ...unanchoredReports]) {
+		if (!emittedReports.has(report.index)) {
+			ordered.push(report);
+			emittedReports.add(report.index);
+		}
+	}
+	return ordered;
+}
+
+function messageAnchorKeys(message) {
+	return uniqueTaskIds([
+		conversationIndexKey(message),
+		String(message?.taskId || '').trim() ? `task:${String(message.taskId).trim()}` : ''
+	]);
+}
+
+function conversationIndexKey(message) {
+	const index = Number(message?.conversationIndex);
+	return Number.isInteger(index) && index >= 0 ? `conversation:${index}` : '';
 }
 
 function renderMessageArticle(message, index, latestUserIndex) {
@@ -3464,7 +3545,6 @@ function handleWorkspaceScroll() {
 		return;
 	}
 	showConversationNavigator();
-	scheduleConversationNavigatorHide();
 	updateConversationNavigatorActiveItem();
 }
 
@@ -3474,8 +3554,7 @@ function conversationNavigatorNeeded() {
 	}
 	return (
 		conversationNavigationItems().length > 1 &&
-		dom.workspaceContent.scrollHeight - dom.workspaceContent.clientHeight >
-			Math.min(CONVERSATION_NAVIGATOR_MIN_HEIGHT, dom.workspaceContent.clientHeight * 0.9)
+		dom.workspaceContent.scrollHeight - dom.workspaceContent.clientHeight > 24
 	);
 }
 
@@ -3495,25 +3574,10 @@ function showConversationNavigator() {
 		return;
 	}
 	state.conversationNavigatorVisible = true;
-	window.clearTimeout(state.conversationNavigatorHideTimer);
-	state.conversationNavigatorHideTimer = null;
 	renderConversationNavigator();
 }
 
-function scheduleConversationNavigatorHide() {
-	window.clearTimeout(state.conversationNavigatorHideTimer);
-	if (state.conversationNavigatorHovered) {
-		return;
-	}
-	state.conversationNavigatorHideTimer = window.setTimeout(
-		() => hideConversationNavigator(),
-		CONVERSATION_NAVIGATOR_HIDE_DELAY_MS
-	);
-}
-
 function hideConversationNavigator(options = {}) {
-	window.clearTimeout(state.conversationNavigatorHideTimer);
-	state.conversationNavigatorHideTimer = null;
 	state.conversationNavigatorVisible = false;
 	state.conversationNavigatorHovered = false;
 	if (!dom.conversationNavigator) {
@@ -3531,32 +3595,25 @@ function renderConversationNavigator() {
 	if (!dom.conversationNavigator || !dom.conversationNavigatorList) {
 		return;
 	}
-	if (!conversationNavigatorNeeded() || !state.conversationNavigatorVisible) {
+	if (!conversationNavigatorNeeded()) {
 		hideConversationNavigator();
 		return;
 	}
+	state.conversationNavigatorVisible = true;
 	const items = conversationNavigationItems();
 	dom.conversationNavigator.classList.remove('hidden');
 	dom.conversationNavigator.classList.add('visible');
 	dom.conversationNavigatorList.innerHTML = items
-		.map((item) => `<button type="button" class="conversation-navigator-item" data-navigator-message-index="${item.index}" data-prompt="${escapeAttr(item.prompt)}" title="${escapeAttr(item.prompt)}">
+		.map((item) => `<button type="button" class="conversation-navigator-item" data-navigator-message-index="${item.index}" data-prompt="${escapeAttr(item.prompt)}" title="${escapeAttr(item.prompt)}" aria-label="跳转到：${escapeAttr(item.prompt)}">
 			<span class="conversation-navigator-line" aria-hidden="true"></span>
+			<span class="conversation-navigator-title">${escapeHtml(navigatorPromptTitle(item.prompt))}</span>
 		</button>`)
 		.join('');
 	updateConversationNavigatorActiveItem();
 }
 
-function renderConversationNavigatorPreview(button) {
-	if (!dom.conversationNavigatorPreview) {
-		return;
-	}
-	const prompt = String(button?.dataset.prompt || '').trim();
-	if (!prompt) {
-		dom.conversationNavigatorPreview.classList.add('hidden');
-		return;
-	}
-	dom.conversationNavigatorPreview.textContent = truncateText(prompt, 96);
-	dom.conversationNavigatorPreview.classList.remove('hidden');
+function navigatorPromptTitle(prompt) {
+	return String(prompt || '').trim();
 }
 
 function updateConversationNavigatorActiveItem() {
@@ -4984,8 +5041,11 @@ function upsertReportMessage(content, options = {}) {
 		return false;
 	}
 	const taskId = String(options.taskId || state.taskId || '').trim();
+	const reportKey = String(options.reportKey || '').trim();
+	const conversationIndex = Number(options.conversationIndex);
 	const index = state.messages.findIndex((message) => (
-		message.kind === 'report' && String(message.taskId || '') === taskId
+		message.kind === 'report' &&
+		(reportKey ? String(message.reportKey || '') === reportKey : String(message.taskId || '') === taskId)
 	));
 	const liveCounts = taskId ? reportArtifactCounts(taskId) : {};
 	const artifactCountsSnapshot = hasArtifactCounts(liveCounts)
@@ -4998,6 +5058,8 @@ function upsertReportMessage(content, options = {}) {
 		format: 'markdown',
 		kind: 'report',
 		taskId,
+		reportKey,
+		conversationIndex: Number.isInteger(conversationIndex) && conversationIndex >= 0 ? conversationIndex : undefined,
 		artifactCountsSnapshot
 	};
 	if (
@@ -5016,8 +5078,49 @@ function upsertReportMessage(content, options = {}) {
 		));
 	state.messages = index >= 0
 		? state.messages.map((item, itemIndex) => (itemIndex === index ? message : item))
-		: [...messages, message];
+		: insertReportMessage(messages, message, {
+			insertAfterConversationIndex: options.insertAfterConversationIndex,
+			insertAfterTaskId: options.insertAfterTaskId
+		});
 	return true;
+}
+
+function insertReportMessage(messages, message, options = {}) {
+	const conversationIndex = Number(options.insertAfterConversationIndex);
+	if (Number.isInteger(conversationIndex) && conversationIndex >= 0) {
+		let insertIndex = -1;
+		for (let index = 0; index < messages.length; index += 1) {
+			if (Number(messages[index]?.conversationIndex) === conversationIndex) {
+				insertIndex = index;
+			}
+		}
+		if (insertIndex >= 0) {
+			return [
+				...messages.slice(0, insertIndex + 1),
+				message,
+				...messages.slice(insertIndex + 1)
+			];
+		}
+	}
+	const insertAfterTaskId = typeof options === 'string' ? options : options.insertAfterTaskId;
+	const taskId = String(insertAfterTaskId || '').trim();
+	if (!taskId) {
+		return [...messages, message];
+	}
+	let insertIndex = -1;
+	for (let index = 0; index < messages.length; index += 1) {
+		if (String(messages[index]?.taskId || '') === taskId) {
+			insertIndex = index;
+		}
+	}
+	if (insertIndex < 0) {
+		return [...messages, message];
+	}
+	return [
+		...messages.slice(0, insertIndex + 1),
+		message,
+		...messages.slice(insertIndex + 1)
+	];
 }
 
 function rememberReportArtifactCounts(taskId, artifacts) {

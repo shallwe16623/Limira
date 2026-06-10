@@ -411,6 +411,11 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert ".task-thinking-panel" in styles
     assert ".conversation-navigator" in styles
     assert ".conversation-navigator-line" in styles
+    assert ".conversation-navigator-title" in styles
+    assert ".conversation-navigator-item.active .conversation-navigator-line" in styles
+    assert ".conversation-navigator:hover .conversation-navigator-list" in styles
+    assert ".conversation-navigator:hover .conversation-navigator-line" in styles
+    assert ".conversation-navigator:hover .conversation-navigator-title" in styles
     assert ".conversation-navigator-preview" in styles
     assert "max-height: min(52vh, 560px);" not in styles
     assert "overscroll-behavior-y: auto;" not in styles
@@ -460,6 +465,10 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function handleWorkspaceScroll()" in app
     assert "function renderConversationNavigator()" in app
     assert "function conversationNavigationItems()" in app
+    assert "function navigatorPromptTitle(prompt)" in app
+    assert "dom.workspaceContent.scrollHeight - dom.workspaceContent.clientHeight > 24" in app
+    assert "conversation-navigator-title" in app
+    assert "conversationNavigatorHideTimer" not in app
     assert "function scrollToConversationMessage(index)" in app
     assert "data-navigator-message-index" in app
     assert "dom.workspaceContent.addEventListener('scroll', handleWorkspaceScroll);" in app
@@ -509,7 +518,13 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function conversationMembersForTask(task, fallbackTaskId)" in app
     assert "function hydrateConversationHistory(members)" in app
     assert "conversation_members" in app
-    assert "upsertReportMessage(report, { taskId });" in app
+    assert "insertAfterConversationIndex: memberIndex" in app
+    assert "reportKey: conversationReportKey(taskId, memberIndex)" in app
+    assert "function insertReportMessage(messages, message, options = {})" in app
+    assert "function shouldInlineConversationReports()" in app
+    assert "function orderedConversationIndexedMessages(indexedMessages)" in app
+    assert "function messageAnchorKeys(message)" in app
+    assert "const inlineConversationReports = shouldInlineConversationReports();" in app
     assert "taskId" in app[app.index("function upsertReportMessage(content, options = {})") : app.index("function appendThinkingStep")]
     render_messages_block = app[app.index("function renderMessages(options = {})") : app.index("function latestUserMessageIndex()")]
     assert "function messageBelongsToCurrentTask(message)" in app
@@ -574,7 +589,8 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     report_text_block = app[app.index("function reportText(section)") : app.index("const REPORT_TEXT_FIELDS")]
     assert "artifactReadableText(section)" in report_text_block
     assert "stringifyCompact(section)" not in report_text_block
-    assert "item.message.kind !== 'report' || !messageBelongsToCurrentTask(item.message)" in render_messages_block
+    assert "inlineConversationReports ||" in render_messages_block
+    assert "!messageBelongsToCurrentTask(item.message)" in render_messages_block
     assert "item.message.kind === 'report' && messageBelongsToCurrentTask(item.message)" in render_messages_block
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]
     assert "dom.queryInput.value = state.query" not in restore_workspace_block

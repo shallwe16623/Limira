@@ -192,6 +192,17 @@ wait_for_url() {
 	exit 1
 }
 
+frontend_network_url() {
+	local public_host="${LIMIRA_PUBLIC_HOST:-}"
+	if [[ -z "$public_host" ]]; then
+		public_host="$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && $1 != "127.0.0.1" { print; exit }' || true)"
+	fi
+	if [[ -z "$public_host" ]]; then
+		return
+	fi
+	printf 'http://%s:%s/limira\n' "$public_host" "$FRONTEND_PORT"
+}
+
 status_services() {
 	for name in runner backend frontend; do
 		local pid_file="$PID_DIR/$name.pid"
@@ -217,7 +228,12 @@ start_services() {
 	wait_for_url "frontend" "http://127.0.0.1:$FRONTEND_PORT/limira"
 	echo
 	echo "Limira is running:"
-	echo "  Frontend: http://127.0.0.1:$FRONTEND_PORT/limira"
+	echo "  Frontend (same server):     http://127.0.0.1:$FRONTEND_PORT/limira"
+	local network_url
+	network_url="$(frontend_network_url)"
+	if [[ -n "$network_url" ]]; then
+		echo "  Frontend (remote browser):  $network_url"
+	fi
 	echo "  Backend:  http://127.0.0.1:$BACKEND_PORT"
 	echo "  Runner:   http://127.0.0.1:$RUNNER_PORT"
 }

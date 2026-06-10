@@ -9,8 +9,21 @@ PID_DIR="$RUNTIME_DIR/pids"
 CADDY_BIN="${LIMIRA_CADDY_BIN:-"$CADDY_DIR/caddy"}"
 CADDYFILE="${LIMIRA_CADDYFILE:-"$ROOT_DIR/deploy/caddy/Caddyfile"}"
 
+load_env_file() {
+	local file="$1"
+	if [[ -f "$file" ]]; then
+		set -a
+		# shellcheck disable=SC1090
+		. "$file"
+		set +a
+	fi
+}
+
+load_env_file "$ROOT_DIR/.env"
+
+FRONTEND_PORT="${LIMIRA_STANDALONE_PORT:-5173}"
 LIMIRA_DOMAIN="${LIMIRA_DOMAIN:-limira-inc.com}"
-LIMIRA_FRONTEND_UPSTREAM="${LIMIRA_FRONTEND_UPSTREAM:-127.0.0.1:5173}"
+LIMIRA_FRONTEND_UPSTREAM="${LIMIRA_FRONTEND_UPSTREAM:-127.0.0.1:$FRONTEND_PORT}"
 CADDY_ACME_EMAIL="${CADDY_ACME_EMAIL:-admin@$LIMIRA_DOMAIN}"
 
 mkdir -p "$CADDY_DIR" "$LOG_DIR" "$PID_DIR"

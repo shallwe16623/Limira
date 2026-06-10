@@ -67,6 +67,16 @@ docker-compose.limira.yml
 
 前端 `apps/limira-standalone/server.mjs` 只使用 Node.js 内置模块，当前没有 `package.json`，不需要 `npm install`。
 
+如果当前 shell 里没有系统级 `node`，可以把 Node.js 放在本机临时目录并显式指定给启动脚本。`scripts/start-local.sh` 会自动识别 `/tmp/codex-node/node/bin/node`，也可以用 `LIMIRA_NODE_BIN` 覆盖：
+
+```bash
+mkdir -p /tmp/codex-node/node
+# 示例：把已下载的 Node.js linux-x64 tarball 解压到该目录，或按团队机器镜像预置该目录。
+export LIMIRA_NODE_BIN=/tmp/codex-node/node/bin/node
+export PATH="/tmp/codex-node/node/bin:$PATH"
+node --version
+```
+
 ### 2. 安装项目依赖
 
 本地开发和服务启动使用 `apps/limira-runner` 的 Python 环境。它的 `pyproject.toml` 会把 runner、agent、tools 三部分依赖一次装齐，包括 FastAPI/aiohttp、LLM SDK、MCP/FastMCP、PDF/Office 文档解析、PDF 导出、对象存储、Postgres 驱动、测试工具、PDF 上传抽文本需要的 `pypdf`，以及语音输入后端转写使用的开源 `faster-whisper`。
@@ -190,6 +200,14 @@ LIMIRA_SPEECH_MAX_AUDIO_BYTES=26214400
 - 后端：`http://127.0.0.1:8080`
 - 独立前端：`http://127.0.0.1:5173/limira`
 
+`127.0.0.1` 只适合同一台服务器上的进程或浏览器。通过另一台电脑的浏览器访问时，使用启动脚本打印的 `Frontend (remote browser)` 地址，或手动打开：
+
+```text
+http://<server-ip>:<LIMIRA_STANDALONE_PORT>/limira
+```
+
+如果需要固定对外显示的地址，可以设置 `LIMIRA_PUBLIC_HOST=<server-ip-or-domain>` 后再启动。
+
 它会先停止当前端口上的旧进程，再重新启动三段服务，并把日志写到：
 
 ```text
@@ -220,6 +238,8 @@ limira-runtime/pids/
 ```bash
 ./scripts/start-https.sh
 ```
+
+脚本会读取当前 worktree 根目录的 `.env`。如果 `.env` 设置了 `LIMIRA_STANDALONE_PORT`，HTTPS 反向代理默认会转发到同一个前端端口；也可以用 `LIMIRA_FRONTEND_UPSTREAM` 显式覆盖。
 
 默认域名是：
 
@@ -412,7 +432,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run pytest \
   -q -k 'not test_limira_standalone_proxy_only_forwards_limira_api_namespace'
 ```
 
-如果本机有 Node：
+如果本机有 Node，或已按上面的本地 Node 路径设置 `PATH`：
 
 ```bash
 node --check apps/limira-standalone/public/app.js
