@@ -2588,11 +2588,11 @@ function renderThinking() {
 }
 
 function scrollThinkingToLatest() {
-	if (!dom.workspaceContent || isArtifactView()) {
+	if (!dom.thinkingList || isArtifactView()) {
 		return;
 	}
 	window.requestAnimationFrame(() => {
-		dom.workspaceContent.scrollTop = dom.workspaceContent.scrollHeight;
+		dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;
 	});
 }
 

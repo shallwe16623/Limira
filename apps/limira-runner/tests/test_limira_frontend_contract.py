@@ -392,11 +392,13 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function scrollThinkingListToBottom()" not in app
     assert "function keepThinkingListAboveInput()" not in app
     assert "dom.thinkingList.lastElementChild?.scrollIntoView({" not in app
-    assert "dom.workspaceContent.scrollTop = dom.workspaceContent.scrollHeight;" in app
-    assert ".thinking-list {\n\tdisplay: grid;\n\tgap: 0.85rem;\n\tpadding: 1rem;\n}" in styles
-    assert "max-height: min(44vh, 440px);" not in styles
-    assert "overscroll-behavior-y: auto;" not in styles
-    assert "scroll-padding-bottom: 1.5rem;" not in styles
+    assert "dom.workspaceContent.scrollTop = dom.workspaceContent.scrollHeight;" not in app
+    assert "dom.thinkingList.scrollTop = dom.thinkingList.scrollHeight;" in app
+    assert "max-height: min(52vh, 560px);" in styles
+    assert "overflow-y: auto;" in styles
+    assert "overscroll-behavior-y: auto;" in styles
+    assert "padding: 1rem 1rem 2rem;" in styles
+    assert "scrollbar-gutter: stable;" in styles
     assert "overscroll-behavior: contain;" not in styles
     assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in app
     assert "function setSidebarCollapsed(collapsed)" in app

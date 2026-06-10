@@ -930,7 +930,11 @@ label {
 .thinking-list {
 	display: grid;
 	gap: 0.85rem;
-	padding: 1rem;
+	max-height: min(52vh, 560px);
+	overflow-y: auto;
+	overscroll-behavior-y: auto;
+	padding: 1rem 1rem 2rem;
+	scrollbar-gutter: stable;
 }
 
 .thinking-panel.collapsed .thinking-list {
