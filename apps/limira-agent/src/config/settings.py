@@ -19,17 +19,22 @@ from omegaconf import DictConfig
 
 load_dotenv()
 
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
-SERPER_BASE_URL = os.environ.get("SERPER_BASE_URL", "https://google.serper.dev")
 
-JINA_API_KEY = os.environ.get("JINA_API_KEY")
-JINA_BASE_URL = os.environ.get("JINA_BASE_URL", "https://r.jina.ai")
+def _env_string(name: str, default: str = "") -> str:
+    return str(os.environ.get(name) or default)
 
-E2B_API_KEY = os.environ.get("E2B_API_KEY")
 
-SUMMARY_LLM_API_KEY = os.environ.get("SUMMARY_LLM_API_KEY")
-SUMMARY_LLM_BASE_URL = os.environ.get("SUMMARY_LLM_BASE_URL")
-SUMMARY_LLM_MODEL_NAME = os.environ.get("SUMMARY_LLM_MODEL_NAME")
+SERPER_API_KEY = _env_string("SERPER_API_KEY")
+SERPER_BASE_URL = _env_string("SERPER_BASE_URL", "https://google.serper.dev")
+
+JINA_API_KEY = _env_string("JINA_API_KEY")
+JINA_BASE_URL = _env_string("JINA_BASE_URL", "https://r.jina.ai")
+
+E2B_API_KEY = _env_string("E2B_API_KEY")
+
+SUMMARY_LLM_API_KEY = _env_string("SUMMARY_LLM_API_KEY")
+SUMMARY_LLM_BASE_URL = _env_string("SUMMARY_LLM_BASE_URL")
+SUMMARY_LLM_MODEL_NAME = _env_string("SUMMARY_LLM_MODEL_NAME")
 
 
 def create_mcp_server_parameters(cfg: DictConfig, agent_cfg: DictConfig):
