@@ -128,36 +128,38 @@ def build_initial_research_graph(
     """
 
     normalized_query = _normalize_query(query)
-    direct_answer = _is_direct_answer_query(normalized_query) and not scenario
     bounded_units = max(1, min(int(max_units), 8))
-    if direct_answer:
-        bounded_units = min(bounded_units, 2)
     brief = ResearchBrief(
         original_query=normalized_query,
         clarified_question=normalized_query,
         scope=_scope_text(normalized_query, scenario),
-        success_criteria=_success_criteria_for_query(direct_answer=direct_answer),
-        required_sources=_required_sources_for_query(direct_answer=direct_answer),
+        success_criteria=[
+            "Answer the user's question directly.",
+            "Use source-backed claims and preserve source attribution.",
+            "Separate confirmed facts from uncertainty or conflicting claims.",
+        ],
+        required_sources=[
+            "Primary or official sources when available.",
+            "Recent secondary reporting for context when primary sources are incomplete.",
+        ],
         constraints=[
             "Do not invent citations.",
             "Prefer evidence that can be archived and later rechecked.",
-            *(
-                ["Stop searching once the direct answer is sufficiently verified."]
-                if direct_answer
-                else []
-            ),
         ],
     )
-    units = _research_units_for_query(
-        normalized_query,
-        bounded_units,
-        direct_answer=direct_answer,
-    )
+    units = _research_units_for_query(normalized_query, bounded_units)
     plan = ResearchPlan(
         research_units=units,
-        expected_artifacts=_expected_artifacts_for_query(direct_answer=direct_answer),
-        verification_strategy=_verification_strategy_for_query(
-            direct_answer=direct_answer
+        expected_artifacts=[
+            "evidence",
+            "entity",
+            "timeline_event",
+            "verification_result",
+            "report_section",
+        ],
+        verification_strategy=(
+            "Cross-check high-impact claims against at least two independent sources "
+            "or mark the claim as weak/contextual."
         ),
     )
     return ResearchGraphState(
@@ -256,65 +258,7 @@ def _scope_text(query: str, scenario: str | None) -> str:
     return f"Research the user question end to end: {query}"
 
 
-def _success_criteria_for_query(*, direct_answer: bool) -> list[str]:
-    if direct_answer:
-        return [
-            "Answer the user's question directly first.",
-            "Keep the final answer concise unless the user asks for a full report.",
-            "Use source-backed claims and preserve source attribution.",
-        ]
-    return [
-        "Answer the user's question directly.",
-        "Use source-backed claims and preserve source attribution.",
-        "Separate confirmed facts from uncertainty or conflicting claims.",
-    ]
-
-
-def _required_sources_for_query(*, direct_answer: bool) -> list[str]:
-    if direct_answer:
-        return [
-            "Use an official or primary source when available.",
-            "Use recent secondary reporting only when it clarifies the direct answer.",
-        ]
-    return [
-        "Primary or official sources when available.",
-        "Recent secondary reporting for context when primary sources are incomplete.",
-    ]
-
-
-def _expected_artifacts_for_query(*, direct_answer: bool) -> list[str]:
-    if direct_answer:
-        return ["evidence", "verification_result", "report_section"]
-    return [
-        "evidence",
-        "entity",
-        "timeline_event",
-        "verification_result",
-        "report_section",
-    ]
-
-
-def _verification_strategy_for_query(*, direct_answer: bool) -> str:
-    if direct_answer:
-        return (
-            "Verify the direct answer with one authoritative source when available; "
-            "use one corroborating source if the official source is incomplete or ambiguous."
-        )
-    return (
-        "Cross-check high-impact claims against at least two independent sources "
-        "or mark the claim as weak/contextual."
-    )
-
-
-def _research_units_for_query(
-    query: str,
-    max_units: int,
-    *,
-    direct_answer: bool = False,
-) -> list[ResearchUnit]:
-    if direct_answer:
-        return _direct_answer_units_for_query(query, max_units)
-
+def _research_units_for_query(query: str, max_units: int) -> list[ResearchUnit]:
     base_queries = _query_variants(query)
     unit_specs = [
         (
@@ -349,82 +293,9 @@ def _research_units_for_query(
     ]
 
 
-def _direct_answer_units_for_query(query: str, max_units: int) -> list[ResearchUnit]:
-    unit_specs = [
-        (
-            "direct-answer",
-            f"What is the direct answer to: {query}",
-            [query, f"{query} official source"],
-        ),
-        (
-            "verification",
-            f"Which source best verifies the direct answer to: {query}",
-            [f"{query} official", f"{query} latest"],
-        ),
-    ]
-    return [
-        ResearchUnit(
-            id=f"unit-{index + 1}-{unit_id}",
-            question=question,
-            search_queries=_dedupe_queries(queries or [query]),
-            source_policy=SourcePolicy(min_sources=1),
-            max_sources=2,
-        )
-        for index, (unit_id, question, queries) in enumerate(unit_specs[:max_units])
-    ]
-
-
 def _query_variants(query: str) -> list[str]:
     quoted = f'"{query}"' if len(query) < 180 else query
     return _dedupe_queries([query, quoted, f"{query} source", f"{query} report"])
-
-
-def _is_direct_answer_query(query: str) -> bool:
-    normalized = str(query or "").strip()
-    lowered = normalized.casefold()
-    if len(normalized) > 140:
-        return False
-    deep_research_markers = (
-        "研究",
-        "分析",
-        "报告",
-        "梳理",
-        "比较",
-        "全面",
-        "深入",
-        "详细",
-        "结合",
-        "评估",
-        "框架",
-        "strategy",
-        "analysis",
-        "report",
-        "compare",
-        "comprehensive",
-        "deep dive",
-    )
-    if any(marker in lowered for marker in deep_research_markers):
-        return False
-    direct_markers = (
-        "吗",
-        "是否",
-        "是不是",
-        "有没有",
-        "有无",
-        "在不在",
-        "is ",
-        "are ",
-        "was ",
-        "were ",
-        "does ",
-        "did ",
-        "has ",
-        "have ",
-        "whether",
-    )
-    return "?" in normalized or "？" in normalized or any(
-        marker in lowered for marker in direct_markers
-    )
 
 
 def _dedupe_queries(queries: list[str]) -> list[str]:

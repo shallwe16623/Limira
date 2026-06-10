@@ -67,37 +67,6 @@ def test_initial_research_graph_creates_bounded_scope_and_plan():
     assert "Cross-check" in state.plan.verification_strategy
 
 
-def test_direct_answer_research_graph_uses_lightweight_source_targets():
-    state = build_initial_research_graph(
-        task_id="task-direct",
-        query="请问比亚迪在1260H名单上吗",
-    )
-
-    assert len(state.plan.research_units) == 2
-    assert state.plan.research_units[0].id == "unit-1-direct-answer"
-    assert [unit.source_policy.min_sources for unit in state.plan.research_units] == [
-        1,
-        1,
-    ]
-    assert [unit.max_sources for unit in state.plan.research_units] == [2, 2]
-    assert state.plan.expected_artifacts == [
-        "evidence",
-        "verification_result",
-        "report_section",
-    ]
-    assert "direct answer" in state.plan.verification_strategy
-    assert any("Stop searching" in item for item in state.brief.constraints)
-
-    task_description = graph_task_description(
-        state,
-        "请问比亚迪在1260H名单上吗",
-    )
-
-    assert "unit-1-direct-answer" in task_description
-    assert "Source target: at least 1, max 2 sources" in task_description
-    assert "Keep the final answer concise" in task_description
-
-
 def test_research_graph_bootstrap_events_are_serializable_and_ordered():
     state = build_initial_research_graph(
         task_id="task-graph",
