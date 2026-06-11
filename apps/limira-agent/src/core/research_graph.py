@@ -891,9 +891,6 @@ async def execute_research_graph(
             current_output.final_summary,
             current_output.final_boxed_answer,
         )
-    except ValueError as exc:
-        await _emit_graph_error(stream_queue, error_state, exc)
-        raise
     except Exception as exc:
         await _emit_graph_error(stream_queue, error_state, exc)
         raise
@@ -1471,17 +1468,7 @@ def _upload_document_ids(
         value = upload_scope.get("document_ids")
         if isinstance(value, list):
             raw_ids = value
-    if not raw_ids:
-        return []
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for raw_id in raw_ids[:20]:
-        document_id = str(raw_id or "").strip()
-        if not document_id or document_id in seen:
-            continue
-        seen.add(document_id)
-        deduped.append(document_id)
-    return deduped
+    return _normalized_upload_document_ids(raw_ids)
 
 
 def _upload_sources_from_context(
@@ -1673,6 +1660,10 @@ def _upload_context_source_payloads(value: Any) -> list[dict[str, Any]]:
 
 
 def _upload_context_document_ids(value: Any) -> list[str]:
+    return _normalized_upload_document_ids(value)
+
+
+def _normalized_upload_document_ids(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     ids: list[str] = []

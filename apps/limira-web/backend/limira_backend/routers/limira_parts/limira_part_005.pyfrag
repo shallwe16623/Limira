@@ -307,12 +307,13 @@ def _record_artifact_from_event(
             source_event_type=artifact.get("source_event_type"),
         )
     elif artifact_type in {"finding", "verified_claim"}:
+        local_artifact_id = _artifact_primary_id(artifact_type, artifact)
         _record_unresolved_evidence_ref_warning(
             repo,
             task.task_id,
             artifact,
             artifact_type=artifact_type,
-            local_artifact_id=_artifact_primary_id(artifact_type, artifact),
+            local_artifact_id=local_artifact_id,
         )
         if artifact_type == "verified_claim":
             _record_unsupported_verified_claim_warning(
@@ -320,7 +321,7 @@ def _record_artifact_from_event(
                 task.task_id,
                 artifact,
                 artifact_type="verified_claim",
-                local_artifact_id=_artifact_primary_id(artifact_type, artifact),
+                local_artifact_id=local_artifact_id,
             )
     return None
 
