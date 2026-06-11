@@ -609,6 +609,12 @@ class WriterNode(ResearchGraphNode):
                 "verified_claim_count": len(state.verified_claims),
                 "final_summary_length": len(final_summary),
             },
+            artifact_events=[
+                _final_report_section_artifact_event(
+                    state,
+                    final_summary=final_summary,
+                )
+            ],
             final_summary=final_summary,
             final_boxed_answer=final_boxed_answer,
             failure_experience_summary=(
@@ -1257,6 +1263,32 @@ def _verified_claim_artifact_event(claim: VerifiedClaim) -> dict[str, Any]:
             "evidence_refs": list(claim.evidence_ids),
             "rationale": claim.rationale,
             "confidence": claim.confidence,
+            "source_event_type": "research_graph",
+        },
+    }
+
+
+def _final_report_section_artifact_event(
+    state: ResearchGraphState,
+    *,
+    final_summary: str,
+) -> dict[str, Any]:
+    evidence_refs = list(
+        dict.fromkeys(
+            evidence_id
+            for claim in state.verified_claims
+            for evidence_id in claim.evidence_ids
+        )
+    )
+    return {
+        "event": "report_section_generated",
+        "type": "report_section_generated",
+        "payload": {
+            "section_id": "REPORT-GRAPH-FINAL",
+            "title": "Final graph report",
+            "markdown": final_summary,
+            "content": final_summary,
+            "evidence_refs": evidence_refs,
             "source_event_type": "research_graph",
         },
     }

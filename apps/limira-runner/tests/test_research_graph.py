@@ -467,6 +467,19 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
     assert complete_checkpoint["status"] == "completed"
     assert complete_checkpoint["resume_policy"] == "terminal"
     assert complete_checkpoint["recoverable_reason"] is None
+    report_events = [
+        item
+        for item in stream_queue.items
+        if item.get("type") == "report_section_generated"
+    ]
+    assert len(report_events) == 1
+    report_payload = report_events[0]["payload"]
+    assert report_payload["section_id"] == "REPORT-GRAPH-FINAL"
+    assert report_payload["title"] == "Final graph report"
+    assert "## Verified Claims" in report_payload["markdown"]
+    assert report_payload["content"] == report_payload["markdown"]
+    assert report_payload["evidence_refs"]
+    assert report_payload["source_event_type"] == "research_graph"
     assert any(item["event"] == "message" for item in stream_queue.items)
     assert len(_FakeOrchestrator.task_descriptions) == 4
     assert all(
@@ -872,3 +885,7 @@ async def test_feature_flagged_graph_executor_rejects_missing_writer_output(
         for item in stream_queue.items
         if item["event"] == "research_graph_checkpoint"
     ] == ["scope", "plan", "research", "compress", "verify"]
+    assert not any(
+        item.get("type") == "report_section_generated"
+        for item in stream_queue.items
+    )
