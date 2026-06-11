@@ -4,7 +4,10 @@ const tabs = ['证据', '实体', '图谱', '时间线', '地图'];
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 const artifactEvents = new Set([
 	'source_candidate_collected',
+	'retrieved_source_collected',
 	'evidence_collected',
+	'finding_collected',
+	'verified_claim_collected',
 	'entity_extracted',
 	'relation_extracted',
 	'timeline_event_added',
@@ -2539,7 +2542,10 @@ function thinkingStepForStartEvent(eventType, data) {
 function thinkingStepForArtifactEvent(eventType, data) {
 	const labels = {
 		source_candidate_collected: ['source', '发现候选来源', '检索摘要已作为候选来源保存，需进一步阅读或交叉验证后才能作为证据。'],
+		retrieved_source_collected: ['source', '读取来源', '内容型来源已读取，可用于证据晋升和交叉验证。'],
 		evidence_collected: ['evidence', '新增证据', '有新的来源或摘录进入证据池，正在用于后续交叉验证。'],
+		finding_collected: ['verification', '压缩发现', '来源证据已压缩为可核验的阶段性发现。'],
+		verified_claim_collected: ['verification', '核验主张', '主张已链接证据并标记支撑关系。'],
 		entity_extracted: ['entity', '识别关键实体', '从材料中抽取机构、人物、地点、政策或产业对象。'],
 		relation_extracted: ['graph', '更新关系图谱', '识别实体之间的政策、贸易、投资或影响关系。'],
 		timeline_event_added: ['timeline', '补充时间线', '把关键事件按时间顺序沉淀到时间线。'],
@@ -3754,11 +3760,32 @@ function renderArtifactContent() {
 function renderEvidence() {
 	const items = asArray(state.artifacts.evidence);
 	const candidates = asArray(state.artifacts.source_candidates);
+	const retrievedSources = asArray(state.artifacts.retrieved_sources);
+	const findings = asArray(state.artifacts.findings);
+	const verifiedClaims = asArray(state.artifacts.verified_claims);
 	const sections = [];
 	if (items.length) {
 		sections.push(`<section class="artifact-section">
 			<div class="artifact-section-title">已验证证据</div>
 			<div class="artifact-grid">${items.map(evidenceCard).join('')}</div>
+		</section>`);
+	}
+	if (retrievedSources.length) {
+		sections.push(`<section class="artifact-section">
+			<div class="artifact-section-title">已读取来源</div>
+			<div class="artifact-grid">${retrievedSources.map(retrievedSourceCard).join('')}</div>
+		</section>`);
+	}
+	if (findings.length) {
+		sections.push(`<section class="artifact-section">
+			<div class="artifact-section-title">发现</div>
+			<div class="artifact-grid">${findings.map(findingCard).join('')}</div>
+		</section>`);
+	}
+	if (verifiedClaims.length) {
+		sections.push(`<section class="artifact-section">
+			<div class="artifact-section-title">已核验主张</div>
+			<div class="artifact-grid">${verifiedClaims.map(verifiedClaimCard).join('')}</div>
 		</section>`);
 	}
 	if (candidates.length) {
@@ -3788,6 +3815,64 @@ function evidenceCard(item, index) {
 		</div>
 		${summary ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>` : ''}
 		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
+	</article>`;
+}
+
+function retrievedSourceCard(item, index) {
+	const id = item.retrieved_source_id || item.source_id || item.id || `RSRC-${String(index + 1).padStart(3, '0')}`;
+	const title = item.title || item.source || id;
+	const url = safeExternalUrl(item.url || item.source_url || '');
+	const summary = artifactReadableText(item, {
+		fields: ['summary', 'quote_or_summary', 'text', 'content', 'description']
+	});
+	const meta = [
+		id,
+		item.source_type ? `类型 ${item.source_type}` : '',
+		item.content_hash ? `哈希 ${item.content_hash}` : '',
+		item.tool_name ? `工具 ${item.tool_name}` : '',
+		item.retrieved_at || '',
+		item.confidence !== undefined && item.confidence !== null ? `置信度 ${item.confidence}` : ''
+	]
+		.filter((value) => String(value || '').trim())
+		.map((value) => `<span>${escapeHtml(value)}</span>`)
+		.join('');
+	return `<article id="retrieved-source-${safeDomId(id)}" class="artifact-card">
+		<div class="artifact-title">${escapeHtml(title)}</div>
+		<div class="artifact-meta">${meta}</div>
+		${summary ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>` : ''}
+		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开已读取来源</a>` : ''}
+	</article>`;
+}
+
+function findingCard(item, index) {
+	const id = item.finding_id || item.id || `FIND-${String(index + 1).padStart(3, '0')}`;
+	const summary = artifactReadableText(item, {
+		fields: ['summary', 'claim', 'description']
+	});
+	const evidenceIds = asArray(item.evidence_ids || item.evidence_refs).join(', ');
+	return `<article id="finding-${safeDomId(id)}" class="artifact-card">
+		<div class="artifact-title">${escapeHtml(id)}</div>
+		<div class="artifact-meta">
+			${evidenceIds ? `<span>证据 ${escapeHtml(evidenceIds)}</span>` : ''}
+			${item.confidence !== undefined && item.confidence !== null ? `<span>置信度 ${escapeHtml(item.confidence)}</span>` : ''}
+		</div>
+		${summary ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>` : ''}
+	</article>`;
+}
+
+function verifiedClaimCard(item, index) {
+	const id = item.claim_id || item.id || `CLAIM-${String(index + 1).padStart(3, '0')}`;
+	const claim = item.claim || item.summary || id;
+	const evidenceIds = asArray(item.evidence_ids || item.evidence_refs).join(', ');
+	return `<article id="verified-claim-${safeDomId(id)}" class="artifact-card">
+		<div class="artifact-title">${escapeHtml(claim)}</div>
+		<div class="artifact-meta">
+			<span>${escapeHtml(id)}</span>
+			${item.support_type ? `<span>支撑 ${escapeHtml(item.support_type)}</span>` : ''}
+			${evidenceIds ? `<span>证据 ${escapeHtml(evidenceIds)}</span>` : ''}
+			${item.confidence !== undefined && item.confidence !== null ? `<span>置信度 ${escapeHtml(item.confidence)}</span>` : ''}
+		</div>
+		${item.rationale ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(item.rationale)}</div>` : ''}
 	</article>`;
 }
 
@@ -5348,7 +5433,10 @@ function normalizeArtifacts(data) {
 	const source = data.artifacts || data || {};
 	return {
 		source_candidates: asArray(source.source_candidates || source.source_candidates_items || source.sourceCandidates),
+		retrieved_sources: asArray(source.retrieved_sources || source.retrievedSources),
 		evidence: asArray(source.evidence || source.evidence_items),
+		findings: asArray(source.findings),
+		verified_claims: asArray(source.verified_claims || source.verifiedClaims),
 		entities: asArray(source.entities),
 		relations: asArray(source.relations || source.entity_relations),
 		timeline_events: asArray(source.timeline_events || source.timeline),
@@ -5360,7 +5448,10 @@ function normalizeArtifacts(data) {
 function emptyArtifacts() {
 	return {
 		source_candidates: [],
+		retrieved_sources: [],
 		evidence: [],
+		findings: [],
+		verified_claims: [],
 		entities: [],
 		relations: [],
 		timeline_events: [],
@@ -5389,6 +5480,9 @@ function artifactCounts(artifacts = state.artifacts) {
 	return {
 		证据: asArray(artifacts.evidence).length,
 		候选来源: asArray(artifacts.source_candidates).length,
+		已读取来源: asArray(artifacts.retrieved_sources).length,
+		发现: asArray(artifacts.findings).length,
+		已核验主张: asArray(artifacts.verified_claims).length,
 		实体: asArray(artifacts.entities).length,
 		图谱: asArray(artifacts.entities).length + asArray(artifacts.relations).length,
 		时间线: asArray(artifacts.timeline_events).length,
@@ -5687,7 +5781,10 @@ function eventLabel(eventType) {
 		status: '状态',
 		task_update: '任务更新',
 		source_candidate_collected: '候选来源已收集',
+		retrieved_source_collected: '已读取来源',
 		evidence_collected: '证据已收集',
+		finding_collected: '发现已压缩',
+		verified_claim_collected: '主张已核验',
 		entity_extracted: '实体已抽取',
 		relation_extracted: '关系已抽取',
 		timeline_event_added: '时间线已更新',

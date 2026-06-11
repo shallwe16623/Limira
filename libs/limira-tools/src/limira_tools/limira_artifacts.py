@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -10,7 +11,10 @@ REDACTED = "[REDACTED]"
 
 ARTIFACT_EVENT_TYPES: dict[str, str] = {
     "source_candidate": "source_candidate_collected",
+    "retrieved_source": "retrieved_source_collected",
     "evidence": "evidence_collected",
+    "finding": "finding_collected",
+    "verified_claim": "verified_claim_collected",
     "entity": "entity_extracted",
     "relation": "relation_extracted",
     "timeline_event": "timeline_event_added",
@@ -64,7 +68,7 @@ SECRET_PATTERNS = (
 def artifact_recording_prompt_instruction() -> str:
     return """When the `record_research_artifact` tool is available, use it to record OSINT artifacts as structured data before they are summarized in prose.
 
-Record artifacts after search/scrape source discovery or evidence collection, entity or relation extraction, timeline or map extraction, verification work, and report section drafting. Supported `artifact_type` values are: source_candidate, evidence, entity, relation, timeline_event, map_feature, verification, report_section. Treat validation warnings from this tool as non-fatal and continue the research task."""
+Record artifacts after search/scrape source discovery or evidence collection, entity or relation extraction, timeline or map extraction, verification work, and report section drafting. Supported `artifact_type` values are: source_candidate, retrieved_source, evidence, finding, verified_claim, entity, relation, timeline_event, map_feature, verification, report_section. Search snippets are source_candidate records only; promote to evidence only after a content-bearing retrieved_source exists. Treat validation warnings from this tool as non-fatal and continue the research task."""
 
 
 def record_research_artifact(
@@ -90,10 +94,16 @@ def record_research_artifact(
             payload,
         )
 
-    errors = _validate_artifact_payload(normalized_type, payload)
     normalized_refs, ref_errors = _normalize_evidence_refs(evidence_refs)
-    errors.extend(ref_errors)
     normalized_confidence, confidence_error = _normalize_confidence(confidence)
+    artifact_payload = _prepare_artifact_payload(
+        normalized_type,
+        dict(payload),
+        confidence=normalized_confidence,
+        evidence_refs=normalized_refs,
+    )
+    errors = _validate_artifact_payload(normalized_type, artifact_payload)
+    errors.extend(ref_errors)
     if confidence_error:
         errors.append(confidence_error)
 
@@ -102,10 +112,10 @@ def record_research_artifact(
             "invalid_artifact_payload",
             normalized_type,
             errors,
-            payload,
+            artifact_payload,
         )
 
-    artifact_payload = dict(scrub_secrets(payload))
+    artifact_payload = dict(scrub_secrets(artifact_payload))
     artifact_payload.setdefault("artifact_type", normalized_type)
     artifact_payload.setdefault("source_event_type", "record_research_artifact")
     if normalized_refs is not None:
@@ -282,6 +292,29 @@ def _normalize_artifact_type(value: Any) -> str:
     return str(value).strip().lower().replace("-", "_")
 
 
+def _prepare_artifact_payload(
+    artifact_type: str,
+    payload: dict[str, Any],
+    *,
+    confidence: float | None = None,
+    evidence_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    prepared = dict(payload)
+    if confidence is not None:
+        prepared.setdefault("confidence", confidence)
+    if artifact_type == "retrieved_source":
+        prepared.setdefault("retrieved_source_id", _stable_artifact_id("RSRC", prepared))
+    elif artifact_type == "evidence":
+        if evidence_refs:
+            prepared.setdefault("evidence_id", evidence_refs[0])
+        prepared.setdefault("evidence_id", _stable_artifact_id("EVID", prepared))
+    elif artifact_type == "finding":
+        prepared.setdefault("finding_id", _stable_artifact_id("FIND", prepared))
+    elif artifact_type == "verified_claim":
+        prepared.setdefault("claim_id", _stable_artifact_id("CLAIM", prepared))
+    return prepared
+
+
 def _validate_artifact_payload(
     artifact_type: str,
     payload: dict[str, Any],
@@ -300,12 +333,14 @@ def _validate_artifact_payload(
             ),
             "source_candidate requires source, title, summary, snippet, or description",
         )
+    if artifact_type == "retrieved_source":
+        return _validate_retrieved_source_payload(payload)
     if artifact_type == "evidence":
-        return _require_any(
-            payload,
-            ("title", "source_url", "url", "summary", "text", "quote", "content"),
-            "evidence requires source, title, summary, text, quote, or content",
-        )
+        return _validate_evidence_payload(payload)
+    if artifact_type == "finding":
+        return _validate_finding_payload(payload)
+    if artifact_type == "verified_claim":
+        return _validate_verified_claim_payload(payload)
     if artifact_type == "entity":
         return _require_any(payload, ("name",), "entity requires name")
     if artifact_type == "relation":
@@ -349,6 +384,83 @@ def _validate_artifact_payload(
     return [f"unsupported artifact_type: {artifact_type}"]
 
 
+def _validate_retrieved_source_payload(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    errors.extend(
+        _require_any(
+            payload,
+            ("source_url", "url", "document_id"),
+            "retrieved_source requires source_url, url, or document_id",
+        )
+    )
+    errors.extend(
+        _require_any(
+            payload,
+            ("summary", "text", "quote", "content", "quote_or_summary"),
+            "retrieved_source requires content-bearing text, summary, quote, or content",
+        )
+    )
+    errors.extend(_require_any(payload, ("source_type",), "retrieved_source requires source_type"))
+    errors.extend(_require_any(payload, ("retrieved_at",), "retrieved_source requires retrieved_at"))
+    errors.extend(_require_any(payload, ("content_hash",), "retrieved_source requires content_hash"))
+    errors.extend(_require_any(payload, ("tool_name",), "retrieved_source requires tool_name"))
+    errors.extend(_require_any(payload, ("confidence",), "retrieved_source requires confidence"))
+    content_state = str(payload.get("source_content_state") or "").strip()
+    if content_state != "content_bearing":
+        errors.append("retrieved_source requires content_bearing source_content_state")
+    if str(payload.get("source_state") or "").strip() == "source_candidate":
+        errors.append("source_candidate cannot be recorded as retrieved_source")
+    return errors
+
+
+def _validate_evidence_payload(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    errors.extend(
+        _require_any(
+            payload,
+            ("title", "source_url", "url", "summary", "text", "quote", "content", "quote_or_summary"),
+            "evidence requires source, title, summary, text, quote, or content",
+        )
+    )
+    errors.extend(_require_any(payload, ("source_type",), "evidence requires source_type"))
+    errors.extend(_require_any(payload, ("retrieved_at",), "evidence requires retrieved_at"))
+    errors.extend(_require_any(payload, ("content_hash",), "evidence requires content_hash"))
+    evidence_id = str(payload.get("evidence_id") or "").strip()
+    if not is_evidence_ref(evidence_id):
+        errors.append("evidence requires a stable EVID-* evidence_id")
+    if bool(payload.get("candidate")):
+        errors.append("source candidates cannot be promoted to evidence")
+    if str(payload.get("source_state") or "").strip() == "source_candidate":
+        errors.append("source_candidate cannot be promoted to evidence")
+    content_state = str(payload.get("source_content_state") or "").strip()
+    if content_state != "content_bearing":
+        errors.append("evidence requires content-bearing retrieved source material")
+    return errors
+
+
+def _validate_finding_payload(payload: dict[str, Any]) -> list[str]:
+    errors = _require_any(payload, ("summary", "claim"), "finding requires summary or claim")
+    evidence_refs = _evidence_refs_from_payload(payload)
+    if not evidence_refs:
+        errors.append("finding requires evidence_ids or evidence_refs")
+    else:
+        errors.extend(_invalid_evidence_ref_errors(evidence_refs, "finding"))
+    return errors
+
+
+def _validate_verified_claim_payload(payload: dict[str, Any]) -> list[str]:
+    errors = _require_any(payload, ("claim",), "verified_claim requires claim")
+    support_type = str(payload.get("support_type") or "").strip()
+    if support_type not in {"supports", "contradicts", "contextual", "weak"}:
+        errors.append("verified_claim requires support_type supports, contradicts, contextual, or weak")
+    evidence_refs = _evidence_refs_from_payload(payload)
+    if not evidence_refs:
+        errors.append("verified_claim requires evidence_ids or evidence_refs")
+    else:
+        errors.extend(_invalid_evidence_ref_errors(evidence_refs, "verified_claim"))
+    return errors
+
+
 def _require_any(
     payload: dict[str, Any],
     keys: tuple[str, ...],
@@ -359,6 +471,54 @@ def _require_any(
         if value is not None and str(value).strip():
             return []
     return [message]
+
+
+def _evidence_refs_from_payload(payload: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for key in ("evidence_ids", "evidence_refs"):
+        value = payload.get(key)
+        values = [value] if isinstance(value, str) else value
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        for item in values:
+            ref = str(item).strip()
+            if ref and ref not in seen:
+                refs.append(ref)
+                seen.add(ref)
+    return refs
+
+
+def _invalid_evidence_ref_errors(refs: list[str], artifact_type: str) -> list[str]:
+    return [
+        f"{artifact_type} has invalid evidence id: {ref}"
+        for ref in refs
+        if not is_evidence_ref(ref)
+    ]
+
+
+def _stable_artifact_id(prefix: str, payload: dict[str, Any]) -> str:
+    material = "|".join(
+        str(payload.get(key) or "")
+        for key in (
+            "evidence_id",
+            "retrieved_source_id",
+            "claim_id",
+            "finding_id",
+            "content_hash",
+            "source_url",
+            "url",
+            "document_id",
+            "title",
+            "summary",
+            "quote_or_summary",
+            "claim",
+        )
+    )
+    digest = hashlib.sha256(
+        material.encode("utf-8", errors="replace")
+    ).hexdigest()
+    return f"{prefix}-{digest[:12]}"
 
 
 def _normalize_evidence_refs(value: Any) -> tuple[list[str] | None, list[str]]:

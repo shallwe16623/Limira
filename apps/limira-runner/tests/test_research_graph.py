@@ -416,6 +416,36 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
     )
     assert research_checkpoint["current_research_unit"].startswith("unit-4-")
     assert len(research_checkpoint["evidence_ledger"]) == 4
+    assert any(
+        item.get("retrieved_source_id", "").startswith("RSRC-")
+        for item in research_checkpoint["source_ledger"]
+    )
+    assert [
+        item["type"]
+        for item in stream_queue.items
+        if item.get("type")
+        in {
+            "retrieved_source_collected",
+            "evidence_collected",
+            "finding_collected",
+            "verified_claim_collected",
+        }
+    ][:4] == [
+        "retrieved_source_collected",
+        "evidence_collected",
+        "retrieved_source_collected",
+        "evidence_collected",
+    ]
+    verify_checkpoint = next(
+        item for item in checkpoints if item["phase"] == "verify"
+    )
+    assert any(
+        item.get("claim_id", "").startswith("claim-")
+        and item.get("support_type") == "supports"
+        and item.get("evidence_ids")
+        for item in verify_checkpoint["evidence_ledger"]
+    )
+    assert verify_checkpoint["executor_state"]["verified_claims"][0]["support_type"] == "supports"
     complete_checkpoint = checkpoints[-1]
     assert complete_checkpoint["status"] == "completed"
     assert complete_checkpoint["resume_policy"] == "terminal"

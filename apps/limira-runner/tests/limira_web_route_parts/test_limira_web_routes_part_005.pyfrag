@@ -1559,6 +1559,160 @@ async def test_event_proxy_keeps_artifacts_user_scoped():
     assert forbidden.value.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_source_lifecycle_artifacts_are_separate_and_warn_on_weak_claim():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "retrieved_source_collected",
+                "payload": {
+                    "retrieved_source_id": "RSRC-001",
+                    "title": "Source page",
+                    "url": "https://example.test/source",
+                    "summary": "Retrieved source text.",
+                    "source_type": "web_page_content",
+                    "source_state": "retrieved_source",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "a" * 32,
+                    "tool_name": "scrape",
+                    "confidence": 0.8,
+                },
+            },
+            {
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": "EVID-001",
+                    "retrieved_source_id": "RSRC-001",
+                    "title": "Evidence page",
+                    "url": "https://example.test/source",
+                    "summary": "Evidence text.",
+                    "source_type": "web_page_content",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "a" * 32,
+                    "tool_name": "scrape",
+                    "confidence": 0.8,
+                },
+            },
+            {
+                "type": "finding_collected",
+                "payload": {
+                    "finding_id": "FIND-001",
+                    "summary": "Finding linked to evidence.",
+                    "evidence_ids": ["EVID-001"],
+                    "confidence": 0.8,
+                },
+            },
+            {
+                "type": "verified_claim_collected",
+                "payload": {
+                    "claim_id": "CLAIM-001",
+                    "claim": "A weakly supported high-confidence claim.",
+                    "support_type": "weak",
+                    "evidence_ids": ["EVID-001"],
+                    "confidence": 0.9,
+                },
+            },
+            {
+                "type": "report_section_generated",
+                "payload": {
+                    "section_id": "REPORT-LIFECYCLE-SECTION",
+                    "title": "Lifecycle section",
+                    "markdown": "Section cites [EVID-001].",
+                    "evidence_refs": ["EVID-001"],
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "source lifecycle"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["source_candidates"] == []
+    assert artifacts["retrieved_sources"][0]["retrieved_source_id"] == "RSRC-001"
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["findings"][0]["evidence_ids"] == ["EVID-001"]
+    assert artifacts["verified_claims"][0]["support_type"] == "weak"
+    assert artifacts["report_sections"][0]["section_id"] == "REPORT-LIFECYCLE-SECTION"
+
+    claim_warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+        and event["payload"].get("warning") == "unsupported_high_confidence_claim"
+    ]
+    assert any(
+        warning["artifact_type"] == "verified_claim"
+        and warning["local_artifact_id"] == "CLAIM-001"
+        for warning in claim_warnings
+    )
+
+    section_warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+        and event["payload"].get("artifact_type") == "report_section"
+    ]
+    assert section_warnings[-1]["warning"] == "unsupported_high_confidence_claim"
+    assert section_warnings[-1]["local_artifact_id"] == "REPORT-LIFECYCLE-SECTION"
+
+    task = repo.get_task(task_id)
+    report = await limira._store_task_report_pdf(
+        task=task,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+        pdf_exporter=FakePdfExporter(),
+        report_id="REPORT-LIFECYCLE",
+        report_type="final",
+        markdown="Final report cites [EVID-001].",
+        evidence_refs=["EVID-001"],
+        metadata={"source_event_type": "source_lifecycle_test"},
+        record_cloud_document=False,
+    )
+    assert report.evidence_refs == ["EVID-001"]
+
+    report_warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+        and event["payload"].get("artifact_type") == "final_report"
+    ]
+    assert report_warnings[-1]["warning"] == "unsupported_high_confidence_claim"
+    assert report_warnings[-1]["local_artifact_id"] == "REPORT-LIFECYCLE"
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    assert trace["artifacts"]["retrieved_sources"][0]["retrieved_source_id"] == "RSRC-001"
+    assert trace["artifacts"]["findings"][0]["finding_id"] == "FIND-001"
+    assert trace["artifacts"]["verified_claims"][0]["claim_id"] == "CLAIM-001"
+
+
 def test_runner_research_client_uses_server_side_headers(monkeypatch):
     monkeypatch.setenv("LIMIRA_RUNNER_INTERNAL_URL", "http://internal-runner")
     monkeypatch.setenv("LIMIRA_RUNNER_SERVICE_TOKEN", "server-only-token")

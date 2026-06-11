@@ -154,20 +154,18 @@ def _jina_summary_evidence_events(
     summary = _first_text(parsed, "extracted_info", "summary", "content")
     if not summary:
         return []
-    return [
-        _evidence_event(
-            task_id=task_id,
-            tool_name=tool_name,
-            tool_call_id=tool_call_id,
-            index=0,
-            title=_title_from_url(url) or "Web page summary",
-            url=url,
-            summary=summary,
-            source_type="web_page_summary",
-            confidence=0.8,
-            query=_first_text(arguments, "info_to_extract", "query", "q"),
-        )
-    ]
+    return _retrieved_source_and_evidence_events(
+        task_id=task_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        index=0,
+        title=_title_from_url(url) or "Web page summary",
+        url=url,
+        summary=summary,
+        source_type="web_page_summary",
+        confidence=0.8,
+        query=_first_text(arguments, "info_to_extract", "query", "q"),
+    )
 
 
 def _scrape_evidence_events(
@@ -187,23 +185,21 @@ def _scrape_evidence_events(
     summary = _summary_text(result)
     if not (url and summary):
         return []
-    return [
-        _evidence_event(
-            task_id=task_id,
-            tool_name=tool_name,
-            tool_call_id=tool_call_id,
-            index=0,
-            title=_title_from_url(url) or "Scraped web page",
-            url=url,
-            summary=summary,
-            source_type="web_page_content",
-            confidence=0.75,
-            query="",
-        )
-    ]
+    return _retrieved_source_and_evidence_events(
+        task_id=task_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        index=0,
+        title=_title_from_url(url) or "Scraped web page",
+        url=url,
+        summary=summary,
+        source_type="web_page_content",
+        confidence=0.75,
+        query="",
+    )
 
 
-def _evidence_event(
+def _retrieved_source_and_evidence_events(
     *,
     task_id: str,
     tool_name: str,
@@ -215,12 +211,18 @@ def _evidence_event(
     source_type: str,
     confidence: float,
     query: str,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     summary = _summary_text(summary)
     source = url or title or summary
-    content_hash = hashlib.sha256(
-        f"{source}\n{summary}".encode("utf-8", errors="replace")
-    ).hexdigest()[:32]
+    content_hash = _source_content_hash(source, summary)
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    retrieved_source_id = _retrieved_source_id(
+        task_id=task_id,
+        source=source,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        index=index,
+    )
     evidence_id = _evidence_id(
         task_id=task_id,
         source=source,
@@ -228,16 +230,139 @@ def _evidence_event(
         tool_call_id=tool_call_id,
         index=index,
     )
+    return [
+        _retrieved_source_event(
+            retrieved_source_id=retrieved_source_id,
+            title=title,
+            url=url,
+            summary=summary,
+            source_type=source_type,
+            confidence=confidence,
+            query=query,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            content_hash=content_hash,
+            retrieved_at=retrieved_at,
+        ),
+        _evidence_event(
+            evidence_id=evidence_id,
+            retrieved_source_id=retrieved_source_id,
+            title=title,
+            url=url,
+            summary=summary,
+            source_type=source_type,
+            confidence=confidence,
+            query=query,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            content_hash=content_hash,
+            retrieved_at=retrieved_at,
+        ),
+    ]
+
+
+def _retrieved_source_event(
+    *,
+    retrieved_source_id: str,
+    title: str,
+    url: str,
+    summary: str,
+    source_type: str,
+    confidence: float,
+    query: str,
+    tool_name: str,
+    tool_call_id: str,
+    content_hash: str,
+    retrieved_at: str,
+) -> dict[str, Any]:
+    payload = _content_bearing_payload(
+        title=title,
+        url=url,
+        summary=summary,
+        source_type=source_type,
+        query=query,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        content_hash=content_hash,
+        retrieved_at=retrieved_at,
+    )
+    payload.update(
+        {
+            "retrieved_source_id": retrieved_source_id,
+            "source_state": "retrieved_source",
+            "candidate": False,
+        }
+    )
+    return record_research_artifact(
+        "retrieved_source",
+        payload,
+        confidence=confidence,
+    )
+
+
+def _evidence_event(
+    *,
+    evidence_id: str,
+    retrieved_source_id: str,
+    title: str,
+    url: str,
+    summary: str,
+    source_type: str,
+    confidence: float,
+    query: str,
+    tool_name: str,
+    tool_call_id: str,
+    content_hash: str,
+    retrieved_at: str,
+) -> dict[str, Any]:
+    payload = _content_bearing_payload(
+        title=title,
+        url=url,
+        summary=summary,
+        source_type=source_type,
+        query=query,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        content_hash=content_hash,
+        retrieved_at=retrieved_at,
+    )
+    payload.update(
+        {
+            "evidence_id": evidence_id,
+            "quote_or_summary": summary,
+            "retrieved_source_id": retrieved_source_id,
+            "source_state": "evidence_item",
+            "candidate": False,
+        }
+    )
+    return record_research_artifact(
+        "evidence",
+        payload,
+        evidence_refs=[evidence_id],
+        confidence=confidence,
+    )
+
+
+def _content_bearing_payload(
+    *,
+    title: str,
+    url: str,
+    summary: str,
+    source_type: str,
+    query: str,
+    tool_name: str,
+    tool_call_id: str,
+    content_hash: str,
+    retrieved_at: str,
+) -> dict[str, Any]:
+    source = url or title or summary
     payload: dict[str, Any] = {
-        "evidence_id": evidence_id,
         "title": title or source,
         "summary": summary,
-        "quote_or_summary": summary,
         "source_type": source_type,
-        "source_state": "verified_evidence",
         "source_content_state": "content_bearing",
-        "candidate": False,
-        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "retrieval_status": "retrieved",
+        "retrieved_at": retrieved_at,
         "content_hash": content_hash,
         "source_event_type": "tool_evidence_ledger",
         "tool_name": tool_name,
@@ -248,12 +373,13 @@ def _evidence_event(
         payload["source_url"] = url
     if query:
         payload["query"] = query
-    return record_research_artifact(
-        "evidence",
-        payload,
-        evidence_refs=[evidence_id],
-        confidence=confidence,
-    )
+    return payload
+
+
+def _source_content_hash(source: str, summary: str) -> str:
+    return hashlib.sha256(
+        f"{source}\n{summary}".encode("utf-8", errors="replace")
+    ).hexdigest()[:32]
 
 
 def _source_candidate_event(
@@ -271,9 +397,7 @@ def _source_candidate_event(
 ) -> dict[str, Any]:
     summary = _summary_text(summary)
     source = url or title or summary
-    content_hash = hashlib.sha256(
-        f"{source}\n{summary}".encode("utf-8", errors="replace")
-    ).hexdigest()[:32]
+    content_hash = _source_content_hash(source, summary)
     candidate_id = _source_candidate_id(
         task_id=task_id,
         source=source,
@@ -334,6 +458,22 @@ def _source_candidate_id(
         f"{task_id}:{tool_name}:{tool_call_id}:{source}:{index}".encode("utf-8")
     ).hexdigest()
     return f"SRC-{digest[:12]}"
+
+
+def _retrieved_source_id(
+    *,
+    task_id: str,
+    source: str,
+    tool_name: str,
+    tool_call_id: str,
+    index: int,
+) -> str:
+    digest = hashlib.sha256(
+        f"{task_id}:retrieved:{tool_name}:{tool_call_id}:{source}:{index}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return f"RSRC-{digest[:12]}"
 
 
 def _parse_json_mapping(value: Any) -> dict[str, Any] | None:

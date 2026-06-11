@@ -225,12 +225,42 @@ def _record_artifact_from_event(
         artifact.setdefault("confidence", metadata["confidence"])
     if metadata.get("notes") is not None:
         artifact.setdefault("notes", metadata["notes"])
+    if artifact_type in {"finding", "verified_claim"}:
+        evidence_refs = _evidence_refs_from_value(
+            artifact.get("evidence_refs") or artifact.get("evidence_ids")
+        )
+        if evidence_refs or "evidence_refs" in artifact or "evidence_ids" in artifact:
+            artifact["evidence_refs"] = evidence_refs
+            artifact["evidence_ids"] = evidence_refs
     if artifact_type == "report_section":
         artifact = _normalize_report_section_artifact(artifact)
     _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
     repo.record_artifact(task.task_id, artifact_type, artifact)
     if artifact_type == "report_section":
         _record_unresolved_evidence_ref_warning(repo, task.task_id, artifact)
+        _record_report_claim_support_warnings(
+            repo,
+            task.task_id,
+            artifact_type="report_section",
+            local_artifact_id=_artifact_primary_id(artifact_type, artifact),
+            source_event_type=artifact.get("source_event_type"),
+        )
+    elif artifact_type in {"finding", "verified_claim"}:
+        _record_unresolved_evidence_ref_warning(
+            repo,
+            task.task_id,
+            artifact,
+            artifact_type=artifact_type,
+            local_artifact_id=_artifact_primary_id(artifact_type, artifact),
+        )
+        if artifact_type == "verified_claim":
+            _record_unsupported_verified_claim_warning(
+                repo,
+                task.task_id,
+                artifact,
+                artifact_type="verified_claim",
+                local_artifact_id=_artifact_primary_id(artifact_type, artifact),
+            )
     return None
 
 
@@ -730,6 +760,92 @@ def _record_unresolved_evidence_ref_warning(
     )
 
 
+def _record_unsupported_verified_claim_warning(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    claim: Mapping[str, Any],
+    *,
+    artifact_type: str,
+    local_artifact_id: str | None = None,
+    source_event_type: Any = None,
+) -> None:
+    try:
+        confidence = float(claim.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 0.75:
+        return
+    support_type = str(claim.get("support_type") or "").strip()
+    refs = _evidence_refs_from_value(
+        claim.get("evidence_refs") or claim.get("evidence_ids")
+    )
+    known = _known_evidence_ids(repo, task_id)
+    missing = [ref for ref in refs if ref not in known]
+    if support_type == "supports" and refs and not missing:
+        return
+    repo.record_artifact_trace_event(
+        task_id,
+        _artifact_trace_event_from_warning(
+            {
+                "type": "artifact_warning",
+                "payload": {
+                    "warning": "unsupported_high_confidence_claim",
+                    "artifact_type": artifact_type,
+                    "source_event_type": source_event_type
+                    if source_event_type is not None
+                    else claim.get("source_event_type"),
+                    "local_artifact_id": local_artifact_id
+                    or claim.get("claim_id")
+                    or claim.get("id"),
+                    "claim": claim.get("claim") or claim.get("summary"),
+                    "support_type": support_type or None,
+                    "confidence": confidence,
+                    "evidence_refs": refs,
+                    "missing_evidence_refs": missing,
+                    "non_fatal": True,
+                },
+            }
+        ),
+    )
+
+
+def _record_final_report_claim_support_warnings(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    *,
+    report_id: str,
+    source_event_type: Any = None,
+) -> None:
+    _record_report_claim_support_warnings(
+        repo,
+        task_id,
+        artifact_type="final_report",
+        local_artifact_id=report_id,
+        source_event_type=source_event_type,
+    )
+
+
+def _record_report_claim_support_warnings(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    *,
+    artifact_type: str,
+    local_artifact_id: str | None,
+    source_event_type: Any = None,
+) -> None:
+    for claim in repo.get_artifacts(task_id).get("verified_claims", []):
+        if not isinstance(claim, Mapping):
+            continue
+        _record_unsupported_verified_claim_warning(
+            repo,
+            task_id,
+            claim,
+            artifact_type=artifact_type,
+            local_artifact_id=local_artifact_id,
+            source_event_type=source_event_type,
+        )
+
+
 def _record_and_return_artifact_warning(
     repo: LimiraTaskRepository,
     task: LimiraTask,
@@ -778,8 +894,14 @@ def _ensure_artifact_id(
     index = len(artifacts[bucket]) + 1
     if artifact_type == "source_candidate":
         artifact.setdefault("candidate_id", f"SRC-{index:03d}")
+    elif artifact_type == "retrieved_source":
+        artifact.setdefault("retrieved_source_id", f"RSRC-{index:03d}")
     elif artifact_type == "evidence":
         artifact.setdefault("evidence_id", f"EVID-{index:03d}")
+    elif artifact_type == "finding":
+        artifact.setdefault("finding_id", f"FIND-{index:03d}")
+    elif artifact_type == "verified_claim":
+        artifact.setdefault("claim_id", f"CLAIM-{index:03d}")
     elif artifact_type == "entity":
         artifact.setdefault("entity_id", f"ENT-{index:03d}")
     elif artifact_type == "relation":
@@ -889,7 +1011,10 @@ def _runner_task_id_from_payload(payload: dict[str, Any]) -> str:
 def _empty_artifact_buckets() -> dict[str, list[dict[str, Any]]]:
     return {
         "source_candidates": [],
+        "retrieved_sources": [],
         "evidence": [],
+        "findings": [],
+        "verified_claims": [],
         "entities": [],
         "relations": [],
         "timeline_events": [],
@@ -965,7 +1090,10 @@ def _generated_report_from_row(row: dict[str, Any]) -> LimiraGeneratedReport:
 def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
     key_by_type = {
         "source_candidate": "candidate_id",
+        "retrieved_source": "retrieved_source_id",
         "evidence": "evidence_id",
+        "finding": "finding_id",
+        "verified_claim": "claim_id",
         "entity": "entity_id",
         "relation": "relation_id",
         "timeline_event": "event_id",

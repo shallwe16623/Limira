@@ -70,13 +70,31 @@ class EvidenceItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=120)
+    retrieved_source_id: str | None = Field(default=None, max_length=120)
     url: str | None = Field(default=None, max_length=4_000)
+    document_id: str | None = Field(default=None, max_length=120)
     title: str | None = Field(default=None, max_length=1_000)
     source_type: str = Field(default="web", max_length=80)
     retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     content_hash: str = Field(min_length=16, max_length=128)
     quote_or_summary: str = Field(min_length=1, max_length=20_000)
     claims: list[str] = Field(default_factory=list, max_length=50)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    tool_name: str | None = Field(default=None, max_length=120)
+
+
+class RetrievedSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=120)
+    url: str | None = Field(default=None, max_length=4_000)
+    document_id: str | None = Field(default=None, max_length=120)
+    title: str | None = Field(default=None, max_length=1_000)
+    source_type: str = Field(min_length=1, max_length=80)
+    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    content_hash: str = Field(min_length=16, max_length=128)
+    quote_or_summary: str = Field(min_length=1, max_length=20_000)
+    tool_name: str = Field(min_length=1, max_length=120)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
@@ -108,6 +126,7 @@ class ResearchGraphState(BaseModel):
     phase: ResearchPhase = ResearchPhase.SCOPE
     brief: ResearchBrief
     plan: ResearchPlan
+    retrieved_sources: list[RetrievedSource] = Field(default_factory=list, max_length=2_000)
     evidence: list[EvidenceItem] = Field(default_factory=list, max_length=2_000)
     findings: list[CompressedFinding] = Field(default_factory=list, max_length=500)
     verified_claims: list[VerifiedClaim] = Field(default_factory=list, max_length=500)
@@ -138,6 +157,7 @@ class ResearchGraphNodeOutput(BaseModel):
     state: ResearchGraphState
     current_research_unit: str | None = None
     executor_state: dict[str, Any] = Field(default_factory=dict)
+    artifact_events: list[dict[str, Any]] = Field(default_factory=list)
     final_summary: str | None = None
     final_boxed_answer: str | None = None
     failure_experience_summary: Any = None
@@ -206,7 +226,9 @@ class ResearchUnitNode(ResearchGraphNode):
         context: ResearchGraphExecutionContext,
         previous: ResearchGraphNodeOutput | None = None,
     ) -> ResearchGraphNodeOutput:
+        retrieved_sources = list(state.retrieved_sources)
         evidence = list(state.evidence)
+        artifact_events: list[dict[str, Any]] = []
         failure_experience_summary = None
         current_unit_id = None
         for index, unit in enumerate(state.plan.research_units):
@@ -227,23 +249,47 @@ class ResearchUnitNode(ResearchGraphNode):
                 final_summary,
                 "research_graph_research_output_required",
             )
-            evidence.append(
-                EvidenceItem(
-                    id=evidence_id_for_source(
-                        task_id=state.task_id,
-                        source=f"graph://{unit.id}",
-                        index=index,
-                    ),
-                    url=f"graph://{unit.id}",
-                    title=unit.question,
-                    source_type="graph_research_unit",
-                    content_hash=hashlib.sha256(
-                        research_summary.encode("utf-8")
-                    ).hexdigest(),
-                    quote_or_summary=research_summary,
-                    claims=[research_summary],
-                    confidence=0.55,
-                )
+            content_hash = hashlib.sha256(
+                research_summary.encode("utf-8")
+            ).hexdigest()
+            retrieved_source = RetrievedSource(
+                id=retrieved_source_id_for_source(
+                    task_id=state.task_id,
+                    source=f"graph://{unit.id}",
+                    index=index,
+                ),
+                url=f"graph://{unit.id}",
+                title=unit.question,
+                source_type="graph_research_unit",
+                content_hash=content_hash,
+                quote_or_summary=research_summary,
+                tool_name="serial_graph_research_unit",
+                confidence=0.55,
+            )
+            evidence_item = EvidenceItem(
+                id=evidence_id_for_source(
+                    task_id=state.task_id,
+                    source=f"graph://{unit.id}",
+                    index=index,
+                ),
+                retrieved_source_id=retrieved_source.id,
+                url=retrieved_source.url,
+                title=unit.question,
+                source_type=retrieved_source.source_type,
+                retrieved_at=retrieved_source.retrieved_at,
+                content_hash=content_hash,
+                quote_or_summary=research_summary,
+                claims=[research_summary],
+                confidence=retrieved_source.confidence,
+                tool_name=retrieved_source.tool_name,
+            )
+            retrieved_sources.append(retrieved_source)
+            evidence.append(evidence_item)
+            artifact_events.extend(
+                [
+                    _retrieved_source_artifact_event(retrieved_source),
+                    _evidence_artifact_event(evidence_item),
+                ]
             )
         completed_units = [
             unit.model_copy(update={"status": "completed"})
@@ -255,6 +301,7 @@ class ResearchUnitNode(ResearchGraphNode):
                 "plan": state.plan.model_copy(
                     update={"research_units": completed_units}
                 ),
+                "retrieved_sources": retrieved_sources,
                 "evidence": evidence,
             }
         )
@@ -264,9 +311,11 @@ class ResearchUnitNode(ResearchGraphNode):
             executor_state={
                 "node": self.__class__.__name__,
                 "research_unit_count": len(completed_units),
+                "retrieved_source_count": len(retrieved_sources),
                 "evidence_count": len(evidence),
                 "legacy_adapter_calls": len(completed_units),
             },
+            artifact_events=artifact_events,
             failure_experience_summary=failure_experience_summary,
         )
 
@@ -292,7 +341,12 @@ class EvidenceCompressorNode(ResearchGraphNode):
                 "node": self.__class__.__name__,
                 "finding_count": len(findings),
                 "evidence_count": len(state.evidence),
+                "findings": [
+                    finding.model_dump(mode="json", exclude_none=True)
+                    for finding in findings
+                ],
             },
+            artifact_events=[_finding_artifact_event(finding) for finding in findings],
             failure_experience_summary=(
                 previous.failure_experience_summary if previous else None
             ),
@@ -335,7 +389,14 @@ class VerifierNode(ResearchGraphNode):
                 "node": self.__class__.__name__,
                 "verified_claim_count": len(verified_claims),
                 "finding_count": len(state.findings),
+                "verified_claims": [
+                    claim.model_dump(mode="json", exclude_none=True)
+                    for claim in verified_claims
+                ],
             },
+            artifact_events=[
+                _verified_claim_artifact_event(claim) for claim in verified_claims
+            ],
             failure_experience_summary=(
                 previous.failure_experience_summary if previous else None
             ),
@@ -493,7 +554,11 @@ def build_initial_research_graph(
     plan = ResearchPlan(
         research_units=units,
         expected_artifacts=[
+            "source_candidate",
+            "retrieved_source",
             "evidence",
+            "finding",
+            "verified_claim",
             "entity",
             "timeline_event",
             "verification_result",
@@ -635,6 +700,7 @@ async def execute_research_graph(
                     }
                 )
             error_state = current_output.state
+            await _emit_graph_artifact_events(stream_queue, current_output.artifact_events)
             await _emit_graph_checkpoint(
                 stream_queue,
                 current_output.state,
@@ -761,6 +827,15 @@ def evidence_id_for_source(*, task_id: str, source: str, index: int = 0) -> str:
     return f"EVID-{digest[:12]}"
 
 
+def retrieved_source_id_for_source(
+    *, task_id: str, source: str, index: int = 0
+) -> str:
+    digest = hashlib.sha256(
+        f"{task_id}:retrieved:{source}:{index}".encode("utf-8")
+    ).hexdigest()
+    return f"RSRC-{digest[:12]}"
+
+
 def _source_policy_text(source_policy: SourcePolicy) -> str:
     return (
         f"prefer_primary_sources={source_policy.prefer_primary_sources}; "
@@ -790,6 +865,16 @@ async def _emit_graph_checkpoint(
         await stream_queue.put(
             graph_checkpoint_event(state, phase, node_output, status=status)
         )
+
+
+async def _emit_graph_artifact_events(
+    stream_queue: Any,
+    artifact_events: list[dict[str, Any]],
+) -> None:
+    if stream_queue is None:
+        return
+    for event in artifact_events:
+        await stream_queue.put(event)
 
 
 async def _emit_graph_error(
@@ -834,7 +919,7 @@ def _research_unit_id_from_evidence(evidence: EvidenceItem, index: int) -> str:
 
 
 def _source_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, Any]]:
-    return [
+    unit_entries = [
         {
             "unit_id": unit.id,
             "status": unit.status,
@@ -843,21 +928,141 @@ def _source_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, A
         }
         for unit in state.plan.research_units
     ]
+    retrieved_entries = [
+        {
+            "retrieved_source_id": source.id,
+            "source_type": source.source_type,
+            "url": source.url,
+            "document_id": source.document_id,
+            "content_hash": source.content_hash,
+            "retrieved_at": source.retrieved_at.isoformat(),
+            "tool_name": source.tool_name,
+            "confidence": source.confidence,
+        }
+        for source in state.retrieved_sources
+    ]
+    return unit_entries + retrieved_entries
 
 
 def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, Any]]:
-    return [
+    evidence_entries = [
         {
             "id": evidence.id,
+            "retrieved_source_id": evidence.retrieved_source_id,
             "source_type": evidence.source_type,
             "url": evidence.url,
+            "document_id": evidence.document_id,
             "title": evidence.title,
             "content_hash": evidence.content_hash,
             "retrieved_at": evidence.retrieved_at.isoformat(),
             "confidence": evidence.confidence,
+            "tool_name": evidence.tool_name,
         }
         for evidence in state.evidence
     ]
+    finding_entries = [
+        {
+            "finding_id": finding.id,
+            "evidence_ids": list(finding.evidence_ids),
+            "confidence": finding.confidence,
+        }
+        for finding in state.findings
+    ]
+    claim_entries = [
+        {
+            "claim_id": claim.id,
+            "support_type": claim.support_type,
+            "evidence_ids": list(claim.evidence_ids),
+            "confidence": claim.confidence,
+        }
+        for claim in state.verified_claims
+    ]
+    return evidence_entries + finding_entries + claim_entries
+
+
+def _retrieved_source_artifact_event(source: RetrievedSource) -> dict[str, Any]:
+    return {
+        "event": "retrieved_source_collected",
+        "type": "retrieved_source_collected",
+        "payload": {
+            "retrieved_source_id": source.id,
+            "title": source.title,
+            "url": source.url,
+            "document_id": source.document_id,
+            "summary": source.quote_or_summary,
+            "quote_or_summary": source.quote_or_summary,
+            "source_type": source.source_type,
+            "source_state": "retrieved_source",
+            "source_content_state": "content_bearing",
+            "retrieval_status": "retrieved",
+            "retrieved_at": source.retrieved_at.isoformat(),
+            "content_hash": source.content_hash,
+            "tool_name": source.tool_name,
+            "confidence": source.confidence,
+            "candidate": False,
+            "source_event_type": "research_graph",
+        },
+    }
+
+
+def _evidence_artifact_event(evidence: EvidenceItem) -> dict[str, Any]:
+    return {
+        "event": "evidence_collected",
+        "type": "evidence_collected",
+        "payload": {
+            "evidence_id": evidence.id,
+            "retrieved_source_id": evidence.retrieved_source_id,
+            "title": evidence.title,
+            "url": evidence.url,
+            "document_id": evidence.document_id,
+            "summary": evidence.quote_or_summary,
+            "quote_or_summary": evidence.quote_or_summary,
+            "source_type": evidence.source_type,
+            "source_state": "evidence_item",
+            "source_content_state": "content_bearing",
+            "retrieval_status": "retrieved",
+            "retrieved_at": evidence.retrieved_at.isoformat(),
+            "content_hash": evidence.content_hash,
+            "tool_name": evidence.tool_name,
+            "confidence": evidence.confidence,
+            "candidate": False,
+            "evidence_refs": [evidence.id],
+            "source_event_type": "research_graph",
+        },
+    }
+
+
+def _finding_artifact_event(finding: CompressedFinding) -> dict[str, Any]:
+    return {
+        "event": "finding_collected",
+        "type": "finding_collected",
+        "payload": {
+            "finding_id": finding.id,
+            "research_unit_id": finding.research_unit_id,
+            "summary": finding.summary,
+            "evidence_ids": list(finding.evidence_ids),
+            "evidence_refs": list(finding.evidence_ids),
+            "confidence": finding.confidence,
+            "source_event_type": "research_graph",
+        },
+    }
+
+
+def _verified_claim_artifact_event(claim: VerifiedClaim) -> dict[str, Any]:
+    return {
+        "event": "verified_claim_collected",
+        "type": "verified_claim_collected",
+        "payload": {
+            "claim_id": claim.id,
+            "claim": claim.claim,
+            "support_type": claim.support_type,
+            "evidence_ids": list(claim.evidence_ids),
+            "evidence_refs": list(claim.evidence_ids),
+            "rationale": claim.rationale,
+            "confidence": claim.confidence,
+            "source_event_type": "research_graph",
+        },
+    }
 
 
 def _normalize_query(query: str) -> str:

@@ -37,7 +37,10 @@ CREATE TABLE IF NOT EXISTS limira_artifact_events (
     artifact_type TEXT NOT NULL CHECK (
         artifact_type IN (
             'source_candidate',
+            'retrieved_source',
             'evidence',
+            'finding',
+            'verified_claim',
             'entity',
             'relation',
             'timeline_event',
@@ -49,7 +52,10 @@ CREATE TABLE IF NOT EXISTS limira_artifact_events (
     bucket TEXT NOT NULL CHECK (
         bucket IN (
             'source_candidates',
+            'retrieved_sources',
             'evidence',
+            'findings',
+            'verified_claims',
             'entities',
             'relations',
             'timeline_events',

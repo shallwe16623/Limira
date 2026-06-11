@@ -16,6 +16,9 @@ MIGRATION_FILE = (
 SOURCE_CANDIDATE_MIGRATION_FILE = (
     ROOT / "deploy/limira/postgres/migrations/002_limira_source_candidates.sql"
 )
+SOURCE_LIFECYCLE_MIGRATION_FILE = (
+    ROOT / "deploy/limira/postgres/migrations/003_limira_source_lifecycle_artifacts.sql"
+)
 LEGACY_PY_PACKAGE = "open" + "_" + "web" + "ui"
 LEGACY_APP_DIR = "open-" + "web" + "ui-limira-runner"
 LEGACY_WEB_NAME_KEY = "WEB" + "UI_NAME"
@@ -309,6 +312,12 @@ def test_limira_migration_creates_required_extensions_tables_and_indexes():
     assert "artifact_event_id text primary key" in tables["limira_artifact_events"]["body"]
     assert "'source_candidate'" in tables["limira_artifact_events"]["body"]
     assert "'source_candidates'" in tables["limira_artifact_events"]["body"]
+    assert "'retrieved_source'" in tables["limira_artifact_events"]["body"]
+    assert "'retrieved_sources'" in tables["limira_artifact_events"]["body"]
+    assert "'finding'" in tables["limira_artifact_events"]["body"]
+    assert "'findings'" in tables["limira_artifact_events"]["body"]
+    assert "'verified_claim'" in tables["limira_artifact_events"]["body"]
+    assert "'verified_claims'" in tables["limira_artifact_events"]["body"]
     assert (
         "constraint uq_limira_artifact_events_task_local unique "
         "(task_id, artifact_type, local_artifact_id)"
@@ -414,6 +423,26 @@ def test_limira_source_candidate_migration_updates_artifact_constraints():
     assert "add constraint chk_limira_artifact_events_bucket check" in sql
     assert "'source_candidate'" in sql
     assert "'source_candidates'" in sql
+
+
+def test_limira_source_lifecycle_migration_updates_artifact_constraints():
+    sql = SOURCE_LIFECYCLE_MIGRATION_FILE.read_text(encoding="utf-8").lower()
+
+    assert "alter table limira_artifact_events" in sql
+    assert "add constraint chk_limira_artifact_events_artifact_type check" in sql
+    assert "add constraint chk_limira_artifact_events_bucket check" in sql
+    for value in (
+        "'source_candidate'",
+        "'retrieved_source'",
+        "'evidence'",
+        "'finding'",
+        "'verified_claim'",
+        "'source_candidates'",
+        "'retrieved_sources'",
+        "'findings'",
+        "'verified_claims'",
+    ):
+        assert value in sql
 
 
 def test_limira_migration_constraints_reference_existing_table_columns():

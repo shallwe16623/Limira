@@ -2018,6 +2018,12 @@ async def _store_task_report_pdf(
         local_artifact_id=report.report_id,
         source_event_type=report_metadata.get("source_event_type"),
     )
+    _record_final_report_claim_support_warnings(
+        repo,
+        task.task_id,
+        report_id=report.report_id,
+        source_event_type=report_metadata.get("source_event_type"),
+    )
     if record_cloud_document:
         _try_record_generated_cloud_document(
             repo,

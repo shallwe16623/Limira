@@ -58,7 +58,10 @@ FORBIDDEN_BROWSER_SUBSTRINGS = {
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 ARTIFACT_BUCKETS = {
     "source_candidate": "source_candidates",
+    "retrieved_source": "retrieved_sources",
     "evidence": "evidence",
+    "finding": "findings",
+    "verified_claim": "verified_claims",
     "entity": "entities",
     "relation": "relations",
     "timeline_event": "timeline_events",
@@ -68,7 +71,10 @@ ARTIFACT_BUCKETS = {
 }
 ARTIFACT_EVENT_TYPES = {
     "source_candidate_collected": "source_candidate",
+    "retrieved_source_collected": "retrieved_source",
     "evidence_collected": "evidence",
+    "finding_collected": "finding",
+    "verified_claim_collected": "verified_claim",
     "entity_extracted": "entity",
     "relation_extracted": "relation",
     "timeline_event_added": "timeline_event",
