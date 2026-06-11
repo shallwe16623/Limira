@@ -108,10 +108,6 @@ async def execute_task_pipeline(
             upload_scope=_context_mapping(research_context, "upload_scope"),
             source_policy=_context_mapping(research_context, "source_policy"),
         )
-        planned_task_description = graph_task_description(
-            graph_state,
-            task_description,
-        )
         if stream_queue is not None:
             for event in graph_bootstrap_events(graph_state):
                 await stream_queue.put(event)
@@ -153,7 +149,10 @@ async def execute_task_pipeline(
                 final_boxed_answer,
                 failure_experience_summary,
             ) = await orchestrator.run_main_agent(
-                task_description=planned_task_description,
+                task_description=graph_task_description(
+                    graph_state,
+                    task_description,
+                ),
                 task_file_name=task_file_name,
                 task_id=task_id,
                 is_final_retry=is_final_retry,
