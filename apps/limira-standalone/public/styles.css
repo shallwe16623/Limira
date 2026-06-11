@@ -861,6 +861,9 @@ label {
 	padding-top: 0.25rem;
 }
 
+.artifact-section { display: flex; flex-direction: column; gap: 1rem; }
+.artifact-section + .artifact-section { margin-top: 2.5rem; }
+.artifact-section-title { font-size: 0.9rem; font-weight: 700; color: var(--muted); }
 .artifact-grid { display: flex; flex-direction: column; gap: 2rem; }
 .artifact-card {
 	background: transparent;

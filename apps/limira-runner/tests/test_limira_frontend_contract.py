@@ -782,8 +782,40 @@ def test_limira_standalone_stream_handler_refreshes_all_artifact_events():
     assert "const artifactEvents = new Set([" in app
     assert "artifactEvents.has(eventType)" in app
     assert "void loadArtifacts();" in app
+    assert "'source_candidate_collected'" in app
+    assert "source_candidate_collected: ['source', '发现候选来源'" in app
+    assert "source_candidate_collected: '候选来源已收集'" in app
     for event_type in _required_frontend_artifact_event_types():
         assert f"'{event_type}'" in app
+
+
+def test_limira_standalone_preserves_and_renders_source_candidates():
+    app = _read(LIMIRA_STANDALONE_APP)
+
+    normalize_block = app[app.index("function normalizeArtifacts(data)") : app.index("function emptyArtifacts()")]
+    assert (
+        "source_candidates: asArray(source.source_candidates || source.source_candidates_items || source.sourceCandidates)"
+        in normalize_block
+    )
+    assert "source_candidates: asArray(source.evidence" not in normalize_block
+
+    empty_block = app[app.index("function emptyArtifacts()") : app.index("function initialMessages()")]
+    assert "source_candidates: []" in empty_block
+
+    render_evidence_block = app[app.index("function renderEvidence()") : app.index("function openEvidenceSource")]
+    assert "const candidates = asArray(state.artifacts.source_candidates);" in render_evidence_block
+    assert "items.map(evidenceCard)" in render_evidence_block
+    assert "candidates.map(sourceCandidateCard)" in render_evidence_block
+    assert "function sourceCandidateCard(item, index)" in render_evidence_block
+    assert "item.candidate_id || item.source_id || item.id" in render_evidence_block
+    assert "item.source_state ? `状态 ${item.source_state}`" in render_evidence_block
+    assert "item.source_content_state ? `内容 ${item.source_content_state}`" in render_evidence_block
+    assert "打开候选来源" in render_evidence_block
+
+    counts_block = app[app.index("function artifactCounts(artifacts = state.artifacts)") : app.index("function mapFeatures")]
+    assert "候选来源: asArray(artifacts.source_candidates).length" in counts_block
+    summary_block = app[app.index("function artifactThinkingSummary(artifacts = state.artifacts)") : app.index("async function loadArtifacts")]
+    assert "'候选来源'" in summary_block
 
 
 def test_limira_standalone_stream_handler_unwraps_nested_runner_events():

@@ -3,6 +3,7 @@ const BACK_TO_CHAT_LABEL = '回到对话';
 const tabs = ['证据', '实体', '图谱', '时间线', '地图'];
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
 const artifactEvents = new Set([
+	'source_candidate_collected',
 	'evidence_collected',
 	'entity_extracted',
 	'relation_extracted',
@@ -2537,6 +2538,7 @@ function thinkingStepForStartEvent(eventType, data) {
 
 function thinkingStepForArtifactEvent(eventType, data) {
 	const labels = {
+		source_candidate_collected: ['source', '发现候选来源', '检索摘要已作为候选来源保存，需进一步阅读或交叉验证后才能作为证据。'],
 		evidence_collected: ['evidence', '新增证据', '有新的来源或摘录进入证据池，正在用于后续交叉验证。'],
 		entity_extracted: ['entity', '识别关键实体', '从材料中抽取机构、人物、地点、政策或产业对象。'],
 		relation_extracted: ['graph', '更新关系图谱', '识别实体之间的政策、贸易、投资或影响关系。'],
@@ -2602,7 +2604,8 @@ function eventThinkingDetail(data) {
 
 function artifactThinkingSummary(artifacts = state.artifacts) {
 	const counts = artifactCounts(artifacts);
-	const parts = tabs
+	const summaryLabels = ['证据', '候选来源', '实体', '图谱', '时间线', '地图'];
+	const parts = summaryLabels
 		.map((tab) => `${tab} ${counts[tab] || 0}`)
 		.filter(Boolean);
 	return parts.length ? `当前成果：${parts.join(' · ')}。` : '当前成果正在整理中。';
@@ -3749,10 +3752,24 @@ function renderArtifactContent() {
 }
 
 function renderEvidence() {
-	const items = state.artifacts.evidence;
-	dom.artifactContent.innerHTML = items.length
-		? `<div class="artifact-grid">${items.map(evidenceCard).join('')}</div>`
-		: emptyState('证据条目会显示在这里。');
+	const items = asArray(state.artifacts.evidence);
+	const candidates = asArray(state.artifacts.source_candidates);
+	const sections = [];
+	if (items.length) {
+		sections.push(`<section class="artifact-section">
+			<div class="artifact-section-title">已验证证据</div>
+			<div class="artifact-grid">${items.map(evidenceCard).join('')}</div>
+		</section>`);
+	}
+	if (candidates.length) {
+		sections.push(`<section class="artifact-section">
+			<div class="artifact-section-title">候选来源</div>
+			<div class="artifact-grid">${candidates.map(sourceCandidateCard).join('')}</div>
+		</section>`);
+	}
+	dom.artifactContent.innerHTML = sections.length
+		? sections.join('')
+		: emptyState('证据条目和候选来源会显示在这里。');
 }
 
 function evidenceCard(item, index) {
@@ -3771,6 +3788,33 @@ function evidenceCard(item, index) {
 		</div>
 		${summary ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>` : ''}
 		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开来源</a>` : ''}
+	</article>`;
+}
+
+function sourceCandidateCard(item, index) {
+	const id = item.candidate_id || item.source_id || item.id || `SRC-${String(index + 1).padStart(3, '0')}`;
+	const title = item.title || item.source || id;
+	const url = safeExternalUrl(item.url || item.source_url || '');
+	const summary = artifactReadableText(item, {
+		fields: ['snippet', 'summary', 'description', 'text']
+	});
+	const meta = [
+		id,
+		item.source_type ? `类型 ${item.source_type}` : '',
+		item.source_state ? `状态 ${item.source_state}` : '',
+		item.source_content_state ? `内容 ${item.source_content_state}` : '',
+		item.confidence !== undefined && item.confidence !== null ? `置信度 ${item.confidence}` : '',
+		item.tool_name ? `工具 ${item.tool_name}` : '',
+		item.retrieved_at || ''
+	]
+		.filter((value) => String(value || '').trim())
+		.map((value) => `<span>${escapeHtml(value)}</span>`)
+		.join('');
+	return `<article id="source-candidate-${safeDomId(id)}" class="artifact-card">
+		<div class="artifact-title">${escapeHtml(title)}</div>
+		<div class="artifact-meta">${meta}</div>
+		${summary ? `<div class="artifact-body markdown-body compact-markdown">${renderMarkdown(summary)}</div>` : ''}
+		${url ? `<a href="${escapeAttr(url)}" class="sandbox-link" data-title="${escapeAttr(title)}" data-summary="${escapeAttr(summary)}" target="_blank" rel="noopener noreferrer">打开候选来源</a>` : ''}
 	</article>`;
 }
 
@@ -5303,6 +5347,7 @@ function localizedErrorDetail(detail) {
 function normalizeArtifacts(data) {
 	const source = data.artifacts || data || {};
 	return {
+		source_candidates: asArray(source.source_candidates || source.source_candidates_items || source.sourceCandidates),
 		evidence: asArray(source.evidence || source.evidence_items),
 		entities: asArray(source.entities),
 		relations: asArray(source.relations || source.entity_relations),
@@ -5314,6 +5359,7 @@ function normalizeArtifacts(data) {
 
 function emptyArtifacts() {
 	return {
+		source_candidates: [],
 		evidence: [],
 		entities: [],
 		relations: [],
@@ -5341,10 +5387,11 @@ function initialThinkingSteps() {
 
 function artifactCounts(artifacts = state.artifacts) {
 	return {
-		证据: artifacts.evidence.length,
-		实体: artifacts.entities.length,
-		图谱: artifacts.entities.length + artifacts.relations.length,
-		时间线: artifacts.timeline_events.length,
+		证据: asArray(artifacts.evidence).length,
+		候选来源: asArray(artifacts.source_candidates).length,
+		实体: asArray(artifacts.entities).length,
+		图谱: asArray(artifacts.entities).length + asArray(artifacts.relations).length,
+		时间线: asArray(artifacts.timeline_events).length,
 		地图: mapFeatures(artifacts).length
 	};
 }
@@ -5639,6 +5686,7 @@ function eventLabel(eventType) {
 		error: '错误',
 		status: '状态',
 		task_update: '任务更新',
+		source_candidate_collected: '候选来源已收集',
 		evidence_collected: '证据已收集',
 		entity_extracted: '实体已抽取',
 		relation_extracted: '关系已抽取',
