@@ -142,18 +142,19 @@ def build_initial_research_graph(
     normalized_query = _normalize_query(query)
     bounded_units = max(1, min(int(max_units), 8))
     upload_document_ids = _upload_document_ids(document_ids, upload_scope)
+    upload_context = _upload_context_summary(upload_scope, upload_document_ids)
     policy = _source_policy_from_context(source_policy)
     brief = ResearchBrief(
         original_query=normalized_query,
         clarified_question=normalized_query,
-        scope=_scope_text(normalized_query, scenario, upload_document_ids),
+        scope=_scope_text(normalized_query, scenario, upload_document_ids, upload_context),
         success_criteria=[
             "Answer the user's question directly.",
             "Use source-backed claims and preserve source attribution.",
             "Separate confirmed facts from uncertainty or conflicting claims.",
         ],
-        required_sources=_required_sources(upload_document_ids, scenario),
-        constraints=_constraints(upload_document_ids),
+        required_sources=_required_sources(upload_document_ids, scenario, upload_context),
+        constraints=_constraints(upload_document_ids, upload_context),
     )
     units = _research_units_for_query(normalized_query, bounded_units, policy)
     plan = ResearchPlan(
@@ -394,13 +395,17 @@ def _scope_text(
     query: str,
     scenario: str | None,
     upload_document_ids: list[str] | None = None,
+    upload_context: dict[str, Any] | None = None,
 ) -> str:
     upload_count = len(upload_document_ids or [])
+    retrieval_status = str((upload_context or {}).get("retrieval_status") or "").strip()
     upload_note = (
         f" Use {upload_count} attached upload source(s) as scoped user-provided context."
         if upload_count
         else ""
     )
+    if upload_note and retrieval_status:
+        upload_note = f"{upload_note} Upload retrieval status: {retrieval_status}."
     if scenario:
         return f"Research scenario '{scenario}' for: {query}.{upload_note}"
     return f"Research the user question end to end: {query}.{upload_note}"
@@ -449,6 +454,7 @@ def _research_units_for_query(
 def _required_sources(
     upload_document_ids: list[str],
     scenario: str | None,
+    upload_context: dict[str, Any] | None = None,
 ) -> list[str]:
     required_sources = [
         "Primary or official sources when available.",
@@ -463,10 +469,19 @@ def _required_sources(
             "Use attached upload documents as user-provided source candidates before "
             "web-only secondary context."
         )
+    retrieved_ids = (upload_context or {}).get("retrieved_document_ids") or []
+    if retrieved_ids:
+        required_sources.append(
+            "Use retrieved upload text for document IDs: "
+            f"{', '.join(str(item) for item in retrieved_ids)}."
+        )
     return required_sources
 
 
-def _constraints(upload_document_ids: list[str]) -> list[str]:
+def _constraints(
+    upload_document_ids: list[str],
+    upload_context: dict[str, Any] | None = None,
+) -> list[str]:
     constraints = [
         "Do not invent citations.",
         "Prefer evidence that can be archived and later rechecked.",
@@ -475,6 +490,12 @@ def _constraints(upload_document_ids: list[str]) -> list[str]:
         constraints.append(
             "Do not claim uploaded document facts were verified unless the retrieved "
             "upload chunk or parsed document content is cited."
+        )
+    context_only_ids = (upload_context or {}).get("context_only_document_ids") or []
+    if context_only_ids:
+        constraints.append(
+            "Treat context-only upload IDs as attachment metadata only until text is "
+            f"retrieved: {', '.join(str(item) for item in context_only_ids)}."
         )
     return constraints
 
@@ -518,6 +539,47 @@ def _upload_document_ids(
         seen.add(document_id)
         deduped.append(document_id)
     return deduped
+
+
+def _upload_context_summary(
+    upload_scope: dict[str, Any] | None,
+    upload_document_ids: list[str],
+) -> dict[str, Any]:
+    if not isinstance(upload_scope, dict):
+        return {}
+    retrieved_ids = _upload_context_document_ids(
+        upload_scope.get("retrieved_document_ids")
+    )
+    context_only_ids = _upload_context_document_ids(
+        upload_scope.get("context_only_document_ids")
+    )
+    status = str(upload_scope.get("retrieval_status") or "").strip()
+    if not status and upload_document_ids:
+        if retrieved_ids and context_only_ids:
+            status = "partial"
+        elif retrieved_ids:
+            status = "retrieved"
+        else:
+            status = "context_only"
+    return {
+        "retrieval_status": status,
+        "retrieved_document_ids": retrieved_ids,
+        "context_only_document_ids": context_only_ids,
+    }
+
+
+def _upload_context_document_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw_id in value[:20]:
+        document_id = str(raw_id or "").strip()
+        if not document_id or document_id in seen:
+            continue
+        seen.add(document_id)
+        ids.append(document_id)
+    return ids
 
 
 def _query_variants(query: str) -> list[str]:

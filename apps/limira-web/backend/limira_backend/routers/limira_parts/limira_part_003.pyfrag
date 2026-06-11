@@ -815,6 +815,11 @@ async def create_research_task(
         user=user,
         documents=attached_source_documents,
     )
+    _record_upload_source_artifacts(
+        repo,
+        task_id=task.task_id,
+        documents=attached_documents,
+    )
     try:
         runner_payload = await research_client.create_research_task(
             query=runner_query,
@@ -1402,16 +1407,130 @@ def _attach_documents_to_task(
     return attached
 
 
+def _upload_source_document_id(document: LimiraUploadedDocument) -> str:
+    metadata = document.metadata or {}
+    source_document_id = str(metadata.get("source_document_id") or "").strip()
+    return source_document_id or document.document_id
+
+
+def _upload_document_text(document: LimiraUploadedDocument) -> str:
+    return str(document.extracted_text or "").strip()
+
+
+def _upload_scope_retrieval_status(
+    documents: list[LimiraUploadedDocument],
+) -> str:
+    if not documents:
+        return "context_only"
+    text_count = sum(1 for document in documents if _upload_document_text(document))
+    if text_count == len(documents):
+        return "retrieved"
+    if text_count:
+        return "partial"
+    return "context_only"
+
+
+def _upload_source_content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _upload_source_candidate_id(
+    task_id: str,
+    document: LimiraUploadedDocument,
+) -> str:
+    source = f"{task_id}:{document.document_id}:{_upload_source_document_id(document)}"
+    digest = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"SRC-UPLOAD-{digest}"
+
+
+def _upload_source_excerpt(text: str, *, max_chars: int = 4000) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _upload_source_candidate_payload(
+    *,
+    task_id: str,
+    document: LimiraUploadedDocument,
+) -> dict[str, Any]:
+    text = _upload_document_text(document)
+    has_text = bool(text)
+    source_document_id = _upload_source_document_id(document)
+    status = "retrieved" if has_text else "context_only"
+    content_state = "content_bearing" if has_text else "context_only"
+    filename = document.original_filename or source_document_id
+    payload: dict[str, Any] = {
+        "candidate_id": _upload_source_candidate_id(task_id, document),
+        "title": f"Uploaded document: {filename}",
+        "summary": _upload_source_excerpt(text, max_chars=800)
+        if has_text
+        else "Uploaded document is attached as context only; extracted text is unavailable.",
+        "source_type": "limira_upload",
+        "source_state": "source_candidate",
+        "source_content_state": content_state,
+        "retrieval_status": status,
+        "candidate": True,
+        "document_id": source_document_id,
+        "attached_document_id": document.document_id,
+        "filename": filename,
+        "content_type": document.content_type,
+        "byte_size": document.byte_size,
+        "language": document.language,
+        "source_event_type": "limira_upload_attachment",
+        "confidence": 0.55 if has_text else 0.1,
+    }
+    if has_text:
+        excerpt = _upload_source_excerpt(text)
+        payload.update(
+            {
+                "text": excerpt,
+                "snippet": _upload_source_excerpt(text, max_chars=800),
+                "text_char_count": len(text),
+                "text_truncated": len(excerpt) < len(text),
+                "content_hash": _upload_source_content_hash(text),
+                "retrieved_at": _history_timestamp(),
+            }
+        )
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _record_upload_source_artifacts(
+    repo: LimiraTaskRepository,
+    *,
+    task_id: str,
+    documents: list[LimiraUploadedDocument],
+) -> None:
+    for document in documents:
+        repo.record_artifact(
+            task_id,
+            "source_candidate",
+            _upload_source_candidate_payload(task_id=task_id, document=document),
+        )
+
+
 def _runner_upload_scope_for_documents(
     source_documents: list[LimiraUploadedDocument],
     attached_documents: list[LimiraUploadedDocument],
 ) -> dict[str, Any]:
+    retrieved_document_ids = [
+        _upload_source_document_id(document)
+        for document in attached_documents
+        if _upload_document_text(document)
+    ]
+    context_only_document_ids = [
+        _upload_source_document_id(document)
+        for document in attached_documents
+        if not _upload_document_text(document)
+    ]
     return {
         "source_type": "limira_upload",
         "document_ids": [document.document_id for document in source_documents],
         "attached_document_ids": [document.document_id for document in attached_documents],
         "document_count": len(source_documents),
-        "retrieval_status": "context_only",
+        "retrieval_status": _upload_scope_retrieval_status(attached_documents),
+        "retrieved_document_ids": retrieved_document_ids,
+        "context_only_document_ids": context_only_document_ids,
     }
 
 

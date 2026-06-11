@@ -119,7 +119,12 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
         query="Assess export control exposure",
         scenario="sanctions_export_controls",
         document_ids=["doc-a", "doc-b"],
-        upload_scope={"document_count": 2},
+        upload_scope={
+            "document_count": 2,
+            "retrieval_status": "partial",
+            "retrieved_document_ids": ["doc-a"],
+            "context_only_document_ids": ["doc-b"],
+        },
         source_policy={
             "min_sources": 5,
             "prefer_primary_sources": False,
@@ -130,8 +135,11 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
 
     assert "sanctions_export_controls" in state.brief.scope
     assert "2 attached upload source(s)" in state.brief.scope
+    assert "Upload retrieval status: partial" in state.brief.scope
     assert any("attached upload documents" in item for item in state.brief.required_sources)
+    assert any("retrieved upload text" in item and "doc-a" in item for item in state.brief.required_sources)
     assert any("uploaded document facts" in item for item in state.brief.constraints)
+    assert any("context-only upload IDs" in item and "doc-b" in item for item in state.brief.constraints)
     assert state.plan.research_units[0].source_policy.min_sources == 5
     assert state.plan.research_units[0].source_policy.prefer_primary_sources is False
 
@@ -238,7 +246,11 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
         research_context={
             "scenario": "sanctions_export_controls",
             "document_ids": ["doc-a"],
-            "upload_scope": {"document_count": 1},
+            "upload_scope": {
+                "document_count": 1,
+                "retrieval_status": "retrieved",
+                "retrieved_document_ids": ["doc-a"],
+            },
             "source_policy": {"min_sources": 5},
         },
     )
@@ -259,6 +271,8 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
     assert "### Research Units" in _FakeOrchestrator.task_descriptions[0]
     assert "sanctions_export_controls" in _FakeOrchestrator.task_descriptions[0]
     assert "1 attached upload source(s)" in _FakeOrchestrator.task_descriptions[0]
+    assert "Upload retrieval status: retrieved" in _FakeOrchestrator.task_descriptions[0]
+    assert "Use retrieved upload text for document IDs: doc-a" in _FakeOrchestrator.task_descriptions[0]
     assert "at least 5" in _FakeOrchestrator.task_descriptions[0]
     assert not any(item["event"] == "research_graph_phase" for item in stream_queue.items)
 

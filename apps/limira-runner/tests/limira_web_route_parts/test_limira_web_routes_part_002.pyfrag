@@ -295,12 +295,125 @@ async def test_research_can_attach_history_documents_without_duplicate_storage()
         "document_ids": ["doc-cloud"],
         "attached_document_ids": [attached[0].document_id],
         "document_count": 1,
-        "retrieval_status": "context_only",
+        "retrieval_status": "retrieved",
+        "retrieved_document_ids": ["doc-cloud"],
+        "context_only_document_ids": [],
     }
     assert runner_call["source_policy"]["prefer_uploaded_documents"] is True
     assert runner_call["source_policy"]["prefer_primary_sources"] is True
+    artifacts = repo.get_artifacts(payload["task_id"])
+    candidate = artifacts["source_candidates"][0]
+    assert candidate["candidate_id"].startswith("SRC-UPLOAD-")
+    assert candidate["document_id"] == "doc-cloud"
+    assert candidate["attached_document_id"] == attached[0].document_id
+    assert candidate["filename"] == "cloud.txt"
+    assert candidate["source_type"] == "limira_upload"
+    assert candidate["source_state"] == "source_candidate"
+    assert candidate["source_content_state"] == "content_bearing"
+    assert candidate["retrieval_status"] == "retrieved"
+    assert candidate["candidate"] is True
+    assert candidate["snippet"] == "cloud memo"
+    assert candidate["text"] == "cloud memo"
+    assert candidate["text_char_count"] == len("cloud memo")
+    assert candidate["text_truncated"] is False
+    assert candidate["content_hash"]
+    assert candidate["retrieved_at"]
+    assert repo.get_artifact_trace_events(payload["task_id"])[0]["type"] == (
+        "source_candidate_collected"
+    )
     assert storage_payload["used_bytes"] == 11
     assert storage_payload["quota_bytes"] == limira.LIMIRA_DEFAULT_ENTERPRISE_USER_STORAGE_QUOTA_BYTES
+
+
+@pytest.mark.asyncio
+async def test_research_records_context_only_upload_candidate_when_text_unavailable():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser(
+        "user-a",
+        account_type="enterprise",
+        organization_id="org-a",
+        organization_role="member",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-empty",
+        owner_user_id="user-a",
+        task_id=None,
+        original_filename="empty.pdf",
+        content_type="application/pdf",
+        byte_size=42,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/uploads/doc-empty.pdf",
+        extracted_text="",
+        language=None,
+        metadata={"sha256": "empty-sha"},
+    )
+
+    payload = await limira.create_research_task(
+        {"query": "use empty uploaded file", "document_ids": ["doc-empty"]},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+
+    attached = repo.list_user_documents(owner_user_id="user-a", task_id=payload["task_id"])
+    runner_call = research.create_calls[0]
+    assert runner_call["document_ids"] == ["doc-empty"]
+    assert runner_call["upload_scope"]["retrieval_status"] == "context_only"
+    assert runner_call["upload_scope"]["retrieved_document_ids"] == []
+    assert runner_call["upload_scope"]["context_only_document_ids"] == ["doc-empty"]
+    artifacts = repo.get_artifacts(payload["task_id"])
+    candidate = artifacts["source_candidates"][0]
+    assert candidate["document_id"] == "doc-empty"
+    assert candidate["attached_document_id"] == attached[0].document_id
+    assert candidate["source_type"] == "limira_upload"
+    assert candidate["source_content_state"] == "context_only"
+    assert candidate["retrieval_status"] == "context_only"
+    assert "content_hash" not in candidate
+    assert "retrieved_at" not in candidate
+    assert "text" not in candidate
+    assert "extracted text is unavailable" in candidate["summary"]
+
+
+@pytest.mark.asyncio
+async def test_research_rejects_unowned_upload_document_before_runner_or_artifacts():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    user = limira.LimiraUser(
+        "user-a",
+        account_type="enterprise",
+        organization_id="org-a",
+        organization_role="member",
+    )
+    repo.record_uploaded_document(
+        document_id="doc-other-user",
+        owner_user_id="user-b",
+        task_id=None,
+        original_filename="other.txt",
+        content_type="text/plain",
+        byte_size=5,
+        minio_bucket="limira-artifacts",
+        object_key="limira/users/hash/uploads/other.txt",
+        extracted_text="other",
+        language=None,
+        metadata={"sha256": "other-sha"},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await limira.create_research_task(
+            {"query": "use unowned file", "document_ids": ["doc-other-user"]},
+            request=None,
+            user=user,
+            repo=repo,
+            research_client=research,
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "document_not_found"
+    assert research.create_calls == []
+    assert repo.list_user_tasks(owner_user_id="user-a", limit=10) == []
+    assert repo.artifacts == {}
 
 
 @pytest.mark.asyncio
