@@ -1,12 +1,15 @@
-    assert evidence_event["payload"]["query"] == "BYD 1260H"
+    assert candidate_event["payload"]["query"] == "BYD 1260H"
 
     artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
-    evidence = artifacts["evidence"][0]
-    assert evidence["evidence_id"].startswith("EVID-")
-    assert evidence["title"] == "DoD 1260H List"
-    assert evidence["source_url"] == "https://example.test/dod-1260h.pdf"
-    assert evidence["summary"] == "Official list entry summary."
-    assert evidence["source_event_type"] == "tool_evidence_ledger"
+    assert artifacts["evidence"] == []
+    candidate = artifacts["source_candidates"][0]
+    assert candidate["candidate_id"].startswith("SRC-")
+    assert candidate["title"] == "DoD 1260H List"
+    assert candidate["source_url"] == "https://example.test/dod-1260h.pdf"
+    assert candidate["summary"] == "Official list entry summary."
+    assert candidate["source_event_type"] == "tool_evidence_ledger"
+    assert candidate["source_state"] == "source_candidate"
+    assert candidate["candidate"] is True
 
     archive_response = await limira.download_task_archive(
         task_id,
@@ -16,10 +19,10 @@
     )
     trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
 
-    assert trace["artifacts"]["evidence"][0]["title"] == "DoD 1260H List"
-    assert trace["artifact_events"][0]["type"] == "evidence_collected"
+    assert trace["artifacts"]["source_candidates"][0]["title"] == "DoD 1260H List"
+    assert trace["artifact_events"][0]["type"] == "source_candidate_collected"
     assert trace["artifact_events"][0]["source_event_type"] == "tool_evidence_ledger"
-    assert trace["artifact_events"][0]["local_artifact_id"].startswith("EVID-")
+    assert trace["artifact_events"][0]["local_artifact_id"].startswith("SRC-")
     assert trace["artifact_warnings"] == []
     _assert_no_browser_leak(trace)
 

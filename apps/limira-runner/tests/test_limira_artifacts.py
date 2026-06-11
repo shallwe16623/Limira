@@ -88,7 +88,7 @@ def test_record_research_artifact_dedupes_and_validates_evidence_refs():
     assert warning["payload"]["errors"] == ["invalid evidence_ref: EVID-abc"]
 
 
-def test_tool_evidence_ledger_derives_google_search_evidence():
+def test_tool_evidence_ledger_derives_google_search_source_candidate():
     ledger = ToolEvidenceLedger(task_id="task-evidence")
     input_message = {
         "event": "tool_call",
@@ -125,15 +125,21 @@ def test_tool_evidence_ledger_derives_google_search_evidence():
     events = ledger.events_from_message(output_message)
 
     assert len(events) == 1
-    assert events[0]["type"] == "evidence_collected"
+    assert events[0]["type"] == "source_candidate_collected"
     payload = events[0]["payload"]
-    assert payload["evidence_id"].startswith("EVID-")
+    assert payload["candidate_id"].startswith("SRC-")
+    assert "evidence_id" not in payload
     assert payload["source_event_type"] == "tool_evidence_ledger"
     assert payload["source_type"] == "web_search_result"
+    assert payload["source_state"] == "source_candidate"
+    assert payload["source_content_state"] == "snippet_only"
+    assert payload["candidate"] is True
     assert payload["title"] == "DoD 1260H List"
     assert payload["url"] == "https://example.test/dod-1260h.pdf"
     assert payload["query"] == "BYD 1260H"
-    assert payload["confidence"] == 0.65
+    assert payload["confidence"] == 0.25
+    assert payload["tool_name"] == "google_search"
+    assert payload["retrieved_at"]
     assert len(payload["content_hash"]) == 32
 
 
@@ -173,13 +179,20 @@ def test_tool_evidence_ledger_derives_jina_summary_evidence():
     )
 
     assert len(events) == 1
+    assert events[0]["type"] == "evidence_collected"
     payload = events[0]["payload"]
     assert payload["source_type"] == "web_page_summary"
+    assert payload["source_state"] == "verified_evidence"
+    assert payload["source_content_state"] == "content_bearing"
+    assert payload["candidate"] is False
     assert payload["source_url"] == SCMP_URL
     assert payload["summary"] == "BYD was reported as added."
+    assert payload["tool_name"] == "scrape_and_extract_info"
+    assert payload["retrieved_at"]
+    assert len(payload["content_hash"]) == 32
 
 
-def test_expand_stream_message_appends_derived_evidence_after_filtered_tool_event():
+def test_expand_stream_message_appends_derived_source_after_filtered_tool_event():
     ledger = ToolEvidenceLedger(task_id="task-evidence")
     expand_stream_message(
         {
@@ -217,7 +230,7 @@ def test_expand_stream_message_appends_derived_evidence_after_filtered_tool_even
 
     assert [event.get("event") or event.get("type") for event in expanded] == [
         "tool_call",
-        "evidence_collected",
+        "source_candidate_collected",
     ]
     assert expanded[0]["data"]["tool_input"]["result"] == json.dumps(
         {
@@ -231,3 +244,4 @@ def test_expand_stream_message_appends_derived_evidence_after_filtered_tool_even
         ensure_ascii=False,
     )
     assert expanded[1]["payload"]["source_event_type"] == "tool_evidence_ledger"
+    assert expanded[1]["payload"]["source_state"] == "source_candidate"

@@ -1799,8 +1799,9 @@ async def test_tool_evidence_ledger_events_reach_artifacts_and_archive_trace():
     )
     events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
 
-    evidence_event = next(
-        event for event in events if event["type"] == "evidence_collected"
+    candidate_event = next(
+        event for event in events if event["type"] == "source_candidate_collected"
     )
-    assert evidence_event["payload"]["source_event_type"] == "tool_evidence_ledger"
-    assert evidence_event["payload"]["source_type"] == "web_search_result"
+    assert candidate_event["payload"]["source_event_type"] == "tool_evidence_ledger"
+    assert candidate_event["payload"]["source_type"] == "web_search_result"
+    assert candidate_event["payload"]["source_state"] == "source_candidate"

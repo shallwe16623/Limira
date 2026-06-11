@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 REDACTED = "[REDACTED]"
 
 ARTIFACT_EVENT_TYPES: dict[str, str] = {
+    "source_candidate": "source_candidate_collected",
     "evidence": "evidence_collected",
     "entity": "entity_extracted",
     "relation": "relation_extracted",
@@ -63,7 +64,7 @@ SECRET_PATTERNS = (
 def artifact_recording_prompt_instruction() -> str:
     return """When the `record_research_artifact` tool is available, use it to record OSINT artifacts as structured data before they are summarized in prose.
 
-Record artifacts after search/scrape evidence collection, entity or relation extraction, timeline or map extraction, verification work, and report section drafting. Supported `artifact_type` values are: evidence, entity, relation, timeline_event, map_feature, verification, report_section. Treat validation warnings from this tool as non-fatal and continue the research task."""
+Record artifacts after search/scrape source discovery or evidence collection, entity or relation extraction, timeline or map extraction, verification work, and report section drafting. Supported `artifact_type` values are: source_candidate, evidence, entity, relation, timeline_event, map_feature, verification, report_section. Treat validation warnings from this tool as non-fatal and continue the research task."""
 
 
 def record_research_artifact(
@@ -285,6 +286,12 @@ def _validate_artifact_payload(
     artifact_type: str,
     payload: dict[str, Any],
 ) -> list[str]:
+    if artifact_type == "source_candidate":
+        return _require_any(
+            payload,
+            ("title", "source_url", "url", "summary", "snippet", "description"),
+            "source_candidate requires source, title, summary, snippet, or description",
+        )
     if artifact_type == "evidence":
         return _require_any(
             payload,

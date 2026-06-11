@@ -776,7 +776,9 @@ def _ensure_artifact_id(
     artifacts = repo.get_artifacts(task_id)
     bucket = ARTIFACT_BUCKETS[artifact_type]
     index = len(artifacts[bucket]) + 1
-    if artifact_type == "evidence":
+    if artifact_type == "source_candidate":
+        artifact.setdefault("candidate_id", f"SRC-{index:03d}")
+    elif artifact_type == "evidence":
         artifact.setdefault("evidence_id", f"EVID-{index:03d}")
     elif artifact_type == "entity":
         artifact.setdefault("entity_id", f"ENT-{index:03d}")
@@ -886,6 +888,7 @@ def _runner_task_id_from_payload(payload: dict[str, Any]) -> str:
 
 def _empty_artifact_buckets() -> dict[str, list[dict[str, Any]]]:
     return {
+        "source_candidates": [],
         "evidence": [],
         "entities": [],
         "relations": [],
@@ -961,6 +964,7 @@ def _generated_report_from_row(row: dict[str, Any]) -> LimiraGeneratedReport:
 
 def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
     key_by_type = {
+        "source_candidate": "candidate_id",
         "evidence": "evidence_id",
         "entity": "entity_id",
         "relation": "relation_id",

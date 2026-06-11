@@ -13,11 +13,12 @@ MAX_EVIDENCE_SUMMARY_CHARS = 4000
 
 
 class ToolEvidenceLedger:
-    """Derive audit evidence events from tool results.
+    """Derive audit source events from tool results.
 
     The model can still create richer artifacts, but source-bearing tools should
-    automatically create evidence records so citations do not depend only on
-    model-initiated recorder calls.
+    automatically create source records so citations do not depend only on
+    model-initiated recorder calls. Snippet-only search results remain source
+    candidates until a content-bearing tool retrieves or summarizes the source.
     """
 
     def __init__(self, *, task_id: str):
@@ -64,7 +65,7 @@ def tool_evidence_events_from_result(
     arguments = arguments if isinstance(arguments, Mapping) else {}
     normalized_tool = str(tool_name or "")
     if normalized_tool == "google_search":
-        return _google_search_evidence_events(
+        return _google_search_source_candidate_events(
             task_id=task_id,
             tool_name=normalized_tool,
             tool_call_id=str(tool_call_id or ""),
@@ -90,7 +91,7 @@ def tool_evidence_events_from_result(
     return []
 
 
-def _google_search_evidence_events(
+def _google_search_source_candidate_events(
     *,
     task_id: str,
     tool_name: str,
@@ -120,7 +121,7 @@ def _google_search_evidence_events(
         if not (url or summary):
             continue
         events.append(
-            _evidence_event(
+            _source_candidate_event(
                 task_id=task_id,
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
@@ -129,7 +130,7 @@ def _google_search_evidence_events(
                 url=url,
                 summary=summary,
                 source_type="web_search_result",
-                confidence=0.65,
+                confidence=0.25,
                 query=query,
             )
         )
@@ -233,6 +234,9 @@ def _evidence_event(
         "summary": summary,
         "quote_or_summary": summary,
         "source_type": source_type,
+        "source_state": "verified_evidence",
+        "source_content_state": "content_bearing",
+        "candidate": False,
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "content_hash": content_hash,
         "source_event_type": "tool_evidence_ledger",
@@ -252,6 +256,58 @@ def _evidence_event(
     )
 
 
+def _source_candidate_event(
+    *,
+    task_id: str,
+    tool_name: str,
+    tool_call_id: str,
+    index: int,
+    title: str,
+    url: str,
+    summary: str,
+    source_type: str,
+    confidence: float,
+    query: str,
+) -> dict[str, Any]:
+    summary = _summary_text(summary)
+    source = url or title or summary
+    content_hash = hashlib.sha256(
+        f"{source}\n{summary}".encode("utf-8", errors="replace")
+    ).hexdigest()[:32]
+    candidate_id = _source_candidate_id(
+        task_id=task_id,
+        source=source,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        index=index,
+    )
+    payload: dict[str, Any] = {
+        "candidate_id": candidate_id,
+        "title": title or source,
+        "summary": summary,
+        "snippet": summary,
+        "source_type": source_type,
+        "source_state": "source_candidate",
+        "source_content_state": "snippet_only",
+        "candidate": True,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "content_hash": content_hash,
+        "source_event_type": "tool_evidence_ledger",
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+    }
+    if url:
+        payload["url"] = url
+        payload["source_url"] = url
+    if query:
+        payload["query"] = query
+    return record_research_artifact(
+        "source_candidate",
+        payload,
+        confidence=confidence,
+    )
+
+
 def _evidence_id(
     *,
     task_id: str,
@@ -264,6 +320,20 @@ def _evidence_id(
         f"{task_id}:{tool_name}:{tool_call_id}:{source}:{index}".encode("utf-8")
     ).hexdigest()
     return f"EVID-{digest[:12]}"
+
+
+def _source_candidate_id(
+    *,
+    task_id: str,
+    source: str,
+    tool_name: str,
+    tool_call_id: str,
+    index: int,
+) -> str:
+    digest = hashlib.sha256(
+        f"{task_id}:{tool_name}:{tool_call_id}:{source}:{index}".encode("utf-8")
+    ).hexdigest()
+    return f"SRC-{digest[:12]}"
 
 
 def _parse_json_mapping(value: Any) -> dict[str, Any] | None:

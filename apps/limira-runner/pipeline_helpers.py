@@ -278,11 +278,12 @@ def expand_stream_message(
     *,
     evidence_ledger: ToolEvidenceLedger | None = None,
 ) -> list[dict]:
-    """Filter one runner message and append derived evidence events.
+    """Filter one runner message and append derived source events.
 
     Existing stream behavior is preserved by keeping the filtered original event
-    first. Tool-layer evidence is appended so reports and archives can persist
-    source records even when the model does not call the artifact recorder.
+    first. Tool-layer source records are appended so reports and archives can
+    persist candidates or evidence when the model does not call the artifact
+    recorder.
     """
 
     filtered = filter_message(copy.deepcopy(message))
