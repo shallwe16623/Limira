@@ -393,6 +393,262 @@ async def test_completed_event_stream_persists_pdf_and_archive_to_cloud_drive():
 
 
 @pytest.mark.asyncio
+async def test_server_side_ingestion_populates_history_without_browser_sse():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = FakePdfExporter()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": "EVID-001",
+                    "title": "Port authority bulletin",
+                    "summary": "New inspection rule published.",
+                    "source_url": "https://example.test/port",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "a" * 32,
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "section_id": "REPORT-001",
+                        "title": "Final report",
+                        "markdown": "# Final report\n\nSupported by [EVID-001].",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "server side ingestion"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    summary = await limira.ingest_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+
+    assert summary["event_types"] == [
+        "evidence_collected",
+        "record_research_artifact",
+        "archive_generated",
+        "status",
+    ]
+    assert research.stream_calls
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_status == "ready"
+    assert repo.get_task(task_id).archive_object_key in storage.objects
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["report_sections"][0]["section_id"] == "REPORT-001"
+    reports = repo.list_task_reports(task_id=task_id)
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].pdf_object_key in storage.objects
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    assert trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-001"
+    assert trace["reports"][0]["report_id"] == "REPORT-001"
+    assert trace["artifact_warnings"] == []
+    _assert_no_browser_leak(summary)
+    _assert_no_browser_leak(trace)
+
+
+@pytest.mark.asyncio
+async def test_server_side_ingestion_is_idempotent_for_duplicate_runner_replay():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    runner_events = [
+        {
+            "task_id": "runner-task-a",
+            "type": "evidence_collected",
+            "payload": {
+                "evidence_id": "EVID-001",
+                "title": "Port authority bulletin",
+                "summary": "New inspection rule published.",
+                "source_url": "https://example.test/port",
+                "source_type": "web_page_summary",
+                "source_state": "evidence_item",
+                "source_content_state": "content_bearing",
+                "retrieved_at": "2026-06-06T12:00:00+00:00",
+                "content_hash": "a" * 32,
+            },
+        },
+        {
+            "task_id": "runner-task-a",
+            "type": "record_research_artifact",
+            "payload": {
+                "artifact_type": "report_section",
+                "payload": {
+                    "title": "Interim report",
+                    "markdown": "Supported by [EVID-001].",
+                },
+                "evidence_refs": ["EVID-001"],
+            },
+        },
+    ]
+    research = FakeResearchClient(
+        events=runner_events,
+        status_payload={
+            "task_id": "runner-task-a",
+            "status": "running",
+            "archive_status": "pending",
+        },
+    )
+    created = await limira.create_research_task(
+        {"query": "duplicate runner replay"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    await limira.ingest_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=limira.InMemoryLimiraObjectStorage(),
+        pdf_exporter=FakePdfExporter(),
+    )
+    await limira.ingest_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=limira.InMemoryLimiraObjectStorage(),
+        pdf_exporter=FakePdfExporter(),
+    )
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert [item["evidence_id"] for item in artifacts["evidence"]] == ["EVID-001"]
+    assert len(artifacts["report_sections"]) == 1
+    trace_events = repo.get_artifact_trace_events(task_id)
+    assert [
+        event["type"]
+        for event in trace_events
+        if event["type"] in {"evidence_collected", "report_section_generated"}
+    ] == ["evidence_collected", "report_section_generated"]
+    assert [
+        event["event_type"]
+        for event in repo.list_task_event_logs(task_id, limit=20)
+    ] == ["evidence_collected", "record_research_artifact", "status"]
+
+
+@pytest.mark.asyncio
+async def test_server_side_ingestion_terminal_history_survives_sse_reconnect():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = FakePdfExporter()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "section_id": "REPORT-001",
+                        "title": "Final report",
+                        "markdown": "# Final report\n\nNo browser stream consumed this.",
+                    },
+                    "evidence_refs": [],
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+    created = await limira.create_research_task(
+        {"query": "server side reconnect"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    await limira.ingest_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+    reports_before = repo.list_task_reports(task_id=task_id)
+    trace_count_before = len(repo.get_artifact_trace_events(task_id))
+    event_log_count_before = len(repo.list_task_event_logs(task_id, limit=20))
+    reattach_research = FakeResearchClient(
+        stream_exception=AssertionError("terminal SSE reconnect must not call runner")
+    )
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=reattach_research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == ["archive_generated", "status"]
+    assert reattach_research.stream_calls == []
+    assert [report.report_id for report in reports_before] == ["REPORT-001"]
+    assert [report.report_id for report in repo.list_task_reports(task_id=task_id)] == [
+        "REPORT-001"
+    ]
+    assert len(repo.get_artifact_trace_events(task_id)) == trace_count_before
+    assert len(repo.list_task_event_logs(task_id, limit=20)) == event_log_count_before
+    assert repo.get_task(task_id).archive_status == "ready"
+
+
+@pytest.mark.asyncio
 async def test_postgres_event_proxy_authoritative_terminal_status_closes_runtime_stream():
     engine = FakeLimiraPostgresEngine()
     repo = limira.PostgresLimiraTaskRepository(

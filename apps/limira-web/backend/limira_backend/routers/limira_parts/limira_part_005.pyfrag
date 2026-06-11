@@ -9,9 +9,46 @@ async def _record_stream_event(
     runtime_state: LimiraRuntimeState,
     task_id: str,
     event: dict[str, Any],
+    *,
+    dedupe_log: bool = False,
 ) -> None:
-    _record_task_event_log(repo, task_id, event)
+    if dedupe_log:
+        _record_task_event_log_once(repo, task_id, event)
+    else:
+        _record_task_event_log(repo, task_id, event)
     await _record_runtime_event(runtime_state, task_id, event)
+
+
+def _record_task_event_log_once(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    if _task_event_log_exists(repo, task_id, event, source="runner_stream"):
+        return
+    _record_task_event_log(repo, task_id, event)
+
+
+def _task_event_log_exists(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    event: dict[str, Any],
+    *,
+    source: str,
+) -> bool:
+    event_type = str(event.get("type") or "runner_event")
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    payload_signature = _canonical_json(scrub_limira_secrets(payload))
+    for existing in repo.list_task_event_logs(task_id, limit=2000):
+        if str(existing.get("event_type") or "") != event_type:
+            continue
+        if str(existing.get("source") or "") != source:
+            continue
+        if _canonical_json(existing.get("payload")) == payload_signature:
+            return True
+    return False
 
 
 def _record_task_event_log(
@@ -193,7 +230,8 @@ def _record_artifact_from_event(
     event: dict[str, Any],
 ) -> dict[str, Any] | None:
     if event.get("type") == "artifact_warning":
-        repo.record_artifact_trace_event(
+        _record_artifact_trace_event_once(
+            repo,
             task.task_id,
             _artifact_trace_event_from_warning(event),
         )
@@ -245,7 +283,16 @@ def _record_artifact_from_event(
             artifact["evidence_ids"] = evidence_refs
     if artifact_type == "report_section":
         artifact = _normalize_report_section_artifact(artifact)
+    had_primary_id = _has_artifact_primary_id(artifact_type, artifact)
     _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
+    if _artifact_already_recorded(
+        repo,
+        task.task_id,
+        artifact_type,
+        artifact,
+        allow_content_match=not had_primary_id,
+    ):
+        return None
     repo.record_artifact(task.task_id, artifact_type, artifact)
     if artifact_type == "report_section":
         _record_unresolved_evidence_ref_warning(repo, task.task_id, artifact)
@@ -926,7 +973,8 @@ def _record_unresolved_evidence_ref_warning(
     missing = [ref for ref in refs if ref not in known]
     if not missing:
         return
-    repo.record_artifact_trace_event(
+    _record_artifact_trace_event_once(
+        repo,
         task_id,
         _artifact_trace_event_from_warning(
             {
@@ -971,7 +1019,8 @@ def _record_unsupported_verified_claim_warning(
     missing = [ref for ref in refs if ref not in known]
     if support_type == "supports" and refs and not missing:
         return
-    repo.record_artifact_trace_event(
+    _record_artifact_trace_event_once(
+        repo,
         task_id,
         _artifact_trace_event_from_warning(
             {
@@ -1039,7 +1088,8 @@ def _record_and_return_artifact_warning(
     task: LimiraTask,
     warning: dict[str, Any],
 ) -> dict[str, Any]:
-    repo.record_artifact_trace_event(
+    _record_artifact_trace_event_once(
+        repo,
         task.task_id,
         _artifact_trace_event_from_warning(warning),
     )
@@ -1102,6 +1152,114 @@ def _ensure_artifact_id(
         artifact.setdefault("section_id", f"REPORT-{index:03d}")
     elif artifact_type == "verification":
         artifact.setdefault("verification_id", f"VERIFY-{index:03d}")
+
+
+def _artifact_primary_key(artifact_type: str) -> str | None:
+    return {
+        "source_candidate": "candidate_id",
+        "retrieved_source": "retrieved_source_id",
+        "evidence": "evidence_id",
+        "finding": "finding_id",
+        "verified_claim": "claim_id",
+        "entity": "entity_id",
+        "relation": "relation_id",
+        "timeline_event": "event_id",
+        "map_feature": "feature_id",
+        "verification": "verification_id",
+        "report_section": "section_id",
+    }.get(artifact_type)
+
+
+def _has_artifact_primary_id(
+    artifact_type: str,
+    artifact: Mapping[str, Any],
+) -> bool:
+    key = _artifact_primary_key(artifact_type)
+    return bool(str(artifact.get(key) or "").strip()) if key else False
+
+
+def _artifact_already_recorded(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    artifact_type: str,
+    artifact: Mapping[str, Any],
+    *,
+    allow_content_match: bool,
+) -> bool:
+    bucket = ARTIFACT_BUCKETS[artifact_type]
+    primary_key = _artifact_primary_key(artifact_type)
+    primary_value = str(artifact.get(primary_key) or "").strip() if primary_key else ""
+    content_signature = (
+        _artifact_content_signature(artifact_type, artifact)
+        if allow_content_match
+        else None
+    )
+    for existing in repo.get_artifacts(task_id).get(bucket, []):
+        if not isinstance(existing, Mapping):
+            continue
+        if (
+            primary_key
+            and primary_value
+            and str(existing.get(primary_key) or "").strip() == primary_value
+        ):
+            return True
+        if (
+            content_signature is not None
+            and _artifact_content_signature(artifact_type, existing)
+            == content_signature
+        ):
+            return True
+    return False
+
+
+def _artifact_content_signature(
+    artifact_type: str,
+    artifact: Mapping[str, Any],
+) -> str:
+    primary_key = _artifact_primary_key(artifact_type)
+    comparable = {
+        str(key): value
+        for key, value in artifact.items()
+        if str(key) != str(primary_key)
+    }
+    return _canonical_json(comparable)
+
+
+def _record_artifact_trace_event_once(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    if _artifact_trace_event_exists(repo, task_id, event):
+        return
+    repo.record_artifact_trace_event(task_id, event)
+
+
+def _artifact_trace_event_exists(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    event: Mapping[str, Any],
+) -> bool:
+    event_key = _artifact_trace_event_key(event)
+    return any(
+        _artifact_trace_event_key(existing) == event_key
+        for existing in repo.get_artifact_trace_events(task_id)
+    )
+
+
+def _artifact_trace_event_key(event: Mapping[str, Any]) -> tuple[str, str, str, str, str, str]:
+    return (
+        str(event.get("type") or ""),
+        str(event.get("artifact_type") or ""),
+        str(event.get("bucket") or ""),
+        str(event.get("local_artifact_id") or ""),
+        str(event.get("source_event_type") or ""),
+        _canonical_json(event.get("payload")),
+    )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _artifact_warning(
@@ -1284,20 +1442,7 @@ def _generated_report_from_row(row: dict[str, Any]) -> LimiraGeneratedReport:
 
 
 def _artifact_primary_id(artifact_type: str, artifact: dict[str, Any]) -> str:
-    key_by_type = {
-        "source_candidate": "candidate_id",
-        "retrieved_source": "retrieved_source_id",
-        "evidence": "evidence_id",
-        "finding": "finding_id",
-        "verified_claim": "claim_id",
-        "entity": "entity_id",
-        "relation": "relation_id",
-        "timeline_event": "event_id",
-        "map_feature": "feature_id",
-        "verification": "verification_id",
-        "report_section": "section_id",
-    }
-    key = key_by_type.get(artifact_type)
+    key = _artifact_primary_key(artifact_type)
     value = artifact.get(key) if key else None
     if value:
         return str(value)

@@ -977,6 +977,29 @@ async def get_task_events(
     )
 
 
+@router.post("/tasks/{task_id}/ingest-events")
+async def ingest_task_events(
+    task_id: str,
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+    research_client: RunnerResearchClientProtocol = Depends(get_research_client),
+    runtime_state: LimiraRuntimeState = Depends(get_runtime_state),
+    object_storage: LimiraObjectStorage = Depends(get_object_storage),
+    pdf_exporter: LimiraPdfExporter = Depends(get_pdf_exporter),
+) -> dict[str, Any]:
+    task = _get_owned_task(repo, task_id, user)
+    summary = await ingest_task_runner_events(
+        task,
+        user,
+        repo,
+        research_client,
+        runtime_state,
+        object_storage,
+        pdf_exporter,
+    )
+    return _assert_browser_safe(summary)
+
+
 @router.get("/tasks/{task_id}/event-logs")
 async def get_task_event_logs(
     task_id: str,

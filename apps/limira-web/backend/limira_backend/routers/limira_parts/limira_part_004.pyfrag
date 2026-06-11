@@ -1299,6 +1299,374 @@ async def _completed_task_asset_events(
     return events
 
 
+def _prepare_runner_event_for_web_history(
+    task: LimiraTask,
+    runner_event: dict[str, Any],
+    *,
+    current_agent_name: str | None,
+) -> tuple[dict[str, Any], str | None]:
+    event = _normalize_runner_event(task, runner_event)
+    event_payload = event.get("payload")
+    next_agent_name = current_agent_name
+    if event.get("type") == "start_of_agent" and isinstance(event_payload, dict):
+        next_agent_name = str(event_payload.get("agent_name") or "")
+    elif event.get("type") == "end_of_agent":
+        next_agent_name = None
+    event = _scrub_final_show_text_event(
+        event,
+        current_agent_name=next_agent_name,
+    )
+    event = _scrub_runner_artifact_event(event)
+    event = _scrub_runner_event(event, task_id=task.task_id)
+    return event, next_agent_name
+
+
+async def _apply_runner_event_to_web_history(
+    *,
+    task: LimiraTask,
+    repo: LimiraTaskRepository,
+    runtime_state: LimiraRuntimeState,
+    event: dict[str, Any],
+    current_agent_name: str | None,
+    completion_asset_events: Callable[[], Awaitable[list[dict[str, Any]]]],
+    dedupe_log: bool,
+) -> tuple[list[dict[str, Any]], str | None]:
+    applied_status = _apply_task_status_from_event(repo, task.task_id, event)
+    if applied_status in FINAL_TASK_STATUSES and isinstance(event.get("payload"), dict):
+        event["payload"]["terminal"] = True
+    warning = _record_artifact_from_event(repo, task, event)
+    final_report_event = _record_final_show_text_report_from_event(
+        repo,
+        task,
+        event,
+        current_agent_name=current_agent_name,
+    )
+
+    events: list[dict[str, Any]] = []
+    if applied_status == "completed":
+        for asset_event in await completion_asset_events():
+            await _record_stream_event(
+                repo,
+                runtime_state,
+                task.task_id,
+                asset_event,
+                dedupe_log=dedupe_log,
+            )
+            events.append(asset_event)
+
+    await _record_stream_event(
+        repo,
+        runtime_state,
+        task.task_id,
+        event,
+        dedupe_log=dedupe_log,
+    )
+    if applied_status in FINAL_TASK_STATUSES:
+        await runtime_state.update_task_runtime(task.task_id, {"terminal": True})
+    events.append(event)
+
+    if warning:
+        await _record_stream_event(
+            repo,
+            runtime_state,
+            task.task_id,
+            warning,
+            dedupe_log=dedupe_log,
+        )
+        events.append(warning)
+    if final_report_event:
+        await _record_stream_event(
+            repo,
+            runtime_state,
+            task.task_id,
+            final_report_event,
+            dedupe_log=dedupe_log,
+        )
+        events.append(final_report_event)
+    return events, applied_status
+
+
+async def _record_web_history_event(
+    *,
+    repo: LimiraTaskRepository,
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+    event: dict[str, Any],
+    dedupe_log: bool,
+) -> None:
+    await _record_stream_event(
+        repo,
+        runtime_state,
+        task_id,
+        event,
+        dedupe_log=dedupe_log,
+    )
+
+
+def _runner_ingestion_summary(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current = repo.get_task(task_id)
+    return {
+        "task_id": task_id,
+        "status": current.status if current else None,
+        "archive_status": current.archive_status if current else None,
+        "event_count": len(events),
+        "event_types": [str(event.get("type") or "runner_event") for event in events],
+    }
+
+
+async def ingest_task_runner_events(
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    research_client: RunnerResearchClientProtocol,
+    runtime_state: LimiraRuntimeState,
+    object_storage: Any = None,
+    pdf_exporter: Any = None,
+) -> dict[str, Any]:
+    completion_assets_generated = False
+    events: list[dict[str, Any]] = []
+
+    async def completion_asset_events() -> list[dict[str, Any]]:
+        nonlocal completion_assets_generated
+        if completion_assets_generated:
+            return []
+        completion_assets_generated = True
+        return await _completed_task_asset_events(
+            task,
+            user,
+            repo,
+            object_storage,
+            pdf_exporter,
+        )
+
+    current = repo.get_task(task.task_id) or task
+    stream_close_reason = "server_ingestion_exhausted"
+    if current.status in FINAL_TASK_STATUSES:
+        if current.status == "completed":
+            for asset_event in await completion_asset_events():
+                await _record_web_history_event(
+                    repo=repo,
+                    runtime_state=runtime_state,
+                    task_id=task.task_id,
+                    event=asset_event,
+                    dedupe_log=True,
+                )
+                events.append(asset_event)
+        terminal_event = _terminal_status_event(current)
+        await _record_web_history_event(
+            repo=repo,
+            runtime_state=runtime_state,
+            task_id=task.task_id,
+            event=terminal_event,
+            dedupe_log=True,
+        )
+        await _mark_terminal_reattach_closed(runtime_state, task.task_id)
+        events.append(terminal_event)
+        return _runner_ingestion_summary(repo, task.task_id, events)
+
+    current = repo.update_task(task.task_id, status="running")
+    await runtime_state.update_task_runtime(
+        task.task_id,
+        {
+            "owner_user_id": user.id,
+            "status": current.status,
+            "archive_status": current.archive_status,
+            "stream_state": "server_ingestion",
+        },
+    )
+    saw_terminal_status = False
+    current_agent_name: str | None = None
+
+    try:
+        async for runner_event in research_client.stream_events(task=task, user=user):
+            event, current_agent_name = _prepare_runner_event_for_web_history(
+                task,
+                runner_event,
+                current_agent_name=current_agent_name,
+            )
+            applied_events, applied_status = await _apply_runner_event_to_web_history(
+                task=task,
+                repo=repo,
+                runtime_state=runtime_state,
+                event=event,
+                current_agent_name=current_agent_name,
+                completion_asset_events=completion_asset_events,
+                dedupe_log=True,
+            )
+            events.extend(applied_events)
+            saw_terminal_status = (
+                saw_terminal_status or applied_status in FINAL_TASK_STATUSES
+            )
+            if applied_status in FINAL_TASK_STATUSES:
+                stream_close_reason = f"terminal_{applied_status}"
+                break
+
+        if not saw_terminal_status:
+            status_event = await _authoritative_runner_status_event(
+                repo,
+                task,
+                user,
+                research_client,
+            )
+            if status_event:
+                if _event_payload_status(status_event) == "completed":
+                    for asset_event in await completion_asset_events():
+                        await _record_web_history_event(
+                            repo=repo,
+                            runtime_state=runtime_state,
+                            task_id=task.task_id,
+                            event=asset_event,
+                            dedupe_log=True,
+                        )
+                        events.append(asset_event)
+                await _record_web_history_event(
+                    repo=repo,
+                    runtime_state=runtime_state,
+                    task_id=task.task_id,
+                    event=status_event,
+                    dedupe_log=True,
+                )
+                events.append(status_event)
+                stream_close_reason = _stream_close_reason_from_event(
+                    status_event,
+                    stream_close_reason,
+                )
+    except RunnerStreamConflict as exc:
+        stream_close_reason = "runner_stream_conflict"
+        status_event = await _authoritative_runner_status_event(
+            repo,
+            task,
+            user,
+            research_client,
+            reason=exc.reason,
+        )
+        if status_event:
+            if _event_payload_status(status_event) == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_web_history_event(
+                        repo=repo,
+                        runtime_state=runtime_state,
+                        task_id=task.task_id,
+                        event=asset_event,
+                        dedupe_log=True,
+                    )
+                    events.append(asset_event)
+            await _record_web_history_event(
+                repo=repo,
+                runtime_state=runtime_state,
+                task_id=task.task_id,
+                event=status_event,
+                dedupe_log=True,
+            )
+            events.append(status_event)
+            stream_close_reason = _stream_close_reason_from_event(
+                status_event,
+                stream_close_reason,
+            )
+    except HTTPException as exc:
+        stream_close_reason = "http_exception"
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            if current.status == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_web_history_event(
+                        repo=repo,
+                        runtime_state=runtime_state,
+                        task_id=task.task_id,
+                        event=asset_event,
+                        dedupe_log=True,
+                    )
+                    events.append(asset_event)
+            terminal_event = _terminal_status_event(current)
+            await _record_web_history_event(
+                repo=repo,
+                runtime_state=runtime_state,
+                task_id=task.task_id,
+                event=terminal_event,
+                dedupe_log=True,
+            )
+            events.append(terminal_event)
+            return _runner_ingestion_summary(repo, task.task_id, events)
+        public_error = _public_error_text(
+            exc.detail,
+            fallback="limira_event_proxy_failed",
+        )
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error=public_error,
+        )
+        error_event = {
+            "task_id": task.task_id,
+            "type": "error",
+            "payload": {"error": public_error},
+        }
+        await _record_web_history_event(
+            repo=repo,
+            runtime_state=runtime_state,
+            task_id=task.task_id,
+            event=error_event,
+            dedupe_log=True,
+        )
+        events.append(error_event)
+    except Exception:
+        stream_close_reason = "limira_event_proxy_failed"
+        current = repo.get_task(task.task_id)
+        if current and current.status in FINAL_TASK_STATUSES:
+            if current.status == "completed":
+                for asset_event in await completion_asset_events():
+                    await _record_web_history_event(
+                        repo=repo,
+                        runtime_state=runtime_state,
+                        task_id=task.task_id,
+                        event=asset_event,
+                        dedupe_log=True,
+                    )
+                    events.append(asset_event)
+            terminal_event = _terminal_status_event(current)
+            await _record_web_history_event(
+                repo=repo,
+                runtime_state=runtime_state,
+                task_id=task.task_id,
+                event=terminal_event,
+                dedupe_log=True,
+            )
+            events.append(terminal_event)
+            return _runner_ingestion_summary(repo, task.task_id, events)
+        repo.update_task(
+            task.task_id,
+            status="failed",
+            archive_status="failed",
+            error="limira_event_proxy_failed",
+        )
+        error_event = {
+            "task_id": task.task_id,
+            "type": "error",
+            "payload": {"error": "limira_event_proxy_failed"},
+        }
+        await _record_web_history_event(
+            repo=repo,
+            runtime_state=runtime_state,
+            task_id=task.task_id,
+            event=error_event,
+            dedupe_log=True,
+        )
+        events.append(error_event)
+    finally:
+        await _mark_runtime_stream_closed(
+            runtime_state,
+            task.task_id,
+            stream_close_reason,
+        )
+
+    return _runner_ingestion_summary(repo, task.task_id, events)
+
+
 async def _limira_event_stream(
     task: LimiraTask,
     user: LimiraUser,
@@ -1327,10 +1695,22 @@ async def _limira_event_stream(
     if current.status in FINAL_TASK_STATUSES:
         if current.status == "completed":
             for asset_event in await completion_asset_events():
-                await _record_stream_event(repo, runtime_state, task.task_id, asset_event)
+                await _record_stream_event(
+                    repo,
+                    runtime_state,
+                    task.task_id,
+                    asset_event,
+                    dedupe_log=True,
+                )
                 yield _sse_bytes(_assert_browser_safe(asset_event))
         terminal_event = _terminal_status_event(current)
-        await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
+        await _record_stream_event(
+            repo,
+            runtime_state,
+            task.task_id,
+            terminal_event,
+            dedupe_log=True,
+        )
         await _mark_terminal_reattach_closed(
             runtime_state,
             task.task_id,
@@ -1372,54 +1752,25 @@ async def _limira_event_stream(
 
     try:
         async for runner_event in research_client.stream_events(task=task, user=user):
-            event = _normalize_runner_event(task, runner_event)
-            event_payload = event.get("payload")
-            if event.get("type") == "start_of_agent" and isinstance(event_payload, dict):
-                current_agent_name = str(event_payload.get("agent_name") or "")
-            elif event.get("type") == "end_of_agent":
-                current_agent_name = None
-            event = _scrub_final_show_text_event(
-                event,
-                current_agent_name=current_agent_name,
-            )
-            event = _scrub_runner_artifact_event(event)
-            event = _scrub_runner_event(event, task_id=task.task_id)
-            applied_status = _apply_task_status_from_event(repo, task.task_id, event)
-            saw_terminal_status = saw_terminal_status or applied_status in FINAL_TASK_STATUSES
-            if applied_status in FINAL_TASK_STATUSES and isinstance(
-                event.get("payload"), dict
-            ):
-                event["payload"]["terminal"] = True
-            warning = _record_artifact_from_event(repo, task, event)
-            final_report_event = _record_final_show_text_report_from_event(
-                repo,
+            event, current_agent_name = _prepare_runner_event_for_web_history(
                 task,
-                event,
+                runner_event,
                 current_agent_name=current_agent_name,
             )
-            if applied_status == "completed":
-                for asset_event in await completion_asset_events():
-                    await _record_stream_event(
-                        repo,
-                        runtime_state,
-                        task.task_id,
-                        asset_event,
-                    )
-                    yield _sse_bytes(_assert_browser_safe(asset_event))
-            await _record_stream_event(repo, runtime_state, task.task_id, event)
-            if applied_status in FINAL_TASK_STATUSES:
-                await runtime_state.update_task_runtime(
-                    task.task_id,
-                    {"terminal": True},
-                )
-
-            yield _sse_bytes(_assert_browser_safe(event))
-            if warning:
-                await _record_stream_event(repo, runtime_state, task.task_id, warning)
-                yield _sse_bytes(_assert_browser_safe(warning))
-            if final_report_event:
-                await _record_stream_event(repo, runtime_state, task.task_id, final_report_event)
-                yield _sse_bytes(_assert_browser_safe(final_report_event))
+            applied_events, applied_status = await _apply_runner_event_to_web_history(
+                task=task,
+                repo=repo,
+                runtime_state=runtime_state,
+                event=event,
+                current_agent_name=current_agent_name,
+                completion_asset_events=completion_asset_events,
+                dedupe_log=False,
+            )
+            saw_terminal_status = (
+                saw_terminal_status or applied_status in FINAL_TASK_STATUSES
+            )
+            for applied_event in applied_events:
+                yield _sse_bytes(_assert_browser_safe(applied_event))
             if applied_status in FINAL_TASK_STATUSES:
                 stream_close_reason = f"terminal_{applied_status}"
                 break
@@ -1508,10 +1859,17 @@ async def _limira_event_stream(
                         runtime_state,
                         task.task_id,
                         asset_event,
+                        dedupe_log=True,
                     )
                     yield _sse_bytes(_assert_browser_safe(asset_event))
             terminal_event = _terminal_status_event(current)
-            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
+            await _record_stream_event(
+                repo,
+                runtime_state,
+                task.task_id,
+                terminal_event,
+                dedupe_log=True,
+            )
             yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
         public_error = _public_error_text(
@@ -1542,10 +1900,17 @@ async def _limira_event_stream(
                         runtime_state,
                         task.task_id,
                         asset_event,
+                        dedupe_log=True,
                     )
                     yield _sse_bytes(_assert_browser_safe(asset_event))
             terminal_event = _terminal_status_event(current)
-            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
+            await _record_stream_event(
+                repo,
+                runtime_state,
+                task.task_id,
+                terminal_event,
+                dedupe_log=True,
+            )
             yield _sse_bytes(_assert_browser_safe(terminal_event))
             return
         repo.update_task(
