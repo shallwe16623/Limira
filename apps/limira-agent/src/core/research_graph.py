@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+EVIDENCE_ID_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
 
 
 class ResearchPhase(StrEnum):
@@ -114,9 +117,20 @@ class VerifiedClaim(BaseModel):
     id: str = Field(min_length=1, max_length=120)
     claim: str = Field(min_length=1, max_length=10_000)
     support_type: Literal["supports", "contradicts", "contextual", "weak"]
-    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    evidence_ids: list[str] = Field(min_length=1, max_length=100)
     rationale: str = Field(default="", max_length=10_000)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def _validate_evidence_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            evidence_id = str(item).strip()
+            if EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id) is None:
+                raise ValueError("verified_claim_evidence_id_invalid")
+            normalized.append(evidence_id)
+        return normalized
 
 
 class ResearchGraphState(BaseModel):
@@ -380,6 +394,7 @@ class VerifierNode(ResearchGraphNode):
         verified_claims = self._verify_claims(state)
         if not verified_claims:
             raise ValueError("research_graph_verifier_output_required")
+        self._validate_verified_claim_evidence(verified_claims, state)
         verified_state = state.model_copy(
             update={"phase": self.phase, "verified_claims": verified_claims}
         )
@@ -421,6 +436,27 @@ class VerifierNode(ResearchGraphNode):
                 )
             )
         return verified_claims
+
+    def _validate_verified_claim_evidence(
+        self,
+        verified_claims: list[VerifiedClaim],
+        state: ResearchGraphState,
+    ) -> None:
+        known_evidence_ids = {evidence.id for evidence in state.evidence}
+        for claim in verified_claims:
+            raw_evidence_ids = getattr(claim, "evidence_ids", None)
+            if not isinstance(raw_evidence_ids, (list, tuple, set)):
+                raise ValueError("research_graph_verified_claim_evidence_required")
+            evidence_ids = [str(evidence_id).strip() for evidence_id in raw_evidence_ids]
+            if not evidence_ids:
+                raise ValueError("research_graph_verified_claim_evidence_required")
+            if any(
+                EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id) is None
+                for evidence_id in evidence_ids
+            ):
+                raise ValueError("research_graph_verified_claim_evidence_required")
+            if any(evidence_id not in known_evidence_ids for evidence_id in evidence_ids):
+                raise ValueError("research_graph_verified_claim_evidence_required")
 
 
 class WriterNode(ResearchGraphNode):

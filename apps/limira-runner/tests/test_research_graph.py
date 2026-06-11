@@ -6,6 +6,7 @@ from src.core import research_graph as research_graph_module
 from src.core.research_graph import (
     ResearchGraphExecutionResult,
     ResearchPhase,
+    VerifiedClaim,
     build_initial_research_graph,
     evidence_id_for_source,
     graph_bootstrap_events,
@@ -589,6 +590,80 @@ async def test_feature_flagged_graph_executor_rejects_missing_verifier_output(
         for item in stream_queue.items
         if item["event"] == "research_graph_checkpoint"
     ] == ["scope", "plan", "research", "compress"]
+
+
+@pytest.mark.parametrize(
+    "evidence_ids",
+    [
+        None,
+        [],
+        ["EVID-999"],
+        ["EVID-1"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_rejects_verified_claim_without_valid_evidence(
+    tmp_path, monkeypatch, evidence_ids
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    def fake_verify_claims(self, state):
+        return [
+            VerifiedClaim.model_construct(
+                id="claim-invalid-evidence",
+                claim="Claim is not linked to valid graph evidence.",
+                support_type="supports",
+                evidence_ids=evidence_ids,
+                rationale="Bypass model validation to exercise runtime graph guard.",
+                confidence=0.9,
+            )
+        ]
+
+    monkeypatch.setattr(
+        research_graph_module.VerifierNode,
+        "_verify_claims",
+        fake_verify_claims,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-invalid-claim-evidence",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == ""
+    assert "research_graph_verified_claim_evidence_required" in result[0]
+    error_events = [
+        item for item in stream_queue.items if item.get("event") == "error"
+    ]
+    assert error_events[-1]["data"] == {
+        "task_id": "task-pipeline-graph-invalid-claim-evidence",
+        "phase": "verify",
+        "error": "research_graph_verified_claim_evidence_required",
+    }
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_phase"
+    ] == ["scope", "plan", "research", "compress", "verify"]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_checkpoint"
+    ] == ["scope", "plan", "research", "compress"]
+    assert not any(
+        item.get("type") == "verified_claim_collected"
+        for item in stream_queue.items
+    )
 
 
 @pytest.mark.asyncio

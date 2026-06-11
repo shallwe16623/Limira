@@ -1773,6 +1773,11 @@ async def test_pdf_route_accepts_existing_hash_evidence_refs_without_warning():
             "title": "Hash-backed source",
             "summary": "Source text.",
             "source_url": "https://example.test/source",
+            "source_type": "web_page_summary",
+            "source_state": "evidence_item",
+            "source_content_state": "content_bearing",
+            "retrieved_at": "2026-06-06T12:00:00+00:00",
+            "content_hash": "e" * 32,
         },
     )
 

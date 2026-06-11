@@ -45,7 +45,16 @@ async def test_event_proxy_records_runtime_state_to_redis():
             },
             {
                 "type": "evidence_collected",
-                "payload": {"title": "Runtime source"},
+                "payload": {
+                    "evidence_id": "EVID-001",
+                    "title": "Runtime source",
+                    "summary": "Runtime source content.",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "c" * 32,
+                },
             },
             {
                 "type": "status",
@@ -1532,7 +1541,16 @@ async def test_event_proxy_keeps_artifacts_user_scoped():
         events=[
             {
                 "type": "evidence_collected",
-                "payload": {"evidence_id": "EVID-777", "title": "private"},
+                "payload": {
+                    "evidence_id": "EVID-777",
+                    "title": "private",
+                    "summary": "Private content-bearing evidence.",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "d" * 32,
+                },
             }
         ]
     )
@@ -1711,6 +1729,142 @@ async def test_source_lifecycle_artifacts_are_separate_and_warn_on_weak_claim():
     assert trace["artifacts"]["retrieved_sources"][0]["retrieved_source_id"] == "RSRC-001"
     assert trace["artifacts"]["findings"][0]["finding_id"] == "FIND-001"
     assert trace["artifacts"]["verified_claims"][0]["claim_id"] == "CLAIM-001"
+
+
+@pytest.mark.asyncio
+async def test_invalid_lifecycle_artifacts_warn_and_do_not_satisfy_evidence_refs():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": "EVID-777",
+                    "title": "Snippet-only result",
+                    "summary": "Search snippet only.",
+                    "source_type": "web_search_result",
+                    "source_state": "source_candidate",
+                    "source_content_state": "snippet_only",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "e" * 32,
+                    "candidate": True,
+                },
+            },
+            {
+                "type": "retrieved_source_collected",
+                "payload": {
+                    "retrieved_source_id": "RSRC-BAD",
+                    "title": "No content source",
+                    "url": "https://example.test/no-content",
+                    "source_type": "web_page_content",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "f" * 32,
+                    "tool_name": "scrape",
+                    "confidence": 0.8,
+                },
+            },
+            {
+                "type": "finding_collected",
+                "payload": {
+                    "finding_id": "FIND-BAD",
+                    "summary": "No evidence links.",
+                    "evidence_ids": [],
+                },
+            },
+            {
+                "type": "verified_claim_collected",
+                "payload": {
+                    "claim_id": "CLAIM-BAD",
+                    "claim": "No support classification or evidence links.",
+                    "confidence": 0.95,
+                },
+            },
+            {
+                "type": "report_section_generated",
+                "payload": {
+                    "section_id": "REPORT-BAD-REF",
+                    "title": "Bad ref report",
+                    "markdown": "This cites rejected evidence [EVID-777].",
+                    "evidence_refs": ["EVID-777"],
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "invalid lifecycle artifacts"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"] == []
+    assert artifacts["retrieved_sources"] == []
+    assert artifacts["findings"] == []
+    assert artifacts["verified_claims"] == []
+    assert artifacts["report_sections"][0]["evidence_refs"] == ["EVID-777"]
+
+    warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+    ]
+    invalid_warnings = [
+        warning
+        for warning in warnings
+        if warning.get("warning") == "invalid_artifact_payload"
+    ]
+    assert {warning["artifact_type"] for warning in invalid_warnings} >= {
+        "evidence",
+        "retrieved_source",
+        "finding",
+        "verified_claim",
+    }
+    unresolved = [
+        warning
+        for warning in warnings
+        if warning.get("warning") == "unresolved_evidence_refs"
+    ]
+    assert unresolved[-1]["artifact_type"] == "report_section"
+    assert unresolved[-1]["evidence_refs"] == ["EVID-777"]
+
+    task = repo.get_task(task_id)
+    report = await limira._store_task_report_pdf(
+        task=task,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+        pdf_exporter=FakePdfExporter(),
+        report_id="REPORT-BAD-FINAL",
+        report_type="final",
+        markdown="Final report cites rejected [EVID-777].",
+        evidence_refs=["EVID-777"],
+        metadata={"source_event_type": "invalid_lifecycle_test"},
+        record_cloud_document=False,
+    )
+    assert report.evidence_refs == ["EVID-777"]
+    final_warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+        and event["payload"].get("artifact_type") == "final_report"
+    ]
+    assert final_warnings[-1]["warning"] == "unresolved_evidence_refs"
+    assert final_warnings[-1]["evidence_refs"] == ["EVID-777"]
 
 
 def test_runner_research_client_uses_server_side_headers(monkeypatch):

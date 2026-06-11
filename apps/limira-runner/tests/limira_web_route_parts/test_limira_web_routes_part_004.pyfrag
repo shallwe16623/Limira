@@ -352,11 +352,17 @@ async def test_event_proxy_streams_runner_events_and_populates_artifacts():
                 "task_id": "runner-task-a",
                 "type": "evidence_collected",
                 "payload": {
+                    "evidence_id": "EVID-001",
                     "title": "Export control notice",
                     "summary": f"Policy update {raw_secret_values[0]}",
                     "source_url": (
                         "https://example.test/source?token=runner-query-secret-123456"
                     ),
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "a" * 32,
                     raw_secret_values[3]: "secret-bearing evidence key",
                     "nested": {
                         raw_secret_values[4]: "secret-bearing nested key",
@@ -1103,6 +1109,11 @@ async def test_event_proxy_accepts_existing_hash_evidence_refs_without_warning()
                     "title": "Hash-backed source",
                     "summary": "Content-bearing source.",
                     "source_url": "https://example.test/source",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "b" * 32,
                 },
             },
             {

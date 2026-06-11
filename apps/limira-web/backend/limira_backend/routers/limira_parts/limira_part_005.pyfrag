@@ -232,6 +232,19 @@ def _record_artifact_from_event(
         if evidence_refs or "evidence_refs" in artifact or "evidence_ids" in artifact:
             artifact["evidence_refs"] = evidence_refs
             artifact["evidence_ids"] = evidence_refs
+    lifecycle_errors = _lifecycle_artifact_validation_errors(artifact_type, artifact)
+    if lifecycle_errors:
+        return _record_and_return_artifact_warning(
+            repo,
+            task,
+            _artifact_warning(
+                task.task_id,
+                event,
+                "invalid_artifact_payload",
+                artifact_type=artifact_type,
+                errors=lifecycle_errors,
+            ),
+        )
     if artifact_type == "report_section":
         artifact = _normalize_report_section_artifact(artifact)
     _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
@@ -716,10 +729,187 @@ def _known_evidence_ids(repo: LimiraTaskRepository, task_id: str) -> set[str]:
     for evidence in artifacts.get("evidence", []):
         if not isinstance(evidence, Mapping):
             continue
+        if _lifecycle_artifact_validation_errors("evidence", evidence):
+            continue
         evidence_id = evidence.get("evidence_id")
         if _is_evidence_ref(evidence_id):
             known.add(str(evidence_id).strip())
     return known
+
+
+def _lifecycle_artifact_validation_errors(
+    artifact_type: str,
+    artifact: Mapping[str, Any],
+) -> list[str]:
+    if artifact_type == "retrieved_source":
+        return _validate_retrieved_source_artifact(artifact)
+    if artifact_type == "evidence":
+        return _validate_evidence_artifact(artifact)
+    if artifact_type == "finding":
+        return _validate_finding_artifact(artifact)
+    if artifact_type == "verified_claim":
+        return _validate_verified_claim_artifact(artifact)
+    return []
+
+
+def _validate_retrieved_source_artifact(artifact: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("source_url", "url", "document_id"),
+            "retrieved_source requires source_url, url, or document_id",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("summary", "text", "quote", "content", "quote_or_summary"),
+            "retrieved_source requires content-bearing text, summary, quote, or content",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("source_type",),
+            "retrieved_source requires source_type",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("retrieved_at",),
+            "retrieved_source requires retrieved_at",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("content_hash",),
+            "retrieved_source requires content_hash",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("tool_name",),
+            "retrieved_source requires tool_name",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("confidence",),
+            "retrieved_source requires confidence",
+        )
+    )
+    if str(artifact.get("source_content_state") or "").strip() != "content_bearing":
+        errors.append("retrieved_source requires content_bearing source_content_state")
+    if str(artifact.get("source_state") or "").strip() == "source_candidate":
+        errors.append("source_candidate cannot be recorded as retrieved_source")
+    return errors
+
+
+def _validate_evidence_artifact(artifact: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    errors.extend(
+        _require_artifact_any(
+            artifact,
+            ("summary", "text", "quote", "content", "quote_or_summary"),
+            "evidence requires content-bearing summary, text, quote, or content",
+        )
+    )
+    errors.extend(
+        _require_artifact_any(artifact, ("source_type",), "evidence requires source_type")
+    )
+    errors.extend(
+        _require_artifact_any(artifact, ("retrieved_at",), "evidence requires retrieved_at")
+    )
+    errors.extend(
+        _require_artifact_any(artifact, ("content_hash",), "evidence requires content_hash")
+    )
+    evidence_id = str(artifact.get("evidence_id") or "").strip()
+    if not _is_evidence_ref(evidence_id):
+        errors.append("evidence requires a stable EVID-* evidence_id")
+    if bool(artifact.get("candidate")):
+        errors.append("source candidates cannot be promoted to evidence")
+    if str(artifact.get("source_state") or "").strip() == "source_candidate":
+        errors.append("source_candidate cannot be promoted to evidence")
+    if str(artifact.get("source_content_state") or "").strip() != "content_bearing":
+        errors.append("evidence requires content-bearing retrieved source material")
+    return errors
+
+
+def _validate_finding_artifact(artifact: Mapping[str, Any]) -> list[str]:
+    errors = _require_artifact_any(
+        artifact,
+        ("summary", "claim"),
+        "finding requires summary or claim",
+    )
+    refs = _lifecycle_evidence_refs(artifact)
+    if not refs:
+        errors.append("finding requires evidence_ids or evidence_refs")
+    else:
+        errors.extend(_invalid_lifecycle_evidence_ref_errors(refs, "finding"))
+    return errors
+
+
+def _validate_verified_claim_artifact(artifact: Mapping[str, Any]) -> list[str]:
+    errors = _require_artifact_any(
+        artifact,
+        ("claim",),
+        "verified_claim requires claim",
+    )
+    support_type = str(artifact.get("support_type") or "").strip()
+    if support_type not in {"supports", "contradicts", "contextual", "weak"}:
+        errors.append(
+            "verified_claim requires support_type supports, contradicts, contextual, or weak"
+        )
+    refs = _lifecycle_evidence_refs(artifact)
+    if not refs:
+        errors.append("verified_claim requires evidence_ids or evidence_refs")
+    else:
+        errors.extend(_invalid_lifecycle_evidence_ref_errors(refs, "verified_claim"))
+    return errors
+
+
+def _require_artifact_any(
+    artifact: Mapping[str, Any],
+    keys: tuple[str, ...],
+    message: str,
+) -> list[str]:
+    for key in keys:
+        value = artifact.get(key)
+        if value is not None and str(value).strip():
+            return []
+    return [message]
+
+
+def _lifecycle_evidence_refs(artifact: Mapping[str, Any]) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for key in ("evidence_ids", "evidence_refs"):
+        value = artifact.get(key)
+        values = [value] if isinstance(value, str) else value
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        for item in values:
+            ref = str(item).strip()
+            if ref and ref not in seen:
+                refs.append(ref)
+                seen.add(ref)
+    return refs
+
+
+def _invalid_lifecycle_evidence_ref_errors(
+    refs: list[str],
+    artifact_type: str,
+) -> list[str]:
+    return [
+        f"{artifact_type} has invalid evidence id: {ref}"
+        for ref in refs
+        if not _is_evidence_ref(ref)
+    ]
 
 
 def _record_unresolved_evidence_ref_warning(
@@ -920,14 +1110,22 @@ def _artifact_warning(
     task_id: str,
     event: dict[str, Any],
     warning: str,
+    *,
+    artifact_type: str | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "warning": warning,
+        "source_event_type": event.get("type"),
+    }
+    if artifact_type:
+        payload["artifact_type"] = artifact_type
+    if errors:
+        payload["errors"] = list(errors)
     return {
         "task_id": task_id,
         "type": "artifact_warning",
-        "payload": {
-            "warning": warning,
-            "source_event_type": event.get("type"),
-        },
+        "payload": payload,
     }
 
 
