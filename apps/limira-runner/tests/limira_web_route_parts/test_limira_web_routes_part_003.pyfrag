@@ -385,7 +385,7 @@ async def test_pdf_route_scrubs_report_secrets_before_persistence_and_export():
     assert limira.LIMIRA_SECRET_REDACTION in report.markdown
     assert limira.LIMIRA_SECRET_REDACTION in report.html
     assert "REDACTED" in report.report_type
-    assert limira.LIMIRA_SECRET_REDACTION in report.evidence_refs
+    assert report.evidence_refs == ["EVID-001"]
     assert report.pdf_object_key in storage.objects
     stored = storage.objects[report.pdf_object_key]
     _assert_no_raw_secret(report.markdown)

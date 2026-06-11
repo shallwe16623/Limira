@@ -1783,9 +1783,13 @@ async def _store_task_report_pdf(
     metadata: Mapping[str, Any] | None = None,
     record_cloud_document: bool = True,
 ) -> LimiraGeneratedReport:
+    normalized_evidence_refs = _normalized_report_evidence_refs(
+        markdown,
+        evidence_refs,
+    )
     report_html = _render_report_html(
         markdown=markdown,
-        evidence_refs=evidence_refs,
+        evidence_refs=normalized_evidence_refs,
     )
     try:
         pdf_bytes = await pdf_exporter.render_pdf(report_html)
@@ -1839,9 +1843,17 @@ async def _store_task_report_pdf(
         markdown=markdown,
         html=report_html,
         pdf_object_key=stored.object_key,
-        evidence_refs=evidence_refs,
+        evidence_refs=normalized_evidence_refs,
         creator_user_id=user.id,
         metadata=report_metadata,
+    )
+    _record_unresolved_evidence_ref_warning(
+        repo,
+        task.task_id,
+        {"evidence_refs": normalized_evidence_refs},
+        artifact_type="final_report",
+        local_artifact_id=report.report_id,
+        source_event_type=report_metadata.get("source_event_type"),
     )
     if record_cloud_document:
         _try_record_generated_cloud_document(
@@ -1923,8 +1935,9 @@ async def export_task_pdf(
     )
     if not scrubbed_markdown.strip():
         raise HTTPException(status_code=400, detail="empty_report_markdown")
-    scrubbed_evidence_refs = _list_of_strings(
-        scrub_limira_secrets(request_data.evidence_refs)
+    scrubbed_evidence_refs = _normalized_report_evidence_refs(
+        scrubbed_markdown,
+        scrub_limira_secrets(request_data.evidence_refs),
     )
 
     report_id = _safe_report_id(

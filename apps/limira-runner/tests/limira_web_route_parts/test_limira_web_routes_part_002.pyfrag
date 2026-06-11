@@ -1623,6 +1623,230 @@ async def test_pdf_route_exports_report_to_storage_and_persists_metadata():
 
 
 @pytest.mark.asyncio
+async def test_pdf_route_accepts_existing_hash_evidence_refs_without_warning():
+    app, repo, _storage = _limira_asgi_app()
+    evidence_ref = "EVID-abcdef123456"
+    repo.create_task(
+        task_id="task-existing-hash-report",
+        owner_user_id="user-a",
+        query="existing hash report",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.update_task(
+        "task-existing-hash-report",
+        status="completed",
+        archive_status="ready",
+    )
+    repo.record_artifact(
+        "task-existing-hash-report",
+        "evidence",
+        {
+            "evidence_id": evidence_ref,
+            "title": "Hash-backed source",
+            "summary": "Source text.",
+            "source_url": "https://example.test/source",
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/tasks/task-existing-hash-report/reports/pdf",
+            json={
+                "report_id": "existing-hash-report",
+                "markdown": f"Finding cites [{evidence_ref}].",
+                "evidence_refs": [evidence_ref],
+            },
+        )
+        archive_response = await client.get(
+            "/api/limira/tasks/task-existing-hash-report/archive.zip"
+        )
+
+    assert response.status_code == 201
+    assert response.json()["evidence_refs"] == [evidence_ref]
+    report = repo.get_user_report(
+        task_id="task-existing-hash-report",
+        report_id="existing-hash-report",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.evidence_refs == [evidence_ref]
+    assert archive_response.status_code == 200
+    trace = json.loads(_archive_member_texts(archive_response.content)["trace.json"])
+    assert trace["artifact_warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_warns_for_missing_final_report_evidence_refs():
+    app, repo, _storage = _limira_asgi_app()
+    hash_ref = "EVID-abcdef123456"
+    repo.create_task(
+        task_id="task-missing-final-report-refs",
+        owner_user_id="user-a",
+        query="missing final report refs",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.update_task(
+        "task-missing-final-report-refs",
+        status="completed",
+        archive_status="ready",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/tasks/task-missing-final-report-refs/reports/pdf",
+            json={
+                "report_id": "missing-final-report-refs",
+                "markdown": f"Finding cites [EVID-999] and [{hash_ref}].",
+                "evidence_refs": ["EVID-999", hash_ref],
+            },
+        )
+        archive_response = await client.get(
+            "/api/limira/tasks/task-missing-final-report-refs/archive.zip"
+        )
+
+    assert response.status_code == 201
+    assert response.json()["evidence_refs"] == ["EVID-999", hash_ref]
+    assert archive_response.status_code == 200
+    trace = json.loads(_archive_member_texts(archive_response.content)["trace.json"])
+    warning = trace["artifact_warnings"][-1]["payload"]
+    assert warning["warning"] == "unresolved_evidence_refs"
+    assert warning["artifact_type"] == "final_report"
+    assert warning["local_artifact_id"] == "missing-final-report-refs"
+    assert warning["source_event_type"] == "browser_pdf_export"
+    assert warning["evidence_refs"] == ["EVID-999", hash_ref]
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_normalizes_explicit_and_markdown_refs_in_order():
+    app, repo, _storage = _limira_asgi_app()
+    hash_ref = "EVID-abcdef123456"
+    second_hash_ref = "EVID-fedcba654321"
+    repo.create_task(
+        task_id="task-normalized-report-refs",
+        owner_user_id="user-a",
+        query="normalized report refs",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/tasks/task-normalized-report-refs/reports/pdf",
+            json={
+                "report_id": "normalized-report-refs",
+                "markdown": (
+                    f"Finding cites [EVID-001], [{hash_ref}], "
+                    f"{second_hash_ref}, EVID-abc, and EVID-abcdef1234567."
+                ),
+                "evidence_refs": [hash_ref, "EVID-002", hash_ref, "EVID-abc"],
+            },
+        )
+
+    assert response.status_code == 201
+    expected_refs = [hash_ref, "EVID-002", "EVID-001", second_hash_ref]
+    assert response.json()["evidence_refs"] == expected_refs
+    report = repo.get_user_report(
+        task_id="task-normalized-report-refs",
+        report_id="normalized-report-refs",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.evidence_refs == expected_refs
+    assert "EVID-abc" not in report.evidence_refs
+
+
+@pytest.mark.asyncio
+async def test_pdf_route_extracts_markdown_only_refs_into_generated_report():
+    app, repo, _storage = _limira_asgi_app()
+    hash_ref = "EVID-abcdef123456"
+    repo.create_task(
+        task_id="task-markdown-only-report-refs",
+        owner_user_id="user-a",
+        query="markdown only report refs",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        response = await client.post(
+            "/api/limira/tasks/task-markdown-only-report-refs/reports/pdf",
+            json={
+                "report_id": "markdown-only-report-refs",
+                "markdown": f"Finding cites [{hash_ref}] and [EVID-001].",
+                "evidence_refs": [],
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["evidence_refs"] == [hash_ref, "EVID-001"]
+    report = repo.get_user_report(
+        task_id="task-markdown-only-report-refs",
+        report_id="markdown-only-report-refs",
+        owner_user_id="user-a",
+    )
+    assert report is not None
+    assert report.evidence_refs == [hash_ref, "EVID-001"]
+
+
+@pytest.mark.asyncio
+async def test_store_task_report_pdf_normalizes_auto_generated_refs_and_warns():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = FakePdfExporter()
+    user = limira.LimiraUser("user-a")
+    hash_ref = "EVID-abcdef123456"
+    task = repo.create_task(
+        task_id="task-auto-final-report-refs",
+        owner_user_id=user.id,
+        query="auto final report refs",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+
+    report = await limira._store_task_report_pdf(
+        task=task,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+        report_id="auto-final-report",
+        report_type="final",
+        markdown=f"Auto final report cites [{hash_ref}], EVID-001, and EVID-abc.",
+        evidence_refs=["EVID-001", "EVID-abc", "EVID-001"],
+        metadata={"source_event_type": "auto_task_completion"},
+        record_cloud_document=False,
+    )
+
+    assert report.evidence_refs == ["EVID-001", hash_ref]
+    assert "EVID-abc" not in report.evidence_refs
+    assert f'data-evidence-ref="{hash_ref}"' in pdf_exporter.html_inputs[0]
+    warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task.task_id)
+        if event["type"] == "artifact_warning"
+    ]
+    assert warnings[-1]["warning"] == "unresolved_evidence_refs"
+    assert warnings[-1]["artifact_type"] == "final_report"
+    assert warnings[-1]["local_artifact_id"] == "auto-final-report"
+    assert warnings[-1]["source_event_type"] == "auto_task_completion"
+    assert warnings[-1]["evidence_refs"] == ["EVID-001", hash_ref]
+
+
+@pytest.mark.asyncio
 async def test_pdf_route_rejects_blank_exporter_output_before_storage():
     app, repo, storage = _limira_asgi_app()
     repo.create_task(

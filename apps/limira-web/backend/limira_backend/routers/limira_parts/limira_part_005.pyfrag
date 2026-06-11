@@ -660,12 +660,19 @@ def _evidence_refs_from_value(value: Any) -> list[str]:
 
 
 def _report_section_evidence_refs(artifact: Mapping[str, Any]) -> list[str]:
+    return _normalized_report_evidence_refs(
+        artifact.get("markdown"),
+        artifact.get("evidence_refs"),
+    )
+
+
+def _normalized_report_evidence_refs(markdown: Any, explicit_refs: Any) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
-    for ref in _evidence_refs_from_value(artifact.get("evidence_refs")):
+    for ref in _evidence_refs_from_value(explicit_refs):
         refs.append(ref)
         seen.add(ref)
-    markdown_refs = _evidence_refs_from_markdown(str(artifact.get("markdown") or ""))
+    markdown_refs = _evidence_refs_from_markdown(str(markdown or ""))
     for ref in markdown_refs:
         if ref not in seen:
             refs.append(ref)
@@ -689,6 +696,10 @@ def _record_unresolved_evidence_ref_warning(
     repo: LimiraTaskRepository,
     task_id: str,
     artifact: Mapping[str, Any],
+    *,
+    artifact_type: str = "report_section",
+    local_artifact_id: str | None = None,
+    source_event_type: Any = None,
 ) -> None:
     refs = _evidence_refs_from_value(artifact.get("evidence_refs"))
     if not refs:
@@ -704,9 +715,13 @@ def _record_unresolved_evidence_ref_warning(
                 "type": "artifact_warning",
                 "payload": {
                     "warning": "unresolved_evidence_refs",
-                    "artifact_type": "report_section",
-                    "source_event_type": artifact.get("source_event_type"),
-                    "local_artifact_id": artifact.get("section_id"),
+                    "artifact_type": artifact_type,
+                    "source_event_type": source_event_type
+                    if source_event_type is not None
+                    else artifact.get("source_event_type"),
+                    "local_artifact_id": local_artifact_id
+                    or artifact.get("section_id")
+                    or artifact.get("report_id"),
                     "evidence_refs": missing,
                     "non_fatal": True,
                 },
