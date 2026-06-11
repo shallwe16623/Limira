@@ -369,6 +369,14 @@ def parse_sse(body):
     ]
 
 
+async def read_sse_data_line(response, timeout=1.0):
+    while True:
+        line = await asyncio.wait_for(response.content.readline(), timeout=timeout)
+        assert line
+        if line.startswith(b"data: "):
+            return line
+
+
 def assert_public_task_response_hides_internal_identifiers(payload):
     serialized = json.dumps(payload, ensure_ascii=False)
     forbidden_fields = (
@@ -824,6 +832,62 @@ async def test_runner_api_event_stream_recovers_stale_running_task_without_worke
             status="failed",
             resume_policy="terminal",
         )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_event_stream_polls_durable_events_for_external_lease(
+    tmp_path,
+):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    running = seed_running_task(
+        store,
+        task_id="task-external-stream",
+        worker_id="runner-other:task-external-stream:worker",
+        lease_expires_at="2026-06-06T13:00:00+00:00",
+    )
+    initial_event = {
+        "task_id": running.task_id,
+        "type": "message",
+        "timestamp": "2026-06-06T12:00:00+00:00",
+        "payload": {"delta": {"content": "initial durable replay"}},
+    }
+    later_event = {
+        "task_id": running.task_id,
+        "type": "message",
+        "timestamp": "2026-06-06T12:00:02+00:00",
+        "payload": {"delta": {"content": "externally appended"}},
+    }
+    store.append_task_event(
+        running.task_id,
+        initial_event,
+        created_at=initial_event["timestamp"],
+    )
+    client, store = await make_client(tmp_path, task_store=store)
+    try:
+        events_response = await client.get(
+            f"/limira-runner/tasks/{running.task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        first_line = await read_sse_data_line(events_response)
+        assert b"initial durable replay" in first_line
+
+        store.append_task_event(
+            running.task_id,
+            later_event,
+            created_at=later_event["timestamp"],
+        )
+        second_line = await read_sse_data_line(events_response)
+        assert b"externally appended" in second_line
+
+        store.update_task(
+            running.task_id,
+            status="completed",
+            completed_at="2026-06-06T12:00:03+00:00",
+        )
+        await asyncio.wait_for(events_response.text(), timeout=1)
     finally:
         await client.close()
 

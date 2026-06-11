@@ -64,6 +64,7 @@ DEFAULT_LLM_PROVIDER = "openai"
 DEFAULT_MODEL_NAME = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 MAX_REPLAY_EVENTS = 1000
+DURABLE_EVENT_POLL_INTERVAL_SECONDS = 0.05
 GRAPH_CHECKPOINT_PHASES = {
     "scope",
     "plan",
@@ -268,10 +269,19 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
         response_prepared = True
         if record.status == "queued":
             _ensure_task_worker(request.app, record.task_id)
-        for event in _task_event_snapshot(request.app, record.task_id):
+        replay_events = _task_event_snapshot(request.app, record.task_id)
+        for event in replay_events:
             await _write_sse(response, event)
         current = _task_store(request.app).get_task(record.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
+            return response
+        if current and _classify_task_lease(request.app, current) == "external_active":
+            await _tail_external_durable_events(
+                request,
+                response,
+                current.task_id,
+                seen_event_count=len(replay_events),
+            )
             return response
         while True:
             event = await queue.get()
@@ -289,6 +299,57 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                 pass
 
     return response
+
+
+async def _tail_external_durable_events(
+    request: web.Request,
+    response: web.StreamResponse,
+    task_id: str,
+    *,
+    seen_event_count: int,
+) -> None:
+    app = request.app
+    while True:
+        await asyncio.sleep(DURABLE_EVENT_POLL_INTERVAL_SECONDS)
+        seen_event_count = await _write_new_durable_events(
+            app,
+            response,
+            task_id,
+            seen_event_count,
+        )
+        record = _task_store(app).get_task(task_id)
+        if not record:
+            return
+        if record.status in FINAL_TASK_STATUSES:
+            await _write_new_durable_events(app, response, task_id, seen_event_count)
+            return
+        if _classify_task_lease(app, record) == "external_active":
+            continue
+        reconciled = _reconcile_task_if_stale(app, record)
+        seen_event_count = await _write_new_durable_events(
+            app,
+            response,
+            task_id,
+            seen_event_count,
+        )
+        if reconciled.status in FINAL_TASK_STATUSES:
+            return
+
+
+async def _write_new_durable_events(
+    app: web.Application,
+    response: web.StreamResponse,
+    task_id: str,
+    seen_event_count: int,
+) -> int:
+    durable_events = _list_durable_task_events(app, task_id)
+    if durable_events:
+        app[TASK_EVENT_LOG_KEY][task_id] = durable_events[-MAX_REPLAY_EVENTS:]
+    if len(durable_events) < seen_event_count:
+        seen_event_count = 0
+    for event in durable_events[seen_event_count:]:
+        await _write_sse(response, event)
+    return len(durable_events)
 
 
 async def _run_task_worker(app: web.Application, task_id: str) -> None:
