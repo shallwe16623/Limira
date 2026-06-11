@@ -98,6 +98,19 @@ class TaskStore:
             ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def list_running_tasks(self, limit: int = 100) -> list[TaskRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM limira_runner_research_tasks
+                WHERE status = ?
+                ORDER BY COALESCE(started_at, created_at) ASC
+                LIMIT ?
+                """,
+                ("running", max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def user_owns_task(self, task_id: str, user_id: str) -> bool:
         record = self.get_task(task_id)
         return bool(record and record.user_id == user_id)
@@ -173,6 +186,43 @@ class TaskStore:
                 WHERE task_id = ? AND status = ?
                 """,
                 ("running", started_at, task_id, "queued"),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
+    def finalize_stale_running_task(
+        self,
+        task_id: str,
+        *,
+        completed_at: str,
+        error: str,
+        warnings: list[str] | None = None,
+    ) -> TaskRecord | None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE limira_runner_research_tasks
+                SET status = ?,
+                    archive_status = ?,
+                    archive_dir = ?,
+                    archive_zip_path = ?,
+                    completed_at = ?,
+                    error = ?,
+                    warnings = ?
+                WHERE task_id = ? AND status = ?
+                """,
+                (
+                    "failed",
+                    "failed",
+                    None,
+                    None,
+                    completed_at,
+                    error,
+                    self._serialize_value(warnings or []),
+                    task_id,
+                    "running",
+                ),
             )
             if cursor.rowcount == 0:
                 return None
@@ -349,12 +399,30 @@ class PostgresTaskStore:
         ORDER BY created_at DESC
         LIMIT %s
     """
+    LIST_RUNNING_TASKS_SQL = f"""
+        SELECT {TASK_COLUMNS}
+        FROM limira_research_tasks
+        WHERE status = 'running'
+        ORDER BY COALESCE(started_at, created_at) ASC
+        LIMIT %s
+    """
     CLAIM_QUEUED_TASK_SQL = f"""
         UPDATE limira_research_tasks
         SET status = 'running',
             started_at = %s
         WHERE task_id = %s
           AND status = 'queued'
+        RETURNING {TASK_COLUMNS}
+    """
+    FINALIZE_STALE_RUNNING_TASK_SQL = f"""
+        UPDATE limira_research_tasks
+        SET status = 'failed',
+            archive_status = 'failed',
+            completed_at = %s,
+            error = %s,
+            metadata = metadata || CAST(%s AS jsonb)
+        WHERE task_id = %s
+          AND status = 'running'
         RETURNING {TASK_COLUMNS}
     """
     CANCEL_QUEUED_TASK_SQL = f"""
@@ -416,6 +484,10 @@ class PostgresTaskStore:
 
     def list_user_tasks(self, user_id: str, limit: int = 100) -> list[TaskRecord]:
         rows = self._fetch_all(self.LIST_USER_TASKS_SQL, (user_id, limit))
+        return [self._row_to_record(row) for row in rows]
+
+    def list_running_tasks(self, limit: int = 100) -> list[TaskRecord]:
+        rows = self._fetch_all(self.LIST_RUNNING_TASKS_SQL, (max(1, int(limit)),))
         return [self._row_to_record(row) for row in rows]
 
     def user_owns_task(self, task_id: str, user_id: str) -> bool:
@@ -497,6 +569,30 @@ class PostgresTaskStore:
 
     def claim_queued_task(self, task_id: str, *, started_at: str) -> TaskRecord | None:
         row = self._fetch_one(self.CLAIM_QUEUED_TASK_SQL, (started_at, task_id))
+        return self._row_to_record(row) if row else None
+
+    def finalize_stale_running_task(
+        self,
+        task_id: str,
+        *,
+        completed_at: str,
+        error: str,
+        warnings: list[str] | None = None,
+    ) -> TaskRecord | None:
+        metadata_updates = {
+            "archive_dir": None,
+            "archive_zip_path": None,
+            "warnings": warnings or [],
+        }
+        row = self._fetch_one(
+            self.FINALIZE_STALE_RUNNING_TASK_SQL,
+            (
+                completed_at,
+                error,
+                _serialize_json(metadata_updates),
+                task_id,
+            ),
+        )
         return self._row_to_record(row) if row else None
 
     def cancel_queued_task(

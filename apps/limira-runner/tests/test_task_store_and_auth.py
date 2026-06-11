@@ -201,6 +201,63 @@ def test_task_store_preserves_terminal_status_from_late_updates(tmp_path):
     assert late_completed.error == "pipeline failed"
 
 
+def test_task_store_lists_and_finalizes_only_running_tasks(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-running",
+        user_id="user-a",
+        query="running",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    store.create_task(
+        task_id="task-terminal",
+        user_id="user-a",
+        query="terminal",
+        created_at="2026-06-06T12:01:00+00:00",
+    )
+    claimed = store.claim_queued_task(
+        "task-running",
+        started_at="2026-06-06T12:02:00+00:00",
+    )
+    terminal = store.update_task(
+        "task-terminal",
+        status="completed",
+        archive_status="ready",
+        completed_at="2026-06-06T12:03:00+00:00",
+    )
+
+    running = store.list_running_tasks()
+    recovered = store.finalize_stale_running_task(
+        "task-running",
+        completed_at="2026-06-06T12:04:00+00:00",
+        error="stale_running_task_recovered:no_active_worker",
+        warnings=["stale running task recovered: no_active_worker"],
+    )
+    terminal_recovery = store.finalize_stale_running_task(
+        "task-terminal",
+        completed_at="2026-06-06T12:05:00+00:00",
+        error="stale_running_task_recovered:no_active_worker",
+        warnings=["should not apply"],
+    )
+
+    assert claimed is not None
+    assert terminal.status == "completed"
+    assert [record.task_id for record in running] == ["task-running"]
+    assert recovered is not None
+    assert recovered.status == "failed"
+    assert recovered.archive_status == "failed"
+    assert recovered.archive_dir is None
+    assert recovered.archive_zip_path is None
+    assert recovered.completed_at == "2026-06-06T12:04:00+00:00"
+    assert recovered.error == "stale_running_task_recovered:no_active_worker"
+    assert recovered.warnings == ["stale running task recovered: no_active_worker"]
+    assert terminal_recovery is None
+    unchanged = store.get_task("task-terminal")
+    assert unchanged.status == "completed"
+    assert unchanged.completed_at == "2026-06-06T12:03:00+00:00"
+    assert unchanged.warnings == []
+
+
 def test_runner_task_store_factory_requires_explicit_sqlite_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("RUNNER_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -274,6 +331,9 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "metadata" in sql
     assert "where task_id = %s" in sql
     assert "and status = 'queued'" in sql
+    assert "where status = 'running'" in sql
+    assert "and status = 'running'" in sql
+    assert "metadata = metadata || cast(%s as jsonb)" in sql
     assert "returning" in sql
     assert "limira_runner_research_tasks" not in sql
 
@@ -375,6 +435,36 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert late_failed.archive_status == "ready"
     assert late_failed.completed_at == "2026-06-06T12:10:00+00:00"
     assert late_failed.error is None
+
+    store.claim_queued_task(
+        "task-c",
+        started_at="2026-06-06T12:14:00+00:00",
+    )
+    running = store.list_running_tasks()
+    assert [record.task_id for record in running] == ["task-c"]
+    recovered = store.finalize_stale_running_task(
+        "task-c",
+        completed_at="2026-06-06T12:15:00+00:00",
+        error="stale_running_task_recovered:no_active_worker",
+        warnings=["stale running task recovered: no_active_worker"],
+    )
+    assert recovered is not None
+    assert recovered.status == "failed"
+    assert recovered.archive_status == "failed"
+    assert recovered.completed_at == "2026-06-06T12:15:00+00:00"
+    assert recovered.error == "stale_running_task_recovered:no_active_worker"
+    assert recovered.warnings == ["stale running task recovered: no_active_worker"]
+    assert recovered.archive_dir is None
+    assert recovered.archive_zip_path is None
+
+    protected = store.finalize_stale_running_task(
+        "task-a",
+        completed_at="2026-06-06T12:16:00+00:00",
+        error="should not overwrite terminal",
+        warnings=["should not overwrite terminal"],
+    )
+    assert protected is None
+    assert store.get_task("task-a").status == "completed"
 
 
 def test_auth_adapter_accepts_trusted_headers_only():
@@ -497,6 +587,16 @@ class FakeRunnerPostgresConnection:
             rows.sort(key=lambda row: row["created_at"], reverse=True)
             return FakeRunnerPostgresCursor(rows[:limit])
 
+        if "select" in lowered and "where status = 'running'" in lowered:
+            (limit,) = params
+            rows = [
+                row
+                for row in self.database.rows.values()
+                if row["status"] == "running"
+            ]
+            rows.sort(key=lambda row: row["started_at"] or row["created_at"])
+            return FakeRunnerPostgresCursor(rows[:limit])
+
         if "set status = 'running'" in lowered:
             started_at, task_id = params
             row = self.database.rows.get(task_id)
@@ -516,6 +616,26 @@ class FakeRunnerPostgresConnection:
             row["started_at"] = started_at
             row["completed_at"] = completed_at
             row["error"] = error
+            return FakeRunnerPostgresCursor([row])
+
+        if "set status = 'failed'" in lowered and "and status = 'running'" in lowered:
+            completed_at, error, metadata_update, task_id = params
+            row = self.database.rows.get(task_id)
+            if not row or row["status"] != "running":
+                return FakeRunnerPostgresCursor([])
+            row["status"] = "failed"
+            row["archive_status"] = "failed"
+            row["completed_at"] = completed_at
+            row["error"] = error
+            metadata = row.get("metadata")
+            if isinstance(metadata, str):
+                import json
+
+                metadata = json.loads(metadata)
+            import json
+
+            metadata.update(json.loads(metadata_update))
+            row["metadata"] = metadata
             return FakeRunnerPostgresCursor([row])
 
         if "update limira_research_tasks" in lowered:

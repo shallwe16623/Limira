@@ -381,6 +381,26 @@ async def wait_for_task_status(store, task_id, status, timeout=1.0):
     raise AssertionError(f"task {task_id} status is {actual!r}, expected {status!r}")
 
 
+def seed_running_task(
+    store,
+    *,
+    user_id="user-a",
+    query="stale running query",
+    task_id=None,
+    started_at="2026-06-06T10:00:00+00:00",
+):
+    record = store.create_task(
+        task_id=task_id or str(uuid.uuid4()),
+        user_id=user_id,
+        query=query,
+        created_at="2026-06-06T09:59:59+00:00",
+        model_summary={},
+    )
+    claimed = store.claim_queued_task(record.task_id, started_at=started_at)
+    assert claimed is not None
+    return claimed
+
+
 def archive_dir_for(store, task_id):
     record = store.get_task(task_id)
     assert record is not None
@@ -467,6 +487,152 @@ async def test_runner_api_start_events_status_and_download(tmp_path):
         with zipfile.ZipFile(io.BytesIO(await download_response.read())) as archive:
             assert sorted(archive.namelist()) == ARCHIVE_MEMBERS
     finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_startup_recovers_stale_running_task_without_worker(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    running = seed_running_task(store)
+    client, store = await make_client(tmp_path, task_store=store)
+    try:
+        recovered = store.get_task(running.task_id)
+        assert recovered.status == "failed"
+        assert recovered.archive_status == "failed"
+        assert recovered.completed_at == "2026-06-06T12:00:01+00:00"
+        assert recovered.error == "stale_running_task_recovered:no_active_worker"
+        assert recovered.warnings == [
+            "stale running task recovered: no_active_worker"
+        ]
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{running.task_id}",
+            headers=USER_A_HEADERS,
+        )
+        status_payload = await status_response.json()
+        assert status_payload["status"] == "failed"
+        assert status_payload["archive_status"] == "failed"
+        assert status_payload["download_url"] is None
+        assert status_payload["error"] == "stale_running_task_recovered:no_active_worker"
+        assert status_payload["warnings"] == [
+            "stale running task recovered: no_active_worker"
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_status_recovers_stale_running_task_without_worker(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        running = seed_running_task(store)
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{running.task_id}",
+            headers=USER_A_HEADERS,
+        )
+        payload = await status_response.json()
+        recovered = store.get_task(running.task_id)
+
+        assert status_response.status == 200
+        assert payload["status"] == "failed"
+        assert payload["archive_status"] == "failed"
+        assert payload["error"] == "stale_running_task_recovered:no_active_worker"
+        assert recovered.status == "failed"
+        assert recovered.completed_at == "2026-06-06T12:00:01+00:00"
+        assert client.server.app[ACTIVE_TASKS_KEY] == set()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_event_stream_recovers_stale_running_task_without_worker(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        running = seed_running_task(store)
+
+        events_response = await client.get(
+            f"/limira-runner/tasks/{running.task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        events = parse_sse(await events_response.text())
+        recovered = store.get_task(running.task_id)
+
+        assert recovered.status == "failed"
+        assert [event["type"] for event in events] == ["error"]
+        assert events[0]["payload"]["status"] == "failed"
+        assert events[0]["payload"]["archive_status"] == "failed"
+        assert events[0]["payload"]["error"] == (
+            "stale_running_task_recovered:no_active_worker"
+        )
+        assert events[0]["payload"]["warning"] == (
+            "stale running task recovered: no_active_worker"
+        )
+        assert events[0]["payload"]["recovery_reason"] == "no_active_worker"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_status_preserves_healthy_active_running_task(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        running = seed_running_task(
+            store,
+            started_at="2026-06-06T12:00:00+00:00",
+        )
+        client.server.app[ACTIVE_TASKS_KEY].add(running.task_id)
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{running.task_id}",
+            headers=USER_A_HEADERS,
+        )
+        payload = await status_response.json()
+        current = store.get_task(running.task_id)
+
+        assert status_response.status == 200
+        assert payload["status"] == "running"
+        assert payload["archive_status"] == "pending"
+        assert payload["error"] is None
+        assert current.status == "running"
+        assert current.completed_at is None
+    finally:
+        client.server.app[ACTIVE_TASKS_KEY].discard(running.task_id)
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_status_recovers_active_task_with_stale_started_at(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("RUNNER_STALE_RUNNING_SECONDS", "60")
+    client, store = await make_client(tmp_path)
+    try:
+        running = seed_running_task(
+            store,
+            started_at="2026-06-06T10:00:00+00:00",
+        )
+        client.server.app[ACTIVE_TASKS_KEY].add(running.task_id)
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{running.task_id}",
+            headers=USER_A_HEADERS,
+        )
+        payload = await status_response.json()
+        current = store.get_task(running.task_id)
+
+        assert status_response.status == 200
+        assert payload["status"] == "failed"
+        assert payload["error"] == "stale_running_task_recovered:stale_started_at"
+        assert current.status == "failed"
+        assert current.warnings == [
+            "stale running task recovered: stale_started_at"
+        ]
+        assert running.task_id not in client.server.app[ACTIVE_TASKS_KEY]
+    finally:
+        client.server.app[ACTIVE_TASKS_KEY].discard(running.task_id)
         await client.close()
 
 

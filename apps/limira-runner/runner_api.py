@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -28,6 +29,8 @@ MAX_QUERY_CHARS = 20_000
 MAX_CONTEXT_STRING_CHARS = 120
 MAX_DOCUMENT_IDS = 20
 MAX_CONTEXT_JSON_CHARS = 20_000
+STALE_RUNNING_SECONDS_ENV = "RUNNER_STALE_RUNNING_SECONDS"
+DEFAULT_STALE_RUNNING_SECONDS = 60 * 60
 
 StreamEvents = Callable[..., Awaitable[Any]]
 PipelineHelpers = tuple[
@@ -122,6 +125,7 @@ def create_app(
     app[TASK_WORKERS_KEY] = {}
     app[TASK_EVENT_LOG_KEY] = {}
     app[TASK_SUBSCRIBERS_KEY] = {}
+    _reconcile_stale_running_tasks(app)
 
     app.router.add_post("/limira-runner/research", start_research)
     app.router.add_get("/limira-runner/tasks/{task_id}", get_task_status)
@@ -188,6 +192,7 @@ async def get_task_status(request: web.Request) -> web.Response:
     record = _get_authorized_task(request, auth)
     if not record:
         return _not_found()
+    record = _reconcile_task_if_stale(request.app, record)
     return web.json_response(_task_response(record))
 
 
@@ -217,6 +222,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
     record = _get_authorized_task(request, auth)
     if not record:
         raise web.HTTPNotFound(text=json.dumps({"error": "not_found"}))
+    record = _reconcile_task_if_stale(request.app, record)
 
     response = web.StreamResponse(
         status=200,
@@ -543,7 +549,141 @@ def _clear_active_task(app: web.Application, task_id: str) -> None:
 
 
 def _task_has_active_worker(app: web.Application, task_id: str) -> bool:
-    return task_id in app[ACTIVE_TASKS_KEY]
+    worker = app[TASK_WORKERS_KEY].get(task_id)
+    return task_id in app[ACTIVE_TASKS_KEY] or bool(worker and not worker.done())
+
+
+def _reconcile_stale_running_tasks(
+    app: web.Application,
+    *,
+    limit: int = 100,
+) -> list[TaskRecord]:
+    store = _task_store(app)
+    if not hasattr(store, "list_running_tasks"):
+        return []
+    reconciled: list[TaskRecord] = []
+    for record in store.list_running_tasks(limit=limit):
+        updated = _reconcile_task_if_stale(app, record)
+        if updated.status in FINAL_TASK_STATUSES and updated.status != record.status:
+            reconciled.append(updated)
+    return reconciled
+
+
+def _reconcile_task_if_stale(
+    app: web.Application,
+    record: TaskRecord,
+) -> TaskRecord:
+    if record.status != "running":
+        return record
+    reason = _stale_running_reason(app, record)
+    if not reason:
+        return record
+    return _finalize_stale_running_task(app, record, reason=reason)
+
+
+def _stale_running_reason(
+    app: web.Application,
+    record: TaskRecord,
+) -> str | None:
+    if record.status != "running":
+        return None
+    if not _task_has_active_worker(app, record.task_id):
+        return "no_active_worker"
+    if not record.started_at:
+        return "missing_started_at"
+
+    now = _parse_timestamp(app[CLOCK_KEY]())
+    started_at = _parse_timestamp(record.started_at)
+    if now is None or started_at is None:
+        return None
+    stale_seconds = _stale_running_seconds()
+    if (now - started_at).total_seconds() <= stale_seconds:
+        return None
+
+    heartbeat_at = _latest_heartbeat_at(app, record.task_id)
+    if heartbeat_at is not None:
+        if (now - heartbeat_at).total_seconds() > stale_seconds:
+            return "stale_heartbeat"
+        return None
+    return "stale_started_at"
+
+
+def _finalize_stale_running_task(
+    app: web.Application,
+    record: TaskRecord,
+    *,
+    reason: str,
+) -> TaskRecord:
+    completed_at = app[CLOCK_KEY]()
+    error = f"stale_running_task_recovered:{reason}"
+    warning = f"stale running task recovered: {reason}"
+    store = _task_store(app)
+    finalizer = getattr(store, "finalize_stale_running_task", None)
+    if finalizer is None:
+        return record
+    updated = finalizer(
+        record.task_id,
+        completed_at=completed_at,
+        error=error,
+        warnings=[warning],
+    )
+    if updated is None:
+        return store.get_task(record.task_id) or record
+
+    event = {
+        "task_id": record.task_id,
+        "type": "error",
+        "timestamp": completed_at,
+        "payload": {
+            "status": "failed",
+            "archive_status": "failed",
+            "terminal": True,
+            "error": error,
+            "warning": warning,
+            "recovery_reason": reason,
+        },
+    }
+    _append_task_event(app, record.task_id, event)
+    _clear_active_task(app, record.task_id)
+    _clear_task_cancel(app, record.task_id)
+    _notify_task_finished(app, record.task_id)
+    return updated
+
+
+def _latest_heartbeat_at(
+    app: web.Application,
+    task_id: str,
+) -> datetime | None:
+    for event in reversed(_task_event_snapshot(app, task_id)):
+        if event.get("type") != "heartbeat":
+            continue
+        timestamp = _parse_timestamp(event.get("timestamp"))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _stale_running_seconds() -> int:
+    try:
+        value = int(str(os.getenv(STALE_RUNNING_SECONDS_ENV, "")).strip())
+    except (TypeError, ValueError):
+        value = DEFAULT_STALE_RUNNING_SECONDS
+    return max(1, value)
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _transport_closing(request: web.Request) -> bool:
