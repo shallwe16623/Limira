@@ -58,6 +58,16 @@ class _FailingOrchestrator:
         raise RuntimeError("graph executor failure")
 
 
+class _MissingFinalOutputOrchestrator:
+    outputs = ("", "", None)
+
+    def __init__(self, **_kwargs):
+        pass
+
+    async def run_main_agent(self, **_kwargs):
+        return self.__class__.outputs
+
+
 def _pipeline_cfg(*, graph_enabled: bool = False):
     agent_cfg = {
         "keep_tool_result": True,
@@ -361,6 +371,49 @@ async def test_feature_flagged_graph_executor_failures_use_pipeline_error_handli
     assert result[1] == ""
     assert "RuntimeError" in result[0]
     assert "graph executor failure" in result[0]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_phase"
+    ] == ["scope", "plan", "research"]
+
+
+@pytest.mark.parametrize(
+    "final_outputs",
+    [
+        ("", "", None),
+        ("   ", "\n\t", None),
+        (None, "final", None),
+        ("summary", None, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_rejects_missing_final_outputs(
+    tmp_path, monkeypatch, final_outputs
+):
+    _MissingFinalOutputOrchestrator.outputs = final_outputs
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(
+        pipeline_module,
+        "Orchestrator",
+        _MissingFinalOutputOrchestrator,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-missing-output",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == ""
+    assert "research_graph_final_output_required" in result[0]
     assert [
         item["data"]["phase"]
         for item in stream_queue.items

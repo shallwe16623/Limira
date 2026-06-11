@@ -248,6 +248,10 @@ async def execute_research_graph(
         task_id=task_id,
         is_final_retry=is_final_retry,
     )
+    final_summary, final_boxed_answer = _validate_graph_final_outputs(
+        final_summary,
+        final_boxed_answer,
+    )
 
     for phase in (ResearchPhase.VERIFY, ResearchPhase.WRITE, ResearchPhase.COMPLETE):
         current_state = current_state.model_copy(update={"phase": phase})
@@ -330,6 +334,24 @@ async def _emit_graph_phase(
 ) -> None:
     if stream_queue is not None:
         await stream_queue.put(graph_phase_event(state, phase))
+
+
+def _validate_graph_final_outputs(
+    final_summary: Any,
+    final_boxed_answer: Any,
+) -> tuple[str, str]:
+    summary = _required_output_text(final_summary)
+    boxed_answer = _required_output_text(final_boxed_answer)
+    return summary, boxed_answer
+
+
+def _required_output_text(value: Any) -> str:
+    if value is None:
+        raise ValueError("research_graph_final_output_required")
+    text = value if isinstance(value, str) else str(value)
+    if not text.strip():
+        raise ValueError("research_graph_final_output_required")
+    return text
 
 
 def _normalize_query(query: str) -> str:
