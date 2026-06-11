@@ -1426,6 +1426,8 @@ async def ingest_task_runner_events(
     runtime_state: LimiraRuntimeState,
     object_storage: Any = None,
     pdf_exporter: Any = None,
+    *,
+    runtime_stream_id: str | None = None,
 ) -> dict[str, Any]:
     completion_assets_generated = False
     events: list[dict[str, Any]] = []
@@ -1464,7 +1466,15 @@ async def ingest_task_runner_events(
             event=terminal_event,
             dedupe_log=True,
         )
-        await _mark_terminal_reattach_closed(runtime_state, task.task_id)
+        if runtime_stream_id:
+            await _mark_runtime_stream_closed(
+                runtime_state,
+                task.task_id,
+                "terminal_reattach",
+                stream_id=runtime_stream_id,
+            )
+        else:
+            await _mark_terminal_reattach_closed(runtime_state, task.task_id)
         events.append(terminal_event)
         return _runner_ingestion_summary(repo, task.task_id, events)
 
@@ -1475,7 +1485,7 @@ async def ingest_task_runner_events(
             "owner_user_id": user.id,
             "status": current.status,
             "archive_status": current.archive_status,
-            "stream_state": "server_ingestion",
+            "ingestion_state": "running",
         },
     )
     saw_terminal_status = False
@@ -1593,7 +1603,7 @@ async def ingest_task_runner_events(
             return _runner_ingestion_summary(repo, task.task_id, events)
         public_error = _public_error_text(
             exc.detail,
-            fallback="limira_event_proxy_failed",
+            fallback="server_ingestion_failed",
         )
         repo.update_task(
             task.task_id,
@@ -1603,8 +1613,12 @@ async def ingest_task_runner_events(
         )
         error_event = {
             "task_id": task.task_id,
-            "type": "error",
-            "payload": {"error": public_error},
+            "type": "server_ingestion_failed",
+            "payload": {
+                "status": "failed",
+                "archive_status": "failed",
+                "error": public_error,
+            },
         }
         await _record_web_history_event(
             repo=repo,
@@ -1642,12 +1656,16 @@ async def ingest_task_runner_events(
             task.task_id,
             status="failed",
             archive_status="failed",
-            error="limira_event_proxy_failed",
+            error="server_ingestion_failed",
         )
         error_event = {
             "task_id": task.task_id,
-            "type": "error",
-            "payload": {"error": "limira_event_proxy_failed"},
+            "type": "server_ingestion_failed",
+            "payload": {
+                "status": "failed",
+                "archive_status": "failed",
+                "error": "server_ingestion_failed",
+            },
         }
         await _record_web_history_event(
             repo=repo,
@@ -1662,9 +1680,128 @@ async def ingest_task_runner_events(
             runtime_state,
             task.task_id,
             stream_close_reason,
+            stream_id=runtime_stream_id,
         )
 
     return _runner_ingestion_summary(repo, task.task_id, events)
+
+
+async def _run_server_ingestion_worker(
+    *,
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    research_client: RunnerResearchClientProtocol,
+    runtime_state: LimiraRuntimeState,
+    object_storage: Any = None,
+    pdf_exporter: Any = None,
+) -> None:
+    current = repo.get_task(task.task_id) or task
+    stream_id = f"server-ingestion-{uuid.uuid4()}"
+    opened = await runtime_state.try_open_stream(
+        task.task_id,
+        owner_user_id=user.id,
+        stream_id=stream_id,
+        fields={
+            "status": current.status,
+            "archive_status": current.archive_status,
+            "stream_owner": "server_ingestion",
+            "ingestion_state": "running",
+        },
+    )
+    if not opened:
+        return
+    try:
+        await ingest_task_runner_events(
+            current,
+            user,
+            repo,
+            research_client,
+            runtime_state,
+            object_storage,
+            pdf_exporter,
+            runtime_stream_id=stream_id,
+        )
+    except Exception as exc:
+        public_error = _public_error_text(
+            str(exc),
+            fallback="server_ingestion_failed",
+        ) or "server_ingestion_failed"
+        current = repo.get_task(task.task_id)
+        if current and current.status not in FINAL_TASK_STATUSES:
+            repo.update_task(
+                task.task_id,
+                status="failed",
+                archive_status="failed",
+                error=public_error,
+            )
+        failure_event = {
+            "task_id": task.task_id,
+            "type": "server_ingestion_failed",
+            "payload": {
+                "status": "failed",
+                "archive_status": "failed",
+                "error": public_error,
+            },
+        }
+        await _record_web_history_event(
+            repo=repo,
+            runtime_state=runtime_state,
+            task_id=task.task_id,
+            event=failure_event,
+            dedupe_log=True,
+        )
+        await _mark_runtime_stream_closed(
+            runtime_state,
+            task.task_id,
+            "server_ingestion_failed",
+            stream_id=stream_id,
+        )
+
+
+SERVER_INGESTION_TASKS: dict[str, asyncio.Task[None]] = {}
+
+
+def _schedule_server_ingestion_worker(
+    *,
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    research_client: RunnerResearchClientProtocol,
+    runtime_state: LimiraRuntimeState | None,
+    object_storage: Any = None,
+    pdf_exporter: Any = None,
+) -> None:
+    if runtime_state is None:
+        return
+    existing = SERVER_INGESTION_TASKS.get(task.task_id)
+    if existing is not None and not existing.done():
+        return
+    kwargs = {
+        "task": task,
+        "user": user,
+        "repo": repo,
+        "research_client": research_client,
+        "runtime_state": runtime_state,
+        "object_storage": object_storage,
+        "pdf_exporter": pdf_exporter,
+    }
+    task_handle = asyncio.create_task(_run_server_ingestion_worker(**kwargs))
+    SERVER_INGESTION_TASKS[task.task_id] = task_handle
+    task_handle.add_done_callback(
+        lambda completed, task_id=task.task_id: (
+            SERVER_INGESTION_TASKS.pop(task_id, None)
+            if SERVER_INGESTION_TASKS.get(task_id) is completed
+            else None
+        )
+    )
+
+
+async def _await_server_ingestion_task(task_id: str) -> None:
+    task_handle = SERVER_INGESTION_TASKS.get(task_id)
+    if task_handle is None:
+        return
+    await task_handle
 
 
 async def _limira_event_stream(

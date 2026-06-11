@@ -778,6 +778,48 @@ async def list_demo_scenarios(
     )
 
 
+def _maybe_runtime_state_dependency(value: Any) -> LimiraRuntimeState | None:
+    return value if hasattr(value, "try_open_stream") else None
+
+
+def _maybe_object_storage_dependency(value: Any) -> LimiraObjectStorage | None:
+    return value if hasattr(value, "put_object") and hasattr(value, "get_object") else None
+
+
+def _maybe_pdf_exporter_dependency(value: Any) -> LimiraPdfExporter | None:
+    return value if hasattr(value, "render_pdf") else None
+
+
+def _request_runtime_state_or_none(request: Request | None) -> LimiraRuntimeState | None:
+    if request is None:
+        return None
+    try:
+        return get_runtime_state(request)
+    except Exception:
+        log.warning("Limira server-side ingestion runtime state unavailable", exc_info=True)
+        return None
+
+
+def _request_object_storage_or_none(request: Request | None) -> LimiraObjectStorage | None:
+    if request is None:
+        return None
+    try:
+        return get_object_storage(request)
+    except Exception:
+        log.warning("Limira server-side ingestion object storage unavailable", exc_info=True)
+        return None
+
+
+def _request_pdf_exporter_or_none(request: Request | None) -> LimiraPdfExporter | None:
+    if request is None:
+        return None
+    try:
+        return get_pdf_exporter(request)
+    except Exception:
+        log.warning("Limira server-side ingestion PDF exporter unavailable", exc_info=True)
+        return None
+
+
 @router.post("/research", status_code=202)
 async def create_research_task(
     form_data: dict[str, Any],
@@ -785,6 +827,9 @@ async def create_research_task(
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
     research_client: RunnerResearchClientProtocol = Depends(get_research_client),
+    runtime_state: Any = None,
+    object_storage: Any = None,
+    pdf_exporter: Any = None,
 ) -> dict[str, Any]:
     if "user_id" in form_data or "owner_user_id" in form_data:
         raise HTTPException(status_code=400, detail="user_id_not_allowed")
@@ -841,6 +886,18 @@ async def create_research_task(
             task.task_id,
             runner_task_id=runner_task_id,
             status=str(runner_payload.get("status") or "queued"),
+        )
+        _schedule_server_ingestion_worker(
+            task=task,
+            user=user,
+            repo=repo,
+            research_client=research_client,
+            runtime_state=_maybe_runtime_state_dependency(runtime_state)
+            or _request_runtime_state_or_none(request),
+            object_storage=_maybe_object_storage_dependency(object_storage)
+            or _request_object_storage_or_none(request),
+            pdf_exporter=_maybe_pdf_exporter_dependency(pdf_exporter)
+            or _request_pdf_exporter_or_none(request),
         )
     except HTTPException as exc:
         public_detail = _public_error_text(
