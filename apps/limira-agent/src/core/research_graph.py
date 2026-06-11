@@ -216,6 +216,22 @@ def graph_phase_event(
     }
 
 
+def graph_error_event(
+    state: ResearchGraphState,
+    error: Exception,
+) -> dict[str, Any]:
+    """Return a stream error event for fatal graph execution failures."""
+
+    return {
+        "event": "error",
+        "data": {
+            "task_id": state.task_id,
+            "phase": state.phase.value,
+            "error": str(error),
+        },
+    }
+
+
 async def execute_research_graph(
     *,
     state: ResearchGraphState,
@@ -248,10 +264,14 @@ async def execute_research_graph(
         task_id=task_id,
         is_final_retry=is_final_retry,
     )
-    final_summary, final_boxed_answer = _validate_graph_final_outputs(
-        final_summary,
-        final_boxed_answer,
-    )
+    try:
+        final_summary, final_boxed_answer = _validate_graph_final_outputs(
+            final_summary,
+            final_boxed_answer,
+        )
+    except ValueError as exc:
+        await _emit_graph_error(stream_queue, current_state, exc)
+        raise
 
     for phase in (ResearchPhase.VERIFY, ResearchPhase.WRITE, ResearchPhase.COMPLETE):
         current_state = current_state.model_copy(update={"phase": phase})
@@ -334,6 +354,15 @@ async def _emit_graph_phase(
 ) -> None:
     if stream_queue is not None:
         await stream_queue.put(graph_phase_event(state, phase))
+
+
+async def _emit_graph_error(
+    stream_queue: Any,
+    state: ResearchGraphState,
+    error: Exception,
+) -> None:
+    if stream_queue is not None:
+        await stream_queue.put(graph_error_event(state, error))
 
 
 def _validate_graph_final_outputs(

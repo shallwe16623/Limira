@@ -414,6 +414,15 @@ async def test_feature_flagged_graph_executor_rejects_missing_final_outputs(
 
     assert result[1] == ""
     assert "research_graph_final_output_required" in result[0]
+    error_events = [
+        item for item in stream_queue.items if item.get("event") == "error"
+    ]
+    assert len(error_events) == 1
+    assert error_events[0]["data"] == {
+        "task_id": "task-pipeline-graph-missing-output",
+        "phase": "research",
+        "error": "research_graph_final_output_required",
+    }
     assert [
         item["data"]["phase"]
         for item in stream_queue.items
