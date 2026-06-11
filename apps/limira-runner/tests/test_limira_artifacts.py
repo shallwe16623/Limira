@@ -1,6 +1,10 @@
 import json
 
-from limira_tools.limira_artifacts import record_research_artifact, scrub_secrets
+from limira_tools.limira_artifacts import (
+    extract_evidence_refs,
+    record_research_artifact,
+    scrub_secrets,
+)
 from limira_tools.limira_evidence import ToolEvidenceLedger
 from pipeline_helpers import expand_stream_message
 
@@ -49,6 +53,39 @@ def test_record_research_artifact_preserves_evidence_source_url():
 
     assert artifact["type"] == "evidence_collected"
     assert artifact["payload"]["url"] == SCMP_URL
+
+
+def test_extract_evidence_refs_accepts_numeric_and_hash_ids_in_first_seen_order():
+    refs = extract_evidence_refs(
+        "Use [EVID-001], EVID-abcdef123456, [EVID-001], "
+        "EVID-ABCDEF123456, EVID-abc, and EVID-abcdef1234567."
+    )
+
+    assert refs == ["EVID-001", "EVID-abcdef123456", "EVID-ABCDEF123456"]
+
+
+def test_record_research_artifact_dedupes_and_validates_evidence_refs():
+    artifact = record_research_artifact(
+        "report_section",
+        {"title": "Finding", "markdown": "Finding [EVID-001]"},
+        evidence_refs=["EVID-001", "EVID-abcdef123456", "EVID-001"],
+    )
+
+    assert artifact["type"] == "report_section_generated"
+    assert artifact["payload"]["evidence_refs"] == [
+        "EVID-001",
+        "EVID-abcdef123456",
+    ]
+
+    warning = record_research_artifact(
+        "report_section",
+        {"title": "Finding", "markdown": "Finding [EVID-abc]"},
+        evidence_refs=["EVID-abc"],
+    )
+
+    assert warning["type"] == "artifact_warning"
+    assert warning["payload"]["warning"] == "invalid_artifact_payload"
+    assert warning["payload"]["errors"] == ["invalid evidence_ref: EVID-abc"]
 
 
 def test_tool_evidence_ledger_derives_google_search_evidence():

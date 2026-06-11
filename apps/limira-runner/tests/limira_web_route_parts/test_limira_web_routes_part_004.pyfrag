@@ -1014,6 +1014,158 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_extracts_hash_evidence_refs_and_warns_on_missing_refs():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    evidence_ref = "EVID-abcdef123456"
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {
+                        "text": (
+                            "# Final answer\n\n"
+                            f"Claim cites [{evidence_ref}], {evidence_ref}, "
+                            "EVID-abc, and EVID-abcdef1234567."
+                        )
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "hash evidence refs"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    report_event = next(
+        event for event in events if event["type"] == "report_section_generated"
+    )
+    assert report_event["payload"]["evidence_refs"] == [evidence_ref]
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["report_sections"][0]["evidence_refs"] == [evidence_ref]
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    assert trace["artifact_warnings"][-1]["payload"]["warning"] == (
+        "unresolved_evidence_refs"
+    )
+    assert trace["artifact_warnings"][-1]["payload"]["evidence_refs"] == [evidence_ref]
+
+
+@pytest.mark.asyncio
+async def test_event_proxy_accepts_existing_hash_evidence_refs_without_warning():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    evidence_ref = "EVID-abcdef123456"
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": evidence_ref,
+                    "title": "Hash-backed source",
+                    "summary": "Content-bearing source.",
+                    "source_url": "https://example.test/source",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {
+                        "text": f"# Final answer\n\nClaim cites [{evidence_ref}]."
+                    },
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "Final Summary", "agent_id": "agent-final"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "existing hash evidence refs"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    report_event = next(
+        event for event in events if event["type"] == "report_section_generated"
+    )
+    assert report_event["payload"]["evidence_refs"] == [evidence_ref]
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == evidence_ref
+    assert artifacts["report_sections"][0]["evidence_refs"] == [evidence_ref]
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    assert trace["artifact_warnings"] == []
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_persists_nested_runner_final_summary_show_text_as_report_section():
     repo = limira.InMemoryLimiraTaskRepository()
     user = limira.LimiraUser("user-a")

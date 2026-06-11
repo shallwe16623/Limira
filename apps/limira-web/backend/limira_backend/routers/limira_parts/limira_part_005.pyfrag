@@ -219,16 +219,18 @@ def _record_artifact_from_event(
     artifact = dict(artifact_payload)
     artifact.setdefault("artifact_type", artifact_type)
     artifact.setdefault("source_event_type", event.get("type"))
-    if artifact_type == "report_section":
-        artifact = _normalize_report_section_artifact(artifact)
     if metadata.get("evidence_refs") is not None:
         artifact.setdefault("evidence_refs", metadata["evidence_refs"])
     if metadata.get("confidence") is not None:
         artifact.setdefault("confidence", metadata["confidence"])
     if metadata.get("notes") is not None:
         artifact.setdefault("notes", metadata["notes"])
+    if artifact_type == "report_section":
+        artifact = _normalize_report_section_artifact(artifact)
     _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
     repo.record_artifact(task.task_id, artifact_type, artifact)
+    if artifact_type == "report_section":
+        _record_unresolved_evidence_ref_warning(repo, task.task_id, artifact)
     return None
 
 
@@ -267,6 +269,7 @@ def _record_final_show_text_report_from_event(
     }
     _ensure_artifact_id(repo, task.task_id, "report_section", artifact)
     repo.record_artifact(task.task_id, "report_section", artifact)
+    _record_unresolved_evidence_ref_warning(repo, task.task_id, artifact)
     return {
         "task_id": task.task_id,
         "type": "report_section_generated",
@@ -578,6 +581,9 @@ def _normalize_report_section_artifact(artifact: dict[str, Any]) -> dict[str, An
     section_id = _report_section_id_from_value(source)
     if section_id and not normalized.get("section_id"):
         normalized["section_id"] = section_id
+    refs = _report_section_evidence_refs(normalized)
+    if refs or "evidence_refs" in normalized:
+        normalized["evidence_refs"] = refs
     return normalized
 
 
@@ -613,15 +619,100 @@ def _public_artifacts(artifacts: Mapping[str, Any]) -> dict[str, list[dict[str, 
     return _normalize_report_section_artifacts(scrubbed if isinstance(scrubbed, Mapping) else {})
 
 
+EVIDENCE_REF_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(EVID-(?:\d{3,}|[0-9a-fA-F]{12}))(?![A-Za-z0-9_-])"
+)
+EVIDENCE_REF_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
+
+
 def _evidence_refs_from_markdown(markdown: str) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
-    for match in re.finditer(r"\[(EVID-\d{3,})\]", markdown):
+    for match in EVIDENCE_REF_PATTERN.finditer(markdown):
         ref = match.group(1)
         if ref not in seen:
             refs.append(ref)
             seen.add(ref)
     return refs
+
+
+def _is_evidence_ref(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and EVIDENCE_REF_FULL_PATTERN.fullmatch(value.strip()) is not None
+    )
+
+
+def _evidence_refs_from_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    refs: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        ref = str(item).strip()
+        if _is_evidence_ref(ref) and ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+    return refs
+
+
+def _report_section_evidence_refs(artifact: Mapping[str, Any]) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for ref in _evidence_refs_from_value(artifact.get("evidence_refs")):
+        refs.append(ref)
+        seen.add(ref)
+    markdown_refs = _evidence_refs_from_markdown(str(artifact.get("markdown") or ""))
+    for ref in markdown_refs:
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+    return refs
+
+
+def _known_evidence_ids(repo: LimiraTaskRepository, task_id: str) -> set[str]:
+    artifacts = repo.get_artifacts(task_id)
+    known: set[str] = set()
+    for evidence in artifacts.get("evidence", []):
+        if not isinstance(evidence, Mapping):
+            continue
+        evidence_id = evidence.get("evidence_id")
+        if _is_evidence_ref(evidence_id):
+            known.add(str(evidence_id).strip())
+    return known
+
+
+def _record_unresolved_evidence_ref_warning(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    artifact: Mapping[str, Any],
+) -> None:
+    refs = _evidence_refs_from_value(artifact.get("evidence_refs"))
+    if not refs:
+        return
+    known = _known_evidence_ids(repo, task_id)
+    missing = [ref for ref in refs if ref not in known]
+    if not missing:
+        return
+    repo.record_artifact_trace_event(
+        task_id,
+        _artifact_trace_event_from_warning(
+            {
+                "type": "artifact_warning",
+                "payload": {
+                    "warning": "unresolved_evidence_refs",
+                    "artifact_type": "report_section",
+                    "source_event_type": artifact.get("source_event_type"),
+                    "local_artifact_id": artifact.get("section_id"),
+                    "evidence_refs": missing,
+                    "non_fatal": True,
+                },
+            }
+        ),
+    )
 
 
 def _record_and_return_artifact_warning(

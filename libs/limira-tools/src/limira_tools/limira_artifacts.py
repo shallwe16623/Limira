@@ -41,6 +41,10 @@ SENSITIVE_ENV_NAMES = {
 AUTHORIZATION_HEADER = re.compile(r"(?im)(\bAuthorization\s*[:=]\s*)([^\r\n;,]+)")
 COOKIE_HEADER = re.compile(r"(?im)(\b(?:Set-)?Cookie\s*[:=]\s*)([^\r\n]+)")
 URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+EVIDENCE_REF_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(EVID-(?:\d{3,}|[0-9a-fA-F]{12}))(?![A-Za-z0-9_-])"
+)
+EVIDENCE_REF_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
 SECRET_PATTERNS = (
     re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
@@ -165,6 +169,26 @@ def artifact_event_from_tool_call(message: dict[str, Any]) -> dict[str, Any] | N
         confidence=tool_input.get("confidence"),
         notes=tool_input.get("notes"),
     )
+
+
+def is_evidence_ref(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and EVIDENCE_REF_FULL_PATTERN.fullmatch(value.strip()) is not None
+    )
+
+
+def extract_evidence_refs(text: Any) -> list[str]:
+    if text is None:
+        return []
+    refs: list[str] = []
+    seen: set[str] = set()
+    for match in EVIDENCE_REF_PATTERN.finditer(str(text)):
+        ref = match.group(1)
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
+    return refs
 
 
 def scrub_secrets(value: Any) -> Any:
@@ -330,11 +354,16 @@ def _normalize_evidence_refs(value: Any) -> tuple[list[str] | None, list[str]]:
         return None, ["evidence_refs must be a string or list of strings"]
 
     refs: list[str] = []
+    seen: set[str] = set()
     for item in values:
         ref = str(item).strip()
         if not ref:
             return None, ["evidence_refs cannot contain empty values"]
-        refs.append(ref)
+        if not is_evidence_ref(ref):
+            return None, [f"invalid evidence_ref: {ref}"]
+        if ref not in seen:
+            refs.append(ref)
+            seen.add(ref)
     return refs, []
 
 
