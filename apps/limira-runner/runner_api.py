@@ -215,6 +215,8 @@ async def cancel_task(request: web.Request) -> web.Response:
             record.task_id,
         ):
             record = _finalize_running_without_worker_cancellation(request, record)
+            if record.status == "running":
+                return _error("task_owned_by_active_worker", status=409)
             return web.json_response(
                 {**_task_response(record), "cancel_requested": True}
             )
@@ -224,6 +226,8 @@ async def cancel_task(request: web.Request) -> web.Response:
         record.task_id,
     ):
         record = _finalize_running_without_worker_cancellation(request, record)
+        if record.status == "running":
+            return _error("task_owned_by_active_worker", status=409)
         return web.json_response({**_task_response(record), "cancel_requested": True})
 
     _request_task_cancel(request.app, record.task_id)
@@ -826,6 +830,7 @@ def _finalize_stale_running_task(
         completed_at=completed_at,
         error=error,
         warnings=[warning],
+        lease_checked_at=completed_at,
     )
     if updated is None:
         return store.get_task(record.task_id) or record
@@ -918,15 +923,31 @@ def _finalize_running_without_worker_cancellation(
     cancelled_at = clock()
     error = "task cancelled because no active stream worker was registered"
     store: TaskStore = request.app[TASK_STORE_KEY]
+    canceller = getattr(store, "cancel_stale_running_task", None)
+    if canceller is None:
+        return record
+    claimed = canceller(
+        record.task_id,
+        completed_at=cancelled_at,
+        error=scrub_secrets(error),
+        archive_status="failed",
+        archive_dir=None,
+        archive_zip_path=None,
+        warnings=["cancelled running task without active stream worker"],
+        lease_checked_at=cancelled_at,
+    )
+    if claimed is None:
+        return store.get_task(record.task_id) or record
+
     writer = request.app[ARCHIVE_WRITER_KEY](request.app[ARCHIVE_ROOT_KEY], clock=clock)
 
     try:
         writer.start(
-            task_id=record.task_id,
-            query=record.query,
-            user_id=record.user_id,
-            model_summary=record.model_summary,
-            start_time=record.started_at or cancelled_at,
+            task_id=claimed.task_id,
+            query=claimed.query,
+            user_id=claimed.user_id,
+            model_summary=claimed.model_summary,
+            start_time=claimed.started_at or cancelled_at,
         )
         end_time = clock()
         archive_result = writer.complete(
@@ -936,8 +957,7 @@ def _finalize_running_without_worker_cancellation(
             end_time=end_time,
         )
         updated = store.update_task(
-            record.task_id,
-            status="cancelled",
+            claimed.task_id,
             completed_at=end_time,
             error=scrub_secrets(error),
             **_archive_result_updates(archive_result),
@@ -946,8 +966,7 @@ def _finalize_running_without_worker_cancellation(
         end_time = clock()
         final_error = f"{error}; archive finalization failed: {exc}"
         updated = store.update_task(
-            record.task_id,
-            status="cancelled",
+            claimed.task_id,
             archive_status="failed",
             archive_dir=None,
             archive_zip_path=None,

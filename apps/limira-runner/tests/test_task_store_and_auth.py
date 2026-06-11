@@ -366,6 +366,67 @@ def test_task_store_lists_and_finalizes_only_running_tasks(tmp_path):
     assert unchanged.warnings == []
 
 
+def test_task_store_recovery_preserves_lease_renewed_after_classification(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    for task_id in ("task-stale-race", "task-cancel-race"):
+        store.create_task(
+            task_id=task_id,
+            user_id="user-a",
+            query=task_id,
+            created_at="2026-06-06T12:00:00+00:00",
+        )
+        store.claim_queued_task(
+            task_id,
+            started_at="2026-06-06T12:01:00+00:00",
+            worker_id=f"worker-{task_id}",
+            lease_expires_at="2026-06-06T12:05:00+00:00",
+        )
+
+    store.renew_task_lease(
+        "task-stale-race",
+        worker_id="worker-task-stale-race",
+        heartbeat_at="2026-06-06T12:10:01+00:00",
+        lease_expires_at="2026-06-06T12:20:00+00:00",
+    )
+    stale_recovery = store.finalize_stale_running_task(
+        "task-stale-race",
+        completed_at="2026-06-06T12:10:02+00:00",
+        error="stale_running_task_recovered:expired_lease",
+        warnings=["stale running task recovered: expired_lease"],
+        lease_checked_at="2026-06-06T12:10:00+00:00",
+    )
+
+    store.renew_task_lease(
+        "task-cancel-race",
+        worker_id="worker-task-cancel-race",
+        heartbeat_at="2026-06-06T12:10:01+00:00",
+        lease_expires_at="2026-06-06T12:20:00+00:00",
+    )
+    cancel_recovery = store.cancel_stale_running_task(
+        "task-cancel-race",
+        completed_at="2026-06-06T12:10:02+00:00",
+        error="task cancelled because no active stream worker was registered",
+        archive_status="failed",
+        archive_dir=None,
+        archive_zip_path=None,
+        warnings=["cancelled running task without active stream worker"],
+        lease_checked_at="2026-06-06T12:10:00+00:00",
+    )
+
+    stale_current = store.get_task("task-stale-race")
+    cancel_current = store.get_task("task-cancel-race")
+    assert stale_recovery is None
+    assert stale_current.status == "running"
+    assert stale_current.lease_expires_at == "2026-06-06T12:20:00+00:00"
+    assert stale_current.completed_at is None
+    assert stale_current.error is None
+    assert cancel_recovery is None
+    assert cancel_current.status == "running"
+    assert cancel_current.lease_expires_at == "2026-06-06T12:20:00+00:00"
+    assert cancel_current.completed_at is None
+    assert cancel_current.error is None
+
+
 def test_runner_task_store_factory_requires_explicit_sqlite_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("RUNNER_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -444,6 +505,8 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "runner_task_id = task_id" in sql
     assert "metadata = metadata || cast(%s as jsonb)" in sql
     assert "runner_lease" in sql
+    assert "lease_expires_at" in sql
+    assert "timestamptz" in sql
     assert "jsonb_build_object" in sql
     assert "limira_task_event_logs" in sql
     assert "source = 'runner'" in sql
@@ -666,6 +729,71 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert protected is None
     assert store.get_task("task-a").status == "completed"
 
+    store.create_task(
+        task_id="task-stale-race",
+        user_id="user-a",
+        query="stale race",
+        created_at="2026-06-06T12:17:00+00:00",
+    )
+    store.claim_queued_task(
+        "task-stale-race",
+        started_at="2026-06-06T12:18:00+00:00",
+        worker_id="worker-stale-race",
+        lease_expires_at="2026-06-06T12:19:00+00:00",
+    )
+    store.renew_task_lease(
+        "task-stale-race",
+        worker_id="worker-stale-race",
+        heartbeat_at="2026-06-06T12:20:01+00:00",
+        lease_expires_at="2026-06-06T12:30:00+00:00",
+    )
+    stale_race = store.finalize_stale_running_task(
+        "task-stale-race",
+        completed_at="2026-06-06T12:20:02+00:00",
+        error="stale_running_task_recovered:expired_lease",
+        warnings=["stale running task recovered: expired_lease"],
+        lease_checked_at="2026-06-06T12:20:00+00:00",
+    )
+    stale_race_current = store.get_task("task-stale-race")
+    assert stale_race is None
+    assert stale_race_current.status == "running"
+    assert stale_race_current.lease_expires_at == "2026-06-06T12:30:00+00:00"
+    assert stale_race_current.completed_at is None
+
+    store.create_task(
+        task_id="task-cancel-race",
+        user_id="user-a",
+        query="cancel race",
+        created_at="2026-06-06T12:21:00+00:00",
+    )
+    store.claim_queued_task(
+        "task-cancel-race",
+        started_at="2026-06-06T12:22:00+00:00",
+        worker_id="worker-cancel-race",
+        lease_expires_at="2026-06-06T12:23:00+00:00",
+    )
+    store.renew_task_lease(
+        "task-cancel-race",
+        worker_id="worker-cancel-race",
+        heartbeat_at="2026-06-06T12:24:01+00:00",
+        lease_expires_at="2026-06-06T12:35:00+00:00",
+    )
+    cancel_race = store.cancel_stale_running_task(
+        "task-cancel-race",
+        completed_at="2026-06-06T12:24:02+00:00",
+        error="task cancelled because no active stream worker was registered",
+        archive_status="failed",
+        archive_dir=None,
+        archive_zip_path=None,
+        warnings=["cancelled running task without active stream worker"],
+        lease_checked_at="2026-06-06T12:24:00+00:00",
+    )
+    cancel_race_current = store.get_task("task-cancel-race")
+    assert cancel_race is None
+    assert cancel_race_current.status == "running"
+    assert cancel_race_current.lease_expires_at == "2026-06-06T12:35:00+00:00"
+    assert cancel_race_current.completed_at is None
+
 
 def test_auth_adapter_accepts_trusted_headers_only():
     auth = authenticate_headers(
@@ -887,6 +1015,29 @@ class FakeRunnerPostgresConnection:
             )
             return FakeRunnerPostgresCursor([])
 
+        if "set status = 'cancelled'" in lowered and "and status = 'running'" in lowered:
+            archive_status, completed_at, error, metadata_update, task_id, checked_at = (
+                params
+            )
+            row = self.database.rows.get(task_id)
+            if not row or row["status"] != "running":
+                return FakeRunnerPostgresCursor([])
+            if (
+                "runner_task_id = task_id" in lowered
+                and row["runner_task_id"] != row["task_id"]
+            ):
+                return FakeRunnerPostgresCursor([])
+            if not _lease_allows_recovery(row, checked_at):
+                return FakeRunnerPostgresCursor([])
+            row["status"] = "cancelled"
+            row["archive_status"] = archive_status
+            row["completed_at"] = completed_at
+            row["error"] = error
+            metadata = _metadata_dict(row)
+            metadata.update(json.loads(metadata_update))
+            row["metadata"] = metadata
+            return FakeRunnerPostgresCursor([row])
+
         if "set status = 'cancelled'" in lowered:
             started_at, completed_at, error, task_id = params
             row = self.database.rows.get(task_id)
@@ -900,7 +1051,7 @@ class FakeRunnerPostgresConnection:
             return FakeRunnerPostgresCursor([row])
 
         if "set status = 'failed'" in lowered and "and status = 'running'" in lowered:
-            completed_at, error, metadata_update, task_id = params
+            completed_at, error, metadata_update, task_id, checked_at = params
             row = self.database.rows.get(task_id)
             if not row or row["status"] != "running":
                 return FakeRunnerPostgresCursor([])
@@ -908,6 +1059,8 @@ class FakeRunnerPostgresConnection:
                 "runner_task_id = task_id" in lowered
                 and row["runner_task_id"] != row["task_id"]
             ):
+                return FakeRunnerPostgresCursor([])
+            if not _lease_allows_recovery(row, checked_at):
                 return FakeRunnerPostgresCursor([])
             row["status"] = "failed"
             row["archive_status"] = "failed"
@@ -974,3 +1127,12 @@ def _metadata_dict(row):
     if isinstance(metadata, dict):
         return dict(metadata)
     return {}
+
+
+def _lease_allows_recovery(row, checked_at):
+    metadata = _metadata_dict(row)
+    lease = metadata.get("runner_lease")
+    if not isinstance(lease, dict):
+        return True
+    lease_expires_at = lease.get("lease_expires_at")
+    return not lease_expires_at or str(lease_expires_at) <= str(checked_at)

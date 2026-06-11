@@ -226,6 +226,76 @@ class StreamClaimRaceStore(TaskStore):
         )
 
 
+class RenewingStaleRecoveryRaceStore(TaskStore):
+    def __init__(self, db_path):
+        super().__init__(db_path)
+        self.renewed_during_recovery = False
+
+    def finalize_stale_running_task(
+        self,
+        task_id,
+        *,
+        completed_at,
+        error,
+        warnings=None,
+        lease_checked_at=None,
+    ):
+        current = self.get_task(task_id)
+        if current and current.worker_id:
+            self.renew_task_lease(
+                task_id,
+                worker_id=current.worker_id,
+                heartbeat_at=completed_at,
+                lease_expires_at="2026-06-06T13:00:00+00:00",
+            )
+            self.renewed_during_recovery = True
+        return super().finalize_stale_running_task(
+            task_id,
+            completed_at=completed_at,
+            error=error,
+            warnings=warnings,
+            lease_checked_at=lease_checked_at,
+        )
+
+
+class RenewingCancelRaceStore(TaskStore):
+    def __init__(self, db_path):
+        super().__init__(db_path)
+        self.renewed_during_cancel = False
+
+    def cancel_stale_running_task(
+        self,
+        task_id,
+        *,
+        completed_at,
+        error,
+        archive_status,
+        archive_dir=None,
+        archive_zip_path=None,
+        warnings=None,
+        lease_checked_at=None,
+    ):
+        current = self.get_task(task_id)
+        if current and current.worker_id:
+            self.renew_task_lease(
+                task_id,
+                worker_id=current.worker_id,
+                heartbeat_at=completed_at,
+                lease_expires_at="2026-06-06T13:00:00+00:00",
+            )
+            self.renewed_during_cancel = True
+        return super().cancel_stale_running_task(
+            task_id,
+            completed_at=completed_at,
+            error=error,
+            archive_status=archive_status,
+            archive_dir=archive_dir,
+            archive_zip_path=archive_zip_path,
+            warnings=warnings,
+            lease_checked_at=lease_checked_at,
+        )
+
+
 async def make_client(
     tmp_path,
     stream_events=completed_stream,
@@ -576,6 +646,32 @@ async def test_runner_api_startup_recovers_stale_running_task_without_worker(tmp
         assert status_payload["warnings"] == [
             "stale running task recovered: no_active_worker"
         ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_startup_preserves_lease_renewed_during_stale_recovery(
+    tmp_path,
+):
+    store = RenewingStaleRecoveryRaceStore(tmp_path / "tasks.sqlite3")
+    running = seed_running_task(
+        store,
+        worker_id="runner-other:task-stale-race:worker",
+        lease_expires_at="2026-06-06T11:00:00+00:00",
+    )
+    client, store = await make_client(tmp_path, task_store=store)
+    try:
+        current = store.get_task(running.task_id)
+
+        assert store.renewed_during_recovery is True
+        assert current.status == "running"
+        assert current.worker_id == "runner-other:task-stale-race:worker"
+        assert current.lease_expires_at == "2026-06-06T13:00:00+00:00"
+        assert current.completed_at is None
+        assert current.error is None
+        assert current.checkpoint == {}
+        assert store.list_task_events(running.task_id) == []
     finally:
         await client.close()
 
@@ -1569,6 +1665,40 @@ async def test_runner_api_cancel_finalizes_expired_external_lease_without_worker
         assert current.error.startswith(
             "task cancelled because no active stream worker was registered"
         )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_cancel_preserves_lease_renewed_during_no_worker_cancel(
+    tmp_path,
+):
+    store = RenewingCancelRaceStore(tmp_path / "tasks.sqlite3")
+    client, store = await make_client(tmp_path, task_store=store)
+    try:
+        seeded = seed_running_task(
+            store,
+            worker_id="runner-other:task-cancel-race:worker",
+            lease_expires_at="2026-06-06T11:00:00+00:00",
+        )
+
+        cancel_response = await client.post(
+            f"/limira-runner/tasks/{seeded.task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        cancel_payload = await cancel_response.json()
+        current = store.get_task(seeded.task_id)
+
+        assert cancel_response.status == 409
+        assert cancel_payload["error"] == "task_owned_by_active_worker"
+        assert store.renewed_during_cancel is True
+        assert current.status == "running"
+        assert current.worker_id == "runner-other:task-cancel-race:worker"
+        assert current.lease_expires_at == "2026-06-06T13:00:00+00:00"
+        assert current.completed_at is None
+        assert current.error is None
+        assert current.archive_dir is None
+        assert store.list_task_events(seeded.task_id) == []
     finally:
         await client.close()
 
