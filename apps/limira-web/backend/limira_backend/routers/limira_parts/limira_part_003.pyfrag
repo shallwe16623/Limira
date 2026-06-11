@@ -968,7 +968,9 @@ async def get_task(
     repo: LimiraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
-    return _assert_browser_safe(task.public_dict())
+    payload = task.public_dict()
+    payload["operational_status"] = _public_task_operational_status(repo, task)
+    return _assert_browser_safe(payload)
 
 
 @router.post("/tasks/{task_id}/history/archive")
@@ -1132,6 +1134,7 @@ async def admin_get_task(
         raise HTTPException(status_code=404, detail="task_not_found")
     payload = task.public_dict()
     payload["admin_view"] = True
+    payload["operational_status"] = _public_task_operational_status(repo, task)
     return _assert_browser_safe(payload)
 
 
@@ -1141,10 +1144,16 @@ _ADMIN_EVENT_LOG_FORBIDDEN_FIELDS = {
     *OBJECT_KEY_FORBIDDEN_FIELDS,
     "adminUserId",
     "admin_user_id",
+    "leaseId",
+    "lease_id",
+    "leaseToken",
+    "lease_token",
     "ownerUserId",
     "runnerTaskId",
     "userId",
     "user_id",
+    "workerId",
+    "worker_id",
 }
 _ADMIN_EVENT_LOG_FORBIDDEN_TEXT = {
     *FORBIDDEN_BROWSER_SUBSTRINGS,
@@ -1159,6 +1168,12 @@ _ADMIN_EVENT_LOG_FORBIDDEN_TEXT = {
     "pdf_object_key",
     "runnerTaskId",
     "runner_task_id",
+    "workerId",
+    "worker_id",
+    "leaseId",
+    "lease_id",
+    "leaseToken",
+    "lease_token",
     "userId",
     "user_id",
 }

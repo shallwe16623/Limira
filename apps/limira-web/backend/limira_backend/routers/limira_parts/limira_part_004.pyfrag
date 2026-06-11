@@ -193,6 +193,12 @@ def _build_persisted_archive_zip(
         evidence_refs=evidence_refs,
     )
     public_model_summary = _public_model_summary(task.model_summary or {})
+    operational_status = _public_task_operational_status(
+        repo,
+        task,
+        task_event_logs=task_event_logs,
+        artifact_events=artifact_events,
+    )
     snapshot_manifest, snapshot_members = _build_evidence_snapshot_members(
         artifacts,
         task_event_logs,
@@ -215,6 +221,7 @@ def _build_persisted_archive_zip(
         },
         "artifact_event_count": len(artifact_events),
         "artifact_warning_count": len(artifact_warnings),
+        "operational_status": operational_status,
         "reports": [report.public_dict() for report in reports],
         "uploaded_documents": [document.public_dict() for document in documents],
         "evidence_snapshots": snapshot_manifest,
@@ -224,6 +231,7 @@ def _build_persisted_archive_zip(
         "artifacts": artifacts,
         "artifact_events": artifact_events,
         "artifact_warnings": artifact_warnings,
+        "operational_status": operational_status,
         "reports": [report.public_dict() for report in reports],
         "uploaded_documents": [document.public_dict() for document in documents],
         "task_event_logs": task_event_logs,
@@ -939,7 +947,23 @@ def _normalize_archive_json_payload(value: Any, *, member_name: str | None) -> A
         trace["artifact_events"] = _normalize_report_section_trace_events(
             [dict(event) for event in artifact_events if isinstance(event, dict)]
         )
+    task_event_logs = trace.get("task_event_logs")
+    if isinstance(task_event_logs, list):
+        trace["task_event_logs"] = [
+            _public_archive_task_event_log(event)
+            for event in task_event_logs
+            if isinstance(event, dict)
+        ]
     return trace
+
+
+def _public_archive_task_event_log(event: dict[str, Any]) -> dict[str, Any]:
+    public_event = dict(event)
+    public_event["payload"] = _public_admin_event_log_value(
+        event.get("payload"),
+        forbidden_values=set(),
+    )
+    return public_event
 
 
 def _public_archive_member_payload(member_name: str, payload: Any) -> Any:

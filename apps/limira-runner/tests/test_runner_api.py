@@ -20,9 +20,10 @@ from runner_api import (
     TASK_EVENT_LOG_KEY,
     UPDATE_STATE_KEY,
     _checkpoint_envelope,
+    _task_response,
     create_app,
 )
-from task_store import TaskStore
+from task_store import TaskRecord, TaskStore
 
 
 USER_A_HEADERS = {
@@ -476,6 +477,64 @@ def test_checkpoint_envelope_reserves_recoverable_runner_fields():
     assert checkpoint["executor_state"]["event_count"] == 0
     assert checkpoint["executor_state"]["render_state"] == {"safe": True}
     assert checkpoint["recoverable_reason"] == "legacy_stream_checkpoint_not_resumable"
+
+
+def test_task_response_exposes_secret_safe_operational_status():
+    record = TaskRecord(
+        task_id="task-observable",
+        user_id="user-a",
+        query="observable query",
+        status="running",
+        archive_status="pending",
+        archive_dir=None,
+        archive_zip_path=None,
+        created_at="2026-06-06T11:59:59+00:00",
+        started_at="2026-06-06T12:00:00+00:00",
+        error="stale_running_task_recovered:OPENAI_API_KEY=sk-secret",
+        model_summary={
+            "provider": "deepseek",
+            "base_url": "https://example.invalid/v1?api_key=sk-secret",
+        },
+        worker_id="runner-one:task-observable:worker-secret",
+        lease_expires_at="2026-06-06T12:10:00+00:00",
+        heartbeat_at="2026-06-06T12:05:00+00:00",
+        attempt=2,
+        checkpoint={
+            "phase": "verify",
+            "status": "running",
+            "current_research_unit": "unit with sk-secret",
+            "source_ledger": [{"url": "https://example.test/secret"}],
+            "evidence_ledger": [{"evidence_id": "EVID-001"}],
+            "executor_state": {"token": "sk-secret"},
+            "resume_policy": "fail_recoverable",
+            "recoverable_reason": "OPENAI_API_KEY=sk-secret",
+        },
+        checkpoint_updated_at="2026-06-06T12:05:01+00:00",
+    )
+
+    payload = _task_response(record)
+    operational = payload["operational_status"]
+
+    assert_public_task_response_hides_internal_identifiers(payload)
+    assert operational["lease"] == {
+        "state": "leased",
+        "worker_present": True,
+        "lease_expires_at": "2026-06-06T12:10:00+00:00",
+        "heartbeat_at": "2026-06-06T12:05:00+00:00",
+        "attempt": 2,
+    }
+    assert operational["checkpoint"]["phase"] == "verify"
+    assert operational["checkpoint"]["status"] == "running"
+    assert operational["checkpoint"]["current_research_unit_present"] is True
+    assert operational["checkpoint"]["source_ledger_count"] == 1
+    assert operational["checkpoint"]["evidence_ledger_count"] == 1
+    assert operational["checkpoint"]["executor_state_present"] is True
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "runner-one:task-observable:worker-secret" not in serialized
+    assert "unit with sk-secret" not in serialized
+    assert "\"executor_state\"" not in serialized
+    assert "sk-secret" not in serialized
+    assert "base_url" not in serialized
 
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):

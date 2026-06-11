@@ -704,6 +704,7 @@ async def test_background_ingestion_failure_records_diagnostic_event():
     repo = limira.InMemoryLimiraTaskRepository()
     user = limira.LimiraUser("user-a")
     runtime_state = limira.InMemoryLimiraRuntimeState()
+    storage = limira.InMemoryLimiraObjectStorage()
     research = FakeResearchClient(
         stream_exception=RuntimeError(
             "OPENAI_API_KEY=sk-background-ingestion-secret"
@@ -717,12 +718,21 @@ async def test_background_ingestion_failure_records_diagnostic_event():
         repo=repo,
         research_client=research,
         runtime_state=runtime_state,
-        object_storage=limira.InMemoryLimiraObjectStorage(),
+        object_storage=storage,
         pdf_exporter=FakePdfExporter(),
     )
     task_id = created["task_id"]
     await limira._await_server_ingestion_task(task_id)
 
+    repo.update_task(
+        task_id,
+        model_summary={
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "api_key": "sk-background-ingestion-secret",
+            "base_url": "https://runner.internal/v1",
+        },
+    )
     task = repo.get_task(task_id)
     assert task.status == "failed"
     assert task.archive_status == "failed"
@@ -739,8 +749,104 @@ async def test_background_ingestion_failure_records_diagnostic_event():
     assert runtime["archive_status"] == "failed"
     assert runtime["error"] == "server_ingestion_failed"
     assert runtime["stream_state"] == "closed"
+    status_payload = await limira.get_task(task_id, user=user, repo=repo)
+    operational = status_payload["operational_status"]
+    assert operational["task"]["status"] == "failed"
+    assert operational["ingestion"]["state"] == "failed"
+    assert operational["ingestion"]["latest_error"] == "server_ingestion_failed"
+    assert operational["diagnostics"]["latest_event_type"] == "server_ingestion_failed"
+    assert operational["event_log_count"] == len(event_logs)
+
+    repo.update_task(task_id, archive_status="ready")
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    assert metadata["operational_status"]["ingestion"]["state"] == "failed"
+    assert trace["operational_status"]["ingestion"]["latest_error"] == (
+        "server_ingestion_failed"
+    )
+    assert trace["task_event_logs"][-1]["event_type"] == "server_ingestion_failed"
+    assert "api_key" not in json.dumps(status_payload, ensure_ascii=False)
+    assert "base_url" not in json.dumps(metadata, ensure_ascii=False)
+    assert "sk-background-ingestion-secret" not in json.dumps(trace, ensure_ascii=False)
+    assert "runner.internal" not in members["metadata.json"]
     _assert_no_browser_leak(event_logs)
     _assert_no_browser_leak(runtime)
+    _assert_no_browser_leak(status_payload)
+    _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
+async def test_task_operational_status_summarizes_recovery_events_in_archive():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    storage = limira.InMemoryLimiraObjectStorage()
+    created = repo.create_task(
+        task_id="task-recovery-observable",
+        owner_user_id=user.id,
+        query="recovery observability",
+        scenario=None,
+        runner_task_id="runner-recovery-observable",
+    )
+    repo.update_task(
+        created.task_id,
+        status="failed",
+        archive_status="ready",
+        error="stale_running_task_recovered:expired_lease",
+    )
+    repo.record_task_event_log(
+        created.task_id,
+        {
+            "type": "error",
+            "payload": {
+                "status": "failed",
+                "archive_status": "failed",
+                "error": "stale_running_task_recovered:expired_lease",
+                "warning": "stale running task recovered: expired_lease",
+                "recovery_reason": "expired_lease",
+                "worker_id": "runner-worker-secret",
+                "lease_token": "lease-token-secret",
+                "OPENAI_API_KEY": "sk-recovery-secret",
+            },
+        },
+    )
+
+    status_payload = await limira.get_task(created.task_id, user=user, repo=repo)
+    operational = status_payload["operational_status"]
+    assert operational["recovery"]["event_count"] == 1
+    assert operational["recovery"]["latest_reason"] == "expired_lease"
+    assert operational["diagnostics"]["latest_error"] == (
+        "stale_running_task_recovered:expired_lease"
+    )
+    assert operational["warnings"]["latest"] == (
+        "stale running task recovered: expired_lease"
+    )
+
+    archive_response = await limira.download_task_archive(
+        created.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    trace = json.loads(members["trace.json"])
+    assert trace["operational_status"]["recovery"]["latest_reason"] == (
+        "expired_lease"
+    )
+    assert "worker_id" not in json.dumps(trace["task_event_logs"], ensure_ascii=False)
+    assert "lease_token" not in json.dumps(trace["task_event_logs"], ensure_ascii=False)
+    combined = json.dumps({"status": status_payload, "archive": members})
+    assert "runner-worker-secret" not in combined
+    assert "lease-token-secret" not in combined
+    assert "sk-recovery-secret" not in combined
+    _assert_no_browser_leak(status_payload)
+    _assert_no_browser_leak(members)
 
 
 @pytest.mark.asyncio

@@ -1830,6 +1830,154 @@ def _public_reason_text(value: Any) -> str | None:
     return _public_error_text(value, fallback="runner_stream_conflict")
 
 
+def _public_task_operational_status(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    *,
+    task_event_logs: list[dict[str, Any]] | None = None,
+    artifact_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    event_logs = list(
+        task_event_logs
+        if task_event_logs is not None
+        else repo.list_task_event_logs(task.task_id, limit=500)
+    )
+    trace_events = list(
+        artifact_events
+        if artifact_events is not None
+        else repo.get_artifact_trace_events(task.task_id)
+    )
+    artifact_warnings = [
+        event for event in trace_events if event.get("type") == "artifact_warning"
+    ]
+    latest_event = event_logs[-1] if event_logs else {}
+    diagnostic_events = [
+        event
+        for event in event_logs
+        if _task_event_log_is_diagnostic(event)
+    ]
+    warning_events = [
+        event
+        for event in event_logs
+        if _task_event_log_warning(event) is not None
+    ]
+    recovery_events = [
+        event
+        for event in event_logs
+        if _task_event_log_recovery_reason(event) is not None
+    ]
+    ingestion_events = [
+        event
+        for event in event_logs
+        if str(event.get("event_type") or "").startswith("server_ingestion")
+    ]
+    latest_diagnostic = diagnostic_events[-1] if diagnostic_events else {}
+
+    status = {
+        "task": {
+            "status": task.status,
+            "archive_status": task.archive_status,
+            "error": _public_error_text(task.error, fallback="limira_task_failed"),
+        },
+        "event_log_count": len(event_logs),
+        "artifact_warning_count": len(artifact_warnings),
+        "latest_event_type": _optional_public_text(latest_event.get("event_type")),
+        "latest_event_source": _optional_public_text(latest_event.get("source")),
+        "diagnostics": {
+            "count": len(diagnostic_events),
+            "latest_event_type": _optional_public_text(
+                latest_diagnostic.get("event_type")
+            ),
+            "latest_error": _task_event_log_error(latest_diagnostic),
+            "latest_warning": _task_event_log_warning(latest_diagnostic),
+        },
+        "ingestion": {
+            "state": _public_ingestion_state(task, event_logs),
+            "event_count": len(ingestion_events),
+            "latest_event_type": _optional_public_text(
+                ingestion_events[-1].get("event_type") if ingestion_events else None
+            ),
+            "latest_error": _task_event_log_error(ingestion_events[-1])
+            if ingestion_events
+            else None,
+        },
+        "recovery": {
+            "event_count": len(recovery_events),
+            "latest_reason": _task_event_log_recovery_reason(recovery_events[-1])
+            if recovery_events
+            else None,
+        },
+        "warnings": {
+            "event_count": len(warning_events),
+            "artifact_warning_count": len(artifact_warnings),
+            "latest": _task_event_log_warning(warning_events[-1])
+            if warning_events
+            else None,
+        },
+    }
+    return _public_metadata_value(status)
+
+
+def _public_ingestion_state(
+    task: LimiraTask,
+    event_logs: list[dict[str, Any]],
+) -> str:
+    if any(
+        str(event.get("event_type") or "") == "server_ingestion_failed"
+        for event in event_logs
+    ):
+        return "failed"
+    if task.status in FINAL_TASK_STATUSES and event_logs:
+        return "complete"
+    if event_logs:
+        return "observed"
+    if task.status == "running":
+        return "pending"
+    return "idle"
+
+
+def _task_event_log_is_diagnostic(event: Mapping[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "")
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    return bool(
+        event_type in {"error", "server_ingestion_failed", "artifact_warning"}
+        or event_type.startswith("server_ingestion")
+        or payload.get("error")
+        or payload.get("warning")
+        or payload.get("recovery_reason")
+    )
+
+
+def _task_event_log_error(event: Mapping[str, Any]) -> str | None:
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    return _optional_public_text(payload.get("error"))
+
+
+def _task_event_log_warning(event: Mapping[str, Any]) -> str | None:
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    return _optional_public_text(payload.get("warning"))
+
+
+def _task_event_log_recovery_reason(event: Mapping[str, Any]) -> str | None:
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    return _optional_public_text(payload.get("recovery_reason"))
+
+
+def _optional_public_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(_public_error_text(value, fallback="limira_internal_value_redacted") or "")
+    return text or None
+
+
 def _public_model_summary(value: Any) -> Any:
     scrubbed = scrub_limira_secrets(value)
     return _public_metadata_value(scrubbed)
@@ -1878,10 +2026,13 @@ def _public_metadata_key(key: Any) -> str | None:
 
 def _is_internal_metadata_field_name(value: str) -> bool:
     normalized = value.strip().lower().replace("-", "_")
+    if SECRET_FIELD_PATTERN.search(normalized):
+        return True
     return bool(
         re.search(
             r"(?:^|_)(?:object_key|minio_object_key|pdf_object_key|"
-            r"archive_object_key|runner_task_id|runner_url|service_token)(?:$|_)",
+            r"archive_object_key|runner_task_id|runner_url|service_token|"
+            r"base_url|api_base|endpoint_url|model_endpoint)(?:$|_)",
             normalized,
         )
     )

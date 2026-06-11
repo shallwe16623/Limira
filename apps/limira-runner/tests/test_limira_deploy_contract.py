@@ -332,10 +332,16 @@ def test_limira_migration_creates_required_extensions_tables_and_indexes():
         in tables["limira_artifact_trace_events"]["body"]
     )
     assert "event_log_id text primary key" in tables["limira_task_event_logs"]["body"]
+    assert "event_type text not null" in tables["limira_task_event_logs"]["body"]
+    assert (
+        "source text not null default 'runner_stream'"
+        in tables["limira_task_event_logs"]["body"]
+    )
     assert (
         "payload jsonb not null default '{}'::jsonb"
         in tables["limira_task_event_logs"]["body"]
     )
+    assert "check" not in tables["limira_task_event_logs"]["body"]
     assert "evidence_storage_id text primary key" in tables["limira_evidence_items"]["body"]
     assert (
         "constraint uq_limira_evidence_items_task_evidence unique "

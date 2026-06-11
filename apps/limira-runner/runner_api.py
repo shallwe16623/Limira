@@ -1085,7 +1085,73 @@ def _task_response(record: TaskRecord) -> dict[str, Any]:
         "completed_at": record.completed_at,
         "error": scrub_secrets(record.error),
         "warnings": record.warnings or [],
+        "operational_status": _task_operational_status(record),
     }
+
+
+def _task_operational_status(record: TaskRecord) -> dict[str, Any]:
+    checkpoint = record.checkpoint if isinstance(record.checkpoint, dict) else {}
+    source_ledger = checkpoint.get("source_ledger")
+    evidence_ledger = checkpoint.get("evidence_ledger")
+    executor_state = checkpoint.get("executor_state")
+    lease_state = "released"
+    if record.status == "running":
+        lease_state = "leased" if record.worker_id and record.lease_expires_at else "missing"
+
+    return {
+        "lease": {
+            "state": lease_state,
+            "worker_present": bool(record.worker_id),
+            "lease_expires_at": record.lease_expires_at,
+            "heartbeat_at": record.heartbeat_at,
+            "attempt": record.attempt,
+        },
+        "checkpoint": {
+            "phase": _optional_operational_text(checkpoint.get("phase")),
+            "status": _optional_operational_text(checkpoint.get("status")),
+            "updated_at": record.checkpoint_updated_at,
+            "current_research_unit_present": bool(
+                checkpoint.get("current_research_unit")
+            ),
+            "resume_policy": _optional_operational_text(
+                checkpoint.get("resume_policy")
+            ),
+            "recoverable_reason": _optional_operational_text(
+                checkpoint.get("recoverable_reason")
+            ),
+            "source_ledger_count": len(source_ledger)
+            if isinstance(source_ledger, list)
+            else 0,
+            "evidence_ledger_count": len(evidence_ledger)
+            if isinstance(evidence_ledger, list)
+            else 0,
+            "executor_state_present": isinstance(executor_state, dict)
+            and bool(executor_state),
+        },
+        "recovery": {
+            "reason": _task_recovery_reason(record, checkpoint),
+        },
+    }
+
+
+def _optional_operational_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(scrub_secrets(value)).strip()
+    return text or None
+
+
+def _task_recovery_reason(
+    record: TaskRecord,
+    checkpoint: dict[str, Any],
+) -> str | None:
+    error = str(record.error or "")
+    prefix = "stale_running_task_recovered:"
+    if error.startswith(prefix):
+        return _optional_operational_text(error.removeprefix(prefix))
+    if checkpoint.get("phase") == "recovered":
+        return _optional_operational_text(checkpoint.get("recoverable_reason"))
+    return None
 
 
 def _task_context_from_payload(
