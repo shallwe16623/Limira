@@ -1130,12 +1130,23 @@ async def test_runner_api_persists_graph_checkpoint_stream_events(tmp_path):
         assert events_response.status == 200
         await asyncio.wait_for(events_response.text(), timeout=1)
         completed = await wait_for_task_status(store, task_id, "completed")
-        assert_checkpoint_envelope(
-            completed.checkpoint,
-            phase="finished",
-            status="completed",
-            resume_policy="terminal",
-        )
+        assert completed.checkpoint["phase"] == "verify"
+        assert completed.checkpoint["status"] == "completed"
+        assert completed.checkpoint["resume_policy"] == "terminal"
+        assert completed.checkpoint["recoverable_reason"] is None
+        assert completed.checkpoint["current_research_unit"] == "unit-1-background"
+        assert completed.checkpoint["source_ledger"] == [
+            {"unit_id": "unit-1-background"}
+        ]
+        assert completed.checkpoint["evidence_ledger"] == [
+            {"id": "EVID-abcdef123456"}
+        ]
+        assert completed.checkpoint["executor_state"] == {"node": "VerifierNode"}
+        operational_checkpoint = _task_response(completed)["operational_status"][
+            "checkpoint"
+        ]
+        assert operational_checkpoint["source_ledger_count"] == 1
+        assert operational_checkpoint["evidence_ledger_count"] == 1
     finally:
         await client.close()
 

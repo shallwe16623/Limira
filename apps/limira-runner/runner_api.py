@@ -64,6 +64,16 @@ DEFAULT_LLM_PROVIDER = "openai"
 DEFAULT_MODEL_NAME = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 MAX_REPLAY_EVENTS = 1000
+GRAPH_CHECKPOINT_PHASES = {
+    "scope",
+    "plan",
+    "research",
+    "compress",
+    "verify",
+    "write",
+    "reconcile",
+    "complete",
+}
 log = logging.getLogger(__name__)
 
 
@@ -363,13 +373,13 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
                 _write_task_checkpoint(
                     app,
                     record.task_id,
-                    {
-                        "phase": "stream",
-                        "status": status,
-                        "event_count": len(_task_event_snapshot(app, record.task_id)),
-                        "last_event_type": normalized["type"],
-                        "render_state": state,
-                    },
+                    _stream_checkpoint_payload(
+                        app,
+                        record.task_id,
+                        status,
+                        normalized["type"],
+                        state,
+                    ),
                     updated_at=normalized["timestamp"],
                 )
         if await cancel_check():
@@ -455,12 +465,7 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
             _write_task_checkpoint(
                 app,
                 record.task_id,
-                {
-                    "phase": "finished",
-                    "status": status,
-                    "error": scrub_secrets(error),
-                    "render_state": state,
-                },
+                _finish_checkpoint_payload(app, record.task_id, status, error, state),
                 updated_at=end_time,
             )
             _clear_durable_task_lease(app, record.task_id, worker_id)
@@ -697,6 +702,75 @@ def _write_task_checkpoint(
         checkpoint=scrub_secrets(_checkpoint_envelope(checkpoint)),
         updated_at=updated_at,
     )
+
+
+def _finish_checkpoint_payload(
+    app: web.Application,
+    task_id: str,
+    status: str,
+    error: str | None,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    previous = _read_task_checkpoint(app, task_id)
+    if _is_graph_checkpoint(previous):
+        checkpoint = dict(previous)
+        checkpoint["status"] = status
+        if status == "completed":
+            checkpoint["resume_policy"] = "terminal"
+            checkpoint["recoverable_reason"] = None
+        elif status in FINAL_TASK_STATUSES:
+            checkpoint.setdefault("resume_policy", "fail_recoverable")
+            checkpoint.setdefault(
+                "recoverable_reason",
+                "graph_checkpoint_terminal_task",
+            )
+        return checkpoint
+
+    return {
+        "phase": "finished",
+        "status": status,
+        "error": scrub_secrets(error),
+        "render_state": state,
+    }
+
+
+def _stream_checkpoint_payload(
+    app: web.Application,
+    task_id: str,
+    status: str,
+    event_type: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    previous = _read_task_checkpoint(app, task_id)
+    if _is_graph_checkpoint(previous):
+        checkpoint = dict(previous)
+        checkpoint["status"] = status
+        return checkpoint
+
+    return {
+        "phase": "stream",
+        "status": status,
+        "event_count": len(_task_event_snapshot(app, task_id)),
+        "last_event_type": event_type,
+        "render_state": state,
+    }
+
+
+def _read_task_checkpoint(
+    app: web.Application,
+    task_id: str,
+) -> dict[str, Any] | None:
+    reader = getattr(_task_store(app), "get_task_checkpoint", None)
+    if reader is None:
+        return None
+    checkpoint = reader(task_id)
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def _is_graph_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    return str(checkpoint.get("phase") or "") in GRAPH_CHECKPOINT_PHASES
 
 
 def _checkpoint_envelope(checkpoint: dict[str, Any]) -> dict[str, Any]:
