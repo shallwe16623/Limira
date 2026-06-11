@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from auth_adapter import AuthError, authenticate_headers, reject_body_user_id
-from runner_api import SERVICE_TOKEN_KEY, create_app
+from runner_api import MAX_REPLAY_EVENTS, SERVICE_TOKEN_KEY, create_app
 from task_store import PostgresTaskStore, TaskStore, create_task_store_from_env
 
 
@@ -184,6 +184,33 @@ def test_task_store_persists_lease_heartbeat_checkpoint_and_events(tmp_path):
     assert cleared.worker_id is None
     assert cleared.lease_expires_at is None
     assert cleared.heartbeat_at is None
+
+
+def test_task_store_replays_latest_event_window_in_append_order(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-window",
+        user_id="user-a",
+        query="window",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    for index in range(MAX_REPLAY_EVENTS + 5):
+        store.append_task_event(
+            "task-window",
+            {
+                "task_id": "task-window",
+                "type": "message",
+                "timestamp": "2026-06-06T12:01:00+00:00",
+                "payload": {"index": index},
+            },
+            created_at="2026-06-06T12:01:00+00:00",
+        )
+
+    events = store.list_task_events("task-window", limit=MAX_REPLAY_EVENTS)
+
+    assert len(events) == MAX_REPLAY_EVENTS
+    assert events[0]["payload"]["index"] == 5
+    assert events[-1]["payload"]["index"] == MAX_REPLAY_EVENTS + 4
 
 
 def test_task_store_cancels_only_still_queued_tasks(tmp_path):
@@ -420,6 +447,8 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "jsonb_build_object" in sql
     assert "limira_task_event_logs" in sql
     assert "source = 'runner'" in sql
+    assert "order by created_at desc, event_log_id desc" in sql
+    assert "order by created_at asc, event_log_id asc" in sql
     assert "returning" in sql
     assert "limira_runner_research_tasks" not in sql
 
@@ -528,6 +557,21 @@ def test_postgres_task_store_matches_runner_task_store_contract():
         "message",
         "complete",
     ]
+    for index in range(MAX_REPLAY_EVENTS + 5):
+        store.append_task_event(
+            "task-a",
+            {
+                "task_id": "task-a",
+                "type": "window",
+                "timestamp": "2026-06-06T12:06:00+00:00",
+                "payload": {"index": index},
+            },
+            created_at="2026-06-06T12:06:00+00:00",
+        )
+    window = store.list_task_events("task-a", limit=MAX_REPLAY_EVENTS)
+    assert len(window) == MAX_REPLAY_EVENTS
+    assert window[0]["payload"]["index"] == 5
+    assert window[-1]["payload"]["index"] == MAX_REPLAY_EVENTS + 4
 
     updated = store.update_task(
         "task-a",
@@ -733,11 +777,19 @@ class FakeRunnerPostgresConnection:
         if "from limira_task_event_logs" in lowered:
             task_id, limit = params
             rows = [
-                {"payload": row["payload"]}
+                row
                 for row in self.database.event_logs
                 if row["task_id"] == task_id
             ]
-            return FakeRunnerPostgresCursor(rows[:limit])
+            rows.sort(
+                key=lambda row: (row["created_at"], row["event_log_id"]),
+                reverse=True,
+            )
+            replay = rows[:limit]
+            replay.sort(key=lambda row: (row["created_at"], row["event_log_id"]))
+            return FakeRunnerPostgresCursor(
+                [{"payload": row["payload"]} for row in replay]
+            )
 
         if "select" in lowered and "where task_id = %s" in lowered:
             row = self.database.rows.get(params[0])
@@ -823,14 +875,14 @@ class FakeRunnerPostgresConnection:
             return FakeRunnerPostgresCursor([row])
 
         if "insert into limira_task_event_logs" in lowered:
-            task_id, event_type, payload, created_at = params
+            event_log_id, task_id, event_type, payload, created_at = params
             self.database.event_logs.append(
                 {
+                    "event_log_id": event_log_id,
                     "task_id": task_id,
                     "event_type": event_type,
                     "payload": json.loads(payload),
                     "created_at": created_at,
-                    "event_log_id": f"event-{len(self.database.event_logs) + 1}",
                 }
             )
             return FakeRunnerPostgresCursor([])

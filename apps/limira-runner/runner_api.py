@@ -206,6 +206,19 @@ async def cancel_task(request: web.Request) -> web.Response:
     if record.status in FINAL_TASK_STATUSES:
         return web.json_response(_task_response(record))
 
+    if record.status == "running":
+        lease_state = _classify_task_lease(request.app, record)
+        if lease_state == "external_active":
+            return _error("task_owned_by_active_worker", status=409)
+        if lease_state in {"expired", "missing"} and not _task_has_active_worker(
+            request.app,
+            record.task_id,
+        ):
+            record = _finalize_running_without_worker_cancellation(request, record)
+            return web.json_response(
+                {**_task_response(record), "cancel_requested": True}
+            )
+
     if record.status == "running" and not _task_has_active_worker(
         request.app,
         record.task_id,
@@ -604,6 +617,22 @@ def _task_has_active_worker(app: web.Application, task_id: str) -> bool:
     return task_id in app[ACTIVE_TASKS_KEY] or bool(worker and not worker.done())
 
 
+def _classify_task_lease(app: web.Application, record: TaskRecord) -> str:
+    if record.status != "running":
+        return "missing"
+    if _task_has_active_worker(app, record.task_id):
+        return "local_active"
+    if not record.worker_id or not record.lease_expires_at:
+        return "missing"
+    lease_expires_at = _parse_timestamp(record.lease_expires_at)
+    now = _parse_timestamp(app[CLOCK_KEY]())
+    if lease_expires_at is None or now is None:
+        return "missing"
+    if now <= lease_expires_at:
+        return "external_active"
+    return "expired"
+
+
 def _task_worker_id(app: web.Application, task_id: str) -> str:
     return f"{app[RUNNER_WORKER_ID_KEY]}:{task_id}:{uuid.uuid4()}"
 
@@ -650,7 +679,52 @@ def _write_task_checkpoint(
     writer = getattr(_task_store(app), "write_task_checkpoint", None)
     if writer is None:
         return
-    writer(task_id, checkpoint=scrub_secrets(checkpoint), updated_at=updated_at)
+    writer(
+        task_id,
+        checkpoint=scrub_secrets(_checkpoint_envelope(checkpoint)),
+        updated_at=updated_at,
+    )
+
+
+def _checkpoint_envelope(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(checkpoint or {})
+    phase = str(raw.get("phase") or "unknown")
+    status = str(raw.get("status") or "running")
+    executor_state = raw.get("executor_state")
+    if not isinstance(executor_state, dict):
+        executor_state = {}
+    for key in ("event_count", "last_event_type", "render_state"):
+        if key in raw:
+            executor_state[key] = raw[key]
+
+    terminal = (
+        phase in {"finished", "recovered", "complete"}
+        and status in FINAL_TASK_STATUSES
+    )
+    resume_policy = raw.get("resume_policy")
+    if not isinstance(resume_policy, str) or not resume_policy.strip():
+        resume_policy = "terminal" if terminal else "fail_recoverable"
+    recoverable_reason = raw.get("recoverable_reason")
+    if recoverable_reason is None and resume_policy == "fail_recoverable":
+        recoverable_reason = "legacy_stream_checkpoint_not_resumable"
+
+    source_ledger = raw.get("source_ledger")
+    if not isinstance(source_ledger, list):
+        source_ledger = []
+    evidence_ledger = raw.get("evidence_ledger")
+    if not isinstance(evidence_ledger, list):
+        evidence_ledger = []
+
+    return {
+        "phase": phase,
+        "status": status,
+        "current_research_unit": raw.get("current_research_unit"),
+        "source_ledger": source_ledger,
+        "evidence_ledger": evidence_ledger,
+        "executor_state": executor_state,
+        "resume_policy": resume_policy,
+        "recoverable_reason": recoverable_reason,
+    }
 
 
 def _append_durable_task_event(
@@ -708,15 +782,12 @@ def _stale_running_reason(
 ) -> str | None:
     if record.status != "running":
         return None
+    lease_state = _classify_task_lease(app, record)
+    if lease_state == "external_active":
+        return None
+    if lease_state == "expired":
+        return "expired_lease"
     if not _task_has_active_worker(app, record.task_id):
-        lease_expires_at = _parse_timestamp(record.lease_expires_at)
-        if lease_expires_at is not None:
-            now = _parse_timestamp(app[CLOCK_KEY]())
-            if now is None:
-                return None
-            if now <= lease_expires_at:
-                return None
-            return "expired_lease"
         return "no_active_worker"
     if not record.started_at:
         return "missing_started_at"
@@ -773,6 +844,18 @@ def _finalize_stale_running_task(
         },
     }
     _append_task_event(app, record.task_id, event)
+    _write_task_checkpoint(
+        app,
+        record.task_id,
+        {
+            "phase": "recovered",
+            "status": "failed",
+            "executor_state": {"recovery_reason": reason},
+            "resume_policy": "terminal",
+            "recoverable_reason": error,
+        },
+        updated_at=completed_at,
+    )
     _clear_active_task(app, record.task_id)
     _clear_task_cancel(app, record.task_id)
     _notify_task_finished(app, record.task_id)
@@ -829,6 +912,8 @@ def _finalize_running_without_worker_cancellation(
     request: web.Request,
     record: TaskRecord,
 ) -> TaskRecord:
+    if _classify_task_lease(request.app, record) == "external_active":
+        return record
     clock: Callable[[], str] = request.app[CLOCK_KEY]
     cancelled_at = clock()
     error = "task cancelled because no active stream worker was registered"

@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -318,10 +320,14 @@ class TaskStore:
             rows = conn.execute(
                 """
                 SELECT event_json
-                FROM limira_runner_task_events
-                WHERE task_id = ?
+                FROM (
+                    SELECT event_id, event_json
+                    FROM limira_runner_task_events
+                    WHERE task_id = ?
+                    ORDER BY event_id DESC
+                    LIMIT ?
+                ) replay
                 ORDER BY event_id ASC
-                LIMIT ?
                 """,
                 (task_id, max(1, int(limit))),
             ).fetchall()
@@ -624,21 +630,26 @@ class PostgresTaskStore:
     """
     APPEND_TASK_EVENT_SQL = """
         INSERT INTO limira_task_event_logs (
+            event_log_id,
             task_id,
             event_type,
             source,
             payload,
             created_at
         )
-        VALUES (%s, %s, 'runner', CAST(%s AS jsonb), %s)
+        VALUES (%s, %s, %s, 'runner', CAST(%s AS jsonb), %s)
     """
     LIST_TASK_EVENTS_SQL = """
         SELECT payload
-        FROM limira_task_event_logs
-        WHERE task_id = %s
-          AND source = 'runner'
+        FROM (
+            SELECT event_log_id, created_at, payload
+            FROM limira_task_event_logs
+            WHERE task_id = %s
+              AND source = 'runner'
+            ORDER BY created_at DESC, event_log_id DESC
+            LIMIT %s
+        ) replay
         ORDER BY created_at ASC, event_log_id ASC
-        LIMIT %s
     """
     FINALIZE_STALE_RUNNING_TASK_SQL = f"""
         UPDATE limira_research_tasks
@@ -881,6 +892,7 @@ class PostgresTaskStore:
         self._execute(
             self.APPEND_TASK_EVENT_SQL,
             (
+                _runner_event_log_id(),
                 task_id,
                 str(event.get("type") or event.get("event") or "unknown"),
                 _serialize_json(event),
@@ -1042,6 +1054,10 @@ def _runner_metadata(*, task_context: dict[str, Any] | None = None) -> dict[str,
         "runner_attempt": 0,
         "graph_checkpoint": None,
     }
+
+
+def _runner_event_log_id() -> str:
+    return f"runner-{time.time_ns():020d}-{uuid.uuid4().hex}"
 
 
 def _serialize_json(value: Any) -> str:

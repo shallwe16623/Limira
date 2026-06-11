@@ -19,6 +19,7 @@ from runner_api import (
     STREAM_EVENTS_KEY,
     TASK_EVENT_LOG_KEY,
     UPDATE_STATE_KEY,
+    _checkpoint_envelope,
     create_app,
 )
 from task_store import TaskStore
@@ -299,6 +300,25 @@ def assert_public_task_response_hides_internal_identifiers(payload):
         assert marker not in serialized
 
 
+def assert_checkpoint_envelope(
+    checkpoint,
+    *,
+    phase,
+    status,
+    resume_policy=None,
+):
+    assert checkpoint["phase"] == phase
+    assert checkpoint["status"] == status
+    assert "current_research_unit" in checkpoint
+    assert checkpoint["source_ledger"] == []
+    assert checkpoint["evidence_ledger"] == []
+    assert isinstance(checkpoint["executor_state"], dict)
+    assert "resume_policy" in checkpoint
+    assert "recoverable_reason" in checkpoint
+    if resume_policy is not None:
+        assert checkpoint["resume_policy"] == resume_policy
+
+
 def test_create_app_preserves_partial_helper_overrides(tmp_path, monkeypatch):
     async def custom_stream():
         yield {}
@@ -336,6 +356,28 @@ def test_create_app_preserves_partial_helper_overrides(tmp_path, monkeypatch):
     assert app[RENDER_MARKDOWN_KEY] is custom_render
     assert app[INIT_RENDER_STATE_KEY] is default_init
     assert app[UPDATE_STATE_KEY] is default_update
+
+
+def test_checkpoint_envelope_reserves_recoverable_runner_fields():
+    checkpoint = _checkpoint_envelope(
+        {
+            "phase": "started",
+            "status": "running",
+            "event_count": 0,
+            "render_state": {"safe": True},
+        }
+    )
+
+    assert_checkpoint_envelope(
+        checkpoint,
+        phase="started",
+        status="running",
+        resume_policy="fail_recoverable",
+    )
+    assert checkpoint["current_research_unit"] is None
+    assert checkpoint["executor_state"]["event_count"] == 0
+    assert checkpoint["executor_state"]["render_state"] == {"safe": True}
+    assert checkpoint["recoverable_reason"] == "legacy_stream_checkpoint_not_resumable"
 
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):
@@ -389,6 +431,8 @@ def seed_running_task(
     query="stale running query",
     task_id=None,
     started_at="2026-06-06T10:00:00+00:00",
+    worker_id=None,
+    lease_expires_at=None,
 ):
     record = store.create_task(
         task_id=task_id or str(uuid.uuid4()),
@@ -397,7 +441,12 @@ def seed_running_task(
         created_at="2026-06-06T09:59:59+00:00",
         model_summary={},
     )
-    claimed = store.claim_queued_task(record.task_id, started_at=started_at)
+    claimed = store.claim_queued_task(
+        record.task_id,
+        started_at=started_at,
+        worker_id=worker_id,
+        lease_expires_at=lease_expires_at,
+    )
     assert claimed is not None
     return claimed
 
@@ -505,6 +554,15 @@ async def test_runner_api_startup_recovers_stale_running_task_without_worker(tmp
         assert recovered.warnings == [
             "stale running task recovered: no_active_worker"
         ]
+        assert_checkpoint_envelope(
+            recovered.checkpoint,
+            phase="recovered",
+            status="failed",
+            resume_policy="terminal",
+        )
+        assert recovered.checkpoint["executor_state"]["recovery_reason"] == (
+            "no_active_worker"
+        )
 
         status_response = await client.get(
             f"/limira-runner/tasks/{running.task_id}",
@@ -541,6 +599,12 @@ async def test_runner_api_status_recovers_stale_running_task_without_worker(tmp_
         assert payload["error"] == "stale_running_task_recovered:no_active_worker"
         assert recovered.status == "failed"
         assert recovered.completed_at == "2026-06-06T12:00:01+00:00"
+        assert_checkpoint_envelope(
+            recovered.checkpoint,
+            phase="recovered",
+            status="failed",
+            resume_policy="terminal",
+        )
         assert client.server.app[ACTIVE_TASKS_KEY] == set()
     finally:
         await client.close()
@@ -571,6 +635,12 @@ async def test_runner_api_event_stream_recovers_stale_running_task_without_worke
             "stale running task recovered: no_active_worker"
         )
         assert events[0]["payload"]["recovery_reason"] == "no_active_worker"
+        assert_checkpoint_envelope(
+            recovered.checkpoint,
+            phase="recovered",
+            status="failed",
+            resume_policy="terminal",
+        )
     finally:
         await client.close()
 
@@ -799,8 +869,12 @@ async def test_runner_api_persists_durable_events_checkpoint_and_replays_after_r
         assert completed.worker_id is None
         assert completed.lease_expires_at is None
         assert completed.heartbeat_at is None
-        assert completed.checkpoint["phase"] == "finished"
-        assert completed.checkpoint["status"] == "completed"
+        assert_checkpoint_envelope(
+            completed.checkpoint,
+            phase="finished",
+            status="completed",
+            resume_policy="terminal",
+        )
         assert [event["type"] for event in store.list_task_events(task_id)] == [
             "heartbeat",
             "message",
@@ -857,8 +931,13 @@ async def test_runner_api_renews_durable_lease_while_task_is_active(tmp_path):
         assert running.lease_expires_at
         assert running.heartbeat_at
         assert running.attempt == 1
-        assert running.checkpoint["phase"] == "stream"
-        assert running.checkpoint["last_event_type"] == "message"
+        assert_checkpoint_envelope(
+            running.checkpoint,
+            phase="stream",
+            status="completed",
+            resume_policy="fail_recoverable",
+        )
+        assert running.checkpoint["executor_state"]["last_event_type"] == "message"
 
         probe.release.set()
         events_response = await asyncio.wait_for(events_task, timeout=1)
@@ -866,6 +945,12 @@ async def test_runner_api_renews_durable_lease_while_task_is_active(tmp_path):
         await asyncio.wait_for(events_response.text(), timeout=1)
         completed = await wait_for_task_status(store, task_id, "completed")
         assert completed.worker_id is None
+        assert_checkpoint_envelope(
+            completed.checkpoint,
+            phase="finished",
+            status="completed",
+            resume_policy="terminal",
+        )
     finally:
         await client.close()
 
@@ -1006,6 +1091,12 @@ async def test_runner_api_stream_setup_failure_finalizes_claimed_task(tmp_path):
         assert record.archive_status == "failed"
         assert record.archive_dir is None
         assert record.archive_zip_path is None
+        assert_checkpoint_envelope(
+            record.checkpoint,
+            phase="finished",
+            status="failed",
+            resume_policy="terminal",
+        )
         assert "setupsecret123456" not in json.dumps(record.to_dict())
 
         retry_response = await client.get(
@@ -1420,6 +1511,64 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
             headers=USER_A_HEADERS,
         )
         assert retry_response.status == 200
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_cancel_rejects_running_task_owned_by_healthy_external_lease(
+    tmp_path,
+):
+    client, store = await make_client(tmp_path)
+    try:
+        seeded = seed_running_task(
+            store,
+            worker_id="runner-other:task-external:worker",
+            lease_expires_at="2026-06-06T13:00:00+00:00",
+        )
+
+        cancel_response = await client.post(
+            f"/limira-runner/tasks/{seeded.task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        cancel_payload = await cancel_response.json()
+        current = store.get_task(seeded.task_id)
+
+        assert cancel_response.status == 409
+        assert cancel_payload["error"] == "task_owned_by_active_worker"
+        assert current.status == "running"
+        assert current.worker_id == "runner-other:task-external:worker"
+        assert current.lease_expires_at == "2026-06-06T13:00:00+00:00"
+        assert current.completed_at is None
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_cancel_finalizes_expired_external_lease_without_worker(
+    tmp_path,
+):
+    client, store = await make_client(tmp_path)
+    try:
+        seeded = seed_running_task(
+            store,
+            worker_id="runner-other:task-expired:worker",
+            lease_expires_at="2026-06-06T11:00:00+00:00",
+        )
+
+        cancel_response = await client.post(
+            f"/limira-runner/tasks/{seeded.task_id}/cancel",
+            headers=USER_A_HEADERS,
+        )
+        cancel_payload = await cancel_response.json()
+        current = store.get_task(seeded.task_id)
+
+        assert cancel_response.status == 200
+        assert cancel_payload["status"] == "cancelled"
+        assert current.status == "cancelled"
+        assert current.error.startswith(
+            "task cancelled because no active stream worker was registered"
+        )
     finally:
         await client.close()
 
