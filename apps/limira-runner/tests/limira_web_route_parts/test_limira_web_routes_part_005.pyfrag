@@ -1867,6 +1867,88 @@ async def test_invalid_lifecycle_artifacts_warn_and_do_not_satisfy_evidence_refs
     assert final_warnings[-1]["evidence_refs"] == ["EVID-777"]
 
 
+@pytest.mark.asyncio
+async def test_mixed_lifecycle_evidence_refs_reject_before_normalization():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": "EVID-001",
+                    "title": "Valid source",
+                    "summary": "Valid content-bearing evidence.",
+                    "source_url": "https://example.test/source",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "1" * 32,
+                },
+            },
+            {
+                "type": "finding_collected",
+                "payload": {
+                    "finding_id": "FIND-MIXED",
+                    "summary": "Mixed finding refs.",
+                    "evidence_ids": ["EVID-001", "BAD-REF"],
+                },
+            },
+            {
+                "type": "verified_claim_collected",
+                "payload": {
+                    "claim_id": "CLAIM-MIXED",
+                    "claim": "Mixed verified claim refs.",
+                    "support_type": "supports",
+                    "evidence_ids": ["EVID-001", "BAD-REF"],
+                    "confidence": 0.9,
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "mixed lifecycle refs"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["findings"] == []
+    assert artifacts["verified_claims"] == []
+
+    invalid_warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+        and event["payload"].get("warning") == "invalid_artifact_payload"
+    ]
+    warnings_by_type = {
+        warning["artifact_type"]: warning
+        for warning in invalid_warnings
+        if warning.get("artifact_type") in {"finding", "verified_claim"}
+    }
+    assert set(warnings_by_type) == {"finding", "verified_claim"}
+    assert any("BAD-REF" in error for error in warnings_by_type["finding"]["errors"])
+    assert any(
+        "BAD-REF" in error
+        for error in warnings_by_type["verified_claim"]["errors"]
+    )
+
+
 def test_runner_research_client_uses_server_side_headers(monkeypatch):
     monkeypatch.setenv("LIMIRA_RUNNER_INTERNAL_URL", "http://internal-runner")
     monkeypatch.setenv("LIMIRA_RUNNER_SERVICE_TOKEN", "server-only-token")
