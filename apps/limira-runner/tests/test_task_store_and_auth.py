@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -103,6 +104,86 @@ def test_task_store_claims_queued_task_once(tmp_path):
     current = store.get_task("task-a")
     assert current.status == "running"
     assert current.started_at == "2026-06-06T12:01:00+00:00"
+
+
+def test_task_store_persists_lease_heartbeat_checkpoint_and_events(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-durable",
+        user_id="user-a",
+        query="durable",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+
+    claimed = store.claim_queued_task(
+        "task-durable",
+        started_at="2026-06-06T12:01:00+00:00",
+        worker_id="worker-a",
+        lease_expires_at="2026-06-06T12:06:00+00:00",
+    )
+    duplicate = store.claim_queued_task(
+        "task-durable",
+        started_at="2026-06-06T12:02:00+00:00",
+        worker_id="worker-b",
+        lease_expires_at="2026-06-06T12:07:00+00:00",
+    )
+    wrong_worker_renewal = store.renew_task_lease(
+        "task-durable",
+        worker_id="worker-b",
+        heartbeat_at="2026-06-06T12:03:00+00:00",
+        lease_expires_at="2026-06-06T12:08:00+00:00",
+    )
+    renewed = store.renew_task_lease(
+        "task-durable",
+        worker_id="worker-a",
+        heartbeat_at="2026-06-06T12:04:00+00:00",
+        lease_expires_at="2026-06-06T12:09:00+00:00",
+    )
+    checkpointed = store.write_task_checkpoint(
+        "task-durable",
+        checkpoint={
+            "phase": "research",
+            "current_unit": "unit-1",
+            "evidence_ids": ["EVID-abcdef123456"],
+        },
+        updated_at="2026-06-06T12:04:01+00:00",
+    )
+    store.append_task_event(
+        "task-durable",
+        {"task_id": "task-durable", "type": "message", "timestamp": "t1"},
+        created_at="2026-06-06T12:04:02+00:00",
+    )
+    store.append_task_event(
+        "task-durable",
+        {"task_id": "task-durable", "type": "complete", "timestamp": "t2"},
+        created_at="2026-06-06T12:04:03+00:00",
+    )
+    cleared = store.clear_task_lease("task-durable", worker_id="worker-a")
+
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.worker_id == "worker-a"
+    assert claimed.lease_expires_at == "2026-06-06T12:06:00+00:00"
+    assert claimed.heartbeat_at == "2026-06-06T12:01:00+00:00"
+    assert claimed.attempt == 1
+    assert duplicate is None
+    assert wrong_worker_renewal is None
+    assert renewed is not None
+    assert renewed.worker_id == "worker-a"
+    assert renewed.heartbeat_at == "2026-06-06T12:04:00+00:00"
+    assert renewed.lease_expires_at == "2026-06-06T12:09:00+00:00"
+    assert checkpointed is not None
+    assert checkpointed.checkpoint["phase"] == "research"
+    assert checkpointed.checkpoint["evidence_ids"] == ["EVID-abcdef123456"]
+    assert store.get_task_checkpoint("task-durable")["current_unit"] == "unit-1"
+    assert [event["type"] for event in store.list_task_events("task-durable")] == [
+        "message",
+        "complete",
+    ]
+    assert cleared is not None
+    assert cleared.worker_id is None
+    assert cleared.lease_expires_at is None
+    assert cleared.heartbeat_at is None
 
 
 def test_task_store_cancels_only_still_queued_tasks(tmp_path):
@@ -335,6 +416,10 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "and status = 'running'" in sql
     assert "runner_task_id = task_id" in sql
     assert "metadata = metadata || cast(%s as jsonb)" in sql
+    assert "runner_lease" in sql
+    assert "jsonb_build_object" in sql
+    assert "limira_task_event_logs" in sql
+    assert "source = 'runner'" in sql
     assert "returning" in sql
     assert "limira_runner_research_tasks" not in sql
 
@@ -388,6 +473,8 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     claimed = store.claim_queued_task(
         "task-a",
         started_at="2026-06-06T12:03:00+00:00",
+        worker_id="worker-a",
+        lease_expires_at="2026-06-06T12:08:00+00:00",
     )
     duplicate_claim = store.claim_queued_task(
         "task-a",
@@ -396,7 +483,51 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert claimed is not None
     assert claimed.status == "running"
     assert claimed.context["upload_scope"]["document_count"] == 1
+    assert claimed.worker_id == "worker-a"
+    assert claimed.heartbeat_at == "2026-06-06T12:03:00+00:00"
+    assert claimed.lease_expires_at == "2026-06-06T12:08:00+00:00"
+    assert claimed.attempt == 1
     assert duplicate_claim is None
+
+    assert (
+        store.renew_task_lease(
+            "task-a",
+            worker_id="worker-b",
+            heartbeat_at="2026-06-06T12:04:30+00:00",
+            lease_expires_at="2026-06-06T12:09:30+00:00",
+        )
+        is None
+    )
+    renewed = store.renew_task_lease(
+        "task-a",
+        worker_id="worker-a",
+        heartbeat_at="2026-06-06T12:05:00+00:00",
+        lease_expires_at="2026-06-06T12:10:00+00:00",
+    )
+    assert renewed.heartbeat_at == "2026-06-06T12:05:00+00:00"
+    assert renewed.lease_expires_at == "2026-06-06T12:10:00+00:00"
+
+    checkpointed = store.write_task_checkpoint(
+        "task-a",
+        checkpoint={"phase": "research", "unit": "unit-1"},
+        updated_at="2026-06-06T12:05:30+00:00",
+    )
+    assert checkpointed.checkpoint == {"phase": "research", "unit": "unit-1"}
+    assert store.get_task_checkpoint("task-a")["unit"] == "unit-1"
+    store.append_task_event(
+        "task-a",
+        {"task_id": "task-a", "type": "message", "timestamp": "t1"},
+        created_at="2026-06-06T12:05:31+00:00",
+    )
+    store.append_task_event(
+        "task-a",
+        {"task_id": "task-a", "type": "complete", "timestamp": "t2"},
+        created_at="2026-06-06T12:05:32+00:00",
+    )
+    assert [event["type"] for event in store.list_task_events("task-a")] == [
+        "message",
+        "complete",
+    ]
 
     updated = store.update_task(
         "task-a",
@@ -559,6 +690,7 @@ def test_runner_app_requires_explicit_task_store_or_postgres_config(monkeypatch)
 class FakeRunnerPostgresDatabase:
     def __init__(self):
         self.rows = {}
+        self.event_logs = []
 
     def connect(self):
         return FakeRunnerPostgresConnection(self)
@@ -598,6 +730,15 @@ class FakeRunnerPostgresConnection:
             self.database.rows[row["task_id"]] = row
             return FakeRunnerPostgresCursor([row])
 
+        if "from limira_task_event_logs" in lowered:
+            task_id, limit = params
+            rows = [
+                {"payload": row["payload"]}
+                for row in self.database.event_logs
+                if row["task_id"] == task_id
+            ]
+            return FakeRunnerPostgresCursor(rows[:limit])
+
         if "select" in lowered and "where task_id = %s" in lowered:
             row = self.database.rows.get(params[0])
             return FakeRunnerPostgresCursor([row] if row else [])
@@ -627,13 +768,72 @@ class FakeRunnerPostgresConnection:
             return FakeRunnerPostgresCursor(rows[:limit])
 
         if "set status = 'running'" in lowered:
-            started_at, task_id = params
+            started_at, metadata_update, task_id = params
             row = self.database.rows.get(task_id)
             if not row or row["status"] != "queued":
                 return FakeRunnerPostgresCursor([])
             row["status"] = "running"
             row["started_at"] = started_at
+            metadata = _metadata_dict(row)
+            metadata.update(json.loads(metadata_update))
+            metadata["runner_attempt"] = int(metadata.get("runner_attempt") or 0) + 1
+            row["metadata"] = metadata
             return FakeRunnerPostgresCursor([row])
+
+        if (
+            "metadata->'runner_lease'->>'worker_id'" in lowered
+            and "set metadata = metadata || cast(%s as jsonb)" in lowered
+            and "and status = 'running'" in lowered
+        ):
+            metadata_update, task_id, worker_id = params
+            row = self.database.rows.get(task_id)
+            if not row or row["status"] != "running":
+                return FakeRunnerPostgresCursor([])
+            metadata = _metadata_dict(row)
+            lease = metadata.get("runner_lease")
+            if not isinstance(lease, dict) or lease.get("worker_id") != worker_id:
+                return FakeRunnerPostgresCursor([])
+            metadata.update(json.loads(metadata_update))
+            row["metadata"] = metadata
+            return FakeRunnerPostgresCursor([row])
+
+        if "where task_id = %s" in lowered and "(%s is null" in lowered:
+            metadata_update, task_id, worker_id, _worker_id_again = params
+            row = self.database.rows.get(task_id)
+            if not row:
+                return FakeRunnerPostgresCursor([])
+            metadata = _metadata_dict(row)
+            lease = metadata.get("runner_lease")
+            if worker_id is not None and (
+                not isinstance(lease, dict) or lease.get("worker_id") != worker_id
+            ):
+                return FakeRunnerPostgresCursor([])
+            metadata.update(json.loads(metadata_update))
+            row["metadata"] = metadata
+            return FakeRunnerPostgresCursor([row])
+
+        if "graph_checkpoint" in lowered and "update limira_research_tasks" in lowered:
+            metadata_update, task_id = params
+            row = self.database.rows.get(task_id)
+            if not row:
+                return FakeRunnerPostgresCursor([])
+            metadata = _metadata_dict(row)
+            metadata.update(json.loads(metadata_update))
+            row["metadata"] = metadata
+            return FakeRunnerPostgresCursor([row])
+
+        if "insert into limira_task_event_logs" in lowered:
+            task_id, event_type, payload, created_at = params
+            self.database.event_logs.append(
+                {
+                    "task_id": task_id,
+                    "event_type": event_type,
+                    "payload": json.loads(payload),
+                    "created_at": created_at,
+                    "event_log_id": f"event-{len(self.database.event_logs) + 1}",
+                }
+            )
+            return FakeRunnerPostgresCursor([])
 
         if "set status = 'cancelled'" in lowered:
             started_at, completed_at, error, task_id = params
@@ -661,13 +861,7 @@ class FakeRunnerPostgresConnection:
             row["archive_status"] = "failed"
             row["completed_at"] = completed_at
             row["error"] = error
-            metadata = row.get("metadata")
-            if isinstance(metadata, str):
-                import json
-
-                metadata = json.loads(metadata)
-            import json
-
+            metadata = _metadata_dict(row)
             metadata.update(json.loads(metadata_update))
             row["metadata"] = metadata
             return FakeRunnerPostgresCursor([row])
@@ -702,13 +896,7 @@ class FakeRunnerPostgresConnection:
                 row["model_summary"] = params[value_index]
                 value_index += 1
             if "metadata = metadata || cast(%s as jsonb)" in lowered:
-                metadata = row.get("metadata")
-                if isinstance(metadata, str):
-                    import json
-
-                    metadata = json.loads(metadata)
-                import json
-
+                metadata = _metadata_dict(row)
                 metadata.update(json.loads(params[value_index]))
                 row["metadata"] = metadata
             return FakeRunnerPostgresCursor([row])
@@ -725,3 +913,12 @@ class FakeRunnerPostgresCursor:
 
     def fetchall(self):
         return list(self.rows)
+
+
+def _metadata_dict(row):
+    metadata = row.get("metadata")
+    if isinstance(metadata, str):
+        return json.loads(metadata)
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    return {}

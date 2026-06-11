@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -54,6 +54,7 @@ CANCELLED_TASKS_KEY = web.AppKey("cancelled_tasks", set[str])
 ACTIVE_TASKS_KEY = web.AppKey("active_tasks", set[str])
 TASK_WORKERS_KEY = web.AppKey("task_workers", dict[str, asyncio.Task])
 TASK_EVENT_LOG_KEY = web.AppKey("task_event_log", dict[str, list[dict[str, Any]]])
+RUNNER_WORKER_ID_KEY = web.AppKey("runner_worker_id", str)
 TASK_SUBSCRIBERS_KEY = web.AppKey(
     "task_subscribers",
     dict[str, set[asyncio.Queue[dict[str, Any] | None]]],
@@ -124,6 +125,7 @@ def create_app(
     app[ACTIVE_TASKS_KEY] = set()
     app[TASK_WORKERS_KEY] = {}
     app[TASK_EVENT_LOG_KEY] = {}
+    app[RUNNER_WORKER_ID_KEY] = f"runner-{uuid.uuid4()}"
     app[TASK_SUBSCRIBERS_KEY] = {}
     _reconcile_stale_running_tasks(app)
 
@@ -271,7 +273,13 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
 
     clock: Callable[[], str] = app[CLOCK_KEY]
     started_at = clock()
-    claimed_record = store.claim_queued_task(record.task_id, started_at=started_at)
+    worker_id = _task_worker_id(app, record.task_id)
+    claimed_record = store.claim_queued_task(
+        record.task_id,
+        started_at=started_at,
+        worker_id=worker_id,
+        lease_expires_at=_lease_expires_at_from(started_at),
+    )
     if not claimed_record:
         current_record = store.get_task(record.task_id)
         if current_record and current_record.status in FINAL_TASK_STATUSES:
@@ -296,6 +304,17 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
         )
         writer_started = True
         state = app[INIT_RENDER_STATE_KEY]()
+        _write_task_checkpoint(
+            app,
+            record.task_id,
+            {
+                "phase": "started",
+                "status": "running",
+                "event_count": 0,
+                "render_state": state,
+            },
+            updated_at=started_at,
+        )
 
         async def cancel_check() -> bool:
             return _task_cancel_requested(app, record.task_id)
@@ -307,6 +326,7 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
             cancel_check,
         ):
             normalized = normalize_stream_event(record.task_id, message, clock())
+            _renew_task_lease(app, record.task_id, worker_id, normalized["timestamp"])
             if normalized["type"] != "heartbeat":
                 writer.record_event(normalized)
                 state = app[UPDATE_STATE_KEY](state, scrub_secrets(message))
@@ -314,6 +334,18 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
                     status = "failed"
                     error = _event_error(normalized)
             _append_task_event(app, record.task_id, normalized)
+            _write_task_checkpoint(
+                app,
+                record.task_id,
+                {
+                    "phase": "stream",
+                    "status": status,
+                    "event_count": len(_task_event_snapshot(app, record.task_id)),
+                    "last_event_type": normalized["type"],
+                    "render_state": state,
+                },
+                updated_at=normalized["timestamp"],
+            )
         if await cancel_check():
             status = "cancelled"
             error = "task cancelled"
@@ -394,6 +426,18 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
                     warnings=["stream setup failed before archive writer started"],
                 )
         finally:
+            _write_task_checkpoint(
+                app,
+                record.task_id,
+                {
+                    "phase": "finished",
+                    "status": status,
+                    "error": scrub_secrets(error),
+                    "render_state": state,
+                },
+                updated_at=end_time,
+            )
+            _clear_durable_task_lease(app, record.task_id, worker_id)
             _clear_active_task(app, record.task_id)
             _clear_task_cancel(app, record.task_id)
             _notify_task_finished(app, record.task_id)
@@ -485,7 +529,13 @@ def _task_event_snapshot(
     app: web.Application,
     task_id: str,
 ) -> list[dict[str, Any]]:
-    return list(app[TASK_EVENT_LOG_KEY].get(task_id, []))
+    events = list(app[TASK_EVENT_LOG_KEY].get(task_id, []))
+    if events:
+        return events
+    store_events = _list_durable_task_events(app, task_id)
+    if store_events:
+        app[TASK_EVENT_LOG_KEY][task_id] = store_events[-MAX_REPLAY_EVENTS:]
+    return store_events
 
 
 def _subscribe_task_events(
@@ -515,6 +565,7 @@ def _append_task_event(
     task_id: str,
     event: dict[str, Any],
 ) -> None:
+    _append_durable_task_event(app, task_id, event)
     events = app[TASK_EVENT_LOG_KEY].setdefault(task_id, [])
     events.append(event)
     if len(events) > MAX_REPLAY_EVENTS:
@@ -553,6 +604,76 @@ def _task_has_active_worker(app: web.Application, task_id: str) -> bool:
     return task_id in app[ACTIVE_TASKS_KEY] or bool(worker and not worker.done())
 
 
+def _task_worker_id(app: web.Application, task_id: str) -> str:
+    return f"{app[RUNNER_WORKER_ID_KEY]}:{task_id}:{uuid.uuid4()}"
+
+
+def _lease_expires_at_from(timestamp: str) -> str:
+    parsed = _parse_timestamp(timestamp) or datetime.now(timezone.utc)
+    return (parsed + timedelta(seconds=_stale_running_seconds())).isoformat()
+
+
+def _renew_task_lease(
+    app: web.Application,
+    task_id: str,
+    worker_id: str,
+    heartbeat_at: str,
+) -> None:
+    renew = getattr(_task_store(app), "renew_task_lease", None)
+    if renew is None:
+        return
+    renew(
+        task_id,
+        worker_id=worker_id,
+        heartbeat_at=heartbeat_at,
+        lease_expires_at=_lease_expires_at_from(heartbeat_at),
+    )
+
+
+def _clear_durable_task_lease(
+    app: web.Application,
+    task_id: str,
+    worker_id: str,
+) -> None:
+    clear = getattr(_task_store(app), "clear_task_lease", None)
+    if clear is not None:
+        clear(task_id, worker_id=worker_id)
+
+
+def _write_task_checkpoint(
+    app: web.Application,
+    task_id: str,
+    checkpoint: dict[str, Any],
+    *,
+    updated_at: str,
+) -> None:
+    writer = getattr(_task_store(app), "write_task_checkpoint", None)
+    if writer is None:
+        return
+    writer(task_id, checkpoint=scrub_secrets(checkpoint), updated_at=updated_at)
+
+
+def _append_durable_task_event(
+    app: web.Application,
+    task_id: str,
+    event: dict[str, Any],
+) -> None:
+    appender = getattr(_task_store(app), "append_task_event", None)
+    if appender is None:
+        return
+    appender(task_id, event, created_at=str(event.get("timestamp") or app[CLOCK_KEY]()))
+
+
+def _list_durable_task_events(
+    app: web.Application,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    lister = getattr(_task_store(app), "list_task_events", None)
+    if lister is None:
+        return []
+    return lister(task_id, limit=MAX_REPLAY_EVENTS)
+
+
 def _reconcile_stale_running_tasks(
     app: web.Application,
     *,
@@ -588,6 +709,14 @@ def _stale_running_reason(
     if record.status != "running":
         return None
     if not _task_has_active_worker(app, record.task_id):
+        lease_expires_at = _parse_timestamp(record.lease_expires_at)
+        if lease_expires_at is not None:
+            now = _parse_timestamp(app[CLOCK_KEY]())
+            if now is None:
+                return None
+            if now <= lease_expires_at:
+                return None
+            return "expired_lease"
         return "no_active_worker"
     if not record.started_at:
         return "missing_started_at"
@@ -654,6 +783,11 @@ def _latest_heartbeat_at(
     app: web.Application,
     task_id: str,
 ) -> datetime | None:
+    record = _task_store(app).get_task(task_id)
+    if record and record.heartbeat_at:
+        heartbeat = _parse_timestamp(record.heartbeat_at)
+        if heartbeat is not None:
+            return heartbeat
     for event in reversed(_task_event_snapshot(app, task_id)):
         if event.get("type") != "heartbeat":
             continue

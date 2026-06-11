@@ -31,6 +31,12 @@ class TaskRecord:
     model_summary: dict[str, Any] | None = None
     warnings: list[str] | None = None
     context: dict[str, Any] = field(default_factory=dict)
+    worker_id: str | None = None
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
+    attempt: int = 0
+    checkpoint: dict[str, Any] | None = None
+    checkpoint_updated_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -70,8 +76,10 @@ class TaskStore:
                 INSERT INTO limira_runner_research_tasks (
                     task_id, user_id, query, status, archive_status,
                     archive_dir, archive_zip_path, created_at, started_at,
-                    completed_at, error, model_summary, warnings, context
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    completed_at, error, model_summary, warnings, context,
+                    worker_id, lease_expires_at, heartbeat_at, attempt,
+                    checkpoint, checkpoint_updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._record_values(record),
             )
@@ -177,19 +185,151 @@ class TaskStore:
             raise KeyError(task_id)
         return record
 
-    def claim_queued_task(self, task_id: str, *, started_at: str) -> TaskRecord | None:
+    def claim_queued_task(
+        self,
+        task_id: str,
+        *,
+        started_at: str,
+        worker_id: str | None = None,
+        lease_expires_at: str | None = None,
+    ) -> TaskRecord | None:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE limira_runner_research_tasks
-                SET status = ?, started_at = ?
+                SET status = ?,
+                    started_at = ?,
+                    worker_id = ?,
+                    lease_expires_at = ?,
+                    heartbeat_at = ?,
+                    attempt = attempt + 1
                 WHERE task_id = ? AND status = ?
                 """,
-                ("running", started_at, task_id, "queued"),
+                (
+                    "running",
+                    started_at,
+                    worker_id,
+                    lease_expires_at,
+                    started_at if worker_id else None,
+                    task_id,
+                    "queued",
+                ),
             )
             if cursor.rowcount == 0:
                 return None
         return self.get_task(task_id)
+
+    def renew_task_lease(
+        self,
+        task_id: str,
+        *,
+        worker_id: str,
+        heartbeat_at: str,
+        lease_expires_at: str,
+    ) -> TaskRecord | None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE limira_runner_research_tasks
+                SET heartbeat_at = ?,
+                    lease_expires_at = ?
+                WHERE task_id = ? AND status = ? AND worker_id = ?
+                """,
+                (heartbeat_at, lease_expires_at, task_id, "running", worker_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
+    def clear_task_lease(
+        self,
+        task_id: str,
+        *,
+        worker_id: str | None = None,
+    ) -> TaskRecord | None:
+        values: list[Any] = [None, None, None, task_id]
+        where_clause = "WHERE task_id = ?"
+        if worker_id is not None:
+            where_clause += " AND worker_id = ?"
+            values.append(worker_id)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE limira_runner_research_tasks
+                SET worker_id = ?,
+                    lease_expires_at = ?,
+                    heartbeat_at = ?
+                {where_clause}
+                """,
+                values,
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
+    def write_task_checkpoint(
+        self,
+        task_id: str,
+        *,
+        checkpoint: dict[str, Any],
+        updated_at: str,
+    ) -> TaskRecord | None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE limira_runner_research_tasks
+                SET checkpoint = ?,
+                    checkpoint_updated_at = ?
+                WHERE task_id = ?
+                """,
+                (self._serialize_value(checkpoint), updated_at, task_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
+    def get_task_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        record = self.get_task(task_id)
+        return record.checkpoint if record else None
+
+    def append_task_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        created_at: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO limira_runner_task_events (task_id, event_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (task_id, self._serialize_value(event), created_at),
+            )
+
+    def list_task_events(
+        self,
+        task_id: str,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_json
+                FROM limira_runner_task_events
+                WHERE task_id = ?
+                ORDER BY event_id ASC
+                LIMIT ?
+                """,
+                (task_id, max(1, int(limit))),
+            ).fetchall()
+        return [
+            self._deserialize_json(row["event_json"], default={})
+            for row in rows
+            if row["event_json"] is not None
+        ]
 
     def finalize_stale_running_task(
         self,
@@ -268,15 +408,43 @@ class TaskStore:
                     error TEXT,
                     model_summary TEXT,
                     warnings TEXT,
-                    context TEXT
+                    context TEXT,
+                    worker_id TEXT,
+                    lease_expires_at TEXT,
+                    heartbeat_at TEXT,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    checkpoint TEXT,
+                    checkpoint_updated_at TEXT
                 )
                 """
             )
             self._ensure_sqlite_column(conn, "context", "TEXT")
+            self._ensure_sqlite_column(conn, "worker_id", "TEXT")
+            self._ensure_sqlite_column(conn, "lease_expires_at", "TEXT")
+            self._ensure_sqlite_column(conn, "heartbeat_at", "TEXT")
+            self._ensure_sqlite_column(conn, "attempt", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_sqlite_column(conn, "checkpoint", "TEXT")
+            self._ensure_sqlite_column(conn, "checkpoint_updated_at", "TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_limira_runner_tasks_user_created
                 ON limira_runner_research_tasks (user_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS limira_runner_task_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_limira_runner_task_events_task_event
+                ON limira_runner_task_events (task_id, event_id)
                 """
             )
 
@@ -301,6 +469,12 @@ class TaskStore:
             self._serialize_value(record.model_summary or {}),
             self._serialize_value(record.warnings or []),
             self._serialize_value(record.context or {}),
+            record.worker_id,
+            record.lease_expires_at,
+            record.heartbeat_at,
+            record.attempt,
+            self._serialize_value(record.checkpoint or {}),
+            record.checkpoint_updated_at,
         )
 
     def _row_to_record(self, row: sqlite3.Row) -> TaskRecord:
@@ -319,6 +493,12 @@ class TaskStore:
             model_summary=self._deserialize_json(row["model_summary"], default={}),
             warnings=self._deserialize_json(row["warnings"], default=[]),
             context=self._deserialize_json(row["context"], default={}),
+            worker_id=row["worker_id"],
+            lease_expires_at=row["lease_expires_at"],
+            heartbeat_at=row["heartbeat_at"],
+            attempt=int(row["attempt"] or 0),
+            checkpoint=self._deserialize_json(row["checkpoint"], default={}),
+            checkpoint_updated_at=row["checkpoint_updated_at"],
         )
 
     def _ensure_sqlite_column(
@@ -410,10 +590,55 @@ class PostgresTaskStore:
     CLAIM_QUEUED_TASK_SQL = f"""
         UPDATE limira_research_tasks
         SET status = 'running',
-            started_at = %s
+            started_at = %s,
+            metadata = metadata
+                || CAST(%s AS jsonb)
+                || jsonb_build_object(
+                    'runner_attempt',
+                    COALESCE((metadata->>'runner_attempt')::int, 0) + 1
+                )
         WHERE task_id = %s
           AND status = 'queued'
         RETURNING {TASK_COLUMNS}
+    """
+    RENEW_TASK_LEASE_SQL = f"""
+        UPDATE limira_research_tasks
+        SET metadata = metadata || CAST(%s AS jsonb)
+        WHERE task_id = %s
+          AND status = 'running'
+          AND metadata->'runner_lease'->>'worker_id' = %s
+        RETURNING {TASK_COLUMNS}
+    """
+    CLEAR_TASK_LEASE_SQL = f"""
+        UPDATE limira_research_tasks
+        SET metadata = metadata || CAST(%s AS jsonb)
+        WHERE task_id = %s
+          AND (%s IS NULL OR metadata->'runner_lease'->>'worker_id' = %s)
+        RETURNING {TASK_COLUMNS}
+    """
+    WRITE_TASK_CHECKPOINT_SQL = f"""
+        UPDATE limira_research_tasks
+        SET metadata = metadata || CAST(%s AS jsonb)
+        WHERE task_id = %s
+        RETURNING {TASK_COLUMNS}
+    """
+    APPEND_TASK_EVENT_SQL = """
+        INSERT INTO limira_task_event_logs (
+            task_id,
+            event_type,
+            source,
+            payload,
+            created_at
+        )
+        VALUES (%s, %s, 'runner', CAST(%s AS jsonb), %s)
+    """
+    LIST_TASK_EVENTS_SQL = """
+        SELECT payload
+        FROM limira_task_event_logs
+        WHERE task_id = %s
+          AND source = 'runner'
+        ORDER BY created_at ASC, event_log_id ASC
+        LIMIT %s
     """
     FINALIZE_STALE_RUNNING_TASK_SQL = f"""
         UPDATE limira_research_tasks
@@ -569,9 +794,113 @@ class PostgresTaskStore:
             raise KeyError(task_id)
         return self._row_to_record(row)
 
-    def claim_queued_task(self, task_id: str, *, started_at: str) -> TaskRecord | None:
-        row = self._fetch_one(self.CLAIM_QUEUED_TASK_SQL, (started_at, task_id))
+    def claim_queued_task(
+        self,
+        task_id: str,
+        *,
+        started_at: str,
+        worker_id: str | None = None,
+        lease_expires_at: str | None = None,
+    ) -> TaskRecord | None:
+        metadata_update = {}
+        if worker_id:
+            metadata_update["runner_lease"] = {
+                "worker_id": worker_id,
+                "lease_expires_at": lease_expires_at,
+                "heartbeat_at": started_at,
+            }
+        row = self._fetch_one(
+            self.CLAIM_QUEUED_TASK_SQL,
+            (started_at, _serialize_json(metadata_update), task_id),
+        )
         return self._row_to_record(row) if row else None
+
+    def renew_task_lease(
+        self,
+        task_id: str,
+        *,
+        worker_id: str,
+        heartbeat_at: str,
+        lease_expires_at: str,
+    ) -> TaskRecord | None:
+        metadata_update = {
+            "runner_lease": {
+                "worker_id": worker_id,
+                "heartbeat_at": heartbeat_at,
+                "lease_expires_at": lease_expires_at,
+            }
+        }
+        row = self._fetch_one(
+            self.RENEW_TASK_LEASE_SQL,
+            (_serialize_json(metadata_update), task_id, worker_id),
+        )
+        return self._row_to_record(row) if row else None
+
+    def clear_task_lease(
+        self,
+        task_id: str,
+        *,
+        worker_id: str | None = None,
+    ) -> TaskRecord | None:
+        row = self._fetch_one(
+            self.CLEAR_TASK_LEASE_SQL,
+            (_serialize_json({"runner_lease": None}), task_id, worker_id, worker_id),
+        )
+        return self._row_to_record(row) if row else None
+
+    def write_task_checkpoint(
+        self,
+        task_id: str,
+        *,
+        checkpoint: dict[str, Any],
+        updated_at: str,
+    ) -> TaskRecord | None:
+        metadata_update = {
+            "graph_checkpoint": {
+                "updated_at": updated_at,
+                "state": checkpoint,
+            }
+        }
+        row = self._fetch_one(
+            self.WRITE_TASK_CHECKPOINT_SQL,
+            (_serialize_json(metadata_update), task_id),
+        )
+        return self._row_to_record(row) if row else None
+
+    def get_task_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        record = self.get_task(task_id)
+        return record.checkpoint if record else None
+
+    def append_task_event(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+        *,
+        created_at: str,
+    ) -> None:
+        self._execute(
+            self.APPEND_TASK_EVENT_SQL,
+            (
+                task_id,
+                str(event.get("type") or event.get("event") or "unknown"),
+                _serialize_json(event),
+                created_at,
+            ),
+        )
+
+    def list_task_events(
+        self,
+        task_id: str,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        rows = self._fetch_all(self.LIST_TASK_EVENTS_SQL, (task_id, max(1, int(limit))))
+        events = []
+        for row in rows:
+            payload = _deserialize_json(row.get("payload"), default={})
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
 
     def finalize_stale_running_task(
         self,
@@ -634,6 +963,10 @@ class PostgresTaskStore:
             rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
+        with self._connect() as conn:
+            conn.execute(sql, params)
+
     def _row_to_record(self, row: dict[str, Any]) -> TaskRecord:
         metadata = _deserialize_json(row.get("metadata"), default={})
         warnings = metadata.get("warnings", [])
@@ -642,6 +975,15 @@ class PostgresTaskStore:
         context = metadata.get("task_context", {})
         if not isinstance(context, dict):
             context = {}
+        lease = metadata.get("runner_lease")
+        if not isinstance(lease, dict):
+            lease = {}
+        checkpoint_record = metadata.get("graph_checkpoint")
+        if not isinstance(checkpoint_record, dict):
+            checkpoint_record = {}
+        checkpoint = checkpoint_record.get("state")
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
         return TaskRecord(
             task_id=str(row["task_id"]),
             user_id=str(row["owner_user_id"]),
@@ -657,6 +999,12 @@ class PostgresTaskStore:
             model_summary=_deserialize_json(row.get("model_summary"), default={}),
             warnings=warnings,
             context=context,
+            worker_id=_optional_string(lease.get("worker_id")),
+            lease_expires_at=_optional_string(lease.get("lease_expires_at")),
+            heartbeat_at=_optional_string(lease.get("heartbeat_at")),
+            attempt=int(metadata.get("runner_attempt", 0) or 0),
+            checkpoint=checkpoint,
+            checkpoint_updated_at=_optional_string(checkpoint_record.get("updated_at")),
         )
 
 
@@ -690,6 +1038,9 @@ def _runner_metadata(*, task_context: dict[str, Any] | None = None) -> dict[str,
         "archive_zip_path": None,
         "warnings": [],
         "task_context": task_context or {},
+        "runner_lease": None,
+        "runner_attempt": 0,
+        "graph_checkpoint": None,
     }
 
 

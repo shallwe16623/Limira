@@ -17,6 +17,7 @@ from runner_api import (
     MAX_QUERY_CHARS,
     RENDER_MARKDOWN_KEY,
     STREAM_EVENTS_KEY,
+    TASK_EVENT_LOG_KEY,
     UPDATE_STATE_KEY,
     create_app,
 )
@@ -774,6 +775,97 @@ async def test_runner_api_task_continues_after_event_client_disconnect(tmp_path)
         replay_events = parse_sse(await replay_response.text())
         assert [event["type"] for event in replay_events] == ["message", "message"]
         assert store.get_task(task_id).status == "completed"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_persists_durable_events_checkpoint_and_replays_after_restart(
+    tmp_path,
+):
+    client, store = await make_client(tmp_path)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_response = await client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        events = parse_sse(await events_response.text())
+        completed = await wait_for_task_status(store, task_id, "completed")
+
+        assert [event["type"] for event in events] == ["heartbeat", "message"]
+        assert completed.worker_id is None
+        assert completed.lease_expires_at is None
+        assert completed.heartbeat_at is None
+        assert completed.checkpoint["phase"] == "finished"
+        assert completed.checkpoint["status"] == "completed"
+        assert [event["type"] for event in store.list_task_events(task_id)] == [
+            "heartbeat",
+            "message",
+        ]
+    finally:
+        await client.close()
+
+    restarted_app = create_app(
+        task_store=store,
+        archive_root=tmp_path / "archives-restarted",
+        service_token="shared",
+        stream_events=completed_stream,
+        init_render_state=init_state,
+        update_state_with_event=update_state,
+        render_markdown=render_markdown,
+        clock=Clock(),
+    )
+    assert restarted_app[TASK_EVENT_LOG_KEY] == {}
+    restarted_client = TestClient(TestServer(restarted_app))
+    await restarted_client.start_server()
+    try:
+        replay_response = await restarted_client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert replay_response.status == 200
+        replay_events = parse_sse(await replay_response.text())
+        assert [event["type"] for event in replay_events] == ["heartbeat", "message"]
+        assert [event["type"] for event in restarted_app[TASK_EVENT_LOG_KEY][task_id]] == [
+            "heartbeat",
+            "message",
+        ]
+    finally:
+        await restarted_client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_renews_durable_lease_while_task_is_active(tmp_path):
+    probe = BackgroundExecutionProbe()
+    client, store = await make_client(tmp_path, stream_events=probe.stream)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_task = asyncio.create_task(
+            client.get(
+                f"/limira-runner/tasks/{task_id}/events",
+                headers=USER_A_HEADERS,
+            )
+        )
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
+        running = await wait_for_task_status(store, task_id, "running")
+
+        assert running.worker_id
+        assert running.lease_expires_at
+        assert running.heartbeat_at
+        assert running.attempt == 1
+        assert running.checkpoint["phase"] == "stream"
+        assert running.checkpoint["last_event_type"] == "message"
+
+        probe.release.set()
+        events_response = await asyncio.wait_for(events_task, timeout=1)
+        assert events_response.status == 200
+        await asyncio.wait_for(events_response.text(), timeout=1)
+        completed = await wait_for_task_status(store, task_id, "completed")
+        assert completed.worker_id is None
     finally:
         await client.close()
 
