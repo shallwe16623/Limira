@@ -289,7 +289,15 @@ def _validate_artifact_payload(
     if artifact_type == "source_candidate":
         return _require_any(
             payload,
-            ("title", "source_url", "url", "summary", "snippet", "description"),
+            (
+                "source",
+                "title",
+                "source_url",
+                "url",
+                "summary",
+                "snippet",
+                "description",
+            ),
             "source_candidate requires source, title, summary, snippet, or description",
         )
     if artifact_type == "evidence":

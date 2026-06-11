@@ -88,6 +88,16 @@ def test_record_research_artifact_dedupes_and_validates_evidence_refs():
     assert warning["payload"]["errors"] == ["invalid evidence_ref: EVID-abc"]
 
 
+def test_record_research_artifact_accepts_source_only_source_candidate():
+    artifact = record_research_artifact(
+        "source_candidate",
+        {"source": "https://example.test/source-only"},
+    )
+
+    assert artifact["type"] == "source_candidate_collected"
+    assert artifact["payload"]["source"] == "https://example.test/source-only"
+
+
 def test_tool_evidence_ledger_derives_google_search_source_candidate():
     ledger = ToolEvidenceLedger(task_id="task-evidence")
     input_message = {

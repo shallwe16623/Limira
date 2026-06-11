@@ -403,6 +403,7 @@ class PostgresTaskStore:
         SELECT {TASK_COLUMNS}
         FROM limira_research_tasks
         WHERE status = 'running'
+          AND runner_task_id = task_id
         ORDER BY COALESCE(started_at, created_at) ASC
         LIMIT %s
     """
@@ -423,6 +424,7 @@ class PostgresTaskStore:
             metadata = metadata || CAST(%s AS jsonb)
         WHERE task_id = %s
           AND status = 'running'
+          AND runner_task_id = task_id
         RETURNING {TASK_COLUMNS}
     """
     CANCEL_QUEUED_TASK_SQL = f"""

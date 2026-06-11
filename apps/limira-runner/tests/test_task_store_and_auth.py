@@ -333,6 +333,7 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "and status = 'queued'" in sql
     assert "where status = 'running'" in sql
     assert "and status = 'running'" in sql
+    assert "runner_task_id = task_id" in sql
     assert "metadata = metadata || cast(%s as jsonb)" in sql
     assert "returning" in sql
     assert "limira_runner_research_tasks" not in sql
@@ -440,8 +441,32 @@ def test_postgres_task_store_matches_runner_task_store_contract():
         "task-c",
         started_at="2026-06-06T12:14:00+00:00",
     )
+    fake_db.rows["web-task-running"] = {
+        "task_id": "web-task-running",
+        "owner_user_id": "user-a",
+        "query": "web-owned running task",
+        "status": "running",
+        "archive_status": "pending",
+        "runner_task_id": "task-c",
+        "archive_object_key": None,
+        "archive_zip_sha256": None,
+        "created_at": "2026-06-06T12:00:30+00:00",
+        "started_at": "2026-06-06T12:00:45+00:00",
+        "completed_at": None,
+        "error": None,
+        "model_summary": {},
+        "metadata": {},
+    }
     running = store.list_running_tasks()
     assert [record.task_id for record in running] == ["task-c"]
+    web_recovery = store.finalize_stale_running_task(
+        "web-task-running",
+        completed_at="2026-06-06T12:14:30+00:00",
+        error="should not overwrite web-owned row",
+        warnings=["should not overwrite web-owned row"],
+    )
+    assert web_recovery is None
+    assert store.get_task("web-task-running").status == "running"
     recovered = store.finalize_stale_running_task(
         "task-c",
         completed_at="2026-06-06T12:15:00+00:00",
@@ -593,6 +618,10 @@ class FakeRunnerPostgresConnection:
                 row
                 for row in self.database.rows.values()
                 if row["status"] == "running"
+                and (
+                    "runner_task_id = task_id" not in lowered
+                    or row["runner_task_id"] == row["task_id"]
+                )
             ]
             rows.sort(key=lambda row: row["started_at"] or row["created_at"])
             return FakeRunnerPostgresCursor(rows[:limit])
@@ -622,6 +651,11 @@ class FakeRunnerPostgresConnection:
             completed_at, error, metadata_update, task_id = params
             row = self.database.rows.get(task_id)
             if not row or row["status"] != "running":
+                return FakeRunnerPostgresCursor([])
+            if (
+                "runner_task_id = task_id" in lowered
+                and row["runner_task_id"] != row["task_id"]
+            ):
                 return FakeRunnerPostgresCursor([])
             row["status"] = "failed"
             row["archive_status"] = "failed"
