@@ -1,5 +1,7 @@
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from runner_api import ACTIVE_TASKS_KEY, _reconcile_task_if_stale, create_app
 from src.core.research_graph import (
     UploadedDocumentSourceProvider,
     build_initial_research_graph,
+    execute_research_graph,
     graph_task_description,
 )
 from task_store import TaskStore
@@ -30,6 +33,77 @@ class _OfflinePdfExporter:
     async def render_pdf(self, html_content):
         self.html_inputs.append(html_content)
         return self.pdf_bytes
+
+
+class _OfflineCaptureQueue:
+    def __init__(self):
+        self.items = []
+
+    async def put(self, item):
+        self.items.append(item)
+
+
+class _OfflineFailingOrchestrator:
+    async def run_main_agent(self, **_kwargs):
+        raise RuntimeError("offline graph node failure")
+
+
+class _OfflineResearchClient:
+    def __init__(
+        self,
+        *,
+        runner_task_id="runner-offline-eval",
+        events=None,
+        status_payload=None,
+    ):
+        self.runner_task_id = runner_task_id
+        self.events = list(events or [])
+        self.status_payload = status_payload or {
+            "task_id": runner_task_id,
+            "status": "completed",
+            "archive_status": "ready",
+        }
+        self.create_calls = []
+        self.stream_calls = []
+        self.status_calls = []
+
+    async def create_research_task(
+        self,
+        *,
+        query,
+        scenario,
+        user,
+        conversation_id=None,
+        document_ids=None,
+        upload_scope=None,
+        source_policy=None,
+    ):
+        self.create_calls.append(
+            {
+                "query": query,
+                "scenario": scenario,
+                "user": user,
+                "conversation_id": conversation_id,
+                "document_ids": list(document_ids or []),
+                "upload_scope": dict(upload_scope or {}),
+                "source_policy": dict(source_policy or {}),
+            }
+        )
+        return {
+            "task_id": self.runner_task_id,
+            "status": "queued",
+            "stream_url": f"/limira-runner/tasks/{self.runner_task_id}/events",
+            "task_url": f"/limira-runner/tasks/{self.runner_task_id}",
+        }
+
+    async def stream_events(self, *, task, user):
+        self.stream_calls.append({"task": task, "user": user})
+        for event in self.events:
+            yield event
+
+    async def get_task_status(self, *, task, user):
+        self.status_calls.append({"task": task, "user": user})
+        return dict(self.status_payload)
 
 
 def _uploaded_document(
@@ -55,6 +129,14 @@ def _uploaded_document(
         language="en",
         metadata=metadata,
     )
+
+
+def _archive_member_texts(archive_bytes: bytes) -> dict[str, str]:
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        return {
+            member_name: archive.read(member_name).decode("utf-8")
+            for member_name in archive.namelist()
+        }
 
 
 @pytest.mark.asyncio
@@ -273,6 +355,44 @@ def test_offline_eval_upload_doc_graph_provider_retrieves_text_chunks_only():
     assert state.context_only_upload_document_ids == ["doc-empty"]
 
 
+@pytest.mark.asyncio
+async def test_offline_eval_graph_node_failure_uses_error_event_contract():
+    state = build_initial_research_graph(
+        task_id="eval-graph-node-failure",
+        query="Verify graph node failure handling",
+        max_units=1,
+    )
+    stream_queue = _OfflineCaptureQueue()
+
+    with pytest.raises(RuntimeError, match="offline graph node failure"):
+        await execute_research_graph(
+            state=state,
+            orchestrator=_OfflineFailingOrchestrator(),
+            original_task_description="Verify graph node failure handling",
+            task_id="eval-graph-node-failure",
+            stream_queue=stream_queue,
+        )
+
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_phase"
+    ] == ["scope", "plan", "research"]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+    ] == ["scope", "plan"]
+    assert stream_queue.items[-1] == {
+        "event": "error",
+        "data": {
+            "task_id": "eval-graph-node-failure",
+            "phase": "research",
+            "error": "offline graph node failure",
+        },
+    }
+
+
 def test_offline_eval_scenario_policy_reaches_graph_prompt():
     state = build_initial_research_graph(
         task_id="eval-scenario-policy",
@@ -320,6 +440,112 @@ def test_offline_eval_scenario_policy_reaches_graph_prompt():
     assert "prefer_primary_sources=False" in description
     assert "allow_secondary_sources=False" in description
     assert "require_retrieved_at=False" in description
+
+
+def test_offline_eval_lease_takeover_requires_expired_or_missing_lease(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="eval-lease-takeover",
+        user_id="user-a",
+        query="lease takeover",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    claimed = store.claim_queued_task(
+        "eval-lease-takeover",
+        started_at="2026-06-06T12:01:00+00:00",
+        worker_id="worker-a",
+        lease_expires_at="2026-06-06T12:10:00+00:00",
+    )
+
+    duplicate_claim = store.claim_queued_task(
+        "eval-lease-takeover",
+        started_at="2026-06-06T12:02:00+00:00",
+        worker_id="worker-b",
+        lease_expires_at="2026-06-06T12:12:00+00:00",
+    )
+    wrong_worker_renewal = store.renew_task_lease(
+        "eval-lease-takeover",
+        worker_id="worker-b",
+        heartbeat_at="2026-06-06T12:03:00+00:00",
+        lease_expires_at="2026-06-06T12:13:00+00:00",
+    )
+    active_recovery = store.finalize_stale_running_task(
+        "eval-lease-takeover",
+        completed_at="2026-06-06T12:05:00+00:00",
+        error="stale_running_task_recovered:expired_lease",
+        warnings=["stale running task recovered: expired_lease"],
+        lease_checked_at="2026-06-06T12:05:00+00:00",
+    )
+    expired_recovery = store.finalize_stale_running_task(
+        "eval-lease-takeover",
+        completed_at="2026-06-06T12:11:00+00:00",
+        error="stale_running_task_recovered:expired_lease",
+        warnings=["stale running task recovered: expired_lease"],
+        lease_checked_at="2026-06-06T12:11:00+00:00",
+    )
+
+    assert claimed is not None
+    assert duplicate_claim is None
+    assert wrong_worker_renewal is None
+    assert active_recovery is None
+    assert expired_recovery is not None
+    assert expired_recovery.status == "failed"
+    assert expired_recovery.error == "stale_running_task_recovered:expired_lease"
+    assert expired_recovery.worker_id == "worker-a"
+    assert expired_recovery.lease_expires_at == "2026-06-06T12:10:00+00:00"
+
+
+def test_offline_eval_checkpoint_resume_envelope_survives_store_restart(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    store = TaskStore(db_path)
+    store.create_task(
+        task_id="eval-checkpoint-resume",
+        user_id="user-a",
+        query="checkpoint resume",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    store.claim_queued_task(
+        "eval-checkpoint-resume",
+        started_at="2026-06-06T12:01:00+00:00",
+        worker_id="worker-a",
+        lease_expires_at="2026-06-06T12:11:00+00:00",
+    )
+    checkpoint = {
+        "phase": "research",
+        "status": "running",
+        "current_research_unit": "unit-1-background",
+        "source_ledger": [{"retrieved_source_id": "RSRC-001"}],
+        "evidence_ledger": [{"id": "EVID-001"}],
+        "executor_state": {"node": "ResearchUnitNode", "unit_index": 1},
+        "resume_policy": "fail_recoverable",
+        "recoverable_reason": "serial_graph_checkpoint_not_resumable",
+    }
+
+    checkpointed = store.write_task_checkpoint(
+        "eval-checkpoint-resume",
+        checkpoint=checkpoint,
+        updated_at="2026-06-06T12:02:00+00:00",
+    )
+    restarted = TaskStore(db_path)
+    persisted = restarted.get_task_checkpoint("eval-checkpoint-resume")
+    record = restarted.get_task("eval-checkpoint-resume")
+
+    assert checkpointed is not None
+    assert persisted == checkpoint
+    assert record.checkpoint == checkpoint
+    assert record.checkpoint_updated_at == "2026-06-06T12:02:00+00:00"
+    assert set(persisted) == {
+        "phase",
+        "status",
+        "current_research_unit",
+        "source_ledger",
+        "evidence_ledger",
+        "executor_state",
+        "resume_policy",
+        "recoverable_reason",
+    }
+    assert persisted["resume_policy"] == "fail_recoverable"
+    assert persisted["recoverable_reason"] == "serial_graph_checkpoint_not_resumable"
 
 
 def test_offline_eval_restart_recovery_fails_stale_and_preserves_running_terminal(
@@ -381,3 +607,96 @@ def test_offline_eval_restart_recovery_fails_stale_and_preserves_running_termina
     assert current.status == "running"
     assert store.get_task("eval-healthy").status == "running"
     assert store.get_task("eval-healthy").completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_server_side_ingestion_converges_without_browser_sse():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = _OfflinePdfExporter()
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    user = limira.LimiraUser("user-a")
+    research = _OfflineResearchClient(
+        runner_task_id="runner-server-side-ingestion",
+        events=[
+            {
+                "task_id": "runner-server-side-ingestion",
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": "EVID-001",
+                    "title": "Offline source",
+                    "summary": "Offline source content supports the report.",
+                    "source_url": "https://example.test/offline",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "a" * 32,
+                },
+            },
+            {
+                "task_id": "runner-server-side-ingestion",
+                "type": "record_research_artifact",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "payload": {
+                        "section_id": "REPORT-001",
+                        "title": "Offline final report",
+                        "markdown": "# Offline final report\n\nSupported by [EVID-001].",
+                    },
+                    "evidence_refs": ["EVID-001"],
+                },
+            },
+            {
+                "task_id": "runner-server-side-ingestion",
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ],
+    )
+
+    created = await limira.create_research_task(
+        {"query": "server side ingestion offline eval"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+    await limira._await_server_ingestion_task(created["task_id"])
+
+    task = repo.get_task(created["task_id"])
+    artifacts = await limira.get_task_artifacts(created["task_id"], user=user, repo=repo)
+    reports = repo.list_task_reports(task_id=created["task_id"])
+    event_types = [
+        event["event_type"]
+        for event in repo.list_task_event_logs(created["task_id"], limit=20)
+    ]
+
+    assert research.stream_calls
+    assert task.status == "completed"
+    assert task.archive_status == "ready"
+    assert task.archive_object_key in storage.objects
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["report_sections"][0]["section_id"] == "REPORT-001"
+    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].pdf_object_key in storage.objects
+    assert event_types == [
+        "evidence_collected",
+        "record_research_artifact",
+        "archive_generated",
+        "status",
+    ]
+
+    archive_response = await limira.download_task_archive(
+        created["task_id"],
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    trace = json.loads(_archive_member_texts(archive_response.body)["trace.json"])
+    assert trace["artifacts"]["evidence"][0]["evidence_id"] == "EVID-001"
+    assert trace["reports"][0]["report_id"] == "REPORT-001"
+    assert trace["task"]["status"] == "completed"
