@@ -1,8 +1,8 @@
 """Research graph contracts for the Limira deep-research workflow.
 
-The current executor is still the compatibility single-agent loop. These models
-define the state shape that will let us migrate toward a LangGraph-style graph
-one node at a time without breaking runner, SSE, archive, or frontend contracts.
+The enabled executor is intentionally serial and local for now. It exposes real
+typed node boundaries while keeping the legacy agent available as a bounded
+research-unit adapter and as the default fallback outside the graph flag.
 """
 
 from __future__ import annotations
@@ -122,6 +122,339 @@ class ResearchGraphExecutionResult(BaseModel):
     failure_experience_summary: Any = None
 
 
+class ResearchGraphExecutionContext(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    orchestrator: Any
+    original_task_description: str
+    task_file_name: str | None = None
+    task_id: str = "default_task"
+    is_final_retry: bool = False
+
+
+class ResearchGraphNodeOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    state: ResearchGraphState
+    current_research_unit: str | None = None
+    executor_state: dict[str, Any] = Field(default_factory=dict)
+    final_summary: str | None = None
+    final_boxed_answer: str | None = None
+    failure_experience_summary: Any = None
+
+
+class ResearchGraphNode:
+    phase: ResearchPhase
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        raise NotImplementedError
+
+
+class ScopeNode(ResearchGraphNode):
+    phase = ResearchPhase.SCOPE
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        scoped_state = state.model_copy(update={"phase": self.phase})
+        return ResearchGraphNodeOutput(
+            state=scoped_state,
+            executor_state={
+                "node": self.__class__.__name__,
+                "scope_length": len(scoped_state.brief.scope),
+                "success_criteria_count": len(scoped_state.brief.success_criteria),
+            },
+        )
+
+
+class PlannerNode(ResearchGraphNode):
+    phase = ResearchPhase.PLAN
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        if not state.plan.research_units:
+            raise ValueError("research_graph_plan_required")
+        planned_state = state.model_copy(update={"phase": self.phase})
+        return ResearchGraphNodeOutput(
+            state=planned_state,
+            executor_state={
+                "node": self.__class__.__name__,
+                "research_unit_count": len(planned_state.plan.research_units),
+                "expected_artifacts": list(planned_state.plan.expected_artifacts),
+            },
+        )
+
+
+class ResearchUnitNode(ResearchGraphNode):
+    phase = ResearchPhase.RESEARCH
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        evidence = list(state.evidence)
+        failure_experience_summary = None
+        current_unit_id = None
+        for index, unit in enumerate(state.plan.research_units):
+            current_unit_id = unit.id
+            final_summary, _boxed_answer, failure_experience_summary = (
+                await context.orchestrator.run_main_agent(
+                    task_description=research_unit_task_description(
+                        state,
+                        unit,
+                        context.original_task_description,
+                    ),
+                    task_file_name=context.task_file_name,
+                    task_id=context.task_id,
+                    is_final_retry=context.is_final_retry,
+                )
+            )
+            research_summary = _required_output_text(
+                final_summary,
+                "research_graph_research_output_required",
+            )
+            evidence.append(
+                EvidenceItem(
+                    id=evidence_id_for_source(
+                        task_id=state.task_id,
+                        source=f"graph://{unit.id}",
+                        index=index,
+                    ),
+                    url=f"graph://{unit.id}",
+                    title=unit.question,
+                    source_type="graph_research_unit",
+                    content_hash=hashlib.sha256(
+                        research_summary.encode("utf-8")
+                    ).hexdigest(),
+                    quote_or_summary=research_summary,
+                    claims=[research_summary],
+                    confidence=0.55,
+                )
+            )
+        completed_units = [
+            unit.model_copy(update={"status": "completed"})
+            for unit in state.plan.research_units
+        ]
+        researched_state = state.model_copy(
+            update={
+                "phase": self.phase,
+                "plan": state.plan.model_copy(
+                    update={"research_units": completed_units}
+                ),
+                "evidence": evidence,
+            }
+        )
+        return ResearchGraphNodeOutput(
+            state=researched_state,
+            current_research_unit=current_unit_id,
+            executor_state={
+                "node": self.__class__.__name__,
+                "research_unit_count": len(completed_units),
+                "evidence_count": len(evidence),
+                "legacy_adapter_calls": len(completed_units),
+            },
+            failure_experience_summary=failure_experience_summary,
+        )
+
+
+class EvidenceCompressorNode(ResearchGraphNode):
+    phase = ResearchPhase.COMPRESS
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        if not state.evidence:
+            raise ValueError("research_graph_compressor_output_required")
+        findings = self._compress_findings(state)
+        compressed_state = state.model_copy(
+            update={"phase": self.phase, "findings": findings}
+        )
+        return ResearchGraphNodeOutput(
+            state=compressed_state,
+            executor_state={
+                "node": self.__class__.__name__,
+                "finding_count": len(findings),
+                "evidence_count": len(state.evidence),
+            },
+            failure_experience_summary=(
+                previous.failure_experience_summary if previous else None
+            ),
+        )
+
+    def _compress_findings(self, state: ResearchGraphState) -> list[CompressedFinding]:
+        findings: list[CompressedFinding] = []
+        for index, evidence in enumerate(state.evidence):
+            research_unit_id = _research_unit_id_from_evidence(evidence, index)
+            findings.append(
+                CompressedFinding(
+                    id=f"finding-{index + 1}-{research_unit_id}",
+                    research_unit_id=research_unit_id,
+                    summary=evidence.quote_or_summary,
+                    evidence_ids=[evidence.id],
+                    confidence=evidence.confidence,
+                )
+            )
+        return findings
+
+
+class VerifierNode(ResearchGraphNode):
+    phase = ResearchPhase.VERIFY
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        verified_claims = self._verify_claims(state)
+        if not verified_claims:
+            raise ValueError("research_graph_verifier_output_required")
+        verified_state = state.model_copy(
+            update={"phase": self.phase, "verified_claims": verified_claims}
+        )
+        return ResearchGraphNodeOutput(
+            state=verified_state,
+            executor_state={
+                "node": self.__class__.__name__,
+                "verified_claim_count": len(verified_claims),
+                "finding_count": len(state.findings),
+            },
+            failure_experience_summary=(
+                previous.failure_experience_summary if previous else None
+            ),
+        )
+
+    def _verify_claims(self, state: ResearchGraphState) -> list[VerifiedClaim]:
+        verified_claims: list[VerifiedClaim] = []
+        for index, finding in enumerate(state.findings):
+            if not finding.evidence_ids:
+                continue
+            verified_claims.append(
+                VerifiedClaim(
+                    id=f"claim-{index + 1}-{finding.research_unit_id}",
+                    claim=finding.summary,
+                    support_type="supports",
+                    evidence_ids=list(finding.evidence_ids),
+                    rationale=(
+                        "Serial graph verifier linked the finding to retrieved "
+                        "research-unit evidence."
+                    ),
+                    confidence=finding.confidence,
+                )
+            )
+        return verified_claims
+
+
+class WriterNode(ResearchGraphNode):
+    phase = ResearchPhase.WRITE
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        final_summary, final_boxed_answer = self._compose_report(state)
+        final_summary = _required_output_text(
+            final_summary,
+            "research_graph_writer_output_required",
+        )
+        final_boxed_answer = _required_output_text(
+            final_boxed_answer,
+            "research_graph_writer_output_required",
+        )
+        written_state = state.model_copy(update={"phase": self.phase})
+        return ResearchGraphNodeOutput(
+            state=written_state,
+            executor_state={
+                "node": self.__class__.__name__,
+                "verified_claim_count": len(state.verified_claims),
+                "final_summary_length": len(final_summary),
+            },
+            final_summary=final_summary,
+            final_boxed_answer=final_boxed_answer,
+            failure_experience_summary=(
+                previous.failure_experience_summary if previous else None
+            ),
+        )
+
+    def _compose_report(self, state: ResearchGraphState) -> tuple[str, str]:
+        if not state.verified_claims:
+            return "", ""
+        claim_lines = [
+            f"- {claim.claim} ({claim.support_type}; evidence: "
+            f"{', '.join(claim.evidence_ids)})"
+            for claim in state.verified_claims
+        ]
+        final_summary = (
+            "## Answer\n"
+            f"{state.brief.clarified_question}\n\n"
+            "## Verified Claims\n"
+            f"{chr(10).join(claim_lines)}\n\n"
+            "## Verification Notes\n"
+            f"{state.plan.verification_strategy}"
+        )
+        return final_summary, state.verified_claims[0].claim
+
+
+class ReconcilerNode(ResearchGraphNode):
+    phase = ResearchPhase.RECONCILE
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        if previous is None:
+            raise ValueError("research_graph_writer_output_required")
+        final_summary, final_boxed_answer = _validate_graph_final_outputs(
+            previous.final_summary,
+            previous.final_boxed_answer,
+        )
+        reconciled_state = state.model_copy(update={"phase": self.phase})
+        return ResearchGraphNodeOutput(
+            state=reconciled_state,
+            executor_state={
+                "node": self.__class__.__name__,
+                "verified_claim_count": len(state.verified_claims),
+                "evidence_count": len(state.evidence),
+            },
+            final_summary=final_summary,
+            final_boxed_answer=final_boxed_answer,
+            failure_experience_summary=previous.failure_experience_summary,
+        )
+
+
+def default_research_graph_nodes() -> list[ResearchGraphNode]:
+    return [
+        ScopeNode(),
+        PlannerNode(),
+        ResearchUnitNode(),
+        EvidenceCompressorNode(),
+        VerifierNode(),
+        WriterNode(),
+        ReconcilerNode(),
+    ]
+
+
 def build_initial_research_graph(
     *,
     task_id: str,
@@ -217,6 +550,34 @@ def graph_phase_event(
     }
 
 
+def graph_checkpoint_event(
+    state: ResearchGraphState,
+    phase: ResearchPhase,
+    node_output: ResearchGraphNodeOutput,
+    *,
+    status: Literal["running", "completed", "failed"] = "running",
+) -> dict[str, Any]:
+    """Return a serializable checkpoint event for Runner durable persistence."""
+
+    terminal = phase == ResearchPhase.COMPLETE and status == "completed"
+    return {
+        "event": "research_graph_checkpoint",
+        "data": {
+            "task_id": state.task_id,
+            "phase": phase.value,
+            "status": status,
+            "current_research_unit": node_output.current_research_unit,
+            "source_ledger": _source_ledger_for_checkpoint(state),
+            "evidence_ledger": _evidence_ledger_for_checkpoint(state),
+            "executor_state": dict(node_output.executor_state),
+            "resume_policy": "terminal" if terminal else "fail_recoverable",
+            "recoverable_reason": (
+                None if terminal else "serial_graph_checkpoint_not_resumable"
+            ),
+        },
+    }
+
+
 def graph_error_event(
     state: ResearchGraphState,
     error: Exception,
@@ -243,46 +604,83 @@ async def execute_research_graph(
     is_final_retry: bool = False,
     stream_queue: Any = None,
 ) -> ResearchGraphExecutionResult:
-    """Run the feature-flagged serial graph adapter around the legacy executor.
+    """Run the feature-flagged serial graph executor.
 
-    The graph is intentionally serial and conservative. Scope and plan are
-    deterministic state phases, research delegates to the existing orchestrator,
-    and verify/write/complete are explicit phase boundaries for later nodes.
+    The enabled path executes explicit graph nodes. Only `ResearchUnitNode` may
+    call the legacy orchestrator, and it does so with a bounded single-unit
+    prompt rather than the full graph plan.
     """
 
-    current_state = state
-    for phase in (ResearchPhase.SCOPE, ResearchPhase.PLAN, ResearchPhase.RESEARCH):
-        current_state = current_state.model_copy(update={"phase": phase})
-        await _emit_graph_phase(stream_queue, current_state, phase)
-
-    (
-        final_summary,
-        final_boxed_answer,
-        failure_experience_summary,
-    ) = await orchestrator.run_main_agent(
-        task_description=graph_task_description(current_state, original_task_description),
+    context = ResearchGraphExecutionContext(
+        orchestrator=orchestrator,
+        original_task_description=original_task_description,
         task_file_name=task_file_name,
         task_id=task_id,
         is_final_retry=is_final_retry,
     )
+    current_output = ResearchGraphNodeOutput(state=state)
+    error_state = state
     try:
+        for node in default_research_graph_nodes():
+            active_state = current_output.state.model_copy(update={"phase": node.phase})
+            error_state = active_state
+            await _emit_graph_phase(stream_queue, active_state, node.phase)
+            current_output = await node.run(active_state, context, current_output)
+            if current_output.state.phase != node.phase:
+                current_output = current_output.model_copy(
+                    update={
+                        "state": current_output.state.model_copy(
+                            update={"phase": node.phase}
+                        )
+                    }
+                )
+            error_state = current_output.state
+            await _emit_graph_checkpoint(
+                stream_queue,
+                current_output.state,
+                node.phase,
+                current_output,
+            )
+
         final_summary, final_boxed_answer = _validate_graph_final_outputs(
-            final_summary,
-            final_boxed_answer,
+            current_output.final_summary,
+            current_output.final_boxed_answer,
         )
     except ValueError as exc:
-        await _emit_graph_error(stream_queue, current_state, exc)
+        await _emit_graph_error(stream_queue, error_state, exc)
+        raise
+    except Exception as exc:
+        await _emit_graph_error(stream_queue, error_state, exc)
         raise
 
-    for phase in (ResearchPhase.VERIFY, ResearchPhase.WRITE, ResearchPhase.COMPLETE):
-        current_state = current_state.model_copy(update={"phase": phase})
-        await _emit_graph_phase(stream_queue, current_state, phase)
-
-    return ResearchGraphExecutionResult(
-        state=current_state,
+    complete_state = current_output.state.model_copy(
+        update={"phase": ResearchPhase.COMPLETE}
+    )
+    complete_output = ResearchGraphNodeOutput(
+        state=complete_state,
+        executor_state={
+            "node": "Complete",
+            "verified_claim_count": len(complete_state.verified_claims),
+            "evidence_count": len(complete_state.evidence),
+        },
         final_summary=final_summary,
         final_boxed_answer=final_boxed_answer,
-        failure_experience_summary=failure_experience_summary,
+        failure_experience_summary=current_output.failure_experience_summary,
+    )
+    await _emit_graph_phase(stream_queue, complete_state, ResearchPhase.COMPLETE)
+    await _emit_graph_checkpoint(
+        stream_queue,
+        complete_state,
+        ResearchPhase.COMPLETE,
+        complete_output,
+        status="completed",
+    )
+
+    return ResearchGraphExecutionResult(
+        state=complete_state,
+        final_summary=final_summary,
+        final_boxed_answer=final_boxed_answer,
+        failure_experience_summary=current_output.failure_experience_summary,
     )
 
 
@@ -335,6 +733,29 @@ def graph_task_description(
     )
 
 
+def research_unit_task_description(
+    state: ResearchGraphState,
+    unit: ResearchUnit,
+    original_task_description: str,
+) -> str:
+    """Build a bounded legacy-adapter prompt for one graph research unit."""
+
+    return (
+        f"{str(original_task_description or '').strip()}\n\n"
+        "## Research Unit Node\n\n"
+        "Execute only this research unit. Do not write the final report. "
+        "Return concise source-grounded findings for the compressor node.\n\n"
+        f"Unit ID: {unit.id}\n"
+        f"Question: {unit.question}\n"
+        f"Search queries: {'; '.join(unit.search_queries)}\n"
+        f"Source target: at least {unit.source_policy.min_sources}, "
+        f"max {unit.max_sources} sources\n"
+        f"Source policy: {_source_policy_text(unit.source_policy)}\n\n"
+        f"Scope: {state.brief.scope}\n"
+        f"Constraints: {'; '.join(state.brief.constraints)}"
+    )
+
+
 def evidence_id_for_source(*, task_id: str, source: str, index: int = 0) -> str:
     digest = hashlib.sha256(f"{task_id}:{source}:{index}".encode("utf-8")).hexdigest()
     return f"EVID-{digest[:12]}"
@@ -357,6 +778,20 @@ async def _emit_graph_phase(
         await stream_queue.put(graph_phase_event(state, phase))
 
 
+async def _emit_graph_checkpoint(
+    stream_queue: Any,
+    state: ResearchGraphState,
+    phase: ResearchPhase,
+    node_output: ResearchGraphNodeOutput,
+    *,
+    status: Literal["running", "completed", "failed"] = "running",
+) -> None:
+    if stream_queue is not None:
+        await stream_queue.put(
+            graph_checkpoint_event(state, phase, node_output, status=status)
+        )
+
+
 async def _emit_graph_error(
     stream_queue: Any,
     state: ResearchGraphState,
@@ -370,18 +805,59 @@ def _validate_graph_final_outputs(
     final_summary: Any,
     final_boxed_answer: Any,
 ) -> tuple[str, str]:
-    summary = _required_output_text(final_summary)
-    boxed_answer = _required_output_text(final_boxed_answer)
+    summary = _required_output_text(
+        final_summary,
+        "research_graph_final_output_required",
+    )
+    boxed_answer = _required_output_text(
+        final_boxed_answer,
+        "research_graph_final_output_required",
+    )
     return summary, boxed_answer
 
 
-def _required_output_text(value: Any) -> str:
+def _required_output_text(value: Any, error_name: str) -> str:
     if value is None:
-        raise ValueError("research_graph_final_output_required")
+        raise ValueError(error_name)
     text = value if isinstance(value, str) else str(value)
     if not text.strip():
-        raise ValueError("research_graph_final_output_required")
+        raise ValueError(error_name)
     return text
+
+
+def _research_unit_id_from_evidence(evidence: EvidenceItem, index: int) -> str:
+    if evidence.url and evidence.url.startswith("graph://"):
+        value = evidence.url.removeprefix("graph://").strip()
+        if value:
+            return value
+    return f"unit-{index + 1}"
+
+
+def _source_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, Any]]:
+    return [
+        {
+            "unit_id": unit.id,
+            "status": unit.status,
+            "search_queries": list(unit.search_queries),
+            "source_policy": unit.source_policy.model_dump(mode="json"),
+        }
+        for unit in state.plan.research_units
+    ]
+
+
+def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": evidence.id,
+            "source_type": evidence.source_type,
+            "url": evidence.url,
+            "title": evidence.title,
+            "content_hash": evidence.content_hash,
+            "retrieved_at": evidence.retrieved_at.isoformat(),
+            "confidence": evidence.confidence,
+        }
+        for evidence in state.evidence
+    ]
 
 
 def _normalize_query(query: str) -> str:

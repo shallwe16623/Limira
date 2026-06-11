@@ -192,6 +192,34 @@ class BackgroundExecutionProbe:
         }
 
 
+class GraphCheckpointProbe:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, task_id, query, _unused, disconnect_check=None):
+        assert disconnect_check is not None
+        yield {
+            "event": "research_graph_checkpoint",
+            "data": {
+                "phase": "verify",
+                "status": "running",
+                "current_research_unit": "unit-1-background",
+                "source_ledger": [{"unit_id": "unit-1-background"}],
+                "evidence_ledger": [{"id": "EVID-abcdef123456"}],
+                "executor_state": {"node": "VerifierNode"},
+                "resume_policy": "fail_recoverable",
+                "recoverable_reason": "serial_graph_checkpoint_not_resumable",
+            },
+        }
+        self.started.set()
+        await self.release.wait()
+        yield {
+            "event": "message",
+            "data": {"delta": {"content": " checkpoint complete"}},
+        }
+
+
 class ZipFailWriter(ResearchArchiveWriter):
     def _create_zip(self, zip_path):
         raise RuntimeError("zip unavailable")
@@ -1005,6 +1033,52 @@ async def test_runner_api_persists_durable_events_checkpoint_and_replays_after_r
         ]
     finally:
         await restarted_client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_persists_graph_checkpoint_stream_events(tmp_path):
+    probe = GraphCheckpointProbe()
+    client, store = await make_client(tmp_path, stream_events=probe.stream)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_task = asyncio.create_task(
+            client.get(
+                f"/limira-runner/tasks/{task_id}/events",
+                headers=USER_A_HEADERS,
+            )
+        )
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
+
+        running = await wait_for_task_status(store, task_id, "running")
+        assert running.checkpoint["phase"] == "verify"
+        assert running.checkpoint["status"] == "running"
+        assert running.checkpoint["resume_policy"] == "fail_recoverable"
+        assert running.checkpoint["current_research_unit"] == "unit-1-background"
+        assert running.checkpoint["source_ledger"] == [
+            {"unit_id": "unit-1-background"}
+        ]
+        assert running.checkpoint["evidence_ledger"] == [
+            {"id": "EVID-abcdef123456"}
+        ]
+        assert running.checkpoint["executor_state"] == {"node": "VerifierNode"}
+        assert running.checkpoint["recoverable_reason"] == (
+            "serial_graph_checkpoint_not_resumable"
+        )
+
+        probe.release.set()
+        events_response = await asyncio.wait_for(events_task, timeout=1)
+        assert events_response.status == 200
+        await asyncio.wait_for(events_response.text(), timeout=1)
+        completed = await wait_for_task_status(store, task_id, "completed")
+        assert_checkpoint_envelope(
+            completed.checkpoint,
+            phase="finished",
+            status="completed",
+            resume_policy="terminal",
+        )
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

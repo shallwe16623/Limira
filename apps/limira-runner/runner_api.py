@@ -351,18 +351,27 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
                     status = "failed"
                     error = _event_error(normalized)
             _append_task_event(app, record.task_id, normalized)
-            _write_task_checkpoint(
-                app,
-                record.task_id,
-                {
-                    "phase": "stream",
-                    "status": status,
-                    "event_count": len(_task_event_snapshot(app, record.task_id)),
-                    "last_event_type": normalized["type"],
-                    "render_state": state,
-                },
-                updated_at=normalized["timestamp"],
-            )
+            graph_checkpoint = _graph_checkpoint_from_event(normalized)
+            if graph_checkpoint is not None:
+                _write_task_checkpoint(
+                    app,
+                    record.task_id,
+                    graph_checkpoint,
+                    updated_at=normalized["timestamp"],
+                )
+            else:
+                _write_task_checkpoint(
+                    app,
+                    record.task_id,
+                    {
+                        "phase": "stream",
+                        "status": status,
+                        "event_count": len(_task_event_snapshot(app, record.task_id)),
+                        "last_event_type": normalized["type"],
+                        "render_state": state,
+                    },
+                    updated_at=normalized["timestamp"],
+                )
         if await cancel_check():
             status = "cancelled"
             error = "task cancelled"
@@ -729,6 +738,19 @@ def _checkpoint_envelope(checkpoint: dict[str, Any]) -> dict[str, Any]:
         "resume_policy": resume_policy,
         "recoverable_reason": recoverable_reason,
     }
+
+
+def _graph_checkpoint_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    if event.get("type") != "research_graph_checkpoint":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data
+    checkpoint = payload.get("checkpoint")
+    return checkpoint if isinstance(checkpoint, dict) else None
 
 
 def _append_durable_task_event(

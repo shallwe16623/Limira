@@ -2,6 +2,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from src.core import pipeline as pipeline_module
+from src.core import research_graph as research_graph_module
 from src.core.research_graph import (
     ResearchGraphExecutionResult,
     ResearchPhase,
@@ -359,8 +360,8 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
         stream_queue=stream_queue,
     )
 
-    assert result[0] == "summary"
-    assert result[1] == "final"
+    assert "## Verified Claims" in result[0]
+    assert result[1] == "summary"
     assert [item["event"] for item in stream_queue.items[:2]] == [
         "research_brief_created",
         "research_plan_created",
@@ -369,10 +370,66 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
         item["data"]["phase"]
         for item in stream_queue.items
         if item["event"] == "research_graph_phase"
-    ] == ["scope", "plan", "research", "verify", "write", "complete"]
+    ] == [
+        "scope",
+        "plan",
+        "research",
+        "compress",
+        "verify",
+        "write",
+        "reconcile",
+        "complete",
+    ]
+    checkpoints = [
+        item["data"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_checkpoint"
+    ]
+    assert [item["phase"] for item in checkpoints] == [
+        "scope",
+        "plan",
+        "research",
+        "compress",
+        "verify",
+        "write",
+        "reconcile",
+        "complete",
+    ]
+    for checkpoint in checkpoints:
+        assert set(checkpoint) == {
+            "task_id",
+            "phase",
+            "status",
+            "current_research_unit",
+            "source_ledger",
+            "evidence_ledger",
+            "executor_state",
+            "resume_policy",
+            "recoverable_reason",
+        }
+        assert checkpoint["task_id"] == "task-pipeline-graph-phases"
+        assert isinstance(checkpoint["source_ledger"], list)
+        assert isinstance(checkpoint["evidence_ledger"], list)
+        assert isinstance(checkpoint["executor_state"], dict)
+    research_checkpoint = next(
+        item for item in checkpoints if item["phase"] == "research"
+    )
+    assert research_checkpoint["current_research_unit"].startswith("unit-4-")
+    assert len(research_checkpoint["evidence_ledger"]) == 4
+    complete_checkpoint = checkpoints[-1]
+    assert complete_checkpoint["status"] == "completed"
+    assert complete_checkpoint["resume_policy"] == "terminal"
+    assert complete_checkpoint["recoverable_reason"] is None
     assert any(item["event"] == "message" for item in stream_queue.items)
-    assert len(_FakeOrchestrator.task_descriptions) == 1
-    assert "## Limira Research Workflow" in _FakeOrchestrator.task_descriptions[0]
+    assert len(_FakeOrchestrator.task_descriptions) == 4
+    assert all(
+        "## Research Unit Node" in task_description
+        for task_description in _FakeOrchestrator.task_descriptions
+    )
+    assert all(
+        "## Limira Research Workflow" not in task_description
+        for task_description in _FakeOrchestrator.task_descriptions
+    )
 
 
 @pytest.mark.asyncio
@@ -411,11 +468,10 @@ async def test_feature_flagged_graph_executor_failures_use_pipeline_error_handli
         ("", "", None),
         ("   ", "\n\t", None),
         (None, "final", None),
-        ("summary", None, None),
     ],
 )
 @pytest.mark.asyncio
-async def test_feature_flagged_graph_executor_rejects_missing_final_outputs(
+async def test_feature_flagged_graph_executor_rejects_missing_research_outputs(
     tmp_path, monkeypatch, final_outputs
 ):
     _MissingFinalOutputOrchestrator.outputs = final_outputs
@@ -440,7 +496,7 @@ async def test_feature_flagged_graph_executor_rejects_missing_final_outputs(
     )
 
     assert result[1] == ""
-    assert "research_graph_final_output_required" in result[0]
+    assert "research_graph_research_output_required" in result[0]
     error_events = [
         item for item in stream_queue.items if item.get("event") == "error"
     ]
@@ -448,10 +504,106 @@ async def test_feature_flagged_graph_executor_rejects_missing_final_outputs(
     assert error_events[0]["data"] == {
         "task_id": "task-pipeline-graph-missing-output",
         "phase": "research",
-        "error": "research_graph_final_output_required",
+        "error": "research_graph_research_output_required",
     }
     assert [
         item["data"]["phase"]
         for item in stream_queue.items
         if item["event"] == "research_graph_phase"
     ] == ["scope", "plan", "research"]
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_rejects_missing_verifier_output(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    monkeypatch.setattr(
+        research_graph_module.VerifierNode,
+        "_verify_claims",
+        lambda self, state: [],
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-missing-verifier",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == ""
+    assert "research_graph_verifier_output_required" in result[0]
+    error_events = [
+        item for item in stream_queue.items if item.get("event") == "error"
+    ]
+    assert error_events[-1]["data"] == {
+        "task_id": "task-pipeline-graph-missing-verifier",
+        "phase": "verify",
+        "error": "research_graph_verifier_output_required",
+    }
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_phase"
+    ] == ["scope", "plan", "research", "compress", "verify"]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_checkpoint"
+    ] == ["scope", "plan", "research", "compress"]
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_rejects_missing_writer_output(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    monkeypatch.setattr(
+        research_graph_module.WriterNode,
+        "_compose_report",
+        lambda self, state: ("", ""),
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-missing-writer",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == ""
+    assert "research_graph_writer_output_required" in result[0]
+    error_events = [
+        item for item in stream_queue.items if item.get("event") == "error"
+    ]
+    assert error_events[-1]["data"] == {
+        "task_id": "task-pipeline-graph-missing-writer",
+        "phase": "write",
+        "error": "research_graph_writer_output_required",
+    }
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_phase"
+    ] == ["scope", "plan", "research", "compress", "verify", "write"]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_checkpoint"
+    ] == ["scope", "plan", "research", "compress", "verify"]
