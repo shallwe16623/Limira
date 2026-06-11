@@ -351,7 +351,7 @@ def test_offline_eval_upload_doc_graph_provider_retrieves_text_chunks_only():
     assert retrieved[0].source_type == "limira_upload"
     assert retrieved[0].source_content_state == "content_bearing"
     assert retrieved[0].retrieval_status == "retrieved"
-    assert retrieved[0].content_hash == "f" * 64
+    assert retrieved[0].content_hash == "f" * 32
     assert state.context_only_upload_document_ids == ["doc-empty"]
 
 

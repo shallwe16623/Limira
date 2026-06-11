@@ -17,6 +17,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 EVIDENCE_ID_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
+GRAPH_CONTENT_HASH_CHARS = 32
+GRAPH_SOURCE_SUMMARY_MAX_CHARS = 20_000
+GRAPH_FINDING_SUMMARY_MAX_CHARS = 10_000
 
 
 class ResearchPhase(StrEnum):
@@ -331,9 +334,11 @@ class ResearchUnitNode(ResearchGraphNode):
                 final_summary,
                 "research_graph_research_output_required",
             )
-            content_hash = hashlib.sha256(
-                research_summary.encode("utf-8")
-            ).hexdigest()
+            research_summary = _bounded_graph_text(
+                research_summary,
+                GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+            )
+            content_hash = _short_content_hash(research_summary)
             retrieved_source = RetrievedSource(
                 id=retrieved_source_id_for_source(
                     task_id=state.task_id,
@@ -498,7 +503,10 @@ class EvidenceCompressorNode(ResearchGraphNode):
                 CompressedFinding(
                     id=f"finding-{index + 1}-{research_unit_id}",
                     research_unit_id=research_unit_id,
-                    summary=evidence.quote_or_summary,
+                    summary=_bounded_graph_text(
+                        evidence.quote_or_summary,
+                        GRAPH_FINDING_SUMMARY_MAX_CHARS,
+                    ),
                     evidence_ids=[evidence.id],
                     confidence=evidence.confidence,
                 )
@@ -1506,7 +1514,9 @@ def _upload_source_from_payload(
     attached_document_id = str(payload.get("attached_document_id") or "").strip()
     content_hash = str(payload.get("content_hash") or "").strip()
     if len(content_hash) < 16:
-        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        content_hash = _short_content_hash(text)
+    else:
+        content_hash = _short_content_hash_from_digest(content_hash)
     chunk_id = str(payload.get("chunk_id") or "").strip()
     if not chunk_id:
         chunk_id = _upload_source_chunk_id(document_id, attached_document_id, index)
@@ -1531,6 +1541,26 @@ def _upload_source_from_payload(
         text_char_count=text_char_count_value,
         text_truncated=bool(payload.get("text_truncated")),
     )
+
+
+def _short_content_hash(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[
+        :GRAPH_CONTENT_HASH_CHARS
+    ]
+
+
+def _short_content_hash_from_digest(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) < 16:
+        return _short_content_hash(text)
+    return text[:GRAPH_CONTENT_HASH_CHARS]
+
+
+def _bounded_graph_text(value: str, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
 
 
 def _upload_source_chunk_id(

@@ -1,6 +1,7 @@
 import pytest
 from omegaconf import OmegaConf
 
+from archive_writer import scrub_secrets
 from src.core import pipeline as pipeline_module
 from src.core import research_graph as research_graph_module
 from src.core.research_graph import (
@@ -50,6 +51,17 @@ class _FakeOrchestrator:
             {"event": "message", "data": {"delta": {"content": "legacy executor"}}}
         )
         return "summary", "final", None
+
+
+class _LongSummaryOrchestrator:
+    task_descriptions = []
+
+    def __init__(self, *, stream_queue=None, **_kwargs):
+        self.stream_queue = stream_queue
+
+    async def run_main_agent(self, **kwargs):
+        self.__class__.task_descriptions.append(kwargs["task_description"])
+        return "long research summary " + ("x" * 25_000), "final", None
 
 
 class _FailingOrchestrator:
@@ -556,12 +568,15 @@ async def test_feature_flagged_graph_executor_retrieves_upload_sources(
     evidence_payload = upload_events[2]["payload"]
     assert retrieved_payload["document_id"] == "doc-upload"
     assert retrieved_payload["chunk_id"] == "UPLOAD-CHUNK-001"
-    assert retrieved_payload["content_hash"] == "a" * 64
+    assert retrieved_payload["content_hash"] == "a" * 32
+    assert scrub_secrets(retrieved_payload)["content_hash"] == "a" * 32
     assert retrieved_payload["retrieved_at"] == "2026-06-06T12:00:00+00:00"
     assert retrieved_payload["tool_name"] == "uploaded_document_source_provider"
     assert evidence_payload["document_id"] == "doc-upload"
     assert evidence_payload["chunk_id"] == "UPLOAD-CHUNK-001"
     assert evidence_payload["summary"] == upload_text
+    assert evidence_payload["content_hash"] == "a" * 32
+    assert scrub_secrets(evidence_payload)["content_hash"] == "a" * 32
 
     research_checkpoint = next(
         item["data"]
@@ -573,14 +588,92 @@ async def test_feature_flagged_graph_executor_retrieves_upload_sources(
     assert any(
         item.get("source_type") == "limira_upload"
         and item.get("chunk_id") == "UPLOAD-CHUNK-001"
+        and item.get("content_hash") == "a" * 32
         for item in research_checkpoint["source_ledger"]
     )
     assert any(
         item.get("source_type") == "limira_upload"
         and item.get("chunk_id") == "UPLOAD-CHUNK-001"
+        and item.get("content_hash") == "a" * 32
         for item in research_checkpoint["evidence_ledger"]
     )
     assert len(_FakeOrchestrator.task_descriptions) == 4
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_bounds_long_research_summaries_and_hashes(
+    tmp_path, monkeypatch
+):
+    _LongSummaryOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _LongSummaryOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-long-summary",
+        task_description="Summarize a long research output",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "## Verified Claims" in result[0]
+    retrieved_payloads = [
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "retrieved_source_collected"
+        and item["payload"].get("source_type") == "graph_research_unit"
+    ]
+    evidence_payloads = [
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "evidence_collected"
+        and item["payload"].get("source_type") == "graph_research_unit"
+    ]
+    finding_payloads = [
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "finding_collected"
+    ]
+    claim_payloads = [
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "verified_claim_collected"
+    ]
+
+    assert retrieved_payloads
+    assert evidence_payloads
+    assert finding_payloads
+    assert claim_payloads
+    assert all(len(payload["summary"]) == 20_000 for payload in retrieved_payloads)
+    assert all(len(payload["summary"]) == 20_000 for payload in evidence_payloads)
+    assert all(len(payload["summary"]) == 10_000 for payload in finding_payloads)
+    assert all(len(payload["claim"]) == 10_000 for payload in claim_payloads)
+    for payload in [*retrieved_payloads, *evidence_payloads]:
+        assert len(payload["content_hash"]) == 32
+        assert scrub_secrets(payload)["content_hash"] == payload["content_hash"]
+
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    checkpoint_hashes = [
+        item["content_hash"]
+        for item in [
+            *research_checkpoint["source_ledger"],
+            *research_checkpoint["evidence_ledger"],
+        ]
+        if item.get("content_hash")
+    ]
+    assert checkpoint_hashes
+    assert all(len(content_hash) == 32 for content_hash in checkpoint_hashes)
+    assert len(_LongSummaryOrchestrator.task_descriptions) == 4
 
 
 @pytest.mark.asyncio
