@@ -141,6 +141,8 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
             "prefer_primary_sources": False,
             "allow_secondary_sources": True,
             "require_retrieved_at": True,
+            "prefer_uploaded_documents": True,
+            "prefer_scenario_sources": True,
         },
     )
 
@@ -153,10 +155,20 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
         "Uploaded memo states a controlled export exposure." in item
         for item in state.brief.required_sources
     )
+    assert len(state.upload_sources) == 1
+    assert state.upload_sources[0].document_id == "doc-a"
+    assert state.upload_sources[0].chunk_id.startswith("UPLOAD-CHUNK-")
+    assert state.upload_sources[0].source_type == "limira_upload"
+    assert state.upload_sources[0].text == (
+        "Uploaded memo states a controlled export exposure."
+    )
+    assert state.context_only_upload_document_ids == ["doc-b"]
     assert any("uploaded document facts" in item for item in state.brief.constraints)
     assert any("context-only upload IDs" in item and "doc-b" in item for item in state.brief.constraints)
     assert state.plan.research_units[0].source_policy.min_sources == 5
     assert state.plan.research_units[0].source_policy.prefer_primary_sources is False
+    assert state.plan.research_units[0].source_policy.prefer_uploaded_documents is True
+    assert state.plan.research_units[0].source_policy.prefer_scenario_sources is True
 
 
 def test_research_graph_bootstrap_events_are_serializable_and_ordered():
@@ -209,6 +221,8 @@ def test_graph_task_description_surfaces_source_policy_flags():
             "prefer_primary_sources": False,
             "allow_secondary_sources": False,
             "require_retrieved_at": False,
+            "prefer_uploaded_documents": True,
+            "prefer_scenario_sources": True,
         },
     )
 
@@ -221,6 +235,8 @@ def test_graph_task_description_surfaces_source_policy_flags():
     assert "prefer_primary_sources=False" in task_description
     assert "allow_secondary_sources=False" in task_description
     assert "require_retrieved_at=False" in task_description
+    assert "prefer_uploaded_documents=True" in task_description
+    assert "prefer_scenario_sources=True" in task_description
 
 
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():
@@ -461,6 +477,150 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
         "## Limira Research Workflow" not in task_description
         for task_description in _FakeOrchestrator.task_descriptions
     )
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_retrieves_upload_sources(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    upload_text = "Uploaded memo states the entity is listed under program X."
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-upload-source",
+        task_description="Assess uploaded document evidence",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+        research_context={
+            "document_ids": ["doc-upload"],
+            "upload_scope": {
+                "document_count": 1,
+                "retrieval_status": "retrieved",
+                "retrieved_document_ids": ["doc-upload"],
+                "context_only_document_ids": [],
+                "source_payloads": [
+                    {
+                        "candidate_id": "SRC-UPLOAD-001",
+                        "document_id": "doc-upload",
+                        "attached_document_id": "attached-doc-upload",
+                        "chunk_id": "UPLOAD-CHUNK-001",
+                        "filename": "memo.txt",
+                        "source_type": "limira_upload",
+                        "source_content_state": "content_bearing",
+                        "retrieval_status": "retrieved",
+                        "retrieved_at": "2026-06-06T12:00:00+00:00",
+                        "content_hash": "a" * 64,
+                        "snippet": upload_text,
+                        "text": upload_text,
+                        "text_char_count": len(upload_text),
+                    }
+                ],
+            },
+            "source_policy": {"min_sources": 3},
+        },
+    )
+
+    assert upload_text in result[0]
+    upload_events = [
+        item
+        for item in stream_queue.items
+        if item.get("payload", {}).get("source_type") == "limira_upload"
+    ]
+    assert [item["type"] for item in upload_events[:3]] == [
+        "source_candidate_collected",
+        "retrieved_source_collected",
+        "evidence_collected",
+    ]
+    retrieved_payload = upload_events[1]["payload"]
+    evidence_payload = upload_events[2]["payload"]
+    assert retrieved_payload["document_id"] == "doc-upload"
+    assert retrieved_payload["chunk_id"] == "UPLOAD-CHUNK-001"
+    assert retrieved_payload["content_hash"] == "a" * 64
+    assert retrieved_payload["retrieved_at"] == "2026-06-06T12:00:00+00:00"
+    assert retrieved_payload["tool_name"] == "uploaded_document_source_provider"
+    assert evidence_payload["document_id"] == "doc-upload"
+    assert evidence_payload["chunk_id"] == "UPLOAD-CHUNK-001"
+    assert evidence_payload["summary"] == upload_text
+
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    assert research_checkpoint["executor_state"]["upload_source_count"] == 1
+    assert any(
+        item.get("source_type") == "limira_upload"
+        and item.get("chunk_id") == "UPLOAD-CHUNK-001"
+        for item in research_checkpoint["source_ledger"]
+    )
+    assert any(
+        item.get("source_type") == "limira_upload"
+        and item.get("chunk_id") == "UPLOAD-CHUNK-001"
+        for item in research_checkpoint["evidence_ledger"]
+    )
+    assert len(_FakeOrchestrator.task_descriptions) == 4
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_does_not_promote_context_only_uploads(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-context-only-upload",
+        task_description="Assess context-only upload",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+        research_context={
+            "document_ids": ["doc-empty"],
+            "upload_scope": {
+                "document_count": 1,
+                "retrieval_status": "context_only",
+                "retrieved_document_ids": [],
+                "context_only_document_ids": ["doc-empty"],
+                "source_payloads": [],
+            },
+        },
+    )
+
+    assert "## Verified Claims" in result[0]
+    assert not any(
+        item.get("payload", {}).get("source_type") == "limira_upload"
+        for item in stream_queue.items
+    )
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    assert research_checkpoint["executor_state"]["upload_source_count"] == 0
+    assert research_checkpoint["executor_state"]["context_only_upload_document_ids"] == [
+        "doc-empty"
+    ]
+    assert all(
+        item.get("source_type") != "limira_upload"
+        for item in research_checkpoint["evidence_ledger"]
+    )
+    assert len(_FakeOrchestrator.task_descriptions) == 4
 
 
 @pytest.mark.asyncio

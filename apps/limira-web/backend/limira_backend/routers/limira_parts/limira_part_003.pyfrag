@@ -1443,6 +1443,15 @@ def _upload_source_candidate_id(
     return f"SRC-UPLOAD-{digest}"
 
 
+def _upload_source_chunk_id(
+    task_id: str,
+    document: LimiraUploadedDocument,
+) -> str:
+    source = f"chunk:{task_id}:{document.document_id}:{_upload_source_document_id(document)}"
+    digest = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"UPLOAD-CHUNK-{digest}"
+
+
 def _upload_source_excerpt(text: str, *, max_chars: int = 4000) -> str:
     if len(text) <= max_chars:
         return text
@@ -1462,6 +1471,7 @@ def _upload_source_candidate_payload(
     filename = document.original_filename or source_document_id
     payload: dict[str, Any] = {
         "candidate_id": _upload_source_candidate_id(task_id, document),
+        "chunk_id": _upload_source_chunk_id(task_id, document),
         "title": f"Uploaded document: {filename}",
         "summary": _upload_source_excerpt(text, max_chars=800)
         if has_text
@@ -1529,6 +1539,7 @@ def _runner_upload_source_payloads(
                 "candidate_id": candidate["candidate_id"],
                 "document_id": candidate["document_id"],
                 "attached_document_id": candidate["attached_document_id"],
+                "chunk_id": candidate["chunk_id"],
                 "filename": candidate["filename"],
                 "source_type": candidate["source_type"],
                 "source_state": candidate["source_state"],

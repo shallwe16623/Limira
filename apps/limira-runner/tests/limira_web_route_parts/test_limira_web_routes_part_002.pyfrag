@@ -305,6 +305,7 @@ async def test_research_can_attach_history_documents_without_duplicate_storage()
     runner_source_payload = runner_source_payloads[0]
     assert runner_source_payload["document_id"] == "doc-cloud"
     assert runner_source_payload["attached_document_id"] == attached[0].document_id
+    assert runner_source_payload["chunk_id"].startswith("UPLOAD-CHUNK-")
     assert runner_source_payload["source_type"] == "limira_upload"
     assert runner_source_payload["source_content_state"] == "content_bearing"
     assert runner_source_payload["retrieval_status"] == "retrieved"
@@ -319,6 +320,7 @@ async def test_research_can_attach_history_documents_without_duplicate_storage()
     assert candidate["candidate_id"].startswith("SRC-UPLOAD-")
     assert candidate["document_id"] == "doc-cloud"
     assert candidate["attached_document_id"] == attached[0].document_id
+    assert candidate["chunk_id"] == runner_source_payload["chunk_id"]
     assert candidate["filename"] == "cloud.txt"
     assert candidate["source_type"] == "limira_upload"
     assert candidate["source_state"] == "source_candidate"
@@ -381,6 +383,7 @@ async def test_research_records_context_only_upload_candidate_when_text_unavaila
     candidate = artifacts["source_candidates"][0]
     assert candidate["document_id"] == "doc-empty"
     assert candidate["attached_document_id"] == attached[0].document_id
+    assert candidate["chunk_id"].startswith("UPLOAD-CHUNK-")
     assert candidate["source_type"] == "limira_upload"
     assert candidate["source_content_state"] == "context_only"
     assert candidate["retrieval_status"] == "context_only"

@@ -7,6 +7,7 @@ import pytest
 from limira_tools.limira_evidence import tool_evidence_events_from_result
 from runner_api import ACTIVE_TASKS_KEY, _reconcile_task_if_stale, create_app
 from src.core.research_graph import (
+    UploadedDocumentSourceProvider,
     build_initial_research_graph,
     graph_task_description,
 )
@@ -177,6 +178,7 @@ def test_offline_eval_upload_doc_source_candidates_cover_text_and_context_only()
     assert text_payload["retrieval_status"] == "retrieved"
     assert text_payload["document_id"] == "doc-text"
     assert text_payload["attached_document_id"] == "attached-doc-text"
+    assert text_payload["chunk_id"].startswith("UPLOAD-CHUNK-")
     assert text_payload["text"] == source_text.extracted_text
     assert text_payload["retrieved_at"]
     assert text_payload["content_hash"]
@@ -185,6 +187,7 @@ def test_offline_eval_upload_doc_source_candidates_cover_text_and_context_only()
     assert empty_payload["source_content_state"] == "context_only"
     assert empty_payload["retrieval_status"] == "context_only"
     assert empty_payload["document_id"] == "doc-empty"
+    assert empty_payload["chunk_id"].startswith("UPLOAD-CHUNK-")
     assert "text" not in empty_payload
     assert "retrieved_at" not in empty_payload
     assert "content_hash" not in empty_payload
@@ -201,9 +204,73 @@ def test_offline_eval_upload_doc_source_candidates_cover_text_and_context_only()
     assert len(source_payloads) == 1
     assert source_payloads[0]["document_id"] == "doc-text"
     assert source_payloads[0]["attached_document_id"] == "attached-doc-text"
+    assert source_payloads[0]["chunk_id"] == text_payload["chunk_id"]
     assert source_payloads[0]["text"] == source_text.extracted_text
     assert source_payloads[0]["content_hash"] == text_payload["content_hash"]
     assert source_payloads[0]["retrieved_at"]
+
+
+def test_offline_eval_upload_doc_graph_provider_retrieves_text_chunks_only():
+    state = build_initial_research_graph(
+        task_id="eval-upload-provider",
+        query="Use uploaded memo",
+        document_ids=["doc-text", "doc-empty"],
+        upload_scope={
+            "document_count": 2,
+            "retrieval_status": "partial",
+            "retrieved_document_ids": ["doc-text"],
+            "context_only_document_ids": ["doc-empty"],
+            "source_payloads": [
+                {
+                    "document_id": "doc-text",
+                    "attached_document_id": "attached-doc-text",
+                    "chunk_id": "UPLOAD-CHUNK-A",
+                    "filename": "memo.txt",
+                    "source_type": "limira_upload",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "f" * 64,
+                    "text": "Uploaded memo states the company is listed.",
+                },
+                {
+                    "document_id": "doc-text",
+                    "attached_document_id": "attached-doc-text",
+                    "chunk_id": "UPLOAD-CHUNK-B",
+                    "filename": "memo.txt",
+                    "source_type": "limira_upload",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:01:00+00:00",
+                    "content_hash": "e" * 64,
+                    "text": "Second uploaded memo chunk adds the listing date.",
+                },
+                {
+                    "document_id": "doc-empty",
+                    "attached_document_id": "attached-doc-empty",
+                    "source_type": "limira_upload",
+                    "source_content_state": "context_only",
+                    "retrieval_status": "context_only",
+                    "text": "",
+                },
+            ],
+        },
+    )
+
+    retrieved = UploadedDocumentSourceProvider(state.upload_sources).retrieve()
+
+    assert len(retrieved) == 2
+    assert retrieved[0].document_id == "doc-text"
+    assert retrieved[0].attached_document_id == "attached-doc-text"
+    assert [source.chunk_id for source in retrieved] == [
+        "UPLOAD-CHUNK-A",
+        "UPLOAD-CHUNK-B",
+    ]
+    assert retrieved[0].source_type == "limira_upload"
+    assert retrieved[0].source_content_state == "content_bearing"
+    assert retrieved[0].retrieval_status == "retrieved"
+    assert retrieved[0].content_hash == "f" * 64
+    assert state.context_only_upload_document_ids == ["doc-empty"]
 
 
 def test_offline_eval_scenario_policy_reaches_graph_prompt():

@@ -37,6 +37,8 @@ class SourcePolicy(BaseModel):
     prefer_primary_sources: bool = True
     allow_secondary_sources: bool = True
     require_retrieved_at: bool = True
+    prefer_uploaded_documents: bool = False
+    prefer_scenario_sources: bool = False
 
 
 class ResearchBrief(BaseModel):
@@ -69,6 +71,25 @@ class ResearchPlan(BaseModel):
     verification_strategy: str = Field(min_length=1, max_length=2_000)
 
 
+class UploadedDocumentSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str | None = Field(default=None, max_length=120)
+    document_id: str = Field(min_length=1, max_length=120)
+    attached_document_id: str | None = Field(default=None, max_length=120)
+    chunk_id: str = Field(min_length=1, max_length=120)
+    filename: str | None = Field(default=None, max_length=1_000)
+    source_type: Literal["limira_upload"] = "limira_upload"
+    retrieval_status: Literal["retrieved"] = "retrieved"
+    source_content_state: Literal["content_bearing"] = "content_bearing"
+    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    content_hash: str = Field(min_length=16, max_length=128)
+    text: str = Field(min_length=1, max_length=20_000)
+    snippet: str | None = Field(default=None, max_length=2_000)
+    text_char_count: int | None = Field(default=None, ge=1)
+    text_truncated: bool = False
+
+
 class EvidenceItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,6 +97,7 @@ class EvidenceItem(BaseModel):
     retrieved_source_id: str | None = Field(default=None, max_length=120)
     url: str | None = Field(default=None, max_length=4_000)
     document_id: str | None = Field(default=None, max_length=120)
+    chunk_id: str | None = Field(default=None, max_length=120)
     title: str | None = Field(default=None, max_length=1_000)
     source_type: str = Field(default="web", max_length=80)
     retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -92,6 +114,7 @@ class RetrievedSource(BaseModel):
     id: str = Field(min_length=1, max_length=120)
     url: str | None = Field(default=None, max_length=4_000)
     document_id: str | None = Field(default=None, max_length=120)
+    chunk_id: str | None = Field(default=None, max_length=120)
     title: str | None = Field(default=None, max_length=1_000)
     source_type: str = Field(min_length=1, max_length=80)
     retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -140,6 +163,8 @@ class ResearchGraphState(BaseModel):
     phase: ResearchPhase = ResearchPhase.SCOPE
     brief: ResearchBrief
     plan: ResearchPlan
+    upload_sources: list[UploadedDocumentSource] = Field(default_factory=list, max_length=100)
+    context_only_upload_document_ids: list[str] = Field(default_factory=list, max_length=100)
     retrieved_sources: list[RetrievedSource] = Field(default_factory=list, max_length=2_000)
     evidence: list[EvidenceItem] = Field(default_factory=list, max_length=2_000)
     findings: list[CompressedFinding] = Field(default_factory=list, max_length=500)
@@ -187,6 +212,24 @@ class ResearchGraphNode:
         previous: ResearchGraphNodeOutput | None = None,
     ) -> ResearchGraphNodeOutput:
         raise NotImplementedError
+
+
+class UploadedDocumentSourceProvider:
+    """Local task-scoped provider for text-bearing uploaded document chunks."""
+
+    tool_name = "uploaded_document_source_provider"
+
+    def __init__(self, sources: list[UploadedDocumentSource]):
+        self._sources = list(sources)
+
+    def retrieve(self) -> list[UploadedDocumentSource]:
+        return [
+            source
+            for source in self._sources
+            if source.retrieval_status == "retrieved"
+            and source.source_content_state == "content_bearing"
+            and bool(source.text.strip())
+        ]
 
 
 class ScopeNode(ResearchGraphNode):
@@ -245,6 +288,31 @@ class ResearchUnitNode(ResearchGraphNode):
         artifact_events: list[dict[str, Any]] = []
         failure_experience_summary = None
         current_unit_id = None
+        upload_provider = UploadedDocumentSourceProvider(state.upload_sources)
+        upload_sources = upload_provider.retrieve()
+        for upload_index, upload_source in enumerate(upload_sources):
+            retrieved_source = self._retrieved_source_from_upload(
+                state,
+                upload_source,
+                upload_index,
+                upload_provider.tool_name,
+            )
+            evidence_item = self._evidence_from_upload_source(
+                state,
+                upload_source,
+                retrieved_source,
+                upload_index,
+                upload_provider.tool_name,
+            )
+            retrieved_sources.append(retrieved_source)
+            evidence.append(evidence_item)
+            artifact_events.extend(
+                [
+                    _upload_source_candidate_artifact_event(upload_source),
+                    _retrieved_source_artifact_event(retrieved_source),
+                    _evidence_artifact_event(evidence_item),
+                ]
+            )
         for index, unit in enumerate(state.plan.research_units):
             current_unit_id = unit.id
             final_summary, _boxed_answer, failure_experience_summary = (
@@ -327,10 +395,66 @@ class ResearchUnitNode(ResearchGraphNode):
                 "research_unit_count": len(completed_units),
                 "retrieved_source_count": len(retrieved_sources),
                 "evidence_count": len(evidence),
+                "upload_source_provider": upload_provider.tool_name,
+                "upload_source_count": len(upload_sources),
+                "context_only_upload_document_ids": list(
+                    state.context_only_upload_document_ids
+                ),
                 "legacy_adapter_calls": len(completed_units),
             },
             artifact_events=artifact_events,
             failure_experience_summary=failure_experience_summary,
+        )
+
+    def _retrieved_source_from_upload(
+        self,
+        state: ResearchGraphState,
+        upload_source: UploadedDocumentSource,
+        index: int,
+        tool_name: str,
+    ) -> RetrievedSource:
+        return RetrievedSource(
+            id=retrieved_source_id_for_source(
+                task_id=state.task_id,
+                source=f"upload://{upload_source.document_id}/{upload_source.chunk_id}",
+                index=index,
+            ),
+            document_id=upload_source.document_id,
+            chunk_id=upload_source.chunk_id,
+            title=_upload_source_title(upload_source),
+            source_type="limira_upload",
+            retrieved_at=upload_source.retrieved_at,
+            content_hash=upload_source.content_hash,
+            quote_or_summary=upload_source.text,
+            tool_name=tool_name,
+            confidence=0.8,
+        )
+
+    def _evidence_from_upload_source(
+        self,
+        state: ResearchGraphState,
+        upload_source: UploadedDocumentSource,
+        retrieved_source: RetrievedSource,
+        index: int,
+        tool_name: str,
+    ) -> EvidenceItem:
+        return EvidenceItem(
+            id=evidence_id_for_source(
+                task_id=state.task_id,
+                source=f"upload://{upload_source.document_id}/{upload_source.chunk_id}",
+                index=index,
+            ),
+            retrieved_source_id=retrieved_source.id,
+            document_id=upload_source.document_id,
+            chunk_id=upload_source.chunk_id,
+            title=retrieved_source.title,
+            source_type="limira_upload",
+            retrieved_at=upload_source.retrieved_at,
+            content_hash=upload_source.content_hash,
+            quote_or_summary=upload_source.text,
+            claims=[upload_source.text],
+            confidence=0.8,
+            tool_name=tool_name,
         )
 
 
@@ -573,6 +697,7 @@ def build_initial_research_graph(
     bounded_units = max(1, min(int(max_units), 8))
     upload_document_ids = _upload_document_ids(document_ids, upload_scope)
     upload_context = _upload_context_summary(upload_scope, upload_document_ids)
+    upload_sources = _upload_sources_from_context(upload_context)
     policy = _source_policy_from_context(source_policy)
     brief = ResearchBrief(
         original_query=normalized_query,
@@ -610,6 +735,10 @@ def build_initial_research_graph(
         phase=ResearchPhase.PLAN,
         brief=brief,
         plan=plan,
+        upload_sources=upload_sources,
+        context_only_upload_document_ids=list(
+            upload_context.get("context_only_document_ids") or []
+        ),
     )
 
 
@@ -876,7 +1005,9 @@ def _source_policy_text(source_policy: SourcePolicy) -> str:
     return (
         f"prefer_primary_sources={source_policy.prefer_primary_sources}; "
         f"allow_secondary_sources={source_policy.allow_secondary_sources}; "
-        f"require_retrieved_at={source_policy.require_retrieved_at}"
+        f"require_retrieved_at={source_policy.require_retrieved_at}; "
+        f"prefer_uploaded_documents={source_policy.prefer_uploaded_documents}; "
+        f"prefer_scenario_sources={source_policy.prefer_scenario_sources}"
     )
 
 
@@ -970,6 +1101,7 @@ def _source_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, A
             "source_type": source.source_type,
             "url": source.url,
             "document_id": source.document_id,
+            "chunk_id": source.chunk_id,
             "content_hash": source.content_hash,
             "retrieved_at": source.retrieved_at.isoformat(),
             "tool_name": source.tool_name,
@@ -988,6 +1120,7 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
             "source_type": evidence.source_type,
             "url": evidence.url,
             "document_id": evidence.document_id,
+            "chunk_id": evidence.chunk_id,
             "title": evidence.title,
             "content_hash": evidence.content_hash,
             "retrieved_at": evidence.retrieved_at.isoformat(),
@@ -1016,6 +1149,32 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
     return evidence_entries + finding_entries + claim_entries
 
 
+def _upload_source_candidate_artifact_event(source: UploadedDocumentSource) -> dict[str, Any]:
+    return {
+        "event": "source_candidate_collected",
+        "type": "source_candidate_collected",
+        "payload": {
+            "candidate_id": source.candidate_id,
+            "title": _upload_source_title(source),
+            "summary": source.snippet or source.text,
+            "snippet": source.snippet or source.text,
+            "source_type": source.source_type,
+            "source_state": "source_candidate",
+            "source_content_state": source.source_content_state,
+            "retrieval_status": source.retrieval_status,
+            "document_id": source.document_id,
+            "attached_document_id": source.attached_document_id,
+            "chunk_id": source.chunk_id,
+            "filename": source.filename,
+            "retrieved_at": source.retrieved_at.isoformat(),
+            "content_hash": source.content_hash,
+            "confidence": 0.55,
+            "candidate": True,
+            "source_event_type": "research_graph_upload_source_provider",
+        },
+    }
+
+
 def _retrieved_source_artifact_event(source: RetrievedSource) -> dict[str, Any]:
     return {
         "event": "retrieved_source_collected",
@@ -1025,6 +1184,7 @@ def _retrieved_source_artifact_event(source: RetrievedSource) -> dict[str, Any]:
             "title": source.title,
             "url": source.url,
             "document_id": source.document_id,
+            "chunk_id": source.chunk_id,
             "summary": source.quote_or_summary,
             "quote_or_summary": source.quote_or_summary,
             "source_type": source.source_type,
@@ -1051,6 +1211,7 @@ def _evidence_artifact_event(evidence: EvidenceItem) -> dict[str, Any]:
             "title": evidence.title,
             "url": evidence.url,
             "document_id": evidence.document_id,
+            "chunk_id": evidence.chunk_id,
             "summary": evidence.quote_or_summary,
             "quote_or_summary": evidence.quote_or_summary,
             "source_type": evidence.source_type,
@@ -1250,6 +1411,8 @@ def _source_policy_from_context(source_policy: dict[str, Any] | None) -> SourceP
             "prefer_primary_sources",
             "allow_secondary_sources",
             "require_retrieved_at",
+            "prefer_uploaded_documents",
+            "prefer_scenario_sources",
         )
         if key in source_policy
     }
@@ -1279,6 +1442,102 @@ def _upload_document_ids(
         seen.add(document_id)
         deduped.append(document_id)
     return deduped
+
+
+def _upload_sources_from_context(
+    upload_context: dict[str, Any],
+) -> list[UploadedDocumentSource]:
+    sources: list[UploadedDocumentSource] = []
+    for index, payload in enumerate(upload_context.get("source_payloads") or []):
+        if not isinstance(payload, dict):
+            continue
+        source = _upload_source_from_payload(payload, index)
+        if source is not None:
+            sources.append(source)
+    return sources
+
+
+def _upload_source_from_payload(
+    payload: dict[str, Any],
+    index: int,
+) -> UploadedDocumentSource | None:
+    document_id = str(payload.get("document_id") or "").strip()
+    text = str(payload.get("text") or payload.get("snippet") or "").strip()
+    if not document_id or not text:
+        return None
+    source_content_state = str(
+        payload.get("source_content_state") or "content_bearing"
+    ).strip()
+    retrieval_status = str(payload.get("retrieval_status") or "retrieved").strip()
+    if source_content_state != "content_bearing" or retrieval_status != "retrieved":
+        return None
+    attached_document_id = str(payload.get("attached_document_id") or "").strip()
+    content_hash = str(payload.get("content_hash") or "").strip()
+    if len(content_hash) < 16:
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    chunk_id = str(payload.get("chunk_id") or "").strip()
+    if not chunk_id:
+        chunk_id = _upload_source_chunk_id(document_id, attached_document_id, index)
+    candidate_id = str(payload.get("candidate_id") or "").strip()
+    if not candidate_id:
+        candidate_id = _upload_source_candidate_id(document_id, attached_document_id, index)
+    text_char_count = payload.get("text_char_count")
+    try:
+        text_char_count_value = int(text_char_count) if text_char_count else len(text)
+    except (TypeError, ValueError):
+        text_char_count_value = len(text)
+    return UploadedDocumentSource(
+        candidate_id=candidate_id,
+        document_id=document_id,
+        attached_document_id=attached_document_id or None,
+        chunk_id=chunk_id,
+        filename=str(payload.get("filename") or document_id).strip() or None,
+        retrieved_at=_parse_upload_retrieved_at(payload.get("retrieved_at")),
+        content_hash=content_hash,
+        text=text,
+        snippet=str(payload.get("snippet") or text).strip()[:2_000],
+        text_char_count=text_char_count_value,
+        text_truncated=bool(payload.get("text_truncated")),
+    )
+
+
+def _upload_source_chunk_id(
+    document_id: str,
+    attached_document_id: str | None,
+    index: int,
+) -> str:
+    digest = hashlib.sha256(
+        f"{document_id}:{attached_document_id or ''}:{index}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"UPLOAD-CHUNK-{digest}"
+
+
+def _upload_source_candidate_id(
+    document_id: str,
+    attached_document_id: str | None,
+    index: int,
+) -> str:
+    digest = hashlib.sha256(
+        f"candidate:{document_id}:{attached_document_id or ''}:{index}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"SRC-UPLOAD-{digest}"
+
+
+def _upload_source_title(source: UploadedDocumentSource) -> str:
+    filename = (source.filename or source.document_id).strip()
+    return f"Uploaded document: {filename} ({source.chunk_id})"
+
+
+def _parse_upload_retrieved_at(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if text:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
 
 
 def _upload_context_summary(
@@ -1311,19 +1570,21 @@ def _upload_context_summary(
     }
 
 
-def _upload_context_source_payloads(value: Any) -> list[dict[str, str]]:
+def _upload_context_source_payloads(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
-    payloads: list[dict[str, str]] = []
-    seen: set[str] = set()
+    payloads: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for item in value[:8]:
         if not isinstance(item, dict):
             continue
         document_id = str(item.get("document_id") or "").strip()
         text = str(item.get("text") or item.get("snippet") or "").strip()
-        if not document_id or not text or document_id in seen:
+        chunk_id = str(item.get("chunk_id") or "").strip()
+        dedupe_key = (document_id, chunk_id, text)
+        if not document_id or not text or dedupe_key in seen:
             continue
-        seen.add(document_id)
+        seen.add(dedupe_key)
         payloads.append(
             {
                 "candidate_id": str(item.get("candidate_id") or "").strip(),
@@ -1339,7 +1600,11 @@ def _upload_context_source_payloads(value: Any) -> list[dict[str, str]]:
                 "retrieval_status": str(item.get("retrieval_status") or "").strip(),
                 "retrieved_at": str(item.get("retrieved_at") or "").strip(),
                 "content_hash": str(item.get("content_hash") or "").strip(),
-                "text": text[:1200],
+                "chunk_id": chunk_id,
+                "snippet": str(item.get("snippet") or text).strip()[:800],
+                "text": text[:4000],
+                "text_char_count": item.get("text_char_count"),
+                "text_truncated": bool(item.get("text_truncated")),
             }
         )
     return payloads
