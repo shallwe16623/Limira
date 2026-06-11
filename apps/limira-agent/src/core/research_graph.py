@@ -113,6 +113,15 @@ class ResearchGraphState(BaseModel):
     verified_claims: list[VerifiedClaim] = Field(default_factory=list, max_length=500)
 
 
+class ResearchGraphExecutionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    state: ResearchGraphState
+    final_summary: str
+    final_boxed_answer: str
+    failure_experience_summary: Any = None
+
+
 def build_initial_research_graph(
     *,
     task_id: str,
@@ -192,6 +201,66 @@ def graph_bootstrap_events(state: ResearchGraphState) -> list[dict[str, Any]]:
     ]
 
 
+def graph_phase_event(
+    state: ResearchGraphState,
+    phase: ResearchPhase,
+) -> dict[str, Any]:
+    """Return an additive stream event for serial graph execution progress."""
+
+    return {
+        "event": "research_graph_phase",
+        "data": {
+            "task_id": state.task_id,
+            "phase": phase.value,
+        },
+    }
+
+
+async def execute_research_graph(
+    *,
+    state: ResearchGraphState,
+    orchestrator: Any,
+    original_task_description: str,
+    task_file_name: str | None = None,
+    task_id: str = "default_task",
+    is_final_retry: bool = False,
+    stream_queue: Any = None,
+) -> ResearchGraphExecutionResult:
+    """Run the feature-flagged serial graph adapter around the legacy executor.
+
+    The graph is intentionally serial and conservative. Scope and plan are
+    deterministic state phases, research delegates to the existing orchestrator,
+    and verify/write/complete are explicit phase boundaries for later nodes.
+    """
+
+    current_state = state
+    for phase in (ResearchPhase.SCOPE, ResearchPhase.PLAN, ResearchPhase.RESEARCH):
+        current_state = current_state.model_copy(update={"phase": phase})
+        await _emit_graph_phase(stream_queue, current_state, phase)
+
+    (
+        final_summary,
+        final_boxed_answer,
+        failure_experience_summary,
+    ) = await orchestrator.run_main_agent(
+        task_description=graph_task_description(current_state, original_task_description),
+        task_file_name=task_file_name,
+        task_id=task_id,
+        is_final_retry=is_final_retry,
+    )
+
+    for phase in (ResearchPhase.VERIFY, ResearchPhase.WRITE, ResearchPhase.COMPLETE):
+        current_state = current_state.model_copy(update={"phase": phase})
+        await _emit_graph_phase(stream_queue, current_state, phase)
+
+    return ResearchGraphExecutionResult(
+        state=current_state,
+        final_summary=final_summary,
+        final_boxed_answer=final_boxed_answer,
+        failure_experience_summary=failure_experience_summary,
+    )
+
+
 def graph_task_description(
     state: ResearchGraphState,
     original_task_description: str,
@@ -252,6 +321,15 @@ def _source_policy_text(source_policy: SourcePolicy) -> str:
         f"allow_secondary_sources={source_policy.allow_secondary_sources}; "
         f"require_retrieved_at={source_policy.require_retrieved_at}"
     )
+
+
+async def _emit_graph_phase(
+    stream_queue: Any,
+    state: ResearchGraphState,
+    phase: ResearchPhase,
+) -> None:
+    if stream_queue is not None:
+        await stream_queue.put(graph_phase_event(state, phase))
 
 
 def _normalize_query(query: str) -> str:

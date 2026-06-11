@@ -3,6 +3,7 @@ from omegaconf import OmegaConf
 
 from src.core import pipeline as pipeline_module
 from src.core.research_graph import (
+    ResearchGraphExecutionResult,
     ResearchPhase,
     build_initial_research_graph,
     evidence_id_for_source,
@@ -47,6 +48,41 @@ class _FakeOrchestrator:
             {"event": "message", "data": {"delta": {"content": "legacy executor"}}}
         )
         return "summary", "final", None
+
+
+class _FailingOrchestrator:
+    def __init__(self, **_kwargs):
+        pass
+
+    async def run_main_agent(self, **_kwargs):
+        raise RuntimeError("graph executor failure")
+
+
+def _pipeline_cfg(*, graph_enabled: bool = False):
+    agent_cfg = {
+        "keep_tool_result": True,
+        "main_agent": {"max_turns": 1},
+        "sub_agents": None,
+    }
+    if graph_enabled:
+        agent_cfg["research_graph"] = {"enabled": True}
+    return OmegaConf.create(
+        {
+            "llm": {
+                "provider": "openai-compatible",
+                "base_url": "https://llm.test",
+                "model_name": "test-model",
+                "temperature": 0,
+                "top_p": 1,
+                "min_p": 0,
+                "top_k": 0,
+                "max_tokens": 4096,
+                "repetition_penalty": 1,
+                "async_client": False,
+            },
+            "agent": agent_cfg,
+        }
+    )
 
 
 def test_initial_research_graph_creates_bounded_scope_and_plan():
@@ -176,27 +212,7 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
     monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
     monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
 
-    cfg = OmegaConf.create(
-        {
-            "llm": {
-                "provider": "openai-compatible",
-                "base_url": "https://llm.test",
-                "model_name": "test-model",
-                "temperature": 0,
-                "top_p": 1,
-                "min_p": 0,
-                "top_k": 0,
-                "max_tokens": 4096,
-                "repetition_penalty": 1,
-                "async_client": False,
-            },
-            "agent": {
-                "keep_tool_result": True,
-                "main_agent": {"max_turns": 1},
-                "sub_agents": None,
-            },
-        }
-    )
+    cfg = _pipeline_cfg()
     stream_queue = _CaptureQueue()
 
     result = await pipeline_module.execute_task_pipeline(
@@ -234,3 +250,119 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
     assert "sanctions_export_controls" in _FakeOrchestrator.task_descriptions[0]
     assert "1 attached upload source(s)" in _FakeOrchestrator.task_descriptions[0]
     assert "at least 5" in _FakeOrchestrator.task_descriptions[0]
+    assert not any(item["event"] == "research_graph_phase" for item in stream_queue.items)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_routes_to_graph_executor_when_feature_flag_enabled(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fake_execute_research_graph(**kwargs):
+        await kwargs["stream_queue"].put(
+            {
+                "event": "test_graph_executor_used",
+                "data": {"task_id": kwargs["task_id"]},
+            }
+        )
+        return ResearchGraphExecutionResult(
+            state=kwargs["state"],
+            final_summary="graph summary",
+            final_boxed_answer="graph final",
+            failure_experience_summary="retry context",
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_research_graph",
+        fake_execute_research_graph,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-enabled",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "graph summary"
+    assert result[1] == "graph final"
+    assert result[3] == "retry context"
+    assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[-1]["event"] == "test_graph_executor_used"
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_emits_serial_phase_events(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-phases",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "summary"
+    assert result[1] == "final"
+    assert [item["event"] for item in stream_queue.items[:2]] == [
+        "research_brief_created",
+        "research_plan_created",
+    ]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_phase"
+    ] == ["scope", "plan", "research", "verify", "write", "complete"]
+    assert any(item["event"] == "message" for item in stream_queue.items)
+    assert len(_FakeOrchestrator.task_descriptions) == 1
+    assert "## Limira Research Workflow" in _FakeOrchestrator.task_descriptions[0]
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_failures_use_pipeline_error_handling(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FailingOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-graph-failure",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == ""
+    assert "RuntimeError" in result[0]
+    assert "graph executor failure" in result[0]
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item["event"] == "research_graph_phase"
+    ] == ["scope", "plan", "research"]

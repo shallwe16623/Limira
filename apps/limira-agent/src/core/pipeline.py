@@ -17,7 +17,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from limira_tools.manager import ToolManager
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from ..config.settings import (
     create_mcp_server_parameters,
@@ -32,6 +32,7 @@ from ..logging.task_logger import (
 from .orchestrator import Orchestrator
 from .research_graph import (
     build_initial_research_graph,
+    execute_research_graph,
     graph_bootstrap_events,
     graph_task_description,
 )
@@ -133,16 +134,30 @@ async def execute_task_pipeline(
             sub_agent_tool_definitions=sub_agent_tool_definitions,
         )
 
-        (
-            final_summary,
-            final_boxed_answer,
-            failure_experience_summary,
-        ) = await orchestrator.run_main_agent(
-            task_description=planned_task_description,
-            task_file_name=task_file_name,
-            task_id=task_id,
-            is_final_retry=is_final_retry,
-        )
+        if _research_graph_execution_enabled(cfg):
+            graph_result = await execute_research_graph(
+                state=graph_state,
+                orchestrator=orchestrator,
+                original_task_description=task_description,
+                task_file_name=task_file_name,
+                task_id=task_id,
+                is_final_retry=is_final_retry,
+                stream_queue=stream_queue,
+            )
+            final_summary = graph_result.final_summary
+            final_boxed_answer = graph_result.final_boxed_answer
+            failure_experience_summary = graph_result.failure_experience_summary
+        else:
+            (
+                final_summary,
+                final_boxed_answer,
+                failure_experience_summary,
+            ) = await orchestrator.run_main_agent(
+                task_description=planned_task_description,
+                task_file_name=task_file_name,
+                task_id=task_id,
+                is_final_retry=is_final_retry,
+            )
 
         llm_client.close()
 
@@ -237,6 +252,21 @@ def create_pipeline_components(cfg: DictConfig):
         sub_agent_tool_managers[sub_agent] = sub_agent_tool_manager
 
     return main_agent_tool_manager, sub_agent_tool_managers, output_formatter
+
+
+def _research_graph_execution_enabled(cfg: DictConfig) -> bool:
+    for path in (
+        "agent.research_graph.enabled",
+        "agent.research_graph_execution.enabled",
+    ):
+        value = OmegaConf.select(cfg, path, default=False)
+        if isinstance(value, str):
+            if value.strip().lower() in {"1", "true", "yes", "on"}:
+                return True
+            continue
+        if bool(value):
+            return True
+    return False
 
 
 def _context_mapping(
