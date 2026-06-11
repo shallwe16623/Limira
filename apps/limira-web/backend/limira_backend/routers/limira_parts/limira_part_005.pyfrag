@@ -263,6 +263,9 @@ def _record_artifact_from_event(
         artifact.setdefault("confidence", metadata["confidence"])
     if metadata.get("notes") is not None:
         artifact.setdefault("notes", metadata["notes"])
+    had_primary_id = _has_artifact_primary_id(artifact_type, artifact)
+    if artifact_type == "evidence":
+        _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
     lifecycle_errors = _lifecycle_artifact_validation_errors(artifact_type, artifact)
     if lifecycle_errors:
         return _record_and_return_artifact_warning(
@@ -283,8 +286,8 @@ def _record_artifact_from_event(
             artifact["evidence_ids"] = evidence_refs
     if artifact_type == "report_section":
         artifact = _normalize_report_section_artifact(artifact)
-    had_primary_id = _has_artifact_primary_id(artifact_type, artifact)
-    _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
+    if artifact_type != "evidence":
+        _ensure_artifact_id(repo, task.task_id, artifact_type, artifact)
     if _artifact_already_recorded(
         repo,
         task.task_id,

@@ -2409,6 +2409,62 @@ async def test_source_lifecycle_artifacts_are_separate_and_warn_on_weak_claim():
 
 
 @pytest.mark.asyncio
+async def test_valid_evidence_without_id_gets_generated_before_validation():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "evidence_collected",
+                "payload": {
+                    "title": "Generated evidence id",
+                    "url": "https://example.test/generated-evidence",
+                    "summary": "Content-bearing evidence without an explicit id.",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "9" * 32,
+                    "tool_name": "scrape",
+                    "confidence": 0.82,
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "generated evidence id"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert len(artifacts["evidence"]) == 1
+    assert artifacts["evidence"][0]["evidence_id"] == "EVID-001"
+    assert artifacts["evidence"][0]["summary"] == (
+        "Content-bearing evidence without an explicit id."
+    )
+    invalid_warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+        and event["payload"].get("warning") == "invalid_artifact_payload"
+    ]
+    assert invalid_warnings == []
+
+
+@pytest.mark.asyncio
 async def test_invalid_lifecycle_artifacts_warn_and_do_not_satisfy_evidence_refs():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()
