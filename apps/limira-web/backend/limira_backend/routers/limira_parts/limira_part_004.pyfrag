@@ -989,7 +989,69 @@ def _public_archive_member_payload(member_name: str, payload: Any) -> Any:
                 fallback="limira_task_failed",
             )
         public_payload["task"] = public_task
+    operational_status = public_payload.get("operational_status")
+    if isinstance(operational_status, Mapping):
+        public_payload["operational_status"] = _public_archive_operational_status(
+            operational_status
+        )
     return public_payload
+
+
+def _public_archive_operational_status(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "task": _public_archive_operational_section(
+            value.get("task"),
+            {"status", "archive_status", "error"},
+        ),
+        "event_log_count": _public_archive_nonnegative_int(
+            value.get("event_log_count")
+        ),
+        "artifact_warning_count": _public_archive_nonnegative_int(
+            value.get("artifact_warning_count")
+        ),
+        "latest_event_type": _optional_public_text(value.get("latest_event_type")),
+        "latest_event_source": _optional_public_text(value.get("latest_event_source")),
+        "diagnostics": _public_archive_operational_section(
+            value.get("diagnostics"),
+            {"count", "latest_event_type", "latest_error", "latest_warning"},
+        ),
+        "ingestion": _public_archive_operational_section(
+            value.get("ingestion"),
+            {"state", "event_count", "latest_event_type", "latest_error"},
+        ),
+        "recovery": _public_archive_operational_section(
+            value.get("recovery"),
+            {"event_count", "latest_reason"},
+        ),
+        "warnings": _public_archive_operational_section(
+            value.get("warnings"),
+            {"event_count", "artifact_warning_count", "latest"},
+        ),
+    }
+
+
+def _public_archive_operational_section(
+    value: Any,
+    allowed_keys: set[str],
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    public: dict[str, Any] = {}
+    for key in allowed_keys:
+        item = value.get(key)
+        if key.endswith("count"):
+            public[key] = _public_archive_nonnegative_int(item)
+        else:
+            public[key] = _optional_public_text(item)
+    return public
+
+
+def _public_archive_nonnegative_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
 
 
 def validate_archive_zip(archive_bytes: bytes) -> None:

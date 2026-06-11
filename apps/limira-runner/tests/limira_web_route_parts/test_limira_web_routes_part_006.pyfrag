@@ -164,6 +164,119 @@ def _archive_zip_with_raw_model_summary(
     return buffer.getvalue()
 
 
+def _archive_zip_with_raw_operational_status(
+    *,
+    task_id: str,
+    owner_user_id: str,
+) -> bytes:
+    raw_operational_status = {
+        "task": {
+            "status": "failed",
+            "archive_status": "failed",
+            "error": "stale_running_task_recovered:expired_lease",
+            "runner_task_id": "runner-operational-secret",
+        },
+        "event_log_count": 1,
+        "artifact_warning_count": 0,
+        "latest_event_type": "error",
+        "latest_event_source": "runner_stream",
+        "lease": {
+            "worker_id": "runner-worker-secret",
+            "lease_id": "lease-id-secret",
+            "lease_token": "lease-token-secret",
+        },
+        "checkpoint": {
+            "phase": "verify",
+            "current_research_unit": "raw unit OPENAI_API_KEY=sk-operational-secret",
+            "executor_state": {
+                "model_summary": {
+                    "base_url": "https://runner.internal/v1",
+                    "token": "sk-operational-secret",
+                }
+            },
+        },
+        "diagnostics": {
+            "count": 1,
+            "latest_event_type": "error",
+            "latest_error": "stale_running_task_recovered:expired_lease",
+            "latest_warning": "stale running task recovered: expired_lease",
+            "worker_id": "runner-worker-secret",
+        },
+        "ingestion": {
+            "state": "complete",
+            "event_count": 0,
+            "latest_event_type": None,
+            "latest_error": None,
+            "base_url": "https://runner.internal/v1",
+        },
+        "recovery": {
+            "event_count": 1,
+            "latest_reason": "expired_lease",
+            "executor_state": {"token": "sk-operational-secret"},
+        },
+        "warnings": {
+            "event_count": 1,
+            "artifact_warning_count": 0,
+            "latest": "stale running task recovered: expired_lease",
+        },
+    }
+    task_payload = {
+        "task_id": task_id,
+        "owner_user_id": owner_user_id,
+        "query": "raw operational status reuse",
+        "status": "failed",
+        "archive_status": "ready",
+        "scenario": None,
+        "error": "stale_running_task_recovered:expired_lease",
+        "model_summary": _internal_model_summary(
+            task_id,
+            runner_task_id="runner-operational-secret",
+        ),
+    }
+    metadata = {
+        "task": task_payload,
+        "artifact_counts": {},
+        "artifact_event_count": 0,
+        "artifact_warning_count": 0,
+        "operational_status": raw_operational_status,
+        "reports": [],
+        "uploaded_documents": [],
+    }
+    trace = {
+        "task": dict(task_payload),
+        "artifacts": {},
+        "artifact_events": [],
+        "artifact_warnings": [],
+        "operational_status": dict(raw_operational_status),
+        "reports": [],
+        "uploaded_documents": [],
+        "task_event_logs": [
+            {
+                "event_type": "error",
+                "source": "runner_stream",
+                "payload": {
+                    "error": "stale_running_task_recovered:expired_lease",
+                    "warning": "stale running task recovered: expired_lease",
+                    "recovery_reason": "expired_lease",
+                    "worker_id": "runner-worker-secret",
+                    "lease_token": "lease-token-secret",
+                },
+            }
+        ],
+    }
+    members = {
+        "metadata.json": json.dumps(metadata, ensure_ascii=False),
+        "report.html": "<!doctype html><main>safe report</main>",
+        "report.md": "# safe report",
+        "trace.json": json.dumps(trace, ensure_ascii=False),
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for member_name in ("metadata.json", "report.html", "report.md", "trace.json"):
+            archive.writestr(member_name, members[member_name])
+    return buffer.getvalue()
+
+
 def _archive_zip_with_undecodable_report_member() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:

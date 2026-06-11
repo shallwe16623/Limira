@@ -1717,6 +1717,93 @@ async def test_archive_download_repairs_reused_persisted_model_summary_identifie
 
 
 @pytest.mark.asyncio
+async def test_archive_download_repairs_reused_persisted_operational_status():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-operational-archive-reuse",
+        owner_user_id=user.id,
+        query="archive operational status reuse",
+        scenario=None,
+        runner_task_id="runner-operational-secret",
+    )
+    raw_archive = _archive_zip_with_raw_operational_status(
+        task_id=task.task_id,
+        owner_user_id=user.id,
+    )
+    raw_members = _archive_member_texts(raw_archive)
+    assert "worker_id" in raw_members["metadata.json"]
+    assert "raw unit OPENAI_API_KEY=sk-operational-secret" in raw_members["trace.json"]
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    metadata = json.loads(members["metadata.json"])
+    trace = json.loads(members["trace.json"])
+    for payload in (metadata, trace):
+        operational = payload["operational_status"]
+        assert operational["diagnostics"]["latest_error"] == (
+            "stale_running_task_recovered:expired_lease"
+        )
+        assert operational["recovery"]["latest_reason"] == "expired_lease"
+        assert "lease" not in operational
+        assert "checkpoint" not in operational
+        assert "model_summary" not in json.dumps(operational, ensure_ascii=False)
+    serialized = json.dumps({"metadata": metadata, "trace": trace}, ensure_ascii=False)
+    for leaked in (
+        "worker_id",
+        "lease_id",
+        "lease_token",
+        "runner-worker-secret",
+        "lease-token-secret",
+        "raw unit OPENAI_API_KEY=sk-operational-secret",
+        "executor_state",
+        "runner-operational-secret",
+        "runner.internal",
+        "base_url",
+        "sk-operational-secret",
+    ):
+        assert leaked not in serialized
+    assert task.archive_object_key == stored.object_key
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+    repaired = storage.objects[stored.object_key]
+    assert repaired["data"] == response.body
+    assert repaired["sha256"] == task.archive_zip_sha256
+    assert repaired["metadata"]["archive_sha256"] == task.archive_zip_sha256
+    _assert_no_browser_leak(repaired["data"])
+
+
+@pytest.mark.asyncio
 async def test_postgres_archive_download_repairs_reused_persisted_model_summary_identifiers():
     engine = FakeLimiraPostgresEngine()
     repo = limira.PostgresLimiraTaskRepository(
