@@ -569,6 +569,65 @@ async def test_research_creation_starts_server_side_ingestion_without_browser_ss
 
 
 @pytest.mark.asyncio
+async def test_browser_sse_takes_over_before_background_ingestion_stream_lock():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    pdf_exporter = FakePdfExporter()
+    user = limira.LimiraUser("user-a")
+    runtime_state = limira.InMemoryLimiraRuntimeState()
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "message",
+                "payload": {"content": "live browser progress"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "status",
+                "payload": {"status": "completed", "archive_status": "ready"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "browser stream should win"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=runtime_state,
+        object_storage=storage,
+        pdf_exporter=pdf_exporter,
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert len(research.stream_calls) == 1
+    assert [event["type"] for event in events] == [
+        "message",
+        "archive_generated",
+        "status",
+    ]
+    assert events[0]["payload"]["content"] == "live browser progress"
+    assert not any(
+        event.get("payload", {}).get("reason") == "stream_already_open"
+        for event in events
+    )
+    assert repo.get_task(task_id).status == "completed"
+    assert repo.get_task(task_id).archive_object_key in storage.objects
+
+
+@pytest.mark.asyncio
 async def test_manual_ingestion_after_background_worker_remains_idempotent():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

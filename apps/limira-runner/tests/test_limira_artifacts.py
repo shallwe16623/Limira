@@ -105,6 +105,28 @@ def test_record_research_artifact_accepts_lifecycle_finding_and_verified_claim()
     assert claim["payload"]["support_type"] == "supports"
 
 
+def test_record_research_artifact_preserves_public_evidence_refs_for_claims():
+    finding = record_research_artifact(
+        "finding",
+        {"summary": "Finding from public refs"},
+        evidence_refs=["EVID-001"],
+        confidence=0.7,
+    )
+    claim = record_research_artifact(
+        "verified_claim",
+        {"claim": "Claim from public refs", "support_type": "supports"},
+        evidence_refs=["EVID-001"],
+        confidence=0.8,
+    )
+
+    assert finding["type"] == "finding_collected"
+    assert finding["payload"]["evidence_refs"] == ["EVID-001"]
+    assert finding["payload"]["evidence_ids"] == ["EVID-001"]
+    assert claim["type"] == "verified_claim_collected"
+    assert claim["payload"]["evidence_refs"] == ["EVID-001"]
+    assert claim["payload"]["evidence_ids"] == ["EVID-001"]
+
+
 def test_extract_evidence_refs_accepts_numeric_and_hash_ids_in_first_seen_order():
     refs = extract_evidence_refs(
         "Use [EVID-001], EVID-abcdef123456, [EVID-001], "

@@ -1808,6 +1808,14 @@ async def _run_server_ingestion_worker(
             pdf_exporter,
             runtime_stream_id=stream_id,
         )
+    except asyncio.CancelledError:
+        await _mark_runtime_stream_closed(
+            runtime_state,
+            task.task_id,
+            "server_ingestion_cancelled_for_browser_stream",
+            stream_id=stream_id,
+        )
+        raise
     except Exception as exc:
         public_error = _public_error_text(
             str(exc),
@@ -1846,6 +1854,7 @@ async def _run_server_ingestion_worker(
 
 
 SERVER_INGESTION_TASKS: dict[str, asyncio.Task[None]] = {}
+SERVER_INGESTION_BROWSER_GRACE_SECONDS = 0.25
 
 
 def _schedule_server_ingestion_worker(
@@ -1872,7 +1881,12 @@ def _schedule_server_ingestion_worker(
         "object_storage": object_storage,
         "pdf_exporter": pdf_exporter,
     }
-    task_handle = asyncio.create_task(_run_server_ingestion_worker(**kwargs))
+    task_handle = asyncio.create_task(
+        _delayed_server_ingestion_worker(
+            delay_seconds=SERVER_INGESTION_BROWSER_GRACE_SECONDS,
+            **kwargs,
+        )
+    )
     SERVER_INGESTION_TASKS[task.task_id] = task_handle
     task_handle.add_done_callback(
         lambda completed, task_id=task.task_id: (
@@ -1883,11 +1897,46 @@ def _schedule_server_ingestion_worker(
     )
 
 
+async def _delayed_server_ingestion_worker(
+    *,
+    delay_seconds: float,
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    research_client: RunnerResearchClientProtocol,
+    runtime_state: LimiraRuntimeState,
+    object_storage: Any = None,
+    pdf_exporter: Any = None,
+) -> None:
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    await _run_server_ingestion_worker(
+        task=task,
+        user=user,
+        repo=repo,
+        research_client=research_client,
+        runtime_state=runtime_state,
+        object_storage=object_storage,
+        pdf_exporter=pdf_exporter,
+    )
+
+
 async def _await_server_ingestion_task(task_id: str) -> None:
     task_handle = SERVER_INGESTION_TASKS.get(task_id)
     if task_handle is None:
         return
     await task_handle
+
+
+async def _cancel_server_ingestion_task(task_id: str) -> None:
+    task_handle = SERVER_INGESTION_TASKS.get(task_id)
+    if task_handle is None or task_handle.done():
+        return
+    task_handle.cancel()
+    try:
+        await task_handle
+    except asyncio.CancelledError:
+        pass
 
 
 async def _limira_event_stream(
@@ -1941,6 +1990,7 @@ async def _limira_event_stream(
         yield _sse_bytes(_assert_browser_safe(terminal_event))
         return
 
+    await _cancel_server_ingestion_task(task.task_id)
     stream_id = str(uuid.uuid4())
     opened = await runtime_state.try_open_stream(
         task.task_id,

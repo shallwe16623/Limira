@@ -309,8 +309,14 @@ def _prepare_artifact_payload(
             prepared.setdefault("evidence_id", evidence_refs[0])
         prepared.setdefault("evidence_id", _stable_artifact_id("EVID", prepared))
     elif artifact_type == "finding":
+        if evidence_refs:
+            prepared.setdefault("evidence_refs", list(evidence_refs))
+            prepared.setdefault("evidence_ids", list(evidence_refs))
         prepared.setdefault("finding_id", _stable_artifact_id("FIND", prepared))
     elif artifact_type == "verified_claim":
+        if evidence_refs:
+            prepared.setdefault("evidence_refs", list(evidence_refs))
+            prepared.setdefault("evidence_ids", list(evidence_refs))
         prepared.setdefault("claim_id", _stable_artifact_id("CLAIM", prepared))
     return prepared
 
