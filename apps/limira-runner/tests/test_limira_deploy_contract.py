@@ -13,6 +13,9 @@ RUNNER_API = ROOT / "apps/limira-runner/runner_api.py"
 MIGRATION_FILE = (
     ROOT / "deploy/limira/postgres/migrations/001_limira_osint_schema.sql"
 )
+SOURCE_CANDIDATE_MIGRATION_FILE = (
+    ROOT / "deploy/limira/postgres/migrations/002_limira_source_candidates.sql"
+)
 LEGACY_PY_PACKAGE = "open" + "_" + "web" + "ui"
 LEGACY_APP_DIR = "open-" + "web" + "ui-limira-runner"
 LEGACY_WEB_NAME_KEY = "WEB" + "UI_NAME"
@@ -304,6 +307,8 @@ def test_limira_migration_creates_required_extensions_tables_and_indexes():
         in tables["limira_entities"]["body"]
     )
     assert "artifact_event_id text primary key" in tables["limira_artifact_events"]["body"]
+    assert "'source_candidate'" in tables["limira_artifact_events"]["body"]
+    assert "'source_candidates'" in tables["limira_artifact_events"]["body"]
     assert (
         "constraint uq_limira_artifact_events_task_local unique "
         "(task_id, artifact_type, local_artifact_id)"
@@ -397,6 +402,18 @@ def test_limira_migration_creates_required_extensions_tables_and_indexes():
         "conflicts_with",
     ):
         assert f"'{relation_type}'" in lowered
+
+
+def test_limira_source_candidate_migration_updates_artifact_constraints():
+    sql = SOURCE_CANDIDATE_MIGRATION_FILE.read_text(encoding="utf-8").lower()
+
+    assert "alter table limira_artifact_events" in sql
+    assert "drop constraint if exists limira_artifact_events_artifact_type_check" in sql
+    assert "drop constraint if exists limira_artifact_events_bucket_check" in sql
+    assert "add constraint chk_limira_artifact_events_artifact_type check" in sql
+    assert "add constraint chk_limira_artifact_events_bucket check" in sql
+    assert "'source_candidate'" in sql
+    assert "'source_candidates'" in sql
 
 
 def test_limira_migration_constraints_reference_existing_table_columns():

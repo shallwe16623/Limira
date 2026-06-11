@@ -124,6 +124,15 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
             "retrieval_status": "partial",
             "retrieved_document_ids": ["doc-a"],
             "context_only_document_ids": ["doc-b"],
+            "source_payloads": [
+                {
+                    "document_id": "doc-a",
+                    "filename": "memo.txt",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "hash-a",
+                    "text": "Uploaded memo states a controlled export exposure.",
+                }
+            ],
         },
         source_policy={
             "min_sources": 5,
@@ -138,6 +147,10 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
     assert "Upload retrieval status: partial" in state.brief.scope
     assert any("attached upload documents" in item for item in state.brief.required_sources)
     assert any("retrieved upload text" in item and "doc-a" in item for item in state.brief.required_sources)
+    assert any(
+        "Uploaded memo states a controlled export exposure." in item
+        for item in state.brief.required_sources
+    )
     assert any("uploaded document facts" in item for item in state.brief.constraints)
     assert any("context-only upload IDs" in item and "doc-b" in item for item in state.brief.constraints)
     assert state.plan.research_units[0].source_policy.min_sources == 5

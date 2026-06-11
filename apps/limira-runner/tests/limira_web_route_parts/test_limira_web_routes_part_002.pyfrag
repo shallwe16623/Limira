@@ -290,7 +290,9 @@ async def test_research_can_attach_history_documents_without_duplicate_storage()
     runner_call = research.create_calls[0]
     assert runner_call["conversation_id"] == payload["conversation_id"]
     assert runner_call["document_ids"] == ["doc-cloud"]
-    assert runner_call["upload_scope"] == {
+    runner_upload_scope = dict(runner_call["upload_scope"])
+    runner_source_payloads = runner_upload_scope.pop("source_payloads")
+    assert runner_upload_scope == {
         "source_type": "limira_upload",
         "document_ids": ["doc-cloud"],
         "attached_document_ids": [attached[0].document_id],
@@ -299,6 +301,17 @@ async def test_research_can_attach_history_documents_without_duplicate_storage()
         "retrieved_document_ids": ["doc-cloud"],
         "context_only_document_ids": [],
     }
+    assert len(runner_source_payloads) == 1
+    runner_source_payload = runner_source_payloads[0]
+    assert runner_source_payload["document_id"] == "doc-cloud"
+    assert runner_source_payload["attached_document_id"] == attached[0].document_id
+    assert runner_source_payload["source_type"] == "limira_upload"
+    assert runner_source_payload["source_content_state"] == "content_bearing"
+    assert runner_source_payload["retrieval_status"] == "retrieved"
+    assert runner_source_payload["text"] == "cloud memo"
+    assert runner_source_payload["snippet"] == "cloud memo"
+    assert runner_source_payload["content_hash"]
+    assert runner_source_payload["retrieved_at"]
     assert runner_call["source_policy"]["prefer_uploaded_documents"] is True
     assert runner_call["source_policy"]["prefer_primary_sources"] is True
     artifacts = repo.get_artifacts(payload["task_id"])
@@ -363,6 +376,7 @@ async def test_research_records_context_only_upload_candidate_when_text_unavaila
     assert runner_call["upload_scope"]["retrieval_status"] == "context_only"
     assert runner_call["upload_scope"]["retrieved_document_ids"] == []
     assert runner_call["upload_scope"]["context_only_document_ids"] == ["doc-empty"]
+    assert runner_call["upload_scope"]["source_payloads"] == []
     artifacts = repo.get_artifacts(payload["task_id"])
     candidate = artifacts["source_candidates"][0]
     assert candidate["document_id"] == "doc-empty"

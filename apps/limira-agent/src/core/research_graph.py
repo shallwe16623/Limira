@@ -475,6 +475,29 @@ def _required_sources(
             "Use retrieved upload text for document IDs: "
             f"{', '.join(str(item) for item in retrieved_ids)}."
         )
+    source_payloads = (upload_context or {}).get("source_payloads") or []
+    if source_payloads:
+        required_sources.append(
+            "Use these retrieved upload excerpts as source text before web-only context:"
+        )
+        for payload in source_payloads[:8]:
+            document_id = str(payload.get("document_id") or "unknown").strip()
+            filename = str(payload.get("filename") or document_id).strip()
+            retrieved_at = str(payload.get("retrieved_at") or "").strip()
+            content_hash = str(payload.get("content_hash") or "").strip()
+            text = str(payload.get("text") or payload.get("snippet") or "").strip()
+            if not text:
+                continue
+            metadata = "; ".join(
+                item
+                for item in (
+                    f"file={filename}",
+                    f"retrieved_at={retrieved_at}" if retrieved_at else "",
+                    f"content_hash={content_hash}" if content_hash else "",
+                )
+                if item
+            )
+            required_sources.append(f"Upload {document_id} ({metadata}): {text}")
     return required_sources
 
 
@@ -565,7 +588,44 @@ def _upload_context_summary(
         "retrieval_status": status,
         "retrieved_document_ids": retrieved_ids,
         "context_only_document_ids": context_only_ids,
+        "source_payloads": _upload_context_source_payloads(
+            upload_scope.get("source_payloads")
+        ),
     }
+
+
+def _upload_context_source_payloads(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    payloads: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        document_id = str(item.get("document_id") or "").strip()
+        text = str(item.get("text") or item.get("snippet") or "").strip()
+        if not document_id or not text or document_id in seen:
+            continue
+        seen.add(document_id)
+        payloads.append(
+            {
+                "candidate_id": str(item.get("candidate_id") or "").strip(),
+                "document_id": document_id,
+                "attached_document_id": str(
+                    item.get("attached_document_id") or ""
+                ).strip(),
+                "filename": str(item.get("filename") or document_id).strip(),
+                "source_type": str(item.get("source_type") or "").strip(),
+                "source_content_state": str(
+                    item.get("source_content_state") or ""
+                ).strip(),
+                "retrieval_status": str(item.get("retrieval_status") or "").strip(),
+                "retrieved_at": str(item.get("retrieved_at") or "").strip(),
+                "content_hash": str(item.get("content_hash") or "").strip(),
+                "text": text[:1200],
+            }
+        )
+    return payloads
 
 
 def _upload_context_document_ids(value: Any) -> list[str]:

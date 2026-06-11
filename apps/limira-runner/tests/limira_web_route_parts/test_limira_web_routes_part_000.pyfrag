@@ -198,6 +198,7 @@ async def test_create_research_uses_limira_namespace_and_rejects_body_user_id():
                 "retrieval_status": "context_only",
                 "retrieved_document_ids": [],
                 "context_only_document_ids": [],
+                "source_payloads": [],
             },
             "source_policy": {
                 "min_sources": 3,

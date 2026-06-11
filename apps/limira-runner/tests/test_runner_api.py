@@ -700,6 +700,14 @@ async def test_runner_api_persists_and_streams_task_context(tmp_path):
                     "document_ids": ["doc-a", "doc-b"],
                     "document_count": 2,
                     "retrieval_status": "context_only",
+                    "source_payloads": [
+                        {
+                            "document_id": "doc-a",
+                            "text": "Uploaded excerpt visible to runner.",
+                            "content_hash": "hash-a",
+                            "retrieved_at": "2026-06-06T12:00:00+00:00",
+                        }
+                    ],
                 },
                 "source_policy": {
                     "min_sources": 5,
@@ -716,6 +724,9 @@ async def test_runner_api_persists_and_streams_task_context(tmp_path):
         assert completed.context["conversation_id"] == "conversation-a"
         assert completed.context["document_ids"] == ["doc-a", "doc-b"]
         assert completed.context["upload_scope"]["document_count"] == 2
+        assert completed.context["upload_scope"]["source_payloads"][0]["text"] == (
+            "Uploaded excerpt visible to runner."
+        )
         assert completed.context["source_policy"]["min_sources"] == 5
         assert completed.context["source_policy"]["prefer_uploaded_documents"] is True
         assert context_probe.context == completed.context

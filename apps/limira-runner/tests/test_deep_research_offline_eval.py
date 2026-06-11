@@ -169,6 +169,7 @@ def test_offline_eval_upload_doc_source_candidates_cover_text_and_context_only()
         [source_text, source_empty],
         [attached_text, attached_empty],
     )
+    source_payloads = upload_scope.pop("source_payloads")
 
     assert text_payload["source_type"] == "limira_upload"
     assert text_payload["source_state"] == "source_candidate"
@@ -197,6 +198,12 @@ def test_offline_eval_upload_doc_source_candidates_cover_text_and_context_only()
         "retrieved_document_ids": ["doc-text"],
         "context_only_document_ids": ["doc-empty"],
     }
+    assert len(source_payloads) == 1
+    assert source_payloads[0]["document_id"] == "doc-text"
+    assert source_payloads[0]["attached_document_id"] == "attached-doc-text"
+    assert source_payloads[0]["text"] == source_text.extracted_text
+    assert source_payloads[0]["content_hash"] == text_payload["content_hash"]
+    assert source_payloads[0]["retrieved_at"]
 
 
 def test_offline_eval_scenario_policy_reaches_graph_prompt():
@@ -210,6 +217,15 @@ def test_offline_eval_scenario_policy_reaches_graph_prompt():
             "retrieval_status": "partial",
             "retrieved_document_ids": ["doc-a"],
             "context_only_document_ids": ["doc-b"],
+            "source_payloads": [
+                {
+                    "document_id": "doc-a",
+                    "filename": "memo.txt",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "hash-a",
+                    "text": "Uploaded memo says the entity appears on the list.",
+                }
+            ],
         },
         source_policy={
             "min_sources": 4,
@@ -223,6 +239,8 @@ def test_offline_eval_scenario_policy_reaches_graph_prompt():
 
     assert "sanctions_export_controls" in state.brief.scope
     assert "Upload retrieval status: partial" in state.brief.scope
+    assert "Uploaded memo says the entity appears on the list." in description
+    assert "content_hash=hash-a" in description
     assert any(
         "retrieved upload text" in item and "doc-a" in item
         for item in state.brief.required_sources

@@ -1509,6 +1509,44 @@ def _record_upload_source_artifacts(
         )
 
 
+def _runner_upload_source_payloads(
+    *,
+    task_id: str,
+    documents: list[LimiraUploadedDocument],
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for document in documents:
+        text = _upload_document_text(document)
+        if not text:
+            continue
+        candidate = _upload_source_candidate_payload(task_id=task_id, document=document)
+        excerpt = _upload_source_excerpt(
+            text,
+            max_chars=RUNNER_UPLOAD_SOURCE_TEXT_MAX_CHARS,
+        )
+        payloads.append(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "document_id": candidate["document_id"],
+                "attached_document_id": candidate["attached_document_id"],
+                "filename": candidate["filename"],
+                "source_type": candidate["source_type"],
+                "source_state": candidate["source_state"],
+                "source_content_state": candidate["source_content_state"],
+                "retrieval_status": candidate["retrieval_status"],
+                "snippet": _upload_source_excerpt(excerpt, max_chars=800),
+                "text": excerpt,
+                "text_char_count": candidate["text_char_count"],
+                "text_truncated": candidate["text_char_count"] > len(excerpt),
+                "content_hash": candidate["content_hash"],
+                "retrieved_at": candidate["retrieved_at"],
+            }
+        )
+        if len(payloads) >= RUNNER_UPLOAD_SOURCE_PAYLOAD_MAX_ITEMS:
+            break
+    return payloads
+
+
 def _runner_upload_scope_for_documents(
     source_documents: list[LimiraUploadedDocument],
     attached_documents: list[LimiraUploadedDocument],
@@ -1531,6 +1569,12 @@ def _runner_upload_scope_for_documents(
         "retrieval_status": _upload_scope_retrieval_status(attached_documents),
         "retrieved_document_ids": retrieved_document_ids,
         "context_only_document_ids": context_only_document_ids,
+        "source_payloads": _runner_upload_source_payloads(
+            task_id=str(attached_documents[0].task_id or "")
+            if attached_documents
+            else "",
+            documents=attached_documents,
+        ),
     }
 
 
