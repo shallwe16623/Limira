@@ -316,6 +316,10 @@ final class AppViewModel: ObservableObject {
     }
 
     func presentCompactFileImporter() {
+        guard !AppConfiguration.isUITestMockEnabled else {
+            Task { await uploadMockDocumentForUITest() }
+            return
+        }
         compactPresentation.present(.fileImporter)
     }
 
@@ -612,6 +616,24 @@ final class AppViewModel: ObservableObject {
             uploads.insert(document, at: 0)
             cloudFiles.insert(document, at: 0)
             await loadCloudFiles()
+        }
+    }
+
+    func uploadMockDocumentForUITest() async {
+        guard AppConfiguration.isUITestMockEnabled else { return }
+        await runBusy {
+            let file = UploadFilePayload(
+                data: Data("limira ios ui mock upload".utf8),
+                filename: "limira-ios-ui-upload.txt",
+                contentType: "text/plain"
+            )
+            let document = try await service.uploadDocument(file: file, taskId: selectedTask?.taskId)
+            selectedDocumentIds.insert(document.documentId)
+            uploads.removeAll { $0.documentId == document.documentId }
+            cloudFiles.removeAll { $0.documentId == document.documentId }
+            uploads.insert(document, at: 0)
+            cloudFiles.insert(document, at: 0)
+            statusMessage = "已添加测试文件：\(document.filename)"
         }
     }
 
@@ -1035,6 +1057,8 @@ final class MockVoiceRecorder: VoiceRecording {
 
 final class MockLimiraService: LimiraServicing {
     let tokenStore: TokenStoring = MemoryTokenStore()
+    private var deletedTaskIds: Set<String> = []
+    private var mockUploadedDocuments: [LimiraUploadedDocument] = []
     private var mockTask = LimiraTask(
         taskId: "mock-task-001",
         conversationId: "mock-task-001",
@@ -1075,7 +1099,12 @@ final class MockLimiraService: LimiraServicing {
     }
 
     func loadTasks(archived: Bool, query: String?) async throws -> [LimiraTask] {
-        archived ? [] : [mockTask]
+        guard !deletedTaskIds.contains(mockTask.taskId),
+              mockTask.historyArchived == archived,
+              taskMatches(mockTask, query: query) else {
+            return []
+        }
+        return [mockTask]
     }
 
     func startResearch(query: String, scenario: String?, conversationId: String?, documentIds: [String]) async throws -> LimiraTask {
@@ -1099,9 +1128,21 @@ final class MockLimiraService: LimiraServicing {
         return mockTask
     }
 
-    func archiveHistory(taskId: String) async throws -> LimiraTask { mockTask }
-    func restoreHistory(taskId: String) async throws -> LimiraTask { mockTask }
-    func deleteHistory(taskId: String) async throws {}
+    func archiveHistory(taskId: String) async throws -> LimiraTask {
+        guard taskId == mockTask.taskId, !deletedTaskIds.contains(taskId) else { return mockTask }
+        mockTask.historyArchived = true
+        return mockTask
+    }
+
+    func restoreHistory(taskId: String) async throws -> LimiraTask {
+        guard taskId == mockTask.taskId, !deletedTaskIds.contains(taskId) else { return mockTask }
+        mockTask.historyArchived = false
+        return mockTask
+    }
+
+    func deleteHistory(taskId: String) async throws {
+        deletedTaskIds.insert(taskId)
+    }
 
     func eventStream(taskId: String) -> AsyncThrowingStream<LimiraStreamEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -1147,15 +1188,20 @@ final class MockLimiraService: LimiraServicing {
         ]
     }
     func loadUploads(taskId: String?) async throws -> UploadsResponse {
-        UploadsResponse(documents: [mockDocument(taskId: taskId)], storage: mockStorage())
+        let documents = mockUploadedDocuments.filter { $0.taskId == taskId } + [mockDocument(taskId: taskId)]
+        return UploadsResponse(documents: documents, storage: mockStorage())
     }
     func loadCloudHistory() async throws -> UploadsResponse {
-        UploadsResponse(documents: [mockDocument(taskId: nil)], storage: mockStorage())
+        let documents = mockUploadedDocuments.filter { $0.taskId == nil } + [mockDocument(taskId: nil)]
+        return UploadsResponse(documents: documents, storage: mockStorage())
     }
     func loadStorage() async throws -> LimiraStoragePayload { mockStorage() }
 
     func uploadDocument(file: UploadFilePayload, taskId: String?) async throws -> LimiraUploadedDocument {
-        LimiraUploadedDocument(documentId: "mock-doc", taskId: taskId, filename: file.filename, contentType: file.contentType, byteSize: file.data.count, language: nil, extractedTextChars: nil, downloadUrl: "/api/limira/uploads/mock-doc/download", score: nil, snippet: nil, matchedTerms: nil)
+        let document = LimiraUploadedDocument(documentId: "mock-doc", taskId: taskId, filename: file.filename, contentType: file.contentType, byteSize: file.data.count, language: nil, extractedTextChars: nil, downloadUrl: "/api/limira/uploads/mock-doc/download", score: nil, snippet: "mock uploaded document", matchedTerms: nil)
+        mockUploadedDocuments.removeAll { $0.documentId == document.documentId }
+        mockUploadedDocuments.insert(document, at: 0)
+        return document
     }
 
     func searchUploads(query: String, taskId: String?) async throws -> [LimiraUploadedDocument] { [mockDocument(taskId: taskId)] }
@@ -1203,6 +1249,16 @@ final class MockLimiraService: LimiraServicing {
 
     private func mockStorage() -> LimiraStoragePayload {
         LimiraStoragePayload(usedBytes: 1024, quotaBytes: 10_485_760, remainingBytes: 10_484_736, usageRatio: 0.000097)
+    }
+
+    private func taskMatches(_ task: LimiraTask, query: String?) -> Bool {
+        guard let query = query?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !query.isEmpty else {
+            return true
+        }
+        return task.query.localizedCaseInsensitiveContains(query) ||
+            task.status.localizedCaseInsensitiveContains(query) ||
+            task.taskId.localizedCaseInsensitiveContains(query)
     }
 
     private func mockDocument(taskId: String?) -> LimiraUploadedDocument {

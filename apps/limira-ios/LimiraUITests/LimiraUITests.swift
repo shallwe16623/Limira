@@ -98,6 +98,19 @@ final class LimiraUITests: XCTestCase {
         dismissSystemPrompts(in: app)
         dismissKeyboard(in: app)
 
+        tapHittable(app.buttons["UploadMenuButton"], in: app)
+        tapHittable(app.buttons["UploadFileMenuItem"], in: app)
+        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChips"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChip-mock-doc"].waitForExistence(timeout: 3))
+
+        tapHittable(app.buttons["UploadMenuButton"], in: app)
+        tapHittable(app.buttons["HistoryFilesMenuItem"], in: app)
+        tapHittable(app.buttons["HistoryFilesRefreshButton"], in: app)
+        tapHittable(app.buttons["HistoryFileToggle-mock-cloud-doc"], in: app)
+        tapHittable(app.buttons["HistoryFilesDoneButton"], in: app)
+
+        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChip-mock-cloud-doc"].waitForExistence(timeout: 3))
+
         openSidebar(in: app)
         let search = app.buttons["HistorySearchButton"]
         XCTAssertTrue(scrollTo(search, in: app))
@@ -115,27 +128,35 @@ final class LimiraUITests: XCTestCase {
         XCTAssertTrue(searchRow.waitForExistence(timeout: 3))
         let archive = app.buttons["CompactHistoryArchiveButton-\(taskId)"]
         XCTAssertTrue(scrollTo(archive, in: app))
+        XCTAssertTrue(archive.isHittable)
         archive.tap()
+        tapHittable(app.buttons["HistorySearchDoneButton"], in: app)
 
+        openSidebar(in: app)
+        tapHittable(app.buttons["HistoryArchiveToggleButton"], in: app)
+        let archivedRow = app.buttons["CompactHistoryRow-\(taskId)"]
+        XCTAssertTrue(archivedRow.waitForExistence(timeout: 3))
+        let restore = app.buttons["CompactHistoryArchiveButton-\(taskId)"]
+        XCTAssertTrue(scrollTo(restore, in: app))
+        XCTAssertTrue(restore.isHittable)
+        restore.tap()
+        XCTAssertTrue(archivedRow.waitForNonExistence(timeout: 3))
+
+        tapHittable(app.buttons["HistoryArchiveToggleButton"], in: app)
+        let activeRow = app.buttons["CompactHistoryRow-\(taskId)"]
+        XCTAssertTrue(activeRow.waitForExistence(timeout: 3))
         let delete = app.buttons["CompactHistoryDeleteButton-\(taskId)"]
         XCTAssertTrue(scrollTo(delete, in: app))
+        XCTAssertTrue(delete.isHittable)
         delete.tap()
         let deleteAlert = app.alerts["删除这条对话？"]
         XCTAssertTrue(deleteAlert.waitForExistence(timeout: 3))
-        let cancelDelete = app.buttons.matching(identifier: "CompactHistoryDeleteCancelButton-\(taskId)").firstMatch
-        XCTAssertTrue(cancelDelete.waitForExistence(timeout: 3))
-        XCTAssertTrue(cancelDelete.isHittable)
-        cancelDelete.tap()
-        tapHittable(app.buttons["HistorySearchDoneButton"], in: app)
-
-        tapHittable(app.buttons["UploadMenuButton"], in: app)
-        tapHittable(app.buttons["HistoryFilesMenuItem"], in: app)
-        tapHittable(app.buttons["HistoryFilesRefreshButton"], in: app)
-        tapHittable(app.buttons["HistoryFileToggle-mock-cloud-doc"], in: app)
-        tapHittable(app.buttons["HistoryFilesDoneButton"], in: app)
-
-        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChips"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChip-mock-cloud-doc"].waitForExistence(timeout: 3))
+        let confirmDelete = app.buttons.matching(identifier: "CompactHistoryDeleteConfirmButton-\(taskId)").firstMatch
+        XCTAssertTrue(confirmDelete.waitForExistence(timeout: 3))
+        XCTAssertTrue(confirmDelete.isHittable)
+        confirmDelete.tap()
+        XCTAssertTrue(activeRow.waitForNonExistence(timeout: 3))
+        tapHittable(app.buttons["CompactSidebarCloseButton"], in: app)
 
         openSidebar(in: app)
         let cloud = app.buttons["CompactCloudDriveButton"]
