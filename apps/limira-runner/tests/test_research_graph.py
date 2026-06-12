@@ -6,12 +6,18 @@ from src.core import pipeline as pipeline_module
 from src.core import research_graph as research_graph_module
 from src.core import research_langgraph as research_langgraph_module
 from src.core.research_graph import (
+    LangGraphResearchUnitNode,
     ResearchGraphExecutionContext,
     ResearchGraphExecutionResult,
+    ResearchGraphNodeOutput,
     ResearchGraphState,
     ResearchPhase,
+    RetrieverRegistry,
+    UploadedDocumentSearchRetriever,
+    WebSearchRetriever,
     VerifiedClaim,
     build_initial_research_graph,
+    default_retriever_registry,
     evidence_id_for_source,
     graph_bootstrap_events,
     graph_task_description,
@@ -326,6 +332,30 @@ def test_langgraph_executor_builds_dependency_backed_stategraph():
     assert research_langgraph_module.LANGGRAPH_EXECUTOR_NAME == "langgraph"
 
 
+def test_default_retriever_registry_resolves_required_retrievers():
+    registry = default_retriever_registry()
+
+    assert set(registry.names) >= {
+        "web_search",
+        "page_visit_or_jina_summary",
+        "uploaded_document_search",
+        "legacy_agent_adapter",
+    }
+    assert registry.resolve("web-search").name == "web_search"
+    assert registry.resolve("page_visit_or_jina_summary").name == (
+        "page_visit_or_jina_summary"
+    )
+    assert registry.resolve("uploaded_document_search").name == (
+        "uploaded_document_search"
+    )
+    assert registry.resolve("legacy_agent_adapter").name == "legacy_agent_adapter"
+    with pytest.raises(KeyError, match="unknown_retriever"):
+        registry.resolve("unknown")
+    registry.disable("web_search")
+    with pytest.raises(RuntimeError, match="disabled_retriever:web_search"):
+        registry.resolve("web_search")
+
+
 @pytest.mark.asyncio
 async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_checkpoints():
     _FakeOrchestrator.task_descriptions = []
@@ -620,6 +650,190 @@ async def test_langgraph_research_unit_uses_legacy_only_as_fallback_retriever():
         "promote",
         "synthesize",
     ]
+
+
+@pytest.mark.asyncio
+async def test_langgraph_uploaded_document_retriever_searches_by_unit_query_terms():
+    _FakeOrchestrator.task_descriptions = []
+    matching_text = "Program X exposure is confirmed in this uploaded memo."
+    unrelated_text = "This document discusses unrelated market expansion."
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-upload-search",
+        query="Investigate program X exposure",
+        document_ids=["doc-match", "doc-miss"],
+        upload_scope={
+            "document_count": 2,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-match", "doc-miss"],
+            "source_payloads": [
+                {
+                    "candidate_id": "SRC-UPLOAD-MATCH",
+                    "document_id": "doc-match",
+                    "chunk_id": "UPLOAD-CHUNK-MATCH",
+                    "filename": "match.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "c" * 64,
+                    "text": matching_text,
+                },
+                {
+                    "candidate_id": "SRC-UPLOAD-MISS",
+                    "document_id": "doc-miss",
+                    "chunk_id": "UPLOAD-CHUNK-MISS",
+                    "filename": "miss.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:01:00+00:00",
+                    "content_hash": "d" * 64,
+                    "text": unrelated_text,
+                },
+            ],
+        },
+        max_units=1,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Investigate program X exposure",
+        task_file_name="",
+        task_id="task-langgraph-upload-search",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    assert _FakeOrchestrator.task_descriptions == []
+    assert {
+        candidate.document_id
+        for candidate in result.state.source_candidates
+        if candidate.source_type == "limira_upload"
+    } == {"doc-match"}
+    assert {
+        source.document_id
+        for source in result.state.retrieved_sources
+        if source.source_type == "limira_upload"
+    } == {"doc-match"}
+    assert {
+        item.document_id
+        for item in result.state.evidence
+        if item.source_type == "limira_upload"
+    } == {"doc-match"}
+    assert matching_text in result.final_summary
+    assert unrelated_text not in result.final_summary
+
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    assert research_checkpoint["executor_state"]["unit_substeps"][0][
+        "retriever_order"
+    ] == [
+        "web_search",
+        "page_visit_or_jina_summary",
+        "uploaded_document_search",
+        "legacy_agent_adapter",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_langgraph_retriever_order_respects_source_policy_priorities():
+    _FakeOrchestrator.task_descriptions = []
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-policy-priority",
+        query="Assess scenario source priority",
+        source_policy={
+            "prefer_uploaded_documents": True,
+            "prefer_scenario_sources": True,
+        },
+        max_units=1,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Assess scenario source priority",
+        task_file_name="",
+        task_id="task-langgraph-policy-priority",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    assert _FakeOrchestrator.task_descriptions == []
+    assert any(
+        source.source_type == "page_visit_or_jina_summary"
+        for source in result.state.retrieved_sources
+    )
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    assert research_checkpoint["executor_state"]["unit_substeps"][0][
+        "retriever_order"
+    ] == [
+        "uploaded_document_search",
+        "page_visit_or_jina_summary",
+        "web_search",
+        "legacy_agent_adapter",
+    ]
+    assert research_checkpoint["executor_state"]["legacy_adapter_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_langgraph_unknown_or_disabled_retrievers_emit_warnings():
+    _FakeOrchestrator.task_descriptions = []
+    registry = RetrieverRegistry()
+    registry.register(WebSearchRetriever(), enabled=False)
+    registry.register(UploadedDocumentSearchRetriever())
+    node = LangGraphResearchUnitNode(
+        retriever_registry=registry,
+        retriever_names=[
+            "unknown_retriever",
+            "web_search",
+            "uploaded_document_search",
+        ],
+    )
+    state = build_initial_research_graph(
+        task_id="task-langgraph-retriever-warning",
+        query="Assess context-only upload",
+        document_ids=["doc-empty"],
+        upload_scope={
+            "document_count": 1,
+            "retrieval_status": "context_only",
+            "context_only_document_ids": ["doc-empty"],
+            "source_payloads": [],
+        },
+        max_units=1,
+    )
+    context = ResearchGraphExecutionContext(
+        orchestrator=_FakeOrchestrator(),
+        original_task_description="Assess context-only upload",
+        task_id="task-langgraph-retriever-warning",
+    )
+
+    output = await node.run(state, context, ResearchGraphNodeOutput(state=state))
+
+    assert _FakeOrchestrator.task_descriptions == []
+    assert output.state.evidence == []
+    assert output.executor_state["retriever_warnings"]
+    assert any(
+        "unknown_retriever:unknown_retriever" in warning
+        for warning in output.executor_state["retriever_warnings"]
+    )
+    assert any(
+        "disabled_retriever:web_search" in warning
+        for warning in output.executor_state["retriever_warnings"]
+    )
+    assert output.executor_state["unit_substeps"][0]["warnings"] == (
+        output.executor_state["retriever_warnings"]
+    )
+    assert output.state.warnings[-2:] == output.executor_state["retriever_warnings"]
 
 
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():

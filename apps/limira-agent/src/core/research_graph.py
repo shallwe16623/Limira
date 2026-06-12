@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
@@ -322,6 +323,242 @@ class UploadedDocumentSourceProvider:
         ]
 
 
+@dataclass(frozen=True)
+class RetrieverRequest:
+    state: ResearchGraphState
+    unit: ResearchUnit
+    unit_index: int
+    context: ResearchGraphExecutionContext
+
+
+@dataclass(frozen=True)
+class RetrieverUnitResult:
+    retriever_order: list[str]
+    candidates: list[SourceCandidate]
+    retrieved_sources: list[RetrievedSource]
+    warnings: list[str]
+    legacy_adapter_used: bool
+
+
+class GraphRetriever:
+    name: str
+
+    async def search(self, request: RetrieverRequest) -> list[SourceCandidate]:
+        return []
+
+    async def retrieve(
+        self,
+        request: RetrieverRequest,
+        candidate: SourceCandidate,
+    ) -> RetrievedSource | None:
+        return None
+
+
+class RetrieverRegistry:
+    def __init__(self) -> None:
+        self._retrievers: dict[str, GraphRetriever] = {}
+        self._disabled: set[str] = set()
+
+    def register(self, retriever: GraphRetriever, *, enabled: bool = True) -> None:
+        name = _normalized_retriever_name(retriever.name)
+        if not name:
+            raise ValueError("retriever_name_required")
+        self._retrievers[name] = retriever
+        if enabled:
+            self._disabled.discard(name)
+        else:
+            self._disabled.add(name)
+
+    def resolve(self, name: str) -> GraphRetriever:
+        normalized = _normalized_retriever_name(name)
+        if normalized not in self._retrievers:
+            raise KeyError(f"unknown_retriever:{normalized or 'empty'}")
+        if normalized in self._disabled:
+            raise RuntimeError(f"disabled_retriever:{normalized}")
+        return self._retrievers[normalized]
+
+    def disable(self, name: str) -> None:
+        normalized = _normalized_retriever_name(name)
+        if normalized not in self._retrievers:
+            raise KeyError(f"unknown_retriever:{normalized or 'empty'}")
+        self._disabled.add(normalized)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._retrievers)
+
+
+class WebSearchRetriever(GraphRetriever):
+    name = "web_search"
+
+    async def search(self, request: RetrieverRequest) -> list[SourceCandidate]:
+        return [
+            _snippet_source_candidate_for_unit(
+                request.state,
+                request.unit,
+                request.unit_index,
+            )
+        ]
+
+
+class PageVisitOrJinaSummaryRetriever(GraphRetriever):
+    name = "page_visit_or_jina_summary"
+
+    async def search(self, request: RetrieverRequest) -> list[SourceCandidate]:
+        if not request.unit.source_policy.prefer_scenario_sources:
+            return []
+        return [
+            SourceCandidate(
+                candidate_id=_stable_prefixed_id(
+                    "SRC-PAGE",
+                    f"{request.state.task_id}:{request.unit.id}:page_summary",
+                ),
+                title=f"Scenario-prioritized page summary for {request.unit.id}",
+                summary=(
+                    "Deterministic page-summary candidate for scenario-prioritized "
+                    f"research on {request.unit.question}"
+                ),
+                source_type=self.name,
+                source_state="source_candidate",
+                source_content_state="content_bearing",
+                retrieval_status="retrievable",
+                url=f"jina://{request.unit.id}",
+                confidence=0.45,
+                source_event_type="research_graph_page_summary",
+            )
+        ]
+
+    async def retrieve(
+        self,
+        request: RetrieverRequest,
+        candidate: SourceCandidate,
+    ) -> RetrievedSource | None:
+        if candidate.source_type != self.name:
+            return None
+        summary = _bounded_graph_text(
+            (
+                f"Scenario-prioritized page summary for {request.unit.question}. "
+                f"Query terms: {'; '.join(request.unit.search_queries)}."
+            ),
+            GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+        )
+        return RetrievedSource(
+            id=retrieved_source_id_for_source(
+                task_id=request.state.task_id,
+                source=f"langgraph://{request.unit.id}/page_summary",
+                index=request.unit_index,
+            ),
+            url=candidate.url,
+            title=candidate.title,
+            source_type=self.name,
+            content_hash=_short_content_hash(summary),
+            quote_or_summary=summary,
+            tool_name=self.name,
+            confidence=candidate.confidence,
+        )
+
+
+class UploadedDocumentSearchRetriever(GraphRetriever):
+    name = "uploaded_document_search"
+
+    async def search(self, request: RetrieverRequest) -> list[SourceCandidate]:
+        upload_sources = UploadedDocumentSourceProvider(
+            request.state.upload_sources
+        ).retrieve()
+        matched_uploads = [
+            source
+            for source in upload_sources
+            if _upload_source_matches_unit(source, request.unit)
+        ]
+        if not matched_uploads and request.unit.source_policy.prefer_uploaded_documents:
+            matched_uploads = list(upload_sources)
+        return [_source_candidate_from_upload(source) for source in matched_uploads]
+
+    async def retrieve(
+        self,
+        request: RetrieverRequest,
+        candidate: SourceCandidate,
+    ) -> RetrievedSource | None:
+        if candidate.source_type != "limira_upload":
+            return None
+        upload_sources = UploadedDocumentSourceProvider(
+            request.state.upload_sources
+        ).retrieve()
+        upload_source = _upload_source_for_candidate(candidate, upload_sources)
+        if upload_source is None:
+            return None
+        return _retrieved_source_from_upload_for_unit(
+            state=request.state,
+            unit=request.unit,
+            upload_source=upload_source,
+            index=request.unit_index,
+        )
+
+
+class LegacyAgentAdapterRetriever(GraphRetriever):
+    name = "legacy_agent_adapter"
+
+    async def search(self, request: RetrieverRequest) -> list[SourceCandidate]:
+        return [
+            _legacy_adapter_source_candidate_for_unit(
+                request.state,
+                request.unit,
+                request.unit_index,
+            )
+        ]
+
+    async def retrieve(
+        self,
+        request: RetrieverRequest,
+        candidate: SourceCandidate,
+    ) -> RetrievedSource | None:
+        if candidate.source_type != self.name:
+            return None
+        final_summary, _boxed_answer, _failure_experience_summary = (
+            await request.context.orchestrator.run_main_agent(
+                task_description=research_unit_task_description(
+                    request.state,
+                    request.unit,
+                    request.context.original_task_description,
+                ),
+                task_file_name=request.context.task_file_name,
+                task_id=request.context.task_id,
+                is_final_retry=request.context.is_final_retry,
+            )
+        )
+        research_summary = _required_output_text(
+            final_summary,
+            "research_graph_research_output_required",
+        )
+        research_summary = _bounded_graph_text(
+            research_summary,
+            GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+        )
+        return RetrievedSource(
+            id=retrieved_source_id_for_source(
+                task_id=request.state.task_id,
+                source=f"langgraph://{request.unit.id}/legacy_agent_adapter",
+                index=request.unit_index,
+            ),
+            url=f"graph://{request.unit.id}",
+            title=request.unit.question,
+            source_type=self.name,
+            content_hash=_short_content_hash(research_summary),
+            quote_or_summary=research_summary,
+            tool_name=self.name,
+            confidence=candidate.confidence,
+        )
+
+
+def default_retriever_registry() -> RetrieverRegistry:
+    registry = RetrieverRegistry()
+    registry.register(WebSearchRetriever())
+    registry.register(PageVisitOrJinaSummaryRetriever())
+    registry.register(UploadedDocumentSearchRetriever())
+    registry.register(LegacyAgentAdapterRetriever())
+    return registry
+
+
 class ScopeNode(ResearchGraphNode):
     phase = ResearchPhase.SCOPE
 
@@ -558,6 +795,15 @@ class ResearchUnitNode(ResearchGraphNode):
 class LangGraphResearchUnitNode(ResearchGraphNode):
     phase = ResearchPhase.RESEARCH
 
+    def __init__(
+        self,
+        *,
+        retriever_registry: RetrieverRegistry | None = None,
+        retriever_names: list[str] | None = None,
+    ) -> None:
+        self._retriever_registry = retriever_registry or default_retriever_registry()
+        self._retriever_names = list(retriever_names) if retriever_names else None
+
     async def run(
         self,
         state: ResearchGraphState,
@@ -570,64 +816,36 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
         findings = list(state.findings)
         artifact_events: list[dict[str, Any]] = []
         unit_substeps: list[dict[str, Any]] = []
+        retriever_warnings: list[str] = []
         completed_unit_ids: list[str] = []
         current_unit_id = None
         legacy_adapter_calls = 0
-        upload_sources = UploadedDocumentSourceProvider(state.upload_sources).retrieve()
 
         for unit_index, unit in enumerate(state.plan.research_units):
             current_unit_id = unit.id
-            unit_candidates = self._search_candidates(
-                state,
-                unit,
-                unit_index,
-                upload_sources,
+            unit_result = await self._run_retriever_registry(
+                state=state,
+                unit=unit,
+                unit_index=unit_index,
+                context=context,
             )
-            source_candidates.extend(unit_candidates)
+            source_candidates.extend(unit_result.candidates)
+            retrieved_sources.extend(unit_result.retrieved_sources)
+            retriever_warnings.extend(unit_result.warnings)
+            legacy_adapter_calls += int(unit_result.legacy_adapter_used)
             artifact_events.extend(
                 _source_candidate_artifact_event(candidate)
-                for candidate in unit_candidates
+                for candidate in unit_result.candidates
+            )
+            artifact_events.extend(
+                _retrieved_source_artifact_event(source)
+                for source in unit_result.retrieved_sources
             )
 
-            unit_retrieved_sources: list[RetrievedSource] = []
-            fallback_summary = None
-            fallback_experience_summary = None
-            if not any(
-                candidate.source_type == "limira_upload"
-                and candidate.source_content_state == "content_bearing"
-                for candidate in unit_candidates
-            ):
-                fallback_summary, _boxed_answer, fallback_experience_summary = (
-                    await context.orchestrator.run_main_agent(
-                        task_description=research_unit_task_description(
-                            state,
-                            unit,
-                            context.original_task_description,
-                        ),
-                        task_file_name=context.task_file_name,
-                        task_id=context.task_id,
-                        is_final_retry=context.is_final_retry,
-                    )
-                )
-                legacy_adapter_calls += 1
-
-            for candidate in unit_candidates:
-                retrieved_source = self._retrieve_candidate(
-                    state=state,
-                    unit=unit,
-                    unit_index=unit_index,
-                    candidate=candidate,
-                    upload_sources=upload_sources,
-                    fallback_summary=fallback_summary,
-                )
-                if retrieved_source is None:
-                    continue
-                unit_retrieved_sources.append(retrieved_source)
-                retrieved_sources.append(retrieved_source)
-                artifact_events.append(_retrieved_source_artifact_event(retrieved_source))
-
             unit_evidence: list[EvidenceItem] = []
-            for retrieved_index, retrieved_source in enumerate(unit_retrieved_sources):
+            for retrieved_index, retrieved_source in enumerate(
+                unit_result.retrieved_sources
+            ):
                 evidence_item = _evidence_from_retrieved_source(
                     state=state,
                     unit=unit,
@@ -645,23 +863,22 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
                 {
                     "unit_id": unit.id,
                     "steps": ["search", "retrieve", "promote", "synthesize"],
+                    "retriever_order": unit_result.retriever_order,
                     "source_candidate_ids": [
-                        candidate.candidate_id for candidate in unit_candidates
+                        candidate.candidate_id for candidate in unit_result.candidates
                     ],
                     "snippet_only_candidate_ids": [
                         candidate.candidate_id
-                        for candidate in unit_candidates
+                        for candidate in unit_result.candidates
                         if candidate.source_content_state == "snippet_only"
                     ],
                     "retrieved_source_ids": [
-                        source.id for source in unit_retrieved_sources
+                        source.id for source in unit_result.retrieved_sources
                     ],
                     "evidence_ids": [item.id for item in unit_evidence],
                     "finding_ids": [finding.id for finding in unit_findings],
-                    "legacy_adapter_used": fallback_summary is not None,
-                    "fallback_experience_summary_present": (
-                        fallback_experience_summary is not None
-                    ),
+                    "legacy_adapter_used": unit_result.legacy_adapter_used,
+                    "warnings": list(unit_result.warnings),
                 }
             )
 
@@ -681,6 +898,7 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
                 "retrieved_sources": retrieved_sources,
                 "evidence": evidence,
                 "findings": findings,
+                "warnings": [*state.warnings, *retriever_warnings],
             }
         )
         return ResearchGraphNodeOutput(
@@ -698,87 +916,91 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
                 "unit_substeps": unit_substeps,
                 "resume_marker": "completed_unit_ids_available",
                 "legacy_adapter_calls": legacy_adapter_calls,
+                "retriever_warnings": retriever_warnings,
                 "context_only_upload_document_ids": list(
                     state.context_only_upload_document_ids
                 ),
             },
             artifact_events=artifact_events,
-            failure_experience_summary=(
-                fallback_experience_summary if legacy_adapter_calls else None
-            ),
         )
 
-    def _search_candidates(
-        self,
-        state: ResearchGraphState,
-        unit: ResearchUnit,
-        unit_index: int,
-        upload_sources: list[UploadedDocumentSource],
-    ) -> list[SourceCandidate]:
-        candidates = [_snippet_source_candidate_for_unit(state, unit, unit_index)]
-        matched_uploads = [
-            source
-            for source in upload_sources
-            if _upload_source_matches_unit(source, unit)
-        ]
-        if not matched_uploads and unit.source_policy.prefer_uploaded_documents:
-            matched_uploads = list(upload_sources)
-        candidates.extend(
-            _source_candidate_from_upload(source) for source in matched_uploads
-        )
-        if not matched_uploads:
-            candidates.append(
-                _legacy_adapter_source_candidate_for_unit(state, unit, unit_index)
-            )
-        return candidates
-
-    def _retrieve_candidate(
+    async def _run_retriever_registry(
         self,
         *,
         state: ResearchGraphState,
         unit: ResearchUnit,
         unit_index: int,
-        candidate: SourceCandidate,
-        upload_sources: list[UploadedDocumentSource],
-        fallback_summary: str | None,
-    ) -> RetrievedSource | None:
-        if candidate.source_content_state == "snippet_only":
-            return None
-        if candidate.source_type == "limira_upload":
-            upload_source = _upload_source_for_candidate(candidate, upload_sources)
-            if upload_source is None:
-                return None
-            return _retrieved_source_from_upload_for_unit(
-                state=state,
-                unit=unit,
-                upload_source=upload_source,
-                index=unit_index,
+        context: ResearchGraphExecutionContext,
+    ) -> RetrieverUnitResult:
+        request = RetrieverRequest(
+            state=state,
+            unit=unit,
+            unit_index=unit_index,
+            context=context,
+        )
+        retriever_order = self._retriever_order(unit)
+        non_legacy_names = [
+            name for name in retriever_order if name != "legacy_agent_adapter"
+        ]
+        candidates, retrieved_sources, warnings = await self._run_retrievers(
+            request,
+            non_legacy_names,
+        )
+        legacy_adapter_used = False
+        if not retrieved_sources and "legacy_agent_adapter" in retriever_order:
+            legacy_candidates, legacy_sources, legacy_warnings = (
+                await self._run_retrievers(request, ["legacy_agent_adapter"])
             )
-        if candidate.source_type != "legacy_agent_adapter":
-            return None
-        research_summary = _required_output_text(
-            fallback_summary,
-            "research_graph_research_output_required",
+            candidates.extend(legacy_candidates)
+            retrieved_sources.extend(legacy_sources)
+            warnings.extend(legacy_warnings)
+            legacy_adapter_used = bool(legacy_sources)
+        return RetrieverUnitResult(
+            retriever_order=retriever_order,
+            candidates=candidates,
+            retrieved_sources=retrieved_sources,
+            warnings=warnings,
+            legacy_adapter_used=legacy_adapter_used,
         )
-        research_summary = _bounded_graph_text(
-            research_summary,
-            GRAPH_SOURCE_SUMMARY_MAX_CHARS,
-        )
-        content_hash = _short_content_hash(research_summary)
-        return RetrievedSource(
-            id=retrieved_source_id_for_source(
-                task_id=state.task_id,
-                source=f"langgraph://{unit.id}/legacy_agent_adapter",
-                index=unit_index,
-            ),
-            url=f"graph://{unit.id}",
-            title=unit.question,
-            source_type="legacy_agent_adapter",
-            content_hash=content_hash,
-            quote_or_summary=research_summary,
-            tool_name="legacy_agent_adapter",
-            confidence=0.55,
-        )
+
+    async def _run_retrievers(
+        self,
+        request: RetrieverRequest,
+        names: list[str],
+    ) -> tuple[list[SourceCandidate], list[RetrievedSource], list[str]]:
+        candidates: list[SourceCandidate] = []
+        retrieved_sources: list[RetrievedSource] = []
+        warnings: list[str] = []
+        for name in names:
+            try:
+                retriever = self._retriever_registry.resolve(name)
+            except Exception as exc:
+                warnings.append(f"retriever_unavailable:{name}:{exc}")
+                continue
+            retriever_candidates = await retriever.search(request)
+            candidates.extend(retriever_candidates)
+            for candidate in retriever_candidates:
+                retrieved_source = await retriever.retrieve(request, candidate)
+                if retrieved_source is not None:
+                    retrieved_sources.append(retrieved_source)
+        return candidates, retrieved_sources, warnings
+
+    def _retriever_order(self, unit: ResearchUnit) -> list[str]:
+        if self._retriever_names is not None:
+            return [_normalized_retriever_name(name) for name in self._retriever_names]
+        ordered = [
+            "web_search",
+            "page_visit_or_jina_summary",
+            "uploaded_document_search",
+            "legacy_agent_adapter",
+        ]
+        if unit.source_policy.prefer_scenario_sources:
+            ordered.remove("page_visit_or_jina_summary")
+            ordered.insert(0, "page_visit_or_jina_summary")
+        if unit.source_policy.prefer_uploaded_documents:
+            ordered.remove("uploaded_document_search")
+            ordered.insert(0, "uploaded_document_search")
+        return ordered
 
     def _synthesize_findings(
         self,
@@ -1425,6 +1647,10 @@ def _source_policy_text(source_policy: SourcePolicy) -> str:
         f"prefer_uploaded_documents={source_policy.prefer_uploaded_documents}; "
         f"prefer_scenario_sources={source_policy.prefer_scenario_sources}"
     )
+
+
+def _normalized_retriever_name(value: str) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
 
 
 async def _emit_graph_phase(
