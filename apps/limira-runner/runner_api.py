@@ -77,16 +77,11 @@ RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS = (
     "token",
     "secret",
     "api_key",
-    "apikey",
     "prompt",
     "model_internal",
-    "modelinternal",
     "model_input",
-    "modelinput",
     "model_output",
-    "modeloutput",
     "raw_model",
-    "rawmodel",
 )
 RESUME_ARCHIVE_EXECUTOR_STATE_KEYS = (
     "node",
@@ -1048,7 +1043,8 @@ def _resume_archive_context_key_is_forbidden(key: str) -> bool:
     normalized = key.lower()
     compacted = "".join(ch for ch in normalized if ch.isalnum())
     return any(
-        part in normalized or part in compacted
+        part in normalized
+        or "".join(ch for ch in part if ch.isalnum()) in compacted
         for part in RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS
     )
 

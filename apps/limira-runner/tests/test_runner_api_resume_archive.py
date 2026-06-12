@@ -50,6 +50,9 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
         "raw model output private text",
         "model input transcript private text",
         "raw model private text",
+        "raw user identity private value",
+        "raw user hyphen private value",
+        "raw user compact private value",
     ]
     store = TaskStore(tmp_path / "tasks.sqlite3")
     record = seed_running_task(
@@ -79,6 +82,9 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
                     "modelInternal": secrets[7],
                     "rawPrompt": secrets[8],
                     "runnerServiceToken": secrets[9],
+                    "userId": secrets[13],
+                    "user-id": secrets[14],
+                    "userid": secrets[15],
                 }
             ],
             "evidence_ledger": [
@@ -194,5 +200,8 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
         assert "modelOutput" not in serialized
         assert "modelInput" not in serialized
         assert "rawModel" not in serialized
+        assert "userId" not in serialized
+        assert "user-id" not in serialized
+        assert "userid" not in serialized
         for secret in secrets:
             assert secret not in serialized
