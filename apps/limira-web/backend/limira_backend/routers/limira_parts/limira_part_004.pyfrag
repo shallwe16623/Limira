@@ -364,6 +364,7 @@ def _build_evidence_snapshot_members(
             else "unavailable"
         )
         entry = {
+            "snapshot_format_version": ARCHIVE_SNAPSHOT_FORMAT_VERSION,
             "evidence_id": evidence_id,
             "title": _evidence_title(evidence, evidence_id),
             "url": url,

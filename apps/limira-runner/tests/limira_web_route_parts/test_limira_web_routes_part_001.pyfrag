@@ -719,6 +719,97 @@ async def test_archive_download_regenerates_reused_archive_missing_evidence_snap
 
 
 @pytest.mark.asyncio
+async def test_archive_download_regenerates_reused_archive_with_outdated_evidence_snapshots():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-outdated-snapshot-reuse",
+        owner_user_id=user.id,
+        query="outdated snapshot archive",
+        scenario=None,
+        runner_task_id="runner-outdated-snapshot",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "evidence",
+        {
+            "evidence_id": "EVID-OLD",
+            "title": "Old evidence",
+            "source_url": "https://example.test/old",
+            "summary": "Snapshot format must be regenerated.",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    raw_buffer = io.BytesIO()
+    page_member = "evidence_snapshots/001-EVID-OLD-page.html"
+    summary_member = "evidence_snapshots/001-EVID-OLD-summary.html"
+    with zipfile.ZipFile(raw_buffer, "w") as archive:
+        archive.writestr("metadata.json", "{}")
+        archive.writestr("report.html", "<!doctype html><main>old</main>")
+        archive.writestr("report.md", "# old")
+        archive.writestr("trace.json", "{}")
+        archive.writestr(
+            "evidence_snapshots/manifest.json",
+            json.dumps(
+                {
+                    "snapshots": [
+                        {
+                            "evidence_id": "EVID-OLD",
+                            "page_member_name": page_member,
+                            "summary_member_name": summary_member,
+                        }
+                    ]
+                }
+            ),
+        )
+        archive.writestr(page_member, "<!doctype html><main>old bare html</main>")
+        archive.writestr(summary_member, "<!doctype html><main>old summary</main>")
+    raw_archive = raw_buffer.getvalue()
+    archive_key = limira.build_limira_object_key(
+        owner_user_id=user.id,
+        category="archives",
+        task_id=task.task_id,
+        filename="archive.zip",
+        object_id=task.task_id,
+    )
+    stored = await storage.put_object(
+        object_key=archive_key,
+        data=raw_archive,
+        content_type="application/zip",
+        metadata={
+            "task_id": task.task_id,
+            "owner_user_id": user.id,
+            "archive_sha256": hashlib.sha256(raw_archive).hexdigest(),
+        },
+    )
+    repo.update_task(
+        task.task_id,
+        archive_status="ready",
+        archive_object_key=stored.object_key,
+        archive_zip_sha256=stored.sha256,
+    )
+
+    response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+
+    assert response.body != raw_archive
+    members = _archive_member_texts(response.body)
+    manifest = json.loads(members["evidence_snapshots/manifest.json"])
+    assert (
+        manifest["snapshots"][0]["snapshot_format_version"]
+        == limira.ARCHIVE_SNAPSHOT_FORMAT_VERSION
+    )
+    assert manifest["snapshots"][0]["page_snapshot_source"] == "unavailable"
+    assert task.archive_zip_sha256 == hashlib.sha256(response.body).hexdigest()
+
+
+@pytest.mark.asyncio
 async def test_untasked_upload_does_not_invalidate_task_archive():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

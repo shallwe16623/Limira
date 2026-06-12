@@ -2283,11 +2283,36 @@ def _persisted_archive_reuse_failure_reason(
                     ).hexdigest()
                     if actual_pdf_sha != expected_pdf_sha:
                         return "archive_report_pdf_mismatch"
+                if expected_snapshot_members:
+                    if not set(expected_snapshot_members).issubset(names):
+                        return "archive_evidence_snapshots_missing"
+                    try:
+                        manifest_payload = _parse_archive_json_member(
+                            _decode_archive_text_member(
+                                archive.read(ARCHIVE_SNAPSHOT_MANIFEST)
+                            )
+                        )
+                    except (KeyError, HTTPException):
+                        return "archive_evidence_snapshots_missing"
+                    if not _archive_snapshot_manifest_is_current(manifest_payload):
+                        return "archive_evidence_snapshots_outdated"
         except zipfile.BadZipFile:
             return "invalid_archive_zip"
-        if not set(expected_snapshot_members).issubset(names):
-            return "archive_evidence_snapshots_missing"
     return None
+
+
+def _archive_snapshot_manifest_is_current(manifest_payload: Any) -> bool:
+    if not isinstance(manifest_payload, Mapping):
+        return False
+    snapshots = manifest_payload.get("snapshots")
+    if not isinstance(snapshots, list):
+        return False
+    for snapshot in snapshots:
+        if not isinstance(snapshot, Mapping):
+            return False
+        if snapshot.get("snapshot_format_version") != ARCHIVE_SNAPSHOT_FORMAT_VERSION:
+            return False
+    return True
 
 
 def _clear_persisted_archive_metadata(
