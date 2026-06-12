@@ -273,7 +273,8 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
         response_prepared = True
         if record.status == "queued":
             _ensure_task_worker(request.app, record.task_id)
-        replay_events = _task_event_snapshot(request.app, record.task_id)
+        replay_records = _task_event_records_snapshot(request.app, record.task_id)
+        replay_events = [_durable_record_event(record) for record in replay_records]
         for event in replay_events:
             await _write_sse(response, event)
         current = _task_store(request.app).get_task(record.task_id)
@@ -284,7 +285,9 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
                 request,
                 response,
                 current.task_id,
-                seen_event_count=len(replay_events),
+                seen_event_cursor=_durable_record_cursor(replay_records[-1])
+                if replay_records
+                else None,
             )
             return response
         while True:
@@ -310,31 +313,31 @@ async def _tail_external_durable_events(
     response: web.StreamResponse,
     task_id: str,
     *,
-    seen_event_count: int,
+    seen_event_cursor: Any,
 ) -> None:
     app = request.app
     while True:
         await asyncio.sleep(DURABLE_EVENT_POLL_INTERVAL_SECONDS)
-        seen_event_count = await _write_new_durable_events(
+        seen_event_cursor = await _write_new_durable_events(
             app,
             response,
             task_id,
-            seen_event_count,
+            seen_event_cursor,
         )
         record = _task_store(app).get_task(task_id)
         if not record:
             return
         if record.status in FINAL_TASK_STATUSES:
-            await _write_new_durable_events(app, response, task_id, seen_event_count)
+            await _write_new_durable_events(app, response, task_id, seen_event_cursor)
             return
         if _classify_task_lease(app, record) == "external_active":
             continue
         reconciled = _reconcile_task_if_stale(app, record)
-        seen_event_count = await _write_new_durable_events(
+        seen_event_cursor = await _write_new_durable_events(
             app,
             response,
             task_id,
-            seen_event_count,
+            seen_event_cursor,
         )
         if reconciled.status in FINAL_TASK_STATUSES:
             return
@@ -344,16 +347,23 @@ async def _write_new_durable_events(
     app: web.Application,
     response: web.StreamResponse,
     task_id: str,
-    seen_event_count: int,
-) -> int:
-    durable_events = _list_durable_task_events(app, task_id)
-    if durable_events:
-        app[TASK_EVENT_LOG_KEY][task_id] = durable_events[-MAX_REPLAY_EVENTS:]
-    if len(durable_events) < seen_event_count:
-        seen_event_count = 0
-    for event in durable_events[seen_event_count:]:
+    seen_event_cursor: Any,
+) -> Any:
+    durable_records = _list_durable_task_event_records(
+        app,
+        task_id,
+        after_cursor=seen_event_cursor,
+    )
+    if durable_records:
+        cached_events = app[TASK_EVENT_LOG_KEY].setdefault(task_id, [])
+        cached_events.extend(_durable_record_event(record) for record in durable_records)
+        if len(cached_events) > MAX_REPLAY_EVENTS:
+            del cached_events[:-MAX_REPLAY_EVENTS]
+    for record in durable_records:
+        event = _durable_record_event(record)
         await _write_sse(response, event)
-    return len(durable_events)
+        seen_event_cursor = _durable_record_cursor(record)
+    return seen_event_cursor
 
 
 async def _run_task_worker(app: web.Application, task_id: str) -> None:
@@ -629,13 +639,26 @@ def _task_event_snapshot(
     app: web.Application,
     task_id: str,
 ) -> list[dict[str, Any]]:
-    events = list(app[TASK_EVENT_LOG_KEY].get(task_id, []))
-    if events:
-        return events
-    store_events = _list_durable_task_events(app, task_id)
-    if store_events:
-        app[TASK_EVENT_LOG_KEY][task_id] = store_events[-MAX_REPLAY_EVENTS:]
-    return store_events
+    return [
+        _durable_record_event(record)
+        for record in _task_event_records_snapshot(app, task_id)
+    ]
+
+
+def _task_event_records_snapshot(
+    app: web.Application,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    durable_records = _list_durable_task_event_records(app, task_id)
+    if durable_records:
+        app[TASK_EVENT_LOG_KEY][task_id] = [
+            _durable_record_event(record) for record in durable_records
+        ][-MAX_REPLAY_EVENTS:]
+        return durable_records
+    return [
+        {"cursor": None, "event": event}
+        for event in list(app[TASK_EVENT_LOG_KEY].get(task_id, []))
+    ]
 
 
 def _subscribe_task_events(
@@ -1059,10 +1082,55 @@ def _list_durable_task_events(
     app: web.Application,
     task_id: str,
 ) -> list[dict[str, Any]]:
+    return [
+        _durable_record_event(record)
+        for record in _list_durable_task_event_records(app, task_id)
+    ]
+
+
+def _list_durable_task_event_records(
+    app: web.Application,
+    task_id: str,
+    *,
+    after_cursor: Any = None,
+) -> list[dict[str, Any]]:
+    record_lister = getattr(_task_store(app), "list_task_event_records", None)
+    if record_lister is not None:
+        return [
+            _durable_event_record(item)
+            for item in record_lister(
+                task_id,
+                limit=MAX_REPLAY_EVENTS,
+                after_cursor=after_cursor,
+            )
+        ]
     lister = getattr(_task_store(app), "list_task_events", None)
     if lister is None:
         return []
-    return lister(task_id, limit=MAX_REPLAY_EVENTS)
+    if after_cursor is not None:
+        return []
+    return [
+        {"cursor": None, "event": event}
+        for event in lister(task_id, limit=MAX_REPLAY_EVENTS)
+    ]
+
+
+def _durable_event_record(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"cursor": None, "event": {}}
+    event = value.get("event")
+    if not isinstance(event, dict):
+        event = {}
+    return {"cursor": value.get("cursor"), "event": event}
+
+
+def _durable_record_event(record: dict[str, Any]) -> dict[str, Any]:
+    event = record.get("event") if isinstance(record, dict) else None
+    return event if isinstance(event, dict) else {}
+
+
+def _durable_record_cursor(record: dict[str, Any]) -> Any:
+    return record.get("cursor") if isinstance(record, dict) else None
 
 
 def _reconcile_stale_running_tasks(

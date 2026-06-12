@@ -316,23 +316,52 @@ class TaskStore:
         *,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
+        return [
+            record["event"]
+            for record in self.list_task_event_records(task_id, limit=limit)
+        ]
+
+    def list_task_event_records(
+        self,
+        task_id: str,
+        *,
+        limit: int = 1000,
+        after_cursor: Any = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        after_event_id = _sqlite_event_cursor(after_cursor)
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT event_json
-                FROM (
+            if after_event_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT event_id, event_json
+                    FROM (
+                        SELECT event_id, event_json
+                        FROM limira_runner_task_events
+                        WHERE task_id = ?
+                        ORDER BY event_id DESC
+                        LIMIT ?
+                    ) replay
+                    ORDER BY event_id ASC
+                    """,
+                    (task_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
                     SELECT event_id, event_json
                     FROM limira_runner_task_events
-                    WHERE task_id = ?
-                    ORDER BY event_id DESC
+                    WHERE task_id = ? AND event_id > ?
+                    ORDER BY event_id ASC
                     LIMIT ?
-                ) replay
-                ORDER BY event_id ASC
-                """,
-                (task_id, max(1, int(limit))),
-            ).fetchall()
+                    """,
+                    (task_id, after_event_id, limit),
+                ).fetchall()
         return [
-            self._deserialize_json(row["event_json"], default={})
+            {
+                "cursor": int(row["event_id"]),
+                "event": self._deserialize_json(row["event_json"], default={}),
+            }
             for row in rows
             if row["event_json"] is not None
         ]
@@ -748,7 +777,7 @@ class PostgresTaskStore:
         VALUES (%s, %s, %s, 'runner', CAST(%s AS jsonb), %s)
     """
     LIST_TASK_EVENTS_SQL = """
-        SELECT payload
+        SELECT event_log_id, created_at, payload
         FROM (
             SELECT event_log_id, created_at, payload
             FROM limira_task_event_logs
@@ -758,6 +787,18 @@ class PostgresTaskStore:
             LIMIT %s
         ) replay
         ORDER BY created_at ASC, event_log_id ASC
+    """
+    LIST_TASK_EVENTS_AFTER_SQL = """
+        SELECT event_log_id, created_at, payload
+        FROM limira_task_event_logs
+        WHERE task_id = %s
+          AND source = 'runner'
+          AND (
+              created_at > %s
+              OR (created_at = %s AND event_log_id > %s)
+          )
+        ORDER BY created_at ASC, event_log_id ASC
+        LIMIT %s
     """
     FINALIZE_STALE_RUNNING_TASK_SQL = f"""
         UPDATE limira_research_tasks
@@ -1056,13 +1097,47 @@ class PostgresTaskStore:
         *,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        rows = self._fetch_all(self.LIST_TASK_EVENTS_SQL, (task_id, max(1, int(limit))))
-        events = []
+        return [
+            record["event"]
+            for record in self.list_task_event_records(task_id, limit=limit)
+        ]
+
+    def list_task_event_records(
+        self,
+        task_id: str,
+        *,
+        limit: int = 1000,
+        after_cursor: Any = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        cursor = _postgres_event_cursor(after_cursor)
+        if cursor is None:
+            rows = self._fetch_all(self.LIST_TASK_EVENTS_SQL, (task_id, limit))
+        else:
+            rows = self._fetch_all(
+                self.LIST_TASK_EVENTS_AFTER_SQL,
+                (
+                    task_id,
+                    cursor["created_at"],
+                    cursor["created_at"],
+                    cursor["event_log_id"],
+                    limit,
+                ),
+            )
+        records = []
         for row in rows:
             payload = _deserialize_json(row.get("payload"), default={})
             if isinstance(payload, dict):
-                events.append(payload)
-        return events
+                records.append(
+                    {
+                        "cursor": {
+                            "created_at": _iso_value(row.get("created_at")),
+                            "event_log_id": str(row.get("event_log_id") or ""),
+                        },
+                        "event": payload,
+                    }
+                )
+        return records
 
     def finalize_stale_running_task(
         self,
@@ -1269,6 +1344,25 @@ def _runner_metadata(*, task_context: dict[str, Any] | None = None) -> dict[str,
 
 def _runner_event_log_id() -> str:
     return f"runner-{time.time_ns():020d}-{uuid.uuid4().hex}"
+
+
+def _sqlite_event_cursor(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _postgres_event_cursor(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    created_at = str(value.get("created_at") or "").strip()
+    event_log_id = str(value.get("event_log_id") or "").strip()
+    if not created_at or not event_log_id:
+        return None
+    return {"created_at": created_at, "event_log_id": event_log_id}
 
 
 def _serialize_json(value: Any) -> str:

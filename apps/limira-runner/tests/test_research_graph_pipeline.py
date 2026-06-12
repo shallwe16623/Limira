@@ -393,7 +393,20 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
     assert report_payload["content"] == report_payload["markdown"]
     assert report_payload["evidence_refs"]
     assert report_payload["source_event_type"] == "research_graph"
-    assert any(item["event"] == "message" for item in stream_queue.items)
+    final_message_index = next(
+        index
+        for index, item in enumerate(stream_queue.items)
+        if item.get("event") == "message"
+        and item.get("data", {}).get("source_event_type") == "research_graph"
+        and "## Key Findings" in item.get("data", {}).get("delta", {}).get("content", "")
+    )
+    complete_checkpoint_index = next(
+        index
+        for index, item in enumerate(stream_queue.items)
+        if item.get("event") == "research_graph_checkpoint"
+        and item.get("data", {}).get("phase") == "complete"
+    )
+    assert final_message_index < complete_checkpoint_index
     assert len(_FakeOrchestrator.task_descriptions) == 4
     assert all(
         "## Research Unit Node" in task_description

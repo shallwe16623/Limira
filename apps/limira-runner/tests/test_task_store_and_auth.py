@@ -4,7 +4,13 @@ import sqlite3
 import pytest
 
 from auth_adapter import AuthError, authenticate_headers, reject_body_user_id
-from runner_api import MAX_REPLAY_EVENTS, SERVICE_TOKEN_KEY, create_app
+from runner_api import (
+    MAX_REPLAY_EVENTS,
+    SERVICE_TOKEN_KEY,
+    _task_event_records_snapshot,
+    _write_new_durable_events,
+    create_app,
+)
 from task_store import PostgresTaskStore, TaskStore, create_task_store_from_env
 
 
@@ -211,6 +217,64 @@ def test_task_store_replays_latest_event_window_in_append_order(tmp_path):
     assert len(events) == MAX_REPLAY_EVENTS
     assert events[0]["payload"]["index"] == 5
     assert events[-1]["payload"]["index"] == MAX_REPLAY_EVENTS + 4
+
+
+class _CaptureSseResponse:
+    def __init__(self):
+        self.chunks = []
+
+    async def write(self, data):
+        self.chunks.append(data)
+
+
+@pytest.mark.asyncio
+async def test_runner_durable_event_tail_uses_stable_cursor_after_replay_window(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    task_id = "task-window-cursor"
+    store.create_task(
+        task_id=task_id,
+        user_id="user-a",
+        query="window cursor",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    for index in range(MAX_REPLAY_EVENTS + 5):
+        store.append_task_event(
+            task_id,
+            {
+                "task_id": task_id,
+                "type": "message",
+                "timestamp": "2026-06-06T12:01:00+00:00",
+                "payload": {"index": index},
+            },
+            created_at="2026-06-06T12:01:00+00:00",
+        )
+    app = create_app(task_store=store)
+    replay_records = _task_event_records_snapshot(app, task_id)
+    cursor = replay_records[-1]["cursor"]
+    for index in range(MAX_REPLAY_EVENTS + 5, MAX_REPLAY_EVENTS + 7):
+        store.append_task_event(
+            task_id,
+            {
+                "task_id": task_id,
+                "type": "message",
+                "timestamp": "2026-06-06T12:02:00+00:00",
+                "payload": {"index": index},
+            },
+            created_at="2026-06-06T12:02:00+00:00",
+        )
+    response = _CaptureSseResponse()
+
+    next_cursor = await _write_new_durable_events(app, response, task_id, cursor)
+    emitted = [
+        json.loads(chunk.decode("utf-8").removeprefix("data: ").strip())
+        for chunk in response.chunks
+    ]
+
+    assert [event["payload"]["index"] for event in emitted] == [
+        MAX_REPLAY_EVENTS + 5,
+        MAX_REPLAY_EVENTS + 6,
+    ]
+    assert next_cursor != cursor
 
 
 def test_task_store_cancels_only_still_queued_tasks(tmp_path):

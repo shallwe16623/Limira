@@ -644,6 +644,7 @@ async def execute_research_graph(
         failure_experience_summary=current_output.failure_experience_summary,
     )
     await _emit_graph_phase(stream_queue, complete_state, ResearchPhase.COMPLETE)
+    await _emit_final_report_message(stream_queue, complete_state, final_summary)
     await _emit_graph_checkpoint(
         stream_queue,
         complete_state,
@@ -657,6 +658,25 @@ async def execute_research_graph(
         final_summary=final_summary,
         final_boxed_answer=final_boxed_answer,
         failure_experience_summary=current_output.failure_experience_summary,
+    )
+
+
+async def _emit_final_report_message(
+    stream_queue: Any,
+    state: ResearchGraphState,
+    final_summary: str,
+) -> None:
+    if stream_queue is None:
+        return
+    await stream_queue.put(
+        {
+            "event": "message",
+            "data": {
+                "task_id": state.task_id,
+                "delta": {"content": final_summary},
+                "source_event_type": "research_graph",
+            },
+        }
     )
 
 
