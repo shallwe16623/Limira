@@ -1,3 +1,6 @@
+import asyncio
+import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -84,6 +87,244 @@ def test_preloaded_pipeline_components_create_fresh_task_runtime(monkeypatch):
     assert first_runtime[2] is not second_runtime[2]
     assert first_runtime[0] is not created[0][0]
     assert second_runtime[0] is not created[0][0]
+
+
+@pytest.mark.asyncio
+async def test_stream_events_optimized_isolates_concurrent_task_runtime(monkeypatch):
+    calls = []
+    overlap = threading.Barrier(2, timeout=5)
+
+    class _ConcurrentToolManager:
+        def __init__(self, name):
+            self.name = name
+            self.task_log = None
+            self.browser_session = None
+            self.trace = []
+
+        async def get_all_tool_definitions(self):
+            return [{"name": self.name, "tools": []}]
+
+        def set_task_log(self, task_log):
+            self.task_log = task_log
+            self.trace.append(("task_log", task_log.task_id))
+
+    class _ConcurrentFormatter:
+        def __init__(self, name):
+            self.name = name
+            self.task_id = None
+
+    def fake_create_pipeline_components(_cfg):
+        index = len(calls)
+        return (
+            _ConcurrentToolManager(f"main-{index}"),
+            {"sub": _ConcurrentToolManager(f"sub-{index}")},
+            _ConcurrentFormatter(f"formatter-{index}"),
+        )
+
+    async def fake_execute_task_pipeline(
+        *,
+        task_id,
+        main_agent_tool_manager,
+        sub_agent_tool_managers,
+        output_formatter,
+        stream_queue,
+        **_kwargs,
+    ):
+        task_log = SimpleNamespace(task_id=task_id)
+        main_agent_tool_manager.set_task_log(task_log)
+        main_agent_tool_manager.browser_session = f"browser:{task_id}"
+        sub_agent_tool_managers["sub"].set_task_log(task_log)
+        sub_agent_tool_managers["sub"].browser_session = f"sub-browser:{task_id}"
+        output_formatter.task_id = task_id
+        calls.append(
+            {
+                "task_id": task_id,
+                "main": main_agent_tool_manager,
+                "sub_managers": sub_agent_tool_managers,
+                "sub": sub_agent_tool_managers["sub"],
+                "formatter": output_formatter,
+            }
+        )
+        overlap.wait()
+        assert main_agent_tool_manager.task_log is task_log
+        assert main_agent_tool_manager.browser_session == f"browser:{task_id}"
+        assert sub_agent_tool_managers["sub"].task_log is task_log
+        assert sub_agent_tool_managers["sub"].browser_session == (
+            f"sub-browser:{task_id}"
+        )
+        assert output_formatter.task_id == task_id
+        await stream_queue.put(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": f"search-{task_id}",
+                    "tool_name": "google_search",
+                    "tool_input": {"q": task_id},
+                },
+            }
+        )
+        await stream_queue.put(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": f"search-{task_id}",
+                    "tool_name": "google_search",
+                    "tool_input": {
+                        "result": json.dumps(
+                            {
+                                "searchParameters": {"q": task_id},
+                                "organic": [
+                                    {
+                                        "title": f"Search result for {task_id}",
+                                        "link": f"https://example.test/{task_id}/search",
+                                        "snippet": f"Search snippet for {task_id}",
+                                    }
+                                ],
+                            }
+                        )
+                    },
+                },
+            }
+        )
+        await stream_queue.put(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": f"scrape-{task_id}",
+                    "tool_name": "scrape",
+                    "tool_input": {"url": f"https://example.test/{task_id}/source"},
+                },
+            }
+        )
+        await stream_queue.put(
+            {
+                "event": "tool_call",
+                "data": {
+                    "tool_call_id": f"scrape-{task_id}",
+                    "tool_name": "scrape",
+                    "tool_input": {
+                        "result": f"Retrieved source content for {task_id}",
+                    },
+                },
+            }
+        )
+        return f"summary {task_id}", f"final {task_id}", None, None
+
+    async def collect(task_id):
+        events = []
+        async for event in pipeline_helpers.stream_events_optimized(
+            task_id,
+            f"query {task_id}",
+        ):
+            events.append(event)
+        return events
+
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "_preload_cache",
+        {
+            "cfg": None,
+            "tool_definitions": None,
+            "sub_agent_tool_definitions": None,
+            "loaded": False,
+        },
+    )
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "load_limira_config",
+        lambda _overrides: SimpleNamespace(
+            agent=SimpleNamespace(sub_agents={"sub": {}})
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "create_pipeline_components",
+        fake_create_pipeline_components,
+    )
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "expose_sub_agents_as_tools",
+        lambda _sub_agents: [],
+    )
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "execute_task_pipeline",
+        fake_execute_task_pipeline,
+    )
+
+    task_a_events, task_b_events = await asyncio.wait_for(
+        asyncio.gather(collect("task-a"), collect("task-b")),
+        timeout=10,
+    )
+
+    assert len(calls) == 2
+    by_task = {call["task_id"]: call for call in calls}
+    assert set(by_task) == {"task-a", "task-b"}
+    assert by_task["task-a"]["main"] is not by_task["task-b"]["main"]
+    assert by_task["task-a"]["sub_managers"] is not by_task["task-b"]["sub_managers"]
+    assert by_task["task-a"]["sub"] is not by_task["task-b"]["sub"]
+    assert by_task["task-a"]["formatter"] is not by_task["task-b"]["formatter"]
+    for task_id, call in by_task.items():
+        assert call["main"].task_log.task_id == task_id
+        assert call["main"].browser_session == f"browser:{task_id}"
+        assert call["main"].trace == [("task_log", task_id)]
+        assert call["sub"].task_log.task_id == task_id
+        assert call["sub"].browser_session == f"sub-browser:{task_id}"
+        assert call["sub"].trace == [("task_log", task_id)]
+        assert call["formatter"].task_id == task_id
+    assert "main_agent_tool_manager" not in pipeline_helpers._preload_cache
+    assert "sub_agent_tool_managers" not in pipeline_helpers._preload_cache
+    assert "output_formatter" not in pipeline_helpers._preload_cache
+
+    for task_id, events in {
+        "task-a": task_a_events,
+        "task-b": task_b_events,
+    }.items():
+        tool_call_events = [
+            event for event in events if event.get("event") == "tool_call"
+        ]
+        assert [
+            event["data"]["tool_call_id"] for event in tool_call_events
+        ] == [
+            f"search-{task_id}",
+            f"search-{task_id}",
+            f"scrape-{task_id}",
+            f"scrape-{task_id}",
+        ]
+        assert all(
+            task_id in json.dumps(event, ensure_ascii=False)
+            for event in tool_call_events
+        )
+        assert not any(
+            other_task in json.dumps(event, ensure_ascii=False)
+            for other_task in {"task-a", "task-b"} - {task_id}
+            for event in tool_call_events
+        )
+        derived_events = [
+            event
+            for event in events
+            if event.get("payload", {}).get("source_event_type")
+            == "tool_evidence_ledger"
+        ]
+        assert [event["type"] for event in derived_events] == [
+            "source_candidate_collected",
+            "retrieved_source_collected",
+            "evidence_collected",
+        ]
+        assert all(
+            event["payload"]["tool_call_id"]
+            in {f"search-{task_id}", f"scrape-{task_id}"}
+            for event in derived_events
+        )
+        assert all(
+            task_id in json.dumps(event, ensure_ascii=False)
+            for event in derived_events
+        )
+        assert not any(
+            other_task in json.dumps(event, ensure_ascii=False)
+            for other_task in {"task-a", "task-b"} - {task_id}
+            for event in derived_events
+        )
 
 
 @pytest.mark.asyncio
