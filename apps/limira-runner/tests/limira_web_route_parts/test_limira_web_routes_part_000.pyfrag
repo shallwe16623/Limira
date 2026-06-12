@@ -919,6 +919,94 @@ async def test_limira_google_oauth_callback_creates_verified_session_user(
 
 
 @pytest.mark.asyncio
+async def test_limira_mobile_google_oauth_exchanges_one_time_code(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SQLITE_PATH_ENV, str(tmp_path / "limira_auth.sqlite3"))
+    monkeypatch.setenv(limira.LIMIRA_LEGACY_AUTH_SQLITE_PATH_ENV, str(tmp_path / "missing.db"))
+    monkeypatch.setenv(limira.LIMIRA_AUTH_SECRET_ENV, "test-limira-auth-secret")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_ID_ENV, "google-client-id")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_CLIENT_SECRET_ENV, "google-secret")
+    monkeypatch.setenv(limira.LIMIRA_GOOGLE_OAUTH_AUTH_URL_ENV, "https://google.example/auth")
+
+    async def fake_google_userinfo_from_code(*, code, request, env=os.environ):
+        assert code == "mobile-google-code"
+        return {
+            "google_sub": "mobile-google-user-123",
+            "email": "mobile-google@example.test",
+            "name": "Mobile Google User",
+        }
+
+    monkeypatch.setattr(
+        limira,
+        "_limira_google_userinfo_from_code",
+        fake_google_userinfo_from_code,
+    )
+
+    app = FastAPI()
+    app.include_router(limira.router, prefix="/api/limira")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        start = await client.get(
+            "/api/limira/auth/mobile/google/start",
+            params={"redirect_uri": "limira://auth/callback"},
+            follow_redirects=False,
+        )
+        assert start.status_code == 303
+        assert "set-cookie" not in start.headers
+        parsed_start = urlsplit(start.headers["location"])
+        params = parse_qs(parsed_start.query)
+        assert f"{parsed_start.scheme}://{parsed_start.netloc}{parsed_start.path}" == "https://google.example/auth"
+        assert params["redirect_uri"] == ["http://limira.test/api/limira/auth/google/callback"]
+        state = params["state"][0]
+        mobile_state = limira._limira_mobile_oauth_state_payload(state, provider="google")
+        assert mobile_state["redirect_uri"] == "limira://auth/callback"
+
+        callback = await client.get(
+            "/api/limira/auth/google/callback",
+            params={"code": "mobile-google-code", "state": state},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert "limira_session=" not in callback.headers.get("set-cookie", "")
+        parsed_callback = urlsplit(callback.headers["location"])
+        callback_params = parse_qs(parsed_callback.query)
+        assert f"{parsed_callback.scheme}://{parsed_callback.netloc}{parsed_callback.path}" == "limira://auth/callback"
+        assert callback_params["provider"] == ["google"]
+        assert callback_params["state"] == [state]
+        mobile_code = callback_params["code"][0]
+
+        exchanged = await client.post(
+            "/api/limira/auth/mobile/exchange",
+            json={"provider": "google", "code": mobile_code, "state": state},
+        )
+        assert exchanged.status_code == 200
+        payload = exchanged.json()
+        assert payload["email"] == "mobile-google@example.test"
+        assert payload["name"] == "Mobile Google User"
+        assert payload["token_type"] == "bearer"
+        assert payload["token"]
+
+        replay = await client.post(
+            "/api/limira/auth/mobile/exchange",
+            json={"provider": "google", "code": mobile_code, "state": state},
+        )
+        assert replay.status_code == 400
+        assert replay.json() == {"detail": "invalid_or_expired_auth_token"}
+
+        session = await client.get(
+            "/api/limira/auth/session",
+            headers={"Authorization": f"Bearer {payload['token']}"},
+        )
+        assert session.status_code == 200
+        assert session.json()["email"] == "mobile-google@example.test"
+
+
+@pytest.mark.asyncio
 async def test_limira_wechat_oauth_config_and_start_are_env_gated(
     tmp_path,
     monkeypatch,

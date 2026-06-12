@@ -1577,6 +1577,8 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/auth/password-reset/confirm", "POST"),
         ("/auth/organizations", "GET"),
         ("/auth/enterprise/signin", "POST"),
+        ("/auth/mobile/{provider}/start", "GET"),
+        ("/auth/mobile/exchange", "POST"),
         ("/auth/google/config", "GET"),
         ("/auth/google/start", "GET"),
         ("/auth/google/callback", "GET"),

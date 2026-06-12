@@ -136,6 +136,7 @@ LIMIRA_WECHAT_OAUTH_STATE_COOKIE_NAME = "limira_wechat_oauth_state"
 LIMIRA_AUTH_DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 LIMIRA_AUTH_DEFAULT_EMAIL_VERIFY_TTL_SECONDS = 60 * 60 * 24
 LIMIRA_AUTH_DEFAULT_PASSWORD_RESET_TTL_SECONDS = 60 * 60
+LIMIRA_AUTH_MOBILE_LOGIN_TTL_SECONDS = 2 * 60
 LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS = 10 * 60
 LIMIRA_WECHAT_OAUTH_STATE_TTL_SECONDS = 10 * 60
 LIMIRA_DEFAULT_EMBEDDING_DIMENSIONS = 1536
@@ -456,6 +457,12 @@ class LimiraAuthPasswordResetRequest(BaseModel):
 class LimiraAuthPasswordResetConfirmRequest(BaseModel):
     token: str = Field(min_length=16, max_length=512)
     password: str = Field(min_length=1, max_length=4096)
+
+
+class LimiraMobileOAuthExchangeRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=16, max_length=512)
+    state: str = Field(min_length=16, max_length=2048)
 
 
 class LimiraEnterpriseSigninRequest(BaseModel):

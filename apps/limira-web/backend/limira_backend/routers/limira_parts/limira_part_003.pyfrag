@@ -406,6 +406,37 @@ async def limira_auth_organizations() -> dict[str, Any]:
     }
 
 
+@router.get("/auth/mobile/{provider}/start")
+async def limira_mobile_oauth_start(
+    request: Request,
+    provider: str,
+    redirect_uri: str = Query(..., max_length=240),
+) -> RedirectResponse:
+    normalized_provider = _normalize_mobile_oauth_provider(provider)
+    normalized_redirect_uri = _normalize_mobile_oauth_redirect_uri(redirect_uri)
+    if normalized_provider == "google":
+        if not _limira_google_oauth_enabled():
+            raise HTTPException(status_code=404, detail="google_oauth_not_configured")
+        state = _limira_mobile_oauth_state(
+            provider=normalized_provider,
+            redirect_uri=normalized_redirect_uri,
+        )
+        return RedirectResponse(
+            _limira_google_oauth_authorize_url(request=request, state=state),
+            status_code=303,
+        )
+    if not _limira_wechat_oauth_enabled():
+        raise HTTPException(status_code=404, detail="wechat_oauth_not_configured")
+    state = _limira_mobile_oauth_state(
+        provider=normalized_provider,
+        redirect_uri=normalized_redirect_uri,
+    )
+    return RedirectResponse(
+        _limira_wechat_oauth_authorize_url(request=request, state=state),
+        status_code=303,
+    )
+
+
 @router.get("/auth/google/start")
 async def limira_auth_google_start(request: Request) -> RedirectResponse:
     if not _limira_google_oauth_enabled():
@@ -456,6 +487,39 @@ async def limira_auth_google_callback(
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
 ) -> RedirectResponse:
+    mobile_state = _limira_mobile_oauth_state_payload(state, provider="google")
+    if mobile_state is not None:
+        if error or not code:
+            return RedirectResponse(
+                _limira_mobile_oauth_redirect_url(
+                    mobile_state,
+                    provider="google",
+                    state=str(state),
+                    error="google_auth_failed",
+                ),
+                status_code=303,
+            )
+        identity = await _limira_google_userinfo_from_code(code=code, request=request)
+        user = _limira_auth_upsert_google_user(
+            email=str(identity["email"]),
+            name=str(identity.get("name") or identity["email"]),
+            provider_subject=str(identity.get("google_sub") or identity["email"]),
+        )
+        mobile_code = _limira_auth_create_one_time_token(
+            user_id=user.id,
+            kind="mobile_login",
+            ttl_seconds=LIMIRA_AUTH_MOBILE_LOGIN_TTL_SECONDS,
+        )
+        return RedirectResponse(
+            _limira_mobile_oauth_redirect_url(
+                mobile_state,
+                provider="google",
+                state=str(state),
+                code=mobile_code,
+            ),
+            status_code=303,
+        )
+
     redirect_response = RedirectResponse(
         _limira_google_oauth_login_redirect_url(request, success=False),
         status_code=303,
@@ -501,6 +565,38 @@ async def limira_auth_wechat_callback(
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
 ) -> RedirectResponse:
+    mobile_state = _limira_mobile_oauth_state_payload(state, provider="wechat")
+    if mobile_state is not None:
+        if error or not code:
+            return RedirectResponse(
+                _limira_mobile_oauth_redirect_url(
+                    mobile_state,
+                    provider="wechat",
+                    state=str(state),
+                    error="wechat_auth_failed",
+                ),
+                status_code=303,
+            )
+        identity = await _limira_wechat_userinfo_from_code(code=code)
+        user = _limira_auth_upsert_wechat_user(
+            provider_subject=str(identity["wechat_sub"]),
+            name=str(identity.get("name") or "微信用户"),
+        )
+        mobile_code = _limira_auth_create_one_time_token(
+            user_id=user.id,
+            kind="mobile_login",
+            ttl_seconds=LIMIRA_AUTH_MOBILE_LOGIN_TTL_SECONDS,
+        )
+        return RedirectResponse(
+            _limira_mobile_oauth_redirect_url(
+                mobile_state,
+                provider="wechat",
+                state=str(state),
+                code=mobile_code,
+            ),
+            status_code=303,
+        )
+
     redirect_response = RedirectResponse(
         _limira_wechat_oauth_login_redirect_url(request, success=False),
         status_code=303,
@@ -536,6 +632,27 @@ async def limira_auth_wechat_callback(
     )
     _set_limira_auth_cookie(redirect_response, session_token)
     return redirect_response
+
+
+@router.post("/auth/mobile/exchange")
+async def limira_mobile_oauth_exchange(
+    request_data: LimiraMobileOAuthExchangeRequest,
+    response: Response,
+) -> dict[str, Any]:
+    provider = _normalize_mobile_oauth_provider(request_data.provider)
+    mobile_state = _limira_mobile_oauth_state_payload(
+        request_data.state,
+        provider=provider,
+    )
+    if mobile_state is None:
+        raise HTTPException(status_code=400, detail="invalid_mobile_oauth_state")
+    user = _limira_auth_consume_one_time_token(
+        kind="mobile_login",
+        token=request_data.code,
+    )
+    token = _limira_issue_auth_token(user)
+    _set_limira_auth_cookie(response, token)
+    return _limira_auth_public_user(user, token=token)
 
 
 @router.post("/auth/verify-email")

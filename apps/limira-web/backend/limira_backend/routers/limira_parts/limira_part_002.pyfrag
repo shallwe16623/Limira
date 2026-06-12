@@ -784,6 +784,23 @@ def _normalize_auth_username(username: str | None) -> str:
     return normalized
 
 
+def _normalize_mobile_oauth_provider(provider: str | None) -> str:
+    normalized = str(provider or "").strip().lower()
+    if normalized not in {"google", "wechat"}:
+        raise HTTPException(status_code=404, detail="oauth_provider_not_supported")
+    return normalized
+
+
+def _normalize_mobile_oauth_redirect_uri(redirect_uri: str | None) -> str:
+    normalized = str(redirect_uri or "").strip()
+    parsed = urlsplit(normalized)
+    if parsed.scheme != "limira" or parsed.netloc != "auth" or parsed.path != "/callback":
+        raise HTTPException(status_code=400, detail="invalid_mobile_redirect_uri")
+    if parsed.query or parsed.fragment:
+        raise HTTPException(status_code=400, detail="invalid_mobile_redirect_uri")
+    return normalized
+
+
 def _limira_auth_username_from_email(email: str) -> str:
     local_part = str(email or "").split("@", 1)[0]
     return _limira_auth_username_slug(local_part) or "user"
@@ -992,6 +1009,45 @@ def _limira_auth_reset_password_with_token(
     return user
 
 
+def _limira_auth_consume_one_time_token(
+    *,
+    kind: str,
+    token: str,
+    env: Any = os.environ,
+) -> LimiraAuthRecord:
+    token_hash = _limira_auth_one_time_token_hash(
+        kind=kind,
+        token=str(token).strip(),
+        env=env,
+    )
+    now = int(time.time())
+    with _limira_auth_connect(env) as connection:
+        row = connection.execute(
+            f"""
+            SELECT {_limira_auth_user_select_columns("users")}
+            FROM limira_auth_tokens AS tokens
+            JOIN limira_auth_users AS users ON users.id = tokens.user_id
+            WHERE tokens.kind = ?
+                AND tokens.token_hash = ?
+                AND tokens.consumed_at IS NULL
+                AND tokens.expires_at >= ?
+            """,
+            (kind, token_hash, now),
+        ).fetchone()
+        if row is None or not bool(row["active"]):
+            raise HTTPException(status_code=400, detail="invalid_or_expired_auth_token")
+        connection.execute(
+            """
+            UPDATE limira_auth_tokens
+            SET consumed_at = ?
+            WHERE kind = ? AND token_hash = ?
+            """,
+            (now, kind, token_hash),
+        )
+        connection.commit()
+    return _limira_auth_user_from_row(row)
+
+
 def _limira_public_base_url(request: Request | None, env: Any = os.environ) -> str:
     configured = str(env.get(LIMIRA_PUBLIC_BASE_URL_ENV) or "").strip()
     if configured:
@@ -1192,6 +1248,98 @@ def _limira_verify_wechat_oauth_state(state: str, env: Any = os.environ) -> bool
     except Exception:
         return False
     return int(payload.get("exp") or 0) >= int(time.time())
+
+
+def _limira_mobile_oauth_state(
+    *,
+    provider: str,
+    redirect_uri: str,
+    env: Any = os.environ,
+) -> str:
+    normalized_provider = _normalize_mobile_oauth_provider(provider)
+    normalized_redirect_uri = _normalize_mobile_oauth_redirect_uri(redirect_uri)
+    payload = {
+        "provider": normalized_provider,
+        "redirect_uri": normalized_redirect_uri,
+        "nonce": secrets.token_urlsafe(18),
+        "exp": int(time.time()) + LIMIRA_GOOGLE_OAUTH_STATE_TTL_SECONDS,
+    }
+    encoded_payload = _limira_auth_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signature = hmac.new(
+        _limira_auth_secret(env),
+        f"mobile-oauth-state:{encoded_payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded_payload}.{_limira_auth_b64encode(signature)}"
+
+
+def _limira_mobile_oauth_state_payload(
+    state: str | None,
+    *,
+    provider: str | None = None,
+    env: Any = os.environ,
+) -> dict[str, Any] | None:
+    if not state:
+        return None
+    try:
+        encoded_payload, encoded_signature = str(state).split(".", 1)
+    except ValueError:
+        return None
+    expected = hmac.new(
+        _limira_auth_secret(env),
+        f"mobile-oauth-state:{encoded_payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    try:
+        supplied = _limira_auth_b64decode(encoded_signature)
+    except Exception:
+        return None
+    if not hmac.compare_digest(expected, supplied):
+        return None
+    try:
+        payload = json.loads(_limira_auth_b64decode(encoded_payload).decode("utf-8"))
+    except Exception:
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    try:
+        payload_provider = _normalize_mobile_oauth_provider(payload.get("provider"))
+        redirect_uri = _normalize_mobile_oauth_redirect_uri(payload.get("redirect_uri"))
+    except HTTPException:
+        return None
+    if provider is not None and payload_provider != _normalize_mobile_oauth_provider(provider):
+        return None
+    return {
+        "provider": payload_provider,
+        "redirect_uri": redirect_uri,
+        "exp": int(payload.get("exp") or 0),
+    }
+
+
+def _limira_mobile_oauth_redirect_url(
+    payload: Mapping[str, Any],
+    *,
+    provider: str,
+    state: str,
+    code: str | None = None,
+    error: str | None = None,
+) -> str:
+    redirect_uri = _normalize_mobile_oauth_redirect_uri(payload.get("redirect_uri"))
+    params = {
+        "provider": _normalize_mobile_oauth_provider(provider),
+        "state": str(state),
+    }
+    if error:
+        params["auth_error"] = str(error)
+    elif code:
+        params["code"] = str(code)
+    else:
+        params["auth_error"] = "oauth_login_failed"
+    parsed = urlsplit(redirect_uri)
+    query = urlencode([*parse_qsl(parsed.query, keep_blank_values=True), *params.items()])
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
 def _limira_google_oauth_redirect_uri(
