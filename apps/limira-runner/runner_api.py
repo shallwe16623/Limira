@@ -83,6 +83,10 @@ RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS = (
     "model_output",
     "raw_model",
 )
+RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_COMPACT_PARTS = tuple(
+    "".join(ch for ch in part if ch.isalnum())
+    for part in RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS
+)
 RESUME_ARCHIVE_EXECUTOR_STATE_KEYS = (
     "node",
     "research_graph_executor",
@@ -1042,11 +1046,13 @@ def _bounded_resume_archive_key(value: Any) -> str:
 def _resume_archive_context_key_is_forbidden(key: str) -> bool:
     normalized = key.lower()
     compacted = "".join(ch for ch in normalized if ch.isalnum())
-    return any(
-        part in normalized
-        or "".join(ch for ch in part if ch.isalnum()) in compacted
-        for part in RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS
+    raw_match = any(
+        part in normalized for part in RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS
     )
+    compact_match = any(
+        part in compacted for part in RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_COMPACT_PARTS
+    )
+    return raw_match or compact_match
 
 
 def _bounded_resume_archive_string(value: Any) -> str:

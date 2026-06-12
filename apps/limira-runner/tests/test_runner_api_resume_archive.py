@@ -190,18 +190,22 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
         zip_trace = json.loads(archive.read("trace.json").decode("utf-8"))
     assert zip_trace["events"] == trace["events"]
     serialized_zip_trace = json.dumps(zip_trace, ensure_ascii=False)
+    sensitive_key_names = (
+        "ownerUserId",
+        "apiKey",
+        "modelInternal",
+        "rawPrompt",
+        "runnerServiceToken",
+        "modelOutput",
+        "modelInput",
+        "rawModel",
+        "userId",
+        "user-id",
+        "userid",
+    )
 
     for serialized in (serialized_trace, serialized_zip_trace):
-        assert "ownerUserId" not in serialized
-        assert "apiKey" not in serialized
-        assert "modelInternal" not in serialized
-        assert "rawPrompt" not in serialized
-        assert "runnerServiceToken" not in serialized
-        assert "modelOutput" not in serialized
-        assert "modelInput" not in serialized
-        assert "rawModel" not in serialized
-        assert "userId" not in serialized
-        assert "user-id" not in serialized
-        assert "userid" not in serialized
+        for key_name in sensitive_key_names:
+            assert key_name not in serialized
         for secret in secrets:
             assert secret not in serialized
