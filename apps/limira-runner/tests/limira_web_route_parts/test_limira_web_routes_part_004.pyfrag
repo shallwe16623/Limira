@@ -1014,6 +1014,212 @@ async def test_event_proxy_persists_final_summary_show_text_as_report_section():
 
 
 @pytest.mark.asyncio
+async def test_event_proxy_uses_main_show_text_final_report_for_archive():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    short_summary = "SHORT ONLY SUMMARY: this is not the full report."
+    full_report = (
+        "# 美国企业委托印度代理公司采集工人操作数据训练具身智能调查报告\n\n"
+        "这是一份完整研究报告，必须成为归档和PDF的权威正文。[EVID-001]\n\n"
+        "## 一、事件触发\n\n"
+        "完整报告第一节，包含背景、日期、企业与争议。\n\n"
+        "## 二、企业链路\n\n"
+        "完整报告第二节，描述美国公司、印度代理公司和工厂数据链路。\n\n"
+        "## 三、工人同意与监管\n\n"
+        "完整报告第三节，分析知情同意、工资、设备和法律真空。\n\n"
+        "## 四、结论\n\n"
+        "完整报告结论，明确不能被执行摘要替代。\n"
+        + ("补充调查细节。" * 220)
+    )
+    research = FakeResearchClient(
+        events=[
+            {
+                "task_id": "runner-task-a",
+                "type": "start_of_agent",
+                "payload": {"agent_name": "main", "agent_id": "agent-main"},
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "report_section_generated",
+                "payload": {
+                    "artifact_type": "report_section",
+                    "section_id": "REPORT-001",
+                    "title": "执行摘要",
+                    "summary": short_summary,
+                    "source_event_type": "record_research_artifact",
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "tool_call",
+                "payload": {
+                    "tool_name": "show_text",
+                    "tool_input": {"text": full_report},
+                },
+            },
+            {
+                "task_id": "runner-task-a",
+                "type": "end_of_agent",
+                "payload": {"agent_name": "main", "agent_id": "agent-main"},
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "印度工厂具身智能数据采集"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    events = _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    assert [event["type"] for event in events] == [
+        "start_of_agent",
+        "report_section_generated",
+        "tool_call",
+        "report_section_generated",
+        "end_of_agent",
+        "status",
+    ]
+    generated_reports = repo.list_task_reports(task_id=task_id)
+    assert len(generated_reports) == 1
+    assert generated_reports[0].report_id == "final"
+    assert generated_reports[0].report_type == "final"
+    assert generated_reports[0].markdown == full_report
+    assert generated_reports[0].metadata == {"source_event_type": "final_show_text"}
+
+    archive_response = await limira.download_task_archive(
+        task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert "这是一份完整研究报告" in members["report.md"]
+    assert "完整报告结论，明确不能被执行摘要替代。" in members["report.md"]
+    assert short_summary not in members["report.md"]
+    trace = json.loads(members["trace.json"])
+    assert trace["reports"][0]["report_id"] == "final"
+
+
+@pytest.mark.asyncio
+async def test_completed_task_backfills_final_report_from_runner_archive_trace():
+    repo = limira.InMemoryLimiraTaskRepository()
+    storage = limira.InMemoryLimiraObjectStorage()
+    user = limira.LimiraUser("user-a")
+    short_summary = "只有执行摘要，不能作为最终调查报告。"
+    full_report = (
+        "# 美国企业委托印度代理公司采集工人操作数据训练具身智能调查报告\n\n"
+        "这份正文来自 runner 归档 trace 中的 show_text，后端必须在刷新恢复时补齐。\n\n"
+        "## 一、事件触发\n\n"
+        "完整报告第一节，包含视频传播、工厂场景、头戴摄像头与舆论反应。\n\n"
+        "## 二、企业链路\n\n"
+        "完整报告第二节，说明美国资本、印度代理平台、工厂和具身智能客户的链路。\n\n"
+        "## 三、归档结论\n\n"
+        "完整报告结论，明确不能被短摘要替代。\n"
+        + ("补充事实、来源和监管分析。" * 180)
+    )
+    trace = {
+        "version": 1,
+        "task_id": "runner-archive-trace",
+        "events": [
+            {
+                "type": "start_of_agent",
+                "timestamp": "2026-06-12T05:00:00+00:00",
+                "payload": {
+                    "event": "start_of_agent",
+                    "data": {"agent_name": "main", "agent_id": "agent-main"},
+                },
+            },
+            {
+                "type": "tool_call",
+                "timestamp": "2026-06-12T05:01:00+00:00",
+                "payload": {
+                    "event": "tool_call",
+                    "data": {
+                        "tool_name": "show_text",
+                        "tool_input": {"text": full_report},
+                    },
+                },
+            },
+            {
+                "type": "end_of_agent",
+                "timestamp": "2026-06-12T05:02:00+00:00",
+                "payload": {
+                    "event": "end_of_agent",
+                    "data": {"agent_name": "main", "agent_id": "agent-main"},
+                },
+            },
+        ],
+    }
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("metadata.json", "{}")
+        archive.writestr("report.html", "<!doctype html><main></main>")
+        archive.writestr("report.md", "# runner execution log")
+        archive.writestr("trace.json", json.dumps(trace, ensure_ascii=False))
+    archive_client = FakeArchiveClient(archive_buffer.getvalue())
+
+    task = repo.create_task(
+        task_id="task-backfill-runner-archive",
+        owner_user_id=user.id,
+        query="印度工厂具身智能数据采集",
+        scenario=None,
+        runner_task_id="runner-archive-trace",
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+    repo.record_generated_report(
+        report_id="REPORT-001",
+        task_id=task.task_id,
+        report_type="final",
+        markdown=short_summary,
+        html=None,
+        pdf_object_key=None,
+        evidence_refs=[],
+        creator_user_id=user.id,
+        metadata={"source_event_type": "auto_task_completion"},
+    )
+
+    event_payload = await limira.get_task_event_logs(
+        task.task_id,
+        limit=500,
+        user=user,
+        repo=repo,
+        archive_client=archive_client,
+    )
+
+    reports = repo.list_task_reports(task_id=task.task_id)
+    selected = limira._select_archive_report(reports)
+    assert selected is not None
+    assert selected.report_id == "final"
+    assert selected.markdown == full_report
+    assert any(event["event_type"] == "runner_archive_backfilled" for event in event_payload["events"])
+
+    archive_response = await limira.download_task_archive(
+        task.task_id,
+        user=user,
+        repo=repo,
+        object_storage=storage,
+        archive_client=archive_client,
+    )
+    members = _archive_member_texts(archive_response.body)
+    assert "这份正文来自 runner 归档 trace 中的 show_text" in members["report.md"]
+    assert "完整报告结论，明确不能被短摘要替代。" in members["report.md"]
+    assert short_summary not in members["report.md"]
+
+
+@pytest.mark.asyncio
 async def test_event_proxy_persists_nested_runner_final_summary_show_text_as_report_section():
     repo = limira.InMemoryLimiraTaskRepository()
     user = limira.LimiraUser("user-a")
@@ -1462,7 +1668,7 @@ async def test_postgres_event_proxy_persists_final_summary_show_text_as_report_s
     for secret in raw_secret_values:
         assert secret not in json.dumps(artifacts, ensure_ascii=False)
 
-    persisted_report = engine.generated_reports[(task_id, "REPORT-001")]
+    persisted_report = engine.generated_reports[(task_id, "final")]
     assert persisted_report["creator_user_id"] == "user-a"
     assert persisted_report["markdown"] == report_section["markdown"]
     assert persisted_report["evidence_refs"] == ["EVID-001"]
@@ -1471,8 +1677,13 @@ async def test_postgres_event_proxy_persists_final_summary_show_text_as_report_s
     )
 
     reports = repo.list_task_reports(task_id=task_id)
-    assert [report.report_id for report in reports] == ["REPORT-001"]
+    assert reports[0].report_id == "final"
+    assert reports[0].report_type == "final"
     assert reports[0].markdown == report_section["markdown"]
+    assert any(
+        report.report_id == "REPORT-001" and report.report_type == "section"
+        for report in reports
+    )
 
     archive_response = await limira.download_task_archive(
         task_id,

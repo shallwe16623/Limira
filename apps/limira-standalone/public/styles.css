@@ -1557,8 +1557,10 @@ label {
 	box-shadow: none;
 	padding: 0.25rem;
 	font-size: 1rem;
+	line-height: 1.5;
 	min-height: 24px;
 	max-height: 200px;
+	overflow-y: hidden;
 	color: var(--text);
 	flex: 1;
 }

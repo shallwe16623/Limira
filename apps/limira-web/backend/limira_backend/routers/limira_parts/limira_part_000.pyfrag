@@ -736,6 +736,13 @@ class LimiraTaskRepository(Protocol):
         query: str | None = None,
     ) -> list[LimiraTask]: ...
 
+    def list_conversation_tasks(
+        self,
+        *,
+        owner_user_id: str,
+        conversation_id: str,
+    ) -> list[LimiraTask]: ...
+
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask: ...
 
     def record_artifact(
@@ -1002,6 +1009,23 @@ class InMemoryLimiraTaskRepository:
             and _task_matches_history_search(task, query)
         ]
         return _collapse_history_conversations(tasks)[:limit]
+
+    def list_conversation_tasks(
+        self,
+        *,
+        owner_user_id: str,
+        conversation_id: str,
+    ) -> list[LimiraTask]:
+        normalized_conversation_id = str(conversation_id or "").strip()
+        if not normalized_conversation_id:
+            return []
+        return [
+            task
+            for task in self.tasks.values()
+            if task.owner_user_id == owner_user_id
+            and task.deleted_at is None
+            and _task_conversation_id(task) == normalized_conversation_id
+        ]
 
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
         task = self.get_task(task_id)

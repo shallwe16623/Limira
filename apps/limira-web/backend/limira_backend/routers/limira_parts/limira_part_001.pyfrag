@@ -986,6 +986,31 @@ class PostgresLimiraTaskRepository:
         rows = self._fetch_all(sql, params)
         return _collapse_history_conversations([_task_from_row(row) for row in rows])[:limit]
 
+    def list_conversation_tasks(
+        self,
+        *,
+        owner_user_id: str,
+        conversation_id: str,
+    ) -> list[LimiraTask]:
+        normalized_conversation_id = str(conversation_id or "").strip()
+        if not normalized_conversation_id:
+            return []
+        rows = self._fetch_all(
+            f"""
+            SELECT {self.TASK_COLUMNS}
+            FROM limira_research_tasks
+            WHERE owner_user_id = :owner_user_id
+              AND metadata ->> 'history_deleted_at' IS NULL
+              AND COALESCE(metadata ->> 'conversation_id', task_id) = :conversation_id
+            ORDER BY created_at ASC, task_id ASC
+            """,
+            {
+                "owner_user_id": owner_user_id,
+                "conversation_id": normalized_conversation_id,
+            },
+        )
+        return [_task_from_row(row) for row in rows]
+
     def update_task(self, task_id: str, **updates: Any) -> LimiraTask:
         allowed = {
             "status",

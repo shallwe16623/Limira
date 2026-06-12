@@ -1382,6 +1382,105 @@ async def test_task_history_archive_restore_and_delete_are_owner_scoped():
 
 
 @pytest.mark.asyncio
+async def test_task_history_archive_restore_and_delete_apply_to_whole_conversation():
+    app, repo, _storage = _limira_asgi_app()
+    user = limira.LimiraUser("user-a")
+    root = repo.create_task(
+        task_id="task-conversation-root",
+        owner_user_id=user.id,
+        query="first research prompt",
+        scenario=None,
+        runner_task_id="runner-root",
+    )
+    repo.create_task(
+        task_id="task-conversation-hi",
+        owner_user_id=user.id,
+        query="hi",
+        scenario=None,
+        runner_task_id="runner-hi",
+        conversation_id=root.conversation_id,
+    )
+    repo.create_task(
+        task_id="task-conversation-third",
+        owner_user_id=user.id,
+        query="third research prompt",
+        scenario=None,
+        runner_task_id="runner-third",
+        conversation_id=root.conversation_id,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://limira.test",
+    ) as client:
+        archive_response = await client.post(
+            "/api/limira/tasks/task-conversation-root/history/archive"
+        )
+        active_after_archive = await client.get(
+            "/api/limira/tasks",
+            params={"limit": 10},
+        )
+        archived_after_archive = await client.get(
+            "/api/limira/tasks",
+            params={"limit": 10, "archived": "true"},
+        )
+        restore_response = await client.post(
+            "/api/limira/tasks/task-conversation-hi/history/restore"
+        )
+        active_after_restore = await client.get(
+            "/api/limira/tasks",
+            params={"limit": 10},
+        )
+        delete_response = await client.delete(
+            "/api/limira/tasks/task-conversation-third/history"
+        )
+        active_after_delete = await client.get(
+            "/api/limira/tasks",
+            params={"limit": 10},
+        )
+
+    assert archive_response.status_code == 200
+    assert archive_response.json()["history_archived"] is True
+    assert active_after_archive.status_code == 200
+    assert active_after_archive.json()["tasks"] == []
+    archived_tasks = archived_after_archive.json()["tasks"]
+    assert len(archived_tasks) == 1
+    assert archived_tasks[0]["task_id"] == root.task_id
+    assert archived_tasks[0]["query"] == "first research prompt"
+    assert [task["query"] for task in archived_tasks[0]["conversation_members"]] == [
+        "first research prompt",
+        "hi",
+        "third research prompt",
+    ]
+    assert all(
+        task["history_archived"]
+        for task in archived_tasks[0]["conversation_members"]
+    )
+
+    assert restore_response.status_code == 200
+    assert restore_response.json()["history_archived"] is False
+    restored_tasks = active_after_restore.json()["tasks"]
+    assert len(restored_tasks) == 1
+    assert restored_tasks[0]["task_id"] == root.task_id
+    assert [task["query"] for task in restored_tasks[0]["conversation_members"]] == [
+        "first research prompt",
+        "hi",
+        "third research prompt",
+    ]
+    assert all(
+        not task["history_archived"]
+        for task in restored_tasks[0]["conversation_members"]
+    )
+
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {
+        "deleted": True,
+        "task_id": "task-conversation-third",
+    }
+    assert active_after_delete.json()["tasks"] == []
+
+
+@pytest.mark.asyncio
 async def test_archive_proxy_rejects_not_ready_and_invalid_zip_members():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

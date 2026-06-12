@@ -248,30 +248,44 @@ def _build_persisted_archive_zip(
 def _select_archive_report(
     reports: list[LimiraGeneratedReport],
 ) -> LimiraGeneratedReport | None:
-    for report in reports:
-        if report.report_type == "final":
+    final_reports = [report for report in reports if report.report_type == "final"]
+    for report in final_reports:
+        if report.report_id == "final":
             return report
+    for report in final_reports:
+        if (report.metadata or {}).get("source_event_type") in {
+            "final_show_text",
+            "final_summary_show_text",
+        }:
+            return report
+    if final_reports:
+        return max(final_reports, key=lambda report: len(report.markdown or ""))
     return reports[0] if reports else None
 
 
 def _select_archive_pdf_report(
     reports: list[LimiraGeneratedReport],
 ) -> LimiraGeneratedReport | None:
-    for report in reports:
-        if (
-            report.report_type == "final"
-            and _is_valid_report_pdf_metadata(
-                report.pdf_object_key,
-                (report.metadata or {}).get("pdf_sha256"),
-            )
-        ):
-            return report
-    for report in reports:
+    report = _select_archive_report(reports)
+    if report and _is_valid_report_pdf_metadata(
+        report.pdf_object_key,
+        (report.metadata or {}).get("pdf_sha256"),
+    ):
+        return report
+    for candidate in reports:
+        if candidate.report_type != "final":
+            continue
         if _is_valid_report_pdf_metadata(
-            report.pdf_object_key,
-            (report.metadata or {}).get("pdf_sha256"),
+            candidate.pdf_object_key,
+            (candidate.metadata or {}).get("pdf_sha256"),
         ):
-            return report
+            return candidate
+    for candidate in reports:
+        if _is_valid_report_pdf_metadata(
+            candidate.pdf_object_key,
+            (candidate.metadata or {}).get("pdf_sha256"),
+        ):
+            return candidate
     return None
 
 
@@ -1231,6 +1245,260 @@ def _event_payload_status(event: Mapping[str, Any] | None) -> str:
     return ""
 
 
+def _event_log_signature(event_type: str, payload: Any) -> str:
+    safe_payload = scrub_limira_secrets(
+        payload if isinstance(payload, Mapping) else {"value": payload}
+    )
+    return "\0".join(
+        (
+            str(event_type or "runner_event"),
+            json.dumps(
+                safe_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+    )
+
+
+def _event_signature(event: Mapping[str, Any]) -> str:
+    return _event_log_signature(
+        str(event.get("type") or "runner_event"),
+        event.get("payload"),
+    )
+
+
+def _existing_task_event_signatures(
+    repo: LimiraTaskRepository,
+    task_id: str,
+) -> set[str]:
+    signatures: set[str] = set()
+    for event in repo.list_task_event_logs(task_id, limit=2000):
+        signatures.add(
+            _event_log_signature(
+                str(event.get("event_type") or ""),
+                event.get("payload"),
+            )
+        )
+    return signatures
+
+
+def _task_has_runner_archive_backfill_marker(
+    repo: LimiraTaskRepository,
+    task_id: str,
+) -> bool:
+    return any(
+        event.get("event_type") == "runner_archive_backfilled"
+        for event in repo.list_task_event_logs(task_id, limit=2000)
+    )
+
+
+def _has_authoritative_final_report(reports: list[LimiraGeneratedReport]) -> bool:
+    for report in reports:
+        metadata = report.metadata or {}
+        if report.report_id == "final" and report.markdown.strip():
+            return True
+        if metadata.get("source_event_type") in {
+            "final_show_text",
+            "final_summary_show_text",
+        }:
+            return bool(report.markdown.strip())
+    return False
+
+
+def _read_runner_archive_members(
+    archive_bytes: bytes,
+) -> tuple[str, list[dict[str, Any]]]:
+    validate_archive_zip(archive_bytes)
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        report_markdown = _report_markdown_from_value(
+            _decode_archive_text_member(archive.read("report.md"))
+        ).strip()
+        trace_payload = _parse_archive_json_member(
+            _decode_archive_text_member(archive.read("trace.json"))
+        )
+    trace_events = []
+    if isinstance(trace_payload, Mapping):
+        raw_events = trace_payload.get("events")
+        if isinstance(raw_events, list):
+            trace_events = [event for event in raw_events if isinstance(event, dict)]
+    return report_markdown, trace_events
+
+
+def _record_runner_archive_report(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    *,
+    markdown: str,
+) -> bool:
+    scrubbed_markdown = str(scrub_limira_secrets(markdown)).strip()
+    if not scrubbed_markdown:
+        return False
+    existing = next(
+        (
+            report
+            for report in repo.list_task_reports(task_id=task.task_id)
+            if report.report_id == "runner-archive"
+        ),
+        None,
+    )
+    if existing and existing.markdown.strip() == scrubbed_markdown:
+        return False
+    evidence_refs = _evidence_refs_from_markdown(scrubbed_markdown)
+    repo.record_generated_report(
+        report_id="runner-archive",
+        task_id=task.task_id,
+        report_type="final",
+        markdown=scrubbed_markdown,
+        html=_render_report_html(
+            markdown=scrubbed_markdown,
+            evidence_refs=evidence_refs,
+        ),
+        pdf_object_key=None,
+        evidence_refs=evidence_refs,
+        creator_user_id=task.owner_user_id,
+        metadata={"source_event_type": "runner_archive_report"},
+    )
+    artifacts = repo.get_artifacts(task.task_id)
+    if not any(
+        section.get("source_event_type") == "runner_archive_report"
+        and str(section.get("markdown") or "").strip() == scrubbed_markdown
+        for section in artifacts.get("report_sections", [])
+    ):
+        artifact = {
+            "artifact_type": "report_section",
+            "title": "执行结果",
+            "markdown": scrubbed_markdown,
+            "source_event_type": "runner_archive_report",
+            "evidence_refs": evidence_refs,
+        }
+        _ensure_artifact_id(repo, task.task_id, "report_section", artifact)
+        repo.record_artifact(task.task_id, "report_section", artifact)
+    return True
+
+
+async def _backfill_completed_task_from_runner_archive(
+    task: LimiraTask,
+    user: LimiraUser,
+    repo: LimiraTaskRepository,
+    archive_client: Any = None,
+) -> bool:
+    current = repo.get_task(task.task_id) or task
+    if (
+        current.status != "completed"
+        or not current.runner_task_id
+        or not hasattr(archive_client, "download_archive")
+    ):
+        return False
+
+    reports = repo.list_task_reports(task_id=current.task_id)
+    has_final_report = _has_authoritative_final_report(reports)
+    already_backfilled = _task_has_runner_archive_backfill_marker(repo, current.task_id)
+    if has_final_report and already_backfilled:
+        return False
+
+    try:
+        archive_bytes = await archive_client.download_archive(current, user)
+        report_markdown, trace_events = _read_runner_archive_members(archive_bytes)
+    except Exception:
+        log.warning(
+            "Limira runner archive backfill failed for task_id=%s",
+            current.task_id,
+            exc_info=True,
+        )
+        return False
+
+    changed = False
+    imported_events = 0
+    event_signatures = _existing_task_event_signatures(repo, current.task_id)
+    current_agent_name: str | None = None
+    for runner_event in trace_events:
+        event = _normalize_runner_event(current, runner_event)
+        event_payload = event.get("payload")
+        if event.get("type") == "start_of_agent" and isinstance(event_payload, dict):
+            current_agent_name = str(event_payload.get("agent_name") or "")
+        elif event.get("type") == "end_of_agent":
+            current_agent_name = None
+        event = _scrub_final_show_text_event(
+            event,
+            current_agent_name=current_agent_name,
+        )
+        event = _scrub_runner_artifact_event(event)
+        event = _scrub_runner_event(event, task_id=current.task_id)
+        signature = _event_signature(event)
+        is_duplicate = signature in event_signatures
+        final_report_event = _record_final_show_text_report_from_event(
+            repo,
+            current,
+            event,
+            current_agent_name=current_agent_name,
+        )
+        if not is_duplicate:
+            warning = _record_artifact_from_event(repo, current, event)
+            repo.record_task_event_log(
+                current.task_id,
+                _assert_browser_safe(event),
+                source="runner_archive_backfill",
+            )
+            event_signatures.add(signature)
+            imported_events += 1
+            changed = True
+            if warning:
+                warning_signature = _event_signature(warning)
+                if warning_signature not in event_signatures:
+                    repo.record_task_event_log(
+                        current.task_id,
+                        _assert_browser_safe(warning),
+                        source="runner_archive_backfill",
+                    )
+                    event_signatures.add(warning_signature)
+                    imported_events += 1
+        if final_report_event:
+            final_signature = _event_signature(final_report_event)
+            if final_signature not in event_signatures:
+                repo.record_task_event_log(
+                    current.task_id,
+                    _assert_browser_safe(final_report_event),
+                    source="runner_archive_backfill",
+                )
+                event_signatures.add(final_signature)
+                imported_events += 1
+                changed = True
+
+    has_final_report = _has_authoritative_final_report(
+        repo.list_task_reports(task_id=current.task_id)
+    )
+    imported_runner_report = False
+    if not has_final_report and report_markdown:
+        imported_runner_report = _record_runner_archive_report(
+            repo,
+            current,
+            markdown=report_markdown,
+        )
+        changed = changed or imported_runner_report
+
+    if changed or not already_backfilled:
+        marker_event = {
+            "task_id": current.task_id,
+            "type": "runner_archive_backfilled",
+            "payload": {
+                "imported_events": imported_events,
+                "imported_report": imported_runner_report,
+                "source": "runner_archive",
+            },
+        }
+        repo.record_task_event_log(
+            current.task_id,
+            _assert_browser_safe(marker_event),
+            source="runner_archive_backfill",
+        )
+        if current.archive_object_key or current.archive_zip_sha256:
+            _clear_persisted_archive_metadata(current, repo=repo)
+        changed = True
+    return changed
+
+
 def _completion_asset_warning_event(task_id: str, *, asset: str) -> dict[str, Any]:
     return {
         "task_id": task_id,
@@ -1248,12 +1516,20 @@ async def _completed_task_asset_events(
     repo: LimiraTaskRepository,
     object_storage: Any,
     pdf_exporter: Any,
+    archive_client: Any = None,
 ) -> list[dict[str, Any]]:
     if not _completion_asset_dependencies_available(object_storage, pdf_exporter):
         return []
     current = repo.get_task(task.task_id) or task
     if current.status != "completed":
         return []
+    await _backfill_completed_task_from_runner_archive(
+        current,
+        user,
+        repo,
+        archive_client,
+    )
+    current = repo.get_task(task.task_id) or current
 
     events: list[dict[str, Any]] = []
     try:
@@ -1307,6 +1583,7 @@ async def _limira_event_stream(
     runtime_state: LimiraRuntimeState,
     object_storage: Any = None,
     pdf_exporter: Any = None,
+    archive_client: Any = None,
 ) -> AsyncIterator[bytes]:
     completion_assets_generated = False
 
@@ -1321,6 +1598,7 @@ async def _limira_event_stream(
             repo,
             object_storage,
             pdf_exporter,
+            archive_client,
         )
 
     current = repo.get_task(task.task_id) or task

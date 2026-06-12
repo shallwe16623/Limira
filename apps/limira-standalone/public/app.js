@@ -416,6 +416,9 @@ function bindEvents() {
 		event.preventDefault();
 		void submitResearch();
 	});
+	dom.queryInput.addEventListener('input', () => {
+		resizeQueryInput();
+	});
 	dom.voiceInputButton.addEventListener('click', () => void toggleVoiceInput());
 	dom.refreshArtifactsButton.addEventListener('click', () => void loadArtifacts());
 	dom.thinkingToggleButton.addEventListener('click', () => {
@@ -1437,7 +1440,7 @@ async function deleteHistoryTask(taskId) {
 		state.taskHistory = state.taskHistory.filter((task) => task.task_id !== normalizedTaskId);
 		if (state.taskId === normalizedTaskId) {
 			resetCurrentTaskView();
-			dom.queryInput.value = '';
+			setQueryInputValue('');
 			saveWorkspace();
 			renderStatus();
 			renderMessages({ preserveScroll: true });
@@ -1493,7 +1496,7 @@ async function deleteArchivedHistoryTask(taskId) {
 		);
 		if (state.taskId === normalizedTaskId) {
 			resetCurrentTaskView();
-			dom.queryInput.value = '';
+			setQueryInputValue('');
 			saveWorkspace();
 			renderStatus();
 			renderMessages();
@@ -1542,7 +1545,7 @@ async function selectHistoryTask(taskId) {
 	for (const member of members) {
 		rememberTaskThinkingSteps(member.task_id, historyThinkingSteps(member));
 	}
-	dom.queryInput.value = '';
+	setQueryInputValue('', { syncState: false });
 	saveWorkspace();
 	renderShell();
 	try {
@@ -1620,7 +1623,7 @@ function startNewChat() {
 	state.eventSource = null;
 	bumpWorkspaceGeneration();
 	resetCurrentTaskView();
-	dom.queryInput.value = '';
+	setQueryInputValue('');
 	saveWorkspace();
 	renderShell();
 	void loadUploads();
@@ -2101,7 +2104,7 @@ async function submitResearch() {
 		rememberTaskThinkingSteps(state.taskId);
 		mergeTaskHistory(task, { suppressIfCurrentConversation: wasContinuingConversation });
 		state.savedUserId = state.user?.id || state.savedUserId;
-		dom.queryInput.value = '';
+		setQueryInputValue('', { syncState: false });
 		state.uploads = [];
 		state.uploadResults = [];
 		completeActiveThinkingSteps();
@@ -3693,6 +3696,7 @@ function renderTabs() {
 	dom.workspaceContent.classList.toggle('artifact-mode', isArtifactView());
 	dom.workspaceContent.classList.toggle('conversation-mode', conversationView);
 	dom.inputContainer?.classList.toggle('hidden', state.route !== 'workspace');
+	resizeQueryInput();
 	dom.thinkingPanel?.classList.toggle(
 		'hidden',
 		!conversationView || !hasConversationActivity() || hasCurrentReportMessage()
@@ -4892,9 +4896,25 @@ function appendVoiceTranscript(text) {
 	dom.queryInput.focus();
 }
 
-function setQueryInputValue(value) {
+function setQueryInputValue(value, options = {}) {
 	dom.queryInput.value = value;
-	state.query = value;
+	if (options.syncState !== false) {
+		state.query = value;
+	}
+	resizeQueryInput();
+}
+
+function resizeQueryInput() {
+	if (!dom.queryInput) {
+		return;
+	}
+	const computed = window.getComputedStyle(dom.queryInput);
+	const minHeight = Number.parseFloat(computed.minHeight) || 0;
+	const maxHeight = Number.parseFloat(computed.maxHeight) || Number.POSITIVE_INFINITY;
+	dom.queryInput.style.height = 'auto';
+	const nextHeight = Math.max(minHeight, Math.min(dom.queryInput.scrollHeight, maxHeight));
+	dom.queryInput.style.height = `${nextHeight}px`;
+	dom.queryInput.style.overflowY = dom.queryInput.scrollHeight > maxHeight ? 'auto' : 'hidden';
 }
 
 function joinVoiceText(left, right) {

@@ -239,7 +239,7 @@ def _record_final_show_text_report_from_event(
     *,
     current_agent_name: str | None,
 ) -> dict[str, Any] | None:
-    if current_agent_name != "Final Summary" or event.get("type") != "tool_call":
+    if event.get("type") != "tool_call":
         return None
     payload = event.get("payload")
     if not isinstance(payload, dict) or payload.get("tool_name") != "show_text":
@@ -248,13 +248,31 @@ def _record_final_show_text_report_from_event(
     markdown = _show_text_markdown(tool_input)
     if not markdown:
         return None
+    if current_agent_name != "Final Summary" and not _looks_like_final_report_markdown(
+        markdown
+    ):
+        return None
     scrubbed_markdown = str(scrub_limira_secrets(markdown)).strip()
     if not scrubbed_markdown:
         return None
+    source_event_type = (
+        "final_summary_show_text"
+        if current_agent_name == "Final Summary"
+        else "final_show_text"
+    )
+    _record_final_generated_report(
+        repo,
+        task,
+        markdown=scrubbed_markdown,
+        source_event_type=source_event_type,
+    )
     artifacts = repo.get_artifacts(task.task_id)
     for section in artifacts.get("report_sections", []):
         if (
-            section.get("source_event_type") == "final_summary_show_text"
+            section.get("source_event_type") in {
+                "final_summary_show_text",
+                "final_show_text",
+            }
             and str(section.get("markdown") or "").strip() == scrubbed_markdown
         ):
             return None
@@ -262,7 +280,7 @@ def _record_final_show_text_report_from_event(
         "artifact_type": "report_section",
         "title": _report_title_from_value(tool_input, fallback="最终回答"),
         "markdown": scrubbed_markdown,
-        "source_event_type": "final_summary_show_text",
+        "source_event_type": source_event_type,
         "evidence_refs": _evidence_refs_from_markdown(scrubbed_markdown),
     }
     _ensure_artifact_id(repo, task.task_id, "report_section", artifact)
@@ -272,6 +290,61 @@ def _record_final_show_text_report_from_event(
         "type": "report_section_generated",
         "payload": artifact,
     }
+
+
+def _looks_like_final_report_markdown(markdown: str) -> bool:
+    text = str(markdown or "").strip()
+    if not text:
+        return False
+    if re.match(r"(?is)^#\s*final\s+answer\b", text):
+        return True
+    if len(text) < 800:
+        return False
+    has_top_heading = re.search(r"(?m)^#\s+\S", text) is not None
+    section_count = len(re.findall(r"(?m)^##\s+\S", text))
+    lower_text = text.lower()
+    report_word = any(
+        marker in text
+        for marker in (
+            "最终报告",
+            "调查报告",
+            "研究报告",
+            "详尽调查报告",
+            "综合报告",
+        )
+    ) or any(
+        marker in lower_text
+        for marker in ("final report", "investigation report", "research report")
+    )
+    return has_top_heading and section_count >= 2 and report_word
+
+
+def _record_final_generated_report(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    *,
+    markdown: str,
+    source_event_type: str,
+) -> LimiraGeneratedReport:
+    evidence_refs = _evidence_refs_from_markdown(markdown)
+    existing = _select_archive_report(repo.list_task_reports(task_id=task.task_id))
+    if (
+        existing
+        and existing.report_type == "final"
+        and existing.markdown.strip() == markdown.strip()
+    ):
+        return existing
+    return repo.record_generated_report(
+        report_id="final",
+        task_id=task.task_id,
+        report_type="final",
+        markdown=markdown,
+        html=_render_report_html(markdown=markdown, evidence_refs=evidence_refs),
+        pdf_object_key=None,
+        evidence_refs=evidence_refs,
+        creator_user_id=task.owner_user_id,
+        metadata={"source_event_type": source_event_type},
+    )
 
 
 def _scrub_final_show_text_event(

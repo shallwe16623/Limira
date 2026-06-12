@@ -1,11 +1,13 @@
 import importlib
 
+import dotenv
 from omegaconf import OmegaConf
 
 import src.config.settings as settings
 
 
 def test_mcp_server_parameters_accept_missing_optional_tool_env(monkeypatch):
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
     for name in [
         "SERPER_API_KEY",
         "SERPER_BASE_URL",

@@ -461,6 +461,9 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "rememberTaskThinkingSteps(state.taskId);" in app
     assert "thinkingStepsByTaskId: savedThinkingStepsByTaskId()" in app
     assert "function renderMessages(options = {})" in app
+    assert "dom.queryInput.addEventListener('input', () => {" in app
+    assert "function resizeQueryInput()" in app
+    assert "dom.queryInput.scrollHeight" in app
     assert "preserveScroll" in app
     assert "function handleWorkspaceScroll()" in app
     assert "function renderConversationNavigator()" in app
@@ -482,7 +485,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "switchToWorkspaceRoute();" in select_history_block
     assert "renderShell();" in select_history_block
     assert "await loadTaskProgressRecords();" in select_history_block
-    assert "dom.queryInput.value = '';" in select_history_block
+    assert "setQueryInputValue('', { syncState: false });" in select_history_block
     assert "const members = conversationMembersForTask(cached, normalizedTaskId);" in select_history_block
     assert "state.conversationRootTaskId = rootTaskId;" in select_history_block
     assert "state.conversationTaskIds = uniqueTaskIds(members.map((task) => task.task_id));" in select_history_block

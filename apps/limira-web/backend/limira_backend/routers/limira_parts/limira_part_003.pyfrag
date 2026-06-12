@@ -894,10 +894,12 @@ async def archive_task_history(
     repo: LimiraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
-    archived = repo.update_task(
-        task.task_id,
-        archived_at=_history_timestamp(),
-    )
+    archived_at = _history_timestamp()
+    archived = task
+    for member in _owned_conversation_tasks(repo, task, user):
+        updated = repo.update_task(member.task_id, archived_at=archived_at)
+        if updated.task_id == task.task_id:
+            archived = updated
     return _assert_browser_safe(archived.public_dict())
 
 
@@ -908,7 +910,11 @@ async def restore_task_history(
     repo: LimiraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
-    restored = repo.update_task(task.task_id, archived_at=None)
+    restored = task
+    for member in _owned_conversation_tasks(repo, task, user):
+        updated = repo.update_task(member.task_id, archived_at=None)
+        if updated.task_id == task.task_id:
+            restored = updated
     return _assert_browser_safe(restored.public_dict())
 
 
@@ -919,10 +925,25 @@ async def delete_task_history(
     repo: LimiraTaskRepository = Depends(get_task_repository),
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
-    if task.archived_at is not None:
-        repo.update_task(task.task_id, archived_at=None)
-    repo.update_task(task.task_id, deleted_at=_history_timestamp())
+    deleted_at = _history_timestamp()
+    for member in _owned_conversation_tasks(repo, task, user):
+        if member.archived_at is not None:
+            repo.update_task(member.task_id, archived_at=None)
+        repo.update_task(member.task_id, deleted_at=deleted_at)
     return _assert_browser_safe({"deleted": True, "task_id": task.task_id})
+
+
+def _owned_conversation_tasks(
+    repo: LimiraTaskRepository,
+    task: LimiraTask,
+    user: LimiraUser,
+) -> list[LimiraTask]:
+    conversation_id = _task_conversation_id(task)
+    members = repo.list_conversation_tasks(
+        owner_user_id=user.id,
+        conversation_id=conversation_id,
+    )
+    return members or [task]
 
 
 @router.get("/tasks/{task_id}/events")
@@ -934,6 +955,7 @@ async def get_task_events(
     runtime_state: LimiraRuntimeState = Depends(get_runtime_state),
     object_storage: LimiraObjectStorage = Depends(get_object_storage),
     pdf_exporter: LimiraPdfExporter = Depends(get_pdf_exporter),
+    archive_client: RunnerArchiveClient = Depends(get_archive_client),
 ) -> StreamingResponse:
     task = _get_owned_task(repo, task_id, user)
     return StreamingResponse(
@@ -945,6 +967,7 @@ async def get_task_events(
             runtime_state,
             object_storage,
             pdf_exporter,
+            archive_client,
         ),
         media_type="text/event-stream",
     )
@@ -956,8 +979,10 @@ async def get_task_event_logs(
     limit: int = Query(default=500, ge=1, le=2000),
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
+    archive_client: RunnerArchiveClient = Depends(get_archive_client),
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
+    await _backfill_completed_task_from_runner_archive(task, user, repo, archive_client)
     events = [
         _public_admin_event_log(
             event,
@@ -980,8 +1005,10 @@ async def get_task_artifacts(
     task_id: str,
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
+    archive_client: RunnerArchiveClient = Depends(get_archive_client),
 ) -> dict[str, list[Any]]:
-    _get_owned_task(repo, task_id, user)
+    task = _get_owned_task(repo, task_id, user)
+    await _backfill_completed_task_from_runner_archive(task, user, repo, archive_client)
     artifacts = _public_artifacts(repo.get_artifacts(task_id))
     artifacts["timeline"] = artifacts["timeline_events"]
     return _assert_browser_safe(artifacts)
@@ -992,8 +1019,10 @@ async def list_task_generated_reports(
     task_id: str,
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
+    archive_client: RunnerArchiveClient = Depends(get_archive_client),
 ) -> dict[str, Any]:
-    _get_owned_task(repo, task_id, user)
+    task = _get_owned_task(repo, task_id, user)
+    await _backfill_completed_task_from_runner_archive(task, user, repo, archive_client)
     reports = repo.list_task_reports(task_id=task_id)
     return _assert_browser_safe(
         {
@@ -1009,8 +1038,10 @@ async def download_task_archive(
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
     object_storage: LimiraObjectStorage = Depends(get_object_storage),
+    archive_client: RunnerArchiveClient = Depends(get_archive_client),
 ) -> Response:
     task = _get_owned_task(repo, task_id, user)
+    await _backfill_completed_task_from_runner_archive(task, user, repo, archive_client)
     return await _download_archive(task, user, repo, object_storage)
 
 
