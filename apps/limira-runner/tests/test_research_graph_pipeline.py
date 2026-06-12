@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 
 from archive_writer import scrub_secrets
+import pipeline_helpers
 from src.core import pipeline as pipeline_module
 from src.core import research_graph as research_graph_module
 from src.core.research_graph import (
@@ -18,6 +21,69 @@ from test_research_graph import (
     _MissingFinalOutputOrchestrator,
     _pipeline_cfg,
 )
+
+
+class _TrackingClientFactory:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def close(self):
+        self.closed = True
+
+
+def test_preloaded_pipeline_components_create_fresh_task_runtime(monkeypatch):
+    created = []
+
+    class _PreloadFakeToolManager:
+        def __init__(self, name):
+            self.name = name
+
+        async def get_all_tool_definitions(self):
+            return [{"name": self.name, "tools": []}]
+
+    def fake_create_pipeline_components(_cfg):
+        index = len(created)
+        manager = _PreloadFakeToolManager(f"manager-{index}")
+        formatter = object()
+        created.append((manager, formatter))
+        return manager, {}, formatter
+
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "_preload_cache",
+        {
+            "cfg": None,
+            "tool_definitions": None,
+            "sub_agent_tool_definitions": None,
+            "loaded": False,
+        },
+    )
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "load_limira_config",
+        lambda _overrides: SimpleNamespace(agent=SimpleNamespace(sub_agents=None)),
+    )
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "create_pipeline_components",
+        fake_create_pipeline_components,
+    )
+
+    pipeline_helpers._ensure_preloaded()
+    first_runtime = pipeline_helpers._create_task_pipeline_components()
+    second_runtime = pipeline_helpers._create_task_pipeline_components()
+
+    assert pipeline_helpers._preload_cache["tool_definitions"] == [
+        {"name": "manager-0", "tools": []}
+    ]
+    assert first_runtime[0] is not second_runtime[0]
+    assert first_runtime[2] is not second_runtime[2]
+    assert first_runtime[0] is not created[0][0]
+    assert second_runtime[0] is not created[0][0]
 
 
 @pytest.mark.asyncio
@@ -139,6 +205,95 @@ async def test_pipeline_rejects_invalid_evidence_strict_mode(tmp_path, monkeypat
     assert _FakeOrchestrator.task_descriptions == []
     assert stream_queue.items[-1]["event"] == "error"
     assert "invalid_evidence_strict_mode" in stream_queue.items[-1]["data"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_closes_llm_client_after_successful_legacy_execution(
+    tmp_path, monkeypatch
+):
+    _TrackingClientFactory.instances = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _TrackingClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="legacy"),
+        task_id="task-pipeline-close-success",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "summary"
+    assert len(_TrackingClientFactory.instances) == 1
+    assert _TrackingClientFactory.instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_pipeline_closes_llm_client_when_legacy_orchestrator_fails(
+    tmp_path, monkeypatch
+):
+    _TrackingClientFactory.instances = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _TrackingClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FailingOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="legacy"),
+        task_id="task-pipeline-close-legacy-failure",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "graph executor failure" in result[0]
+    assert len(_TrackingClientFactory.instances) == 1
+    assert _TrackingClientFactory.instances[0].closed is True
+    assert all(item.get("event") != "error" for item in stream_queue.items)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_closes_llm_client_when_langgraph_executor_fails(
+    tmp_path, monkeypatch
+):
+    _TrackingClientFactory.instances = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _TrackingClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fail_langgraph_executor(**_kwargs):
+        raise RuntimeError("langgraph executor failure")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_load_langgraph_executor",
+        lambda: fail_langgraph_executor,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="langgraph"),
+        task_id="task-pipeline-close-langgraph-failure",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "langgraph executor failure" in result[0]
+    assert len(_TrackingClientFactory.instances) == 1
+    assert _TrackingClientFactory.instances[0].closed is True
+    assert all(item.get("event") != "error" for item in stream_queue.items)
 
 
 @pytest.mark.asyncio

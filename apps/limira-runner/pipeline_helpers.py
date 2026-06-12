@@ -133,9 +133,6 @@ def load_limira_config(config_overrides: Optional[dict] = None) -> DictConfig:
 # Tools will be loaded on first request instead of blocking startup
 _preload_cache = {
     "cfg": None,
-    "main_agent_tool_manager": None,
-    "sub_agent_tool_managers": None,
-    "output_formatter": None,
     "tool_definitions": None,
     "sub_agent_tool_definitions": None,
     "loaded": False,
@@ -155,7 +152,7 @@ def _ensure_preloaded():
 
         logger.info("Loading pipeline components (first request)...")
         cfg = load_limira_config(None)
-        main_agent_tool_manager, sub_agent_tool_managers, output_formatter = (
+        main_agent_tool_manager, sub_agent_tool_managers, _output_formatter = (
             create_pipeline_components(cfg)
         )
         tool_definitions = asyncio.run(
@@ -170,13 +167,15 @@ def _ensure_preloaded():
         }
 
         _preload_cache["cfg"] = cfg
-        _preload_cache["main_agent_tool_manager"] = main_agent_tool_manager
-        _preload_cache["sub_agent_tool_managers"] = sub_agent_tool_managers
-        _preload_cache["output_formatter"] = output_formatter
         _preload_cache["tool_definitions"] = tool_definitions
         _preload_cache["sub_agent_tool_definitions"] = sub_agent_tool_definitions
         _preload_cache["loaded"] = True
         logger.info("Pipeline components loaded successfully.")
+
+
+def _create_task_pipeline_components():
+    _ensure_preloaded()
+    return create_pipeline_components(_preload_cache["cfg"])
 
 
 class ThreadSafeAsyncQueue:
@@ -335,6 +334,9 @@ async def stream_events_optimized(
 
             # Ensure pipeline components are loaded (lazy loading)
             _ensure_preloaded()
+            main_agent_tool_manager, sub_agent_tool_managers, output_formatter = (
+                _create_task_pipeline_components()
+            )
 
             async def pipeline_with_cancellation():
                 pipeline_task = asyncio.create_task(
@@ -343,13 +345,9 @@ async def stream_events_optimized(
                         task_id=workflow_id,
                         task_description=query,
                         task_file_name=None,
-                        main_agent_tool_manager=_preload_cache[
-                            "main_agent_tool_manager"
-                        ],
-                        sub_agent_tool_managers=_preload_cache[
-                            "sub_agent_tool_managers"
-                        ],
-                        output_formatter=_preload_cache["output_formatter"],
+                        main_agent_tool_manager=main_agent_tool_manager,
+                        sub_agent_tool_managers=sub_agent_tool_managers,
+                        output_formatter=output_formatter,
                         stream_queue=wrapper_queue,
                         log_dir=os.getenv("LOG_DIR", "logs/api-server"),
                         tool_definitions=_preload_cache["tool_definitions"],

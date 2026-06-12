@@ -111,6 +111,7 @@ async def execute_task_pipeline(
         for sub_agent_tool_manager in sub_agent_tool_managers.values():
             sub_agent_tool_manager.set_task_log(task_log)
 
+    llm_client = None
     try:
         graph_executor = _research_graph_executor(cfg)
         evidence_strict_mode = _evidence_strict_mode(cfg)
@@ -195,8 +196,6 @@ async def execute_task_pipeline(
                 is_final_retry=is_final_retry,
             )
 
-        llm_client.close()
-
         task_log.final_boxed_answer = final_boxed_answer
         task_log.status = "success"
 
@@ -240,6 +239,15 @@ async def execute_task_pipeline(
         return error_message, "", log_file_path, None
 
     finally:
+        if llm_client is not None:
+            try:
+                llm_client.close()
+            except Exception as close_error:
+                task_log.log_step(
+                    "warning",
+                    "llm_client_close_failed",
+                    f"Failed to close LLM client: {close_error}",
+                )
         task_log.end_time = get_utc_plus_8_time()
 
         # Record task summary to structured log
