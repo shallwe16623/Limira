@@ -223,6 +223,9 @@ data/
 *.xcuserstate
 xcuserdata/
 *.xcscmblueprint
+
+# Humanize local loop state
+.humanize/
 data/limira-pdf-debug/
 limira-pdf-debug/
 *.sqlite3
