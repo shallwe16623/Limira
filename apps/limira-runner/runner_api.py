@@ -411,7 +411,7 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
         async for message in app[STREAM_EVENTS_KEY](
             record.task_id,
             record.query,
-            record.context,
+            _stream_task_context(record),
             cancel_check,
         ):
             normalized = normalize_stream_event(record.task_id, message, clock())
@@ -858,6 +858,13 @@ def _checkpoint_with_research_graph_executor(
     return updated
 
 
+def _stream_task_context(record: TaskRecord) -> dict[str, Any]:
+    context = dict(record.context or {})
+    if _is_resumable_langgraph_checkpoint(record.checkpoint):
+        context["resume_checkpoint"] = record.checkpoint
+    return context
+
+
 def _checkpoint_research_graph_executor(
     checkpoint: dict[str, Any] | None,
 ) -> str | None:
@@ -874,6 +881,29 @@ def _checkpoint_research_graph_executor(
             executor_state.get("research_graph_executor")
         )
     return None
+
+
+def _is_resumable_langgraph_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    return (
+        _checkpoint_research_graph_executor(checkpoint) == "langgraph"
+        and str(checkpoint.get("resume_policy") or "").strip()
+        == "resume_from_checkpoint"
+    )
+
+
+def _checkpoint_string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(scrub_secrets(item or "")).strip()
+        if text and text not in seen:
+            result.append(text[:120])
+            seen.add(text)
+    return result
 
 
 def _research_graph_executor_from_event(event: dict[str, Any]) -> str | None:
@@ -962,6 +992,12 @@ def _checkpoint_envelope(checkpoint: dict[str, Any]) -> dict[str, Any]:
         "evidence_ledger": evidence_ledger,
         "executor_state": executor_state,
         "research_graph_executor": research_graph_executor,
+        "last_completed_node": _optional_operational_text(
+            raw.get("last_completed_node")
+        ),
+        "current_node": _optional_operational_text(raw.get("current_node")),
+        "completed_unit_ids": _checkpoint_string_list(raw.get("completed_unit_ids")),
+        "pending_unit_ids": _checkpoint_string_list(raw.get("pending_unit_ids")),
         "resume_policy": resume_policy,
         "recoverable_reason": recoverable_reason,
     }
@@ -1026,6 +1062,9 @@ def _reconcile_task_if_stale(
     reason = _stale_running_reason(app, record)
     if not reason:
         return record
+    resumed = _resume_stale_langgraph_task(app, record, reason=reason)
+    if resumed is not None:
+        return resumed
     return _finalize_stale_running_task(app, record, reason=reason)
 
 
@@ -1114,6 +1153,71 @@ def _finalize_stale_running_task(
     _clear_task_cancel(app, record.task_id)
     _notify_task_finished(app, record.task_id)
     return updated
+
+
+def _resume_stale_langgraph_task(
+    app: web.Application,
+    record: TaskRecord,
+    *,
+    reason: str,
+) -> TaskRecord | None:
+    if not _is_resumable_langgraph_checkpoint(record.checkpoint):
+        return None
+    resumed_at = app[CLOCK_KEY]()
+    warning = f"stale running LangGraph task queued for resume: {reason}"
+    store = _task_store(app)
+    resumer = getattr(store, "resume_stale_running_task", None)
+    if resumer is None:
+        return None
+    resumed = resumer(
+        record.task_id,
+        resumed_at=resumed_at,
+        warnings=[warning],
+        lease_checked_at=resumed_at,
+    )
+    if resumed is None:
+        return store.get_task(record.task_id) or record
+
+    event = {
+        "task_id": record.task_id,
+        "type": "status",
+        "timestamp": resumed_at,
+        "payload": {
+            "status": "queued",
+            "archive_status": "pending",
+            "terminal": False,
+            "warning": warning,
+            "recovery_reason": reason,
+            "resume_policy": "resume_from_checkpoint",
+        },
+    }
+    _append_task_event(app, record.task_id, event)
+    checkpoint = dict(record.checkpoint or {})
+    executor_state = checkpoint.get("executor_state")
+    if not isinstance(executor_state, dict):
+        executor_state = {}
+    else:
+        executor_state = dict(executor_state)
+    executor_state.update(
+        {
+            "recovery_reason": reason,
+            "resume_queued_at": resumed_at,
+            "resume_status": "queued",
+        }
+    )
+    checkpoint.update(
+        {
+            "status": "queued",
+            "executor_state": executor_state,
+            "resume_policy": "resume_from_checkpoint",
+            "recoverable_reason": None,
+        }
+    )
+    _write_task_checkpoint(app, record.task_id, checkpoint, updated_at=resumed_at)
+    _clear_active_task(app, record.task_id)
+    _clear_task_cancel(app, record.task_id)
+    _notify_task_finished(app, record.task_id)
+    return _task_store(app).get_task(record.task_id) or resumed
 
 
 def _latest_heartbeat_at(
@@ -1338,6 +1442,10 @@ def _task_operational_status(record: TaskRecord) -> dict[str, Any]:
             "phase": _optional_operational_text(checkpoint.get("phase")),
             "status": _optional_operational_text(checkpoint.get("status")),
             "research_graph_executor": research_graph_executor,
+            "last_completed_node": _optional_operational_text(
+                checkpoint.get("last_completed_node")
+            ),
+            "current_node": _optional_operational_text(checkpoint.get("current_node")),
             "updated_at": record.checkpoint_updated_at,
             "current_research_unit_present": bool(
                 checkpoint.get("current_research_unit")
@@ -1354,6 +1462,16 @@ def _task_operational_status(record: TaskRecord) -> dict[str, Any]:
             "evidence_ledger_count": len(evidence_ledger)
             if isinstance(evidence_ledger, list)
             else 0,
+            "completed_unit_count": len(
+                checkpoint.get("completed_unit_ids")
+                if isinstance(checkpoint.get("completed_unit_ids"), list)
+                else []
+            ),
+            "pending_unit_count": len(
+                checkpoint.get("pending_unit_ids")
+                if isinstance(checkpoint.get("pending_unit_ids"), list)
+                else []
+            ),
             "executor_state_present": isinstance(executor_state, dict)
             and bool(executor_state),
         },

@@ -65,11 +65,17 @@ async def execute_langgraph_research(
         is_final_retry=is_final_retry,
         evidence_strict_mode=strict_mode,
     )
-    graph = build_langgraph_research_graph(context=context, stream_queue=stream_queue)
+    resume_start_phase = state.resume_start_phase if state.resume_from_checkpoint else None
+    graph = build_langgraph_research_graph(
+        context=context,
+        stream_queue=stream_queue,
+        resume_start_phase=resume_start_phase,
+    )
+    previous_output = _initial_previous_output(state)
     runtime = await graph.ainvoke(
         {
             "graph_state": state,
-            "previous_output": ResearchGraphNodeOutput(state=state),
+            "previous_output": previous_output,
         }
     )
     final_state = runtime["graph_state"]
@@ -85,6 +91,7 @@ def build_langgraph_research_graph(
     *,
     context: ResearchGraphExecutionContext,
     stream_queue: Any | None,
+    resume_start_phase: ResearchPhase | None = None,
 ):
     """Build the concrete LangGraph StateGraph for the research skeleton."""
 
@@ -107,12 +114,44 @@ def build_langgraph_research_graph(
     )
 
     previous = START
-    for node_name in node_names:
+    start_index = _node_start_index(node_names, resume_start_phase)
+    for node_name in node_names[start_index:]:
         graph.add_edge(previous, node_name)
         previous = node_name
     graph.add_edge(previous, "complete")
     graph.add_edge("complete", END)
     return graph.compile(name="limira-langgraph-research")
+
+
+def _node_start_index(
+    node_names: list[str],
+    resume_start_phase: ResearchPhase | None,
+) -> int:
+    if resume_start_phase is None:
+        return 0
+    if resume_start_phase == ResearchPhase.COMPLETE:
+        return len(node_names)
+    try:
+        return node_names.index(resume_start_phase.value)
+    except ValueError:
+        return 0
+
+
+def _initial_previous_output(state: ResearchGraphState) -> ResearchGraphNodeOutput:
+    final_summary = None
+    final_boxed_answer = None
+    if (
+        state.resume_from_checkpoint
+        and state.resume_start_phase == ResearchPhase.COMPLETE
+        and state.report_sections
+    ):
+        final_summary = state.report_sections[-1].markdown
+        final_boxed_answer = final_summary
+    return ResearchGraphNodeOutput(
+        state=state,
+        final_summary=final_summary,
+        final_boxed_answer=final_boxed_answer,
+    )
 
 
 def _langgraph_node_runner(

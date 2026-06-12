@@ -20,6 +20,8 @@ from runner_api import (
     TASK_EVENT_LOG_KEY,
     UPDATE_STATE_KEY,
     _checkpoint_envelope,
+    _reconcile_task_if_stale,
+    _stream_task_context,
     _task_response,
     create_app,
 )
@@ -560,10 +562,14 @@ def test_task_response_exposes_secret_safe_operational_status():
         checkpoint={
             "phase": "verify",
             "status": "running",
+            "last_completed_node": "verify",
+            "current_node": "write",
             "current_research_unit": "unit with sk-secret",
             "source_ledger": [{"url": "https://example.test/secret"}],
             "evidence_ledger": [{"evidence_id": "EVID-001"}],
             "executor_state": {"token": "sk-secret"},
+            "completed_unit_ids": ["unit-1", "unit-2"],
+            "pending_unit_ids": ["unit-3"],
             "resume_policy": "fail_recoverable",
             "recoverable_reason": "OPENAI_API_KEY=sk-secret",
         },
@@ -583,9 +589,13 @@ def test_task_response_exposes_secret_safe_operational_status():
     }
     assert operational["checkpoint"]["phase"] == "verify"
     assert operational["checkpoint"]["status"] == "running"
+    assert operational["checkpoint"]["last_completed_node"] == "verify"
+    assert operational["checkpoint"]["current_node"] == "write"
     assert operational["checkpoint"]["current_research_unit_present"] is True
     assert operational["checkpoint"]["source_ledger_count"] == 1
     assert operational["checkpoint"]["evidence_ledger_count"] == 1
+    assert operational["checkpoint"]["completed_unit_count"] == 2
+    assert operational["checkpoint"]["pending_unit_count"] == 1
     assert operational["checkpoint"]["executor_state_present"] is True
     serialized = json.dumps(payload, ensure_ascii=False)
     assert "runner-one:task-observable:worker-secret" not in serialized
@@ -627,6 +637,69 @@ def test_task_response_exposes_selected_research_graph_executor(executor):
         == executor
     )
     assert "\"executor_state\"" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_stale_recovery_requeues_resumable_langgraph_checkpoint(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    app = create_app(
+        task_store=store,
+        archive_root=tmp_path / "archives",
+        service_token="shared",
+        stream_events=completed_stream,
+        init_render_state=init_state,
+        update_state_with_event=update_state,
+        render_markdown=render_markdown,
+        clock=lambda: "2026-06-06T12:10:00+00:00",
+    )
+    record = seed_running_task(
+        store,
+        task_id="task-resumable-langgraph",
+        worker_id="worker-resume",
+        lease_expires_at="2026-06-06T12:05:00+00:00",
+    )
+    checkpoint = _checkpoint_envelope(
+        {
+            "phase": "research",
+            "status": "running",
+            "current_research_unit": "unit-1",
+            "source_ledger": [{"ledger_type": "research_unit", "unit_id": "unit-1"}],
+            "evidence_ledger": [],
+            "executor_state": {"research_graph_executor": "langgraph"},
+            "research_graph_executor": "langgraph",
+            "last_completed_node": "research",
+            "current_node": "compress",
+            "completed_unit_ids": ["unit-1"],
+            "pending_unit_ids": [],
+            "resume_policy": "resume_from_checkpoint",
+            "recoverable_reason": "langgraph_checkpoint_resumable",
+        }
+    )
+    store.write_task_checkpoint(
+        record.task_id,
+        checkpoint=checkpoint,
+        updated_at="2026-06-06T12:04:00+00:00",
+    )
+    running = store.get_task(record.task_id)
+
+    resumed = _reconcile_task_if_stale(app, running)
+
+    assert resumed.status == "queued"
+    assert resumed.archive_status == "pending"
+    assert resumed.worker_id is None
+    assert resumed.lease_expires_at is None
+    assert resumed.error is None
+    assert resumed.warnings == [
+        "stale running LangGraph task queued for resume: expired_lease"
+    ]
+    persisted_checkpoint = store.get_task_checkpoint(record.task_id)
+    assert persisted_checkpoint["status"] == "queued"
+    assert persisted_checkpoint["resume_policy"] == "resume_from_checkpoint"
+    assert persisted_checkpoint["recoverable_reason"] is None
+    assert persisted_checkpoint["executor_state"]["resume_status"] == "queued"
+    assert store.list_task_events(record.task_id)[-1]["payload"]["status"] == "queued"
+    stream_context = _stream_task_context(resumed)
+    assert stream_context["resume_checkpoint"]["phase"] == "research"
+    assert stream_context["resume_checkpoint"]["current_node"] == "compress"
 
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):

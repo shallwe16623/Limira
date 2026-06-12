@@ -31,6 +31,7 @@ from ..logging.task_logger import (
 )
 from .orchestrator import Orchestrator
 from .research_graph import (
+    apply_langgraph_resume_checkpoint,
     build_initial_research_graph,
     execute_research_graph,
     graph_bootstrap_events,
@@ -122,6 +123,11 @@ async def execute_task_pipeline(
             source_policy=_context_mapping(research_context, "source_policy"),
             evidence_strict_mode=evidence_strict_mode,
         )
+        if graph_executor == RESEARCH_GRAPH_EXECUTOR_LANGGRAPH:
+            graph_state = apply_langgraph_resume_checkpoint(
+                graph_state,
+                _context_mapping(research_context, "resume_checkpoint"),
+            )
         if stream_queue is not None:
             await stream_queue.put(_research_graph_executor_event(task_id, graph_executor))
             for event in graph_bootstrap_events(graph_state):

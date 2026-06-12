@@ -24,6 +24,8 @@ EVIDENCE_ID_TOKEN_PATTERN = re.compile(
 GRAPH_CONTENT_HASH_CHARS = 32
 GRAPH_SOURCE_SUMMARY_MAX_CHARS = 20_000
 GRAPH_FINDING_SUMMARY_MAX_CHARS = 10_000
+LANGGRAPH_RESUME_POLICY = "resume_from_checkpoint"
+LANGGRAPH_RESUME_RECOVERABLE_REASON = "langgraph_checkpoint_resumable"
 VERIFIER_NEGATIVE_MARKERS = (
     "not listed",
     "not designated",
@@ -317,6 +319,8 @@ class ResearchGraphState(BaseModel):
     verified_claims: list[VerifiedClaim] = Field(default_factory=list, max_length=500)
     report_sections: list[ReportSection] = Field(default_factory=list, max_length=100)
     warnings: list[str] = Field(default_factory=list, max_length=200)
+    resume_from_checkpoint: bool = False
+    resume_start_phase: ResearchPhase | None = None
 
     @field_validator("warnings")
     @classmethod
@@ -895,12 +899,40 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
         artifact_events: list[dict[str, Any]] = []
         unit_substeps: list[dict[str, Any]] = []
         retriever_warnings: list[str] = []
-        completed_unit_ids: list[str] = []
+        completed_unit_ids: list[str] = [
+            unit.id for unit in state.plan.research_units if unit.status == "completed"
+        ]
         current_unit_id = None
         legacy_adapter_calls = 0
 
         for unit_index, unit in enumerate(state.plan.research_units):
             current_unit_id = unit.id
+            if unit.status == "completed":
+                unit_substeps.append(
+                    {
+                        "unit_id": unit.id,
+                        "steps": [],
+                        "resume_action": "skipped_completed_unit",
+                        "retriever_order": [],
+                        "source_candidate_ids": [],
+                        "snippet_only_candidate_ids": [],
+                        "retrieved_source_ids": [],
+                        "evidence_ids": [
+                            item.id
+                            for item in evidence
+                            if _research_unit_id_from_evidence(item, unit_index)
+                            == unit.id
+                        ],
+                        "finding_ids": [
+                            finding.id
+                            for finding in findings
+                            if finding.research_unit_id == unit.id
+                        ],
+                        "legacy_adapter_used": False,
+                        "warnings": [],
+                    }
+                )
+                continue
             unit_result = await self._run_retriever_registry(
                 state=state,
                 unit=unit,
@@ -936,7 +968,8 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
 
             unit_findings = self._synthesize_findings(unit, unit_evidence, unit_index)
             findings.extend(unit_findings)
-            completed_unit_ids.append(unit.id)
+            if unit.id not in completed_unit_ids:
+                completed_unit_ids.append(unit.id)
             unit_substeps.append(
                 {
                     "unit_id": unit.id,
@@ -960,8 +993,15 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
                 }
             )
 
+        completed_unit_set = set(completed_unit_ids)
         completed_units = [
-            unit.model_copy(update={"status": "completed"})
+            unit.model_copy(
+                update={
+                    "status": "completed"
+                    if unit.id in completed_unit_set
+                    else unit.status
+                }
+            )
             for unit in state.plan.research_units
         ]
         researched_state = state.model_copy(
@@ -1542,6 +1582,21 @@ def graph_checkpoint_event(
     terminal = phase == ResearchPhase.COMPLETE and status == "completed"
     executor_state = dict(node_output.executor_state)
     executor_state["research_graph_executor"] = research_graph_executor
+    resume_metadata = _resume_metadata_for_checkpoint(
+        state,
+        phase,
+        terminal=terminal,
+        research_graph_executor=research_graph_executor,
+    )
+    executor_state.update(
+        {
+            "last_completed_node": resume_metadata["last_completed_node"],
+            "current_node": resume_metadata["current_node"],
+            "completed_unit_ids": list(resume_metadata["completed_unit_ids"]),
+            "pending_unit_ids": list(resume_metadata["pending_unit_ids"]),
+            "resume_policy": resume_metadata["resume_policy"],
+        }
+    )
     return {
         "event": "research_graph_checkpoint",
         "data": {
@@ -1555,12 +1610,433 @@ def graph_checkpoint_event(
             "evidence_ledger": _evidence_ledger_for_checkpoint(state),
             "executor_state": executor_state,
             "research_graph_executor": research_graph_executor,
-            "resume_policy": "terminal" if terminal else "fail_recoverable",
-            "recoverable_reason": (
-                None if terminal else "serial_graph_checkpoint_not_resumable"
-            ),
+            **resume_metadata,
         },
     }
+
+
+def _resume_metadata_for_checkpoint(
+    state: ResearchGraphState,
+    phase: ResearchPhase,
+    *,
+    terminal: bool,
+    research_graph_executor: str,
+) -> dict[str, Any]:
+    completed_unit_ids = [
+        unit.id for unit in state.plan.research_units if unit.status == "completed"
+    ]
+    pending_unit_ids = [
+        unit.id for unit in state.plan.research_units if unit.status != "completed"
+    ]
+    current_node = None if terminal else _next_graph_phase_value(phase)
+    if research_graph_executor == "langgraph" and not terminal:
+        resume_policy = LANGGRAPH_RESUME_POLICY
+        recoverable_reason = LANGGRAPH_RESUME_RECOVERABLE_REASON
+    else:
+        resume_policy = "terminal" if terminal else "fail_recoverable"
+        recoverable_reason = (
+            None if terminal else "serial_graph_checkpoint_not_resumable"
+        )
+    return {
+        "last_completed_node": phase.value,
+        "current_node": current_node,
+        "completed_unit_ids": completed_unit_ids,
+        "pending_unit_ids": pending_unit_ids,
+        "resume_policy": resume_policy,
+        "recoverable_reason": recoverable_reason,
+    }
+
+
+def _next_graph_phase_value(phase: ResearchPhase) -> str | None:
+    order = [
+        ResearchPhase.SCOPE,
+        ResearchPhase.PLAN,
+        ResearchPhase.RESEARCH,
+        ResearchPhase.COMPRESS,
+        ResearchPhase.VERIFY,
+        ResearchPhase.WRITE,
+        ResearchPhase.RECONCILE,
+        ResearchPhase.COMPLETE,
+    ]
+    try:
+        index = order.index(phase)
+    except ValueError:
+        return None
+    if index + 1 >= len(order):
+        return None
+    return order[index + 1].value
+
+
+def apply_langgraph_resume_checkpoint(
+    state: ResearchGraphState,
+    checkpoint: dict[str, Any] | None,
+) -> ResearchGraphState:
+    """Restore bounded graph state from a resumable LangGraph checkpoint."""
+
+    if not _is_langgraph_resume_checkpoint(checkpoint):
+        return state
+    assert checkpoint is not None
+    phase = _checkpoint_phase(checkpoint.get("phase")) or state.phase
+    current_node = _checkpoint_phase(checkpoint.get("current_node"))
+    resume_start_phase = current_node or _checkpoint_phase(_next_graph_phase_value(phase))
+    source_ledger = checkpoint.get("source_ledger")
+    evidence_ledger = checkpoint.get("evidence_ledger")
+    source_entries = source_ledger if isinstance(source_ledger, list) else []
+    evidence_entries = evidence_ledger if isinstance(evidence_ledger, list) else []
+    completed_unit_ids = _checkpoint_string_list(checkpoint.get("completed_unit_ids"))
+    pending_unit_ids = _checkpoint_string_list(checkpoint.get("pending_unit_ids"))
+    unit_status_by_id = _checkpoint_unit_statuses(source_entries)
+    if not completed_unit_ids:
+        completed_unit_ids = [
+            unit_id
+            for unit_id, status in unit_status_by_id.items()
+            if status == "completed"
+        ]
+    completed_unit_set = set(completed_unit_ids)
+    pending_unit_set = set(pending_unit_ids)
+
+    def restored_unit_status(unit: ResearchUnit) -> str:
+        if unit.id in completed_unit_set:
+            return "completed"
+        if unit.id in pending_unit_set:
+            return "pending"
+        return unit_status_by_id.get(unit.id, unit.status)
+
+    restored_units = [
+        unit.model_copy(update={"status": restored_unit_status(unit)})
+        for unit in state.plan.research_units
+    ]
+    restored_findings = _checkpoint_findings(evidence_entries)
+    restored_verified_claims = _checkpoint_verified_claims(evidence_entries)
+    restored_claims = _merge_graph_claims(
+        _claim_state_from_findings(restored_findings),
+        _claim_state_from_verified_claims(restored_verified_claims),
+    )
+    return state.model_copy(
+        update={
+            "phase": phase,
+            "plan": state.plan.model_copy(update={"research_units": restored_units}),
+            "current_unit_id": _optional_checkpoint_text(
+                checkpoint.get("current_research_unit"),
+                80,
+            ),
+            "research_units": restored_units,
+            "source_candidates": _checkpoint_source_candidates(source_entries),
+            "retrieved_sources": _checkpoint_retrieved_sources(source_entries),
+            "evidence": _checkpoint_evidence(evidence_entries),
+            "findings": restored_findings,
+            "claims": restored_claims,
+            "verified_claims": restored_verified_claims,
+            "report_sections": _checkpoint_report_sections(evidence_entries),
+            "resume_from_checkpoint": True,
+            "resume_start_phase": resume_start_phase,
+            "warnings": [
+                *state.warnings,
+                "langgraph_resume_from_checkpoint",
+            ],
+        }
+    )
+
+
+def _is_langgraph_resume_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    executor = str(
+        checkpoint.get("research_graph_executor")
+        or (checkpoint.get("executor_state") or {}).get("research_graph_executor")
+        or ""
+    ).strip().lower()
+    return (
+        executor == "langgraph"
+        and str(checkpoint.get("resume_policy") or "").strip()
+        == LANGGRAPH_RESUME_POLICY
+    )
+
+
+def _checkpoint_phase(value: Any) -> ResearchPhase | None:
+    if value is None:
+        return None
+    try:
+        return ResearchPhase(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _checkpoint_string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            result.append(text[:120])
+            seen.add(text)
+    return result
+
+
+def _checkpoint_unit_statuses(entries: list[Any]) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("ledger_type") not in {None, "research_unit"}:
+            continue
+        unit_id = str(entry.get("unit_id") or "").strip()
+        status = str(entry.get("status") or "").strip()
+        if unit_id and status in {"pending", "running", "completed", "failed"}:
+            statuses[unit_id[:80]] = status
+    return statuses
+
+
+def _checkpoint_source_candidates(entries: list[Any]) -> list[SourceCandidate]:
+    candidates: list[SourceCandidate] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ledger_type") != "source_candidate":
+            continue
+        try:
+            candidates.append(
+                SourceCandidate(
+                    candidate_id=_optional_checkpoint_text(
+                        entry.get("candidate_id"),
+                        120,
+                    ),
+                    title=_optional_checkpoint_text(entry.get("title"), 1_000),
+                    summary=_optional_checkpoint_text(entry.get("summary"), 2_000),
+                    source_type=str(entry.get("source_type") or "web")[:80],
+                    source_state=str(
+                        entry.get("source_state") or "source_candidate"
+                    )[:80],
+                    source_content_state=_optional_checkpoint_text(
+                        entry.get("source_content_state"),
+                        80,
+                    ),
+                    retrieval_status=_optional_checkpoint_text(
+                        entry.get("retrieval_status"),
+                        80,
+                    ),
+                    url=_optional_checkpoint_text(entry.get("url"), 4_000),
+                    document_id=_optional_checkpoint_text(
+                        entry.get("document_id"),
+                        120,
+                    ),
+                    attached_document_id=_optional_checkpoint_text(
+                        entry.get("attached_document_id"),
+                        120,
+                    ),
+                    chunk_id=_optional_checkpoint_text(entry.get("chunk_id"), 120),
+                    filename=_optional_checkpoint_text(entry.get("filename"), 1_000),
+                    retrieved_at=_checkpoint_datetime(entry.get("retrieved_at")),
+                    content_hash=_optional_checkpoint_text(
+                        entry.get("content_hash"),
+                        128,
+                    ),
+                    confidence=_checkpoint_float(entry.get("confidence"), 0.5),
+                    source_event_type=_optional_checkpoint_text(
+                        entry.get("source_event_type"),
+                        120,
+                    ),
+                )
+            )
+        except ValueError:
+            continue
+    return candidates
+
+
+def _checkpoint_retrieved_sources(entries: list[Any]) -> list[RetrievedSource]:
+    sources: list[RetrievedSource] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ledger_type") != "retrieved_source":
+            continue
+        source_id = str(entry.get("retrieved_source_id") or "").strip()
+        quote = str(entry.get("quote_or_summary") or "").strip()
+        content_hash = str(entry.get("content_hash") or "").strip()
+        if not source_id or not quote or not content_hash:
+            continue
+        try:
+            sources.append(
+                RetrievedSource(
+                    id=source_id[:120],
+                    url=_optional_checkpoint_text(entry.get("url"), 4_000),
+                    document_id=_optional_checkpoint_text(
+                        entry.get("document_id"),
+                        120,
+                    ),
+                    chunk_id=_optional_checkpoint_text(entry.get("chunk_id"), 120),
+                    title=_optional_checkpoint_text(entry.get("title"), 1_000),
+                    source_type=str(entry.get("source_type") or "web")[:80],
+                    retrieved_at=_checkpoint_datetime(entry.get("retrieved_at"))
+                    or datetime.now(timezone.utc),
+                    content_hash=content_hash[:128],
+                    quote_or_summary=_bounded_graph_text(
+                        quote,
+                        GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+                    ),
+                    tool_name=str(entry.get("tool_name") or "checkpoint_resume")[:120],
+                    confidence=_checkpoint_float(entry.get("confidence"), 0.5),
+                )
+            )
+        except ValueError:
+            continue
+    return sources
+
+
+def _checkpoint_evidence(entries: list[Any]) -> list[EvidenceItem]:
+    evidence_items: list[EvidenceItem] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ledger_type") not in {None, "evidence"}:
+            continue
+        evidence_id = str(entry.get("id") or "").strip()
+        quote = str(entry.get("quote_or_summary") or "").strip()
+        content_hash = str(entry.get("content_hash") or "").strip()
+        if not evidence_id or not quote or not content_hash:
+            continue
+        try:
+            evidence_items.append(
+                EvidenceItem(
+                    id=evidence_id[:120],
+                    retrieved_source_id=_optional_checkpoint_text(
+                        entry.get("retrieved_source_id"),
+                        120,
+                    ),
+                    url=_optional_checkpoint_text(entry.get("url"), 4_000),
+                    document_id=_optional_checkpoint_text(
+                        entry.get("document_id"),
+                        120,
+                    ),
+                    chunk_id=_optional_checkpoint_text(entry.get("chunk_id"), 120),
+                    title=_optional_checkpoint_text(entry.get("title"), 1_000),
+                    source_type=str(entry.get("source_type") or "web")[:80],
+                    retrieved_at=_checkpoint_datetime(entry.get("retrieved_at"))
+                    or datetime.now(timezone.utc),
+                    content_hash=content_hash[:128],
+                    quote_or_summary=_bounded_graph_text(
+                        quote,
+                        GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+                    ),
+                    claims=_checkpoint_string_list(entry.get("claims"))[:50],
+                    confidence=_checkpoint_float(entry.get("confidence"), 0.5),
+                    tool_name=_optional_checkpoint_text(entry.get("tool_name"), 120),
+                )
+            )
+        except ValueError:
+            continue
+    return evidence_items
+
+
+def _checkpoint_findings(entries: list[Any]) -> list[CompressedFinding]:
+    findings: list[CompressedFinding] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ledger_type") != "finding":
+            continue
+        finding_id = str(entry.get("finding_id") or "").strip()
+        unit_id = str(entry.get("research_unit_id") or "").strip()
+        summary = str(entry.get("summary") or "").strip()
+        if not finding_id or not unit_id or not summary:
+            continue
+        try:
+            findings.append(
+                CompressedFinding(
+                    id=finding_id[:120],
+                    research_unit_id=unit_id[:80],
+                    summary=_bounded_graph_text(
+                        summary,
+                        GRAPH_FINDING_SUMMARY_MAX_CHARS,
+                    ),
+                    evidence_ids=_checkpoint_string_list(entry.get("evidence_ids"))[:100],
+                    confidence=_checkpoint_float(entry.get("confidence"), 0.5),
+                )
+            )
+        except ValueError:
+            continue
+    return findings
+
+
+def _checkpoint_verified_claims(entries: list[Any]) -> list[VerifiedClaim]:
+    claims: list[VerifiedClaim] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ledger_type") != "verified_claim":
+            continue
+        claim_id = str(entry.get("claim_id") or "").strip()
+        claim_text = str(entry.get("claim") or "").strip()
+        support_type = str(entry.get("support_type") or "").strip()
+        if not claim_id or not claim_text or not support_type:
+            continue
+        try:
+            claims.append(
+                VerifiedClaim(
+                    id=claim_id[:120],
+                    claim=_bounded_graph_text(claim_text, 10_000),
+                    support_type=support_type,  # type: ignore[arg-type]
+                    evidence_ids=_checkpoint_string_list(entry.get("evidence_ids"))[:100],
+                    rationale=_bounded_graph_text(
+                        str(entry.get("rationale") or ""),
+                        10_000,
+                    ),
+                    confidence=_checkpoint_float(entry.get("confidence"), 0.5),
+                )
+            )
+        except ValueError:
+            continue
+    return claims
+
+
+def _checkpoint_report_sections(entries: list[Any]) -> list[ReportSection]:
+    sections: list[ReportSection] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ledger_type") != "report_section":
+            continue
+        section_id = str(entry.get("section_id") or "").strip()
+        title = str(entry.get("title") or "").strip()
+        markdown = str(entry.get("markdown") or "").strip()
+        if not section_id or not title or not markdown:
+            continue
+        try:
+            sections.append(
+                ReportSection(
+                    section_id=section_id[:120],
+                    title=title[:1_000],
+                    markdown=_bounded_graph_text(markdown, 20_000),
+                    evidence_refs=_checkpoint_string_list(entry.get("evidence_refs"))[:200],
+                    source_event_type=_optional_checkpoint_text(
+                        entry.get("source_event_type"),
+                        120,
+                    ),
+                )
+            )
+        except ValueError:
+            continue
+    return sections
+
+
+def _checkpoint_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _checkpoint_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(1.0, max(0.0, parsed))
+
+
+def _optional_checkpoint_text(value: Any, max_chars: int) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:max_chars]
 
 
 def graph_error_event(
@@ -1997,6 +2473,7 @@ def _research_unit_id_from_evidence(evidence: EvidenceItem, index: int) -> str:
 def _source_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, Any]]:
     unit_entries = [
         {
+            "ledger_type": "research_unit",
             "unit_id": unit.id,
             "status": unit.status,
             "search_queries": list(unit.search_queries),
@@ -2004,26 +2481,57 @@ def _source_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, A
         }
         for unit in state.plan.research_units
     ]
+    candidate_entries = [
+        {
+            "ledger_type": "source_candidate",
+            "candidate_id": candidate.candidate_id,
+            "title": candidate.title,
+            "summary": candidate.summary,
+            "source_type": candidate.source_type,
+            "source_state": candidate.source_state,
+            "source_content_state": candidate.source_content_state,
+            "retrieval_status": candidate.retrieval_status,
+            "url": candidate.url,
+            "document_id": candidate.document_id,
+            "attached_document_id": candidate.attached_document_id,
+            "chunk_id": candidate.chunk_id,
+            "filename": candidate.filename,
+            "retrieved_at": candidate.retrieved_at.isoformat()
+            if candidate.retrieved_at
+            else None,
+            "content_hash": candidate.content_hash,
+            "confidence": candidate.confidence,
+            "source_event_type": candidate.source_event_type,
+        }
+        for candidate in state.source_candidates
+    ]
     retrieved_entries = [
         {
+            "ledger_type": "retrieved_source",
             "retrieved_source_id": source.id,
+            "title": source.title,
             "source_type": source.source_type,
             "url": source.url,
             "document_id": source.document_id,
             "chunk_id": source.chunk_id,
             "content_hash": source.content_hash,
             "retrieved_at": source.retrieved_at.isoformat(),
+            "quote_or_summary": _bounded_graph_text(
+                source.quote_or_summary,
+                GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+            ),
             "tool_name": source.tool_name,
             "confidence": source.confidence,
         }
         for source in state.retrieved_sources
     ]
-    return unit_entries + retrieved_entries
+    return unit_entries + candidate_entries + retrieved_entries
 
 
 def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str, Any]]:
     evidence_entries = [
         {
+            "ledger_type": "evidence",
             "id": evidence.id,
             "retrieved_source_id": evidence.retrieved_source_id,
             "source_type": evidence.source_type,
@@ -2033,6 +2541,11 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
             "title": evidence.title,
             "content_hash": evidence.content_hash,
             "retrieved_at": evidence.retrieved_at.isoformat(),
+            "quote_or_summary": _bounded_graph_text(
+                evidence.quote_or_summary,
+                GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+            ),
+            "claims": list(evidence.claims),
             "confidence": evidence.confidence,
             "tool_name": evidence.tool_name,
         }
@@ -2040,7 +2553,10 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
     ]
     finding_entries = [
         {
+            "ledger_type": "finding",
             "finding_id": finding.id,
+            "research_unit_id": finding.research_unit_id,
+            "summary": finding.summary,
             "evidence_ids": list(finding.evidence_ids),
             "confidence": finding.confidence,
         }
@@ -2048,14 +2564,28 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
     ]
     claim_entries = [
         {
+            "ledger_type": "verified_claim",
             "claim_id": claim.id,
+            "claim": claim.claim,
             "support_type": claim.support_type,
             "evidence_ids": list(claim.evidence_ids),
+            "rationale": claim.rationale,
             "confidence": claim.confidence,
         }
         for claim in state.verified_claims
     ]
-    return evidence_entries + finding_entries + claim_entries
+    report_entries = [
+        {
+            "ledger_type": "report_section",
+            "section_id": section.section_id,
+            "title": section.title,
+            "markdown": _bounded_graph_text(section.markdown, 20_000),
+            "evidence_refs": list(section.evidence_refs),
+            "source_event_type": section.source_event_type,
+        }
+        for section in state.report_sections
+    ]
+    return evidence_entries + finding_entries + claim_entries + report_entries
 
 
 def _upload_source_candidate_artifact_event(source: UploadedDocumentSource) -> dict[str, Any]:

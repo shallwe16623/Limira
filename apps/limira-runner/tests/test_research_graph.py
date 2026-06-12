@@ -21,6 +21,7 @@ from src.core.research_graph import (
     VerifierNode,
     WebSearchRetriever,
     VerifiedClaim,
+    apply_langgraph_resume_checkpoint,
     build_initial_research_graph,
     default_retriever_registry,
     evidence_id_for_source,
@@ -658,11 +659,155 @@ async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_check
     assert checkpoints
     for checkpoint in checkpoints:
         assert checkpoint["research_graph_executor"] == "langgraph"
+        if checkpoint["phase"] != "complete":
+            assert checkpoint["resume_policy"] == "resume_from_checkpoint"
+            assert checkpoint["last_completed_node"] == checkpoint["phase"]
+            assert checkpoint["current_node"]
+            assert "completed_unit_ids" in checkpoint
+            assert "pending_unit_ids" in checkpoint
         assert forbidden_checkpoint_fields.isdisjoint(checkpoint)
     complete_checkpoint = checkpoints[-1]
     assert complete_checkpoint["phase"] == "complete"
     assert complete_checkpoint["status"] == "completed"
+    assert complete_checkpoint["resume_policy"] == "terminal"
     assert complete_checkpoint["current_research_unit"].startswith("unit-2-")
+
+
+@pytest.mark.asyncio
+async def test_langgraph_resume_rebuilds_state_and_skips_completed_research_artifacts():
+    _FakeOrchestrator.task_descriptions = []
+    upload_text = "Uploaded memo confirms the entity is listed under program X."
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-resume",
+        query="Assess uploaded document evidence",
+        document_ids=["doc-upload"],
+        upload_scope={
+            "document_count": 1,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-upload"],
+            "context_only_document_ids": [],
+            "source_payloads": [
+                {
+                    "candidate_id": "SRC-UPLOAD-RESUME",
+                    "document_id": "doc-upload",
+                    "chunk_id": "UPLOAD-CHUNK-RESUME",
+                    "filename": "resume.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "b" * 64,
+                    "text": upload_text,
+                    "text_char_count": len(upload_text),
+                }
+            ],
+        },
+        source_policy={"prefer_uploaded_documents": True},
+        max_units=1,
+    )
+    first_queue = _CaptureQueue()
+    await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=first_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id="task-langgraph-resume",
+        is_final_retry=False,
+        stream_queue=first_queue,
+    )
+    research_checkpoint = next(
+        item["data"]
+        for item in first_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+
+    resumed_state = apply_langgraph_resume_checkpoint(
+        initial_state,
+        research_checkpoint,
+    )
+
+    assert resumed_state.resume_from_checkpoint is True
+    assert resumed_state.resume_start_phase == ResearchPhase.COMPRESS
+    assert resumed_state.retrieved_sources
+    assert resumed_state.evidence
+    assert all(unit.status == "completed" for unit in resumed_state.plan.research_units)
+
+    resume_queue = _CaptureQueue()
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=resumed_state,
+        orchestrator=_FakeOrchestrator(stream_queue=resume_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id="task-langgraph-resume",
+        is_final_retry=False,
+        stream_queue=resume_queue,
+    )
+
+    phase_events = [
+        item["data"]["phase"]
+        for item in resume_queue.items
+        if item.get("event") == "research_graph_phase"
+    ]
+    assert phase_events[0] == "compress"
+    assert result.state.phase == ResearchPhase.COMPLETE
+    assert not any(
+        item.get("type")
+        in {
+            "source_candidate_collected",
+            "retrieved_source_collected",
+            "evidence_collected",
+        }
+        for item in resume_queue.items
+    )
+
+
+@pytest.mark.asyncio
+async def test_langgraph_research_node_retries_pending_units_without_completed_duplicates():
+    _FakeOrchestrator.task_descriptions = []
+    state = build_initial_research_graph(
+        task_id="task-langgraph-current-unit-retry",
+        query="Retry pending unit",
+        max_units=2,
+    )
+    first_unit, second_unit = state.plan.research_units
+    existing_evidence = _evidence_item(
+        "EVID-001",
+        "Existing evidence from a completed unit.",
+    )
+    resumed_plan_units = [
+        first_unit.model_copy(update={"status": "completed"}),
+        second_unit.model_copy(update={"status": "pending"}),
+    ]
+    resumed_state = state.model_copy(
+        update={
+            "plan": state.plan.model_copy(update={"research_units": resumed_plan_units}),
+            "research_units": resumed_plan_units,
+            "evidence": [existing_evidence],
+        }
+    )
+    context = ResearchGraphExecutionContext(
+        orchestrator=_FakeOrchestrator(stream_queue=_CaptureQueue()),
+        original_task_description="Retry pending unit",
+        task_id=state.task_id,
+    )
+
+    output = await LangGraphResearchUnitNode().run(
+        resumed_state,
+        context,
+        ResearchGraphNodeOutput(state=resumed_state),
+    )
+
+    substeps = output.executor_state["unit_substeps"]
+    assert substeps[0]["resume_action"] == "skipped_completed_unit"
+    assert substeps[1]["steps"] == ["search", "retrieve", "promote", "synthesize"]
+    assert _FakeOrchestrator.task_descriptions
+    assert all(
+        event["payload"].get("evidence_id") != "EVID-001"
+        for event in output.artifact_events
+        if event.get("type") == "evidence_collected"
+    )
+    assert output.state.plan.research_units[0].status == "completed"
+    assert output.state.plan.research_units[1].status == "completed"
 
 
 @pytest.mark.asyncio
@@ -1375,6 +1520,74 @@ async def test_pipeline_routes_to_explicit_langgraph_executor(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_pipeline_applies_langgraph_resume_checkpoint_context(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fake_langgraph_executor(**kwargs):
+        state = kwargs["state"]
+        assert state.resume_from_checkpoint is True
+        assert state.resume_start_phase == ResearchPhase.COMPRESS
+        assert state.evidence[0].id == "EVID-001"
+        return ResearchGraphExecutionResult(
+            state=state,
+            final_summary="resumed langgraph summary",
+            final_boxed_answer="resumed langgraph final",
+            failure_experience_summary=None,
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_load_langgraph_executor",
+        lambda: fake_langgraph_executor,
+    )
+    stream_queue = _CaptureQueue()
+    checkpoint = {
+        "phase": "research",
+        "status": "queued",
+        "current_node": "compress",
+        "research_graph_executor": "langgraph",
+        "resume_policy": "resume_from_checkpoint",
+        "completed_unit_ids": ["unit-1-verify-a-company-designation"],
+        "pending_unit_ids": [],
+        "source_ledger": [
+            {
+                "ledger_type": "research_unit",
+                "unit_id": "unit-1-verify-a-company-designation",
+                "status": "completed",
+            }
+        ],
+        "evidence_ledger": [
+            {
+                "ledger_type": "evidence",
+                "id": "EVID-001",
+                "source_type": "web",
+                "content_hash": "a" * 32,
+                "retrieved_at": "2026-06-06T12:00:00+00:00",
+                "quote_or_summary": "Checkpoint evidence.",
+            }
+        ],
+    }
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="langgraph"),
+        task_id="task-pipeline-langgraph-resume",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        research_context={"resume_checkpoint": checkpoint},
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "resumed langgraph summary"
+    assert result[1] == "resumed langgraph final"
+
+
+@pytest.mark.asyncio
 async def test_pipeline_rejects_invalid_graph_executor(tmp_path, monkeypatch):
     _FakeOrchestrator.task_descriptions = []
     monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
@@ -1614,6 +1827,10 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
             "evidence_ledger",
             "executor_state",
             "research_graph_executor",
+            "last_completed_node",
+            "current_node",
+            "completed_unit_ids",
+            "pending_unit_ids",
             "resume_policy",
             "recoverable_reason",
         }

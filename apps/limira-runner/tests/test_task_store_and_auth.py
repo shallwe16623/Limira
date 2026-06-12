@@ -368,7 +368,7 @@ def test_task_store_lists_and_finalizes_only_running_tasks(tmp_path):
 
 def test_task_store_recovery_preserves_lease_renewed_after_classification(tmp_path):
     store = TaskStore(tmp_path / "tasks.sqlite3")
-    for task_id in ("task-stale-race", "task-cancel-race"):
+    for task_id in ("task-stale-race", "task-cancel-race", "task-resume-race"):
         store.create_task(
             task_id=task_id,
             user_id="user-a",
@@ -412,9 +412,22 @@ def test_task_store_recovery_preserves_lease_renewed_after_classification(tmp_pa
         warnings=["cancelled running task without active stream worker"],
         lease_checked_at="2026-06-06T12:10:00+00:00",
     )
+    store.renew_task_lease(
+        "task-resume-race",
+        worker_id="worker-task-resume-race",
+        heartbeat_at="2026-06-06T12:10:01+00:00",
+        lease_expires_at="2026-06-06T12:20:00+00:00",
+    )
+    resume_recovery = store.resume_stale_running_task(
+        "task-resume-race",
+        resumed_at="2026-06-06T12:10:02+00:00",
+        warnings=["stale running LangGraph task queued for resume: expired_lease"],
+        lease_checked_at="2026-06-06T12:10:00+00:00",
+    )
 
     stale_current = store.get_task("task-stale-race")
     cancel_current = store.get_task("task-cancel-race")
+    resume_current = store.get_task("task-resume-race")
     assert stale_recovery is None
     assert stale_current.status == "running"
     assert stale_current.lease_expires_at == "2026-06-06T12:20:00+00:00"
@@ -425,6 +438,44 @@ def test_task_store_recovery_preserves_lease_renewed_after_classification(tmp_pa
     assert cancel_current.lease_expires_at == "2026-06-06T12:20:00+00:00"
     assert cancel_current.completed_at is None
     assert cancel_current.error is None
+    assert resume_recovery is None
+    assert resume_current.status == "running"
+    assert resume_current.lease_expires_at == "2026-06-06T12:20:00+00:00"
+    assert resume_current.completed_at is None
+    assert resume_current.error is None
+
+
+def test_task_store_resume_stale_running_task_requeues_expired_lease(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.create_task(
+        task_id="task-resumable",
+        user_id="user-a",
+        query="resume",
+        created_at="2026-06-06T12:00:00+00:00",
+    )
+    store.claim_queued_task(
+        "task-resumable",
+        started_at="2026-06-06T12:01:00+00:00",
+        worker_id="worker-resume",
+        lease_expires_at="2026-06-06T12:05:00+00:00",
+    )
+
+    resumed = store.resume_stale_running_task(
+        "task-resumable",
+        resumed_at="2026-06-06T12:10:00+00:00",
+        warnings=["resume scheduled"],
+        lease_checked_at="2026-06-06T12:10:00+00:00",
+    )
+
+    assert resumed is not None
+    assert resumed.status == "queued"
+    assert resumed.archive_status == "pending"
+    assert resumed.completed_at is None
+    assert resumed.error is None
+    assert resumed.warnings == ["resume scheduled"]
+    assert resumed.worker_id is None
+    assert resumed.lease_expires_at is None
+    assert resumed.heartbeat_at is None
 
 
 def test_runner_task_store_factory_requires_explicit_sqlite_fallback(tmp_path, monkeypatch):
@@ -513,6 +564,7 @@ def test_postgres_task_store_sql_targets_limira_research_tasks():
     assert "order by created_at desc, event_log_id desc" in sql
     assert "order by created_at asc, event_log_id asc" in sql
     assert "returning" in sql
+    assert "set status = 'queued'" in sql
     assert "limira_runner_research_tasks" not in sql
 
 
@@ -720,6 +772,33 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert recovered.archive_dir is None
     assert recovered.archive_zip_path is None
 
+    store.create_task(
+        task_id="task-resume",
+        user_id="user-a",
+        query="resume",
+        created_at="2026-06-06T12:15:30+00:00",
+    )
+    store.claim_queued_task(
+        "task-resume",
+        started_at="2026-06-06T12:15:45+00:00",
+        worker_id="worker-resume",
+        lease_expires_at="2026-06-06T12:16:00+00:00",
+    )
+    resumed = store.resume_stale_running_task(
+        "task-resume",
+        resumed_at="2026-06-06T12:17:00+00:00",
+        warnings=["resume scheduled"],
+        lease_checked_at="2026-06-06T12:17:00+00:00",
+    )
+    assert resumed is not None
+    assert resumed.status == "queued"
+    assert resumed.archive_status == "pending"
+    assert resumed.completed_at is None
+    assert resumed.error is None
+    assert resumed.warnings == ["resume scheduled"]
+    assert resumed.worker_id is None
+    assert resumed.lease_expires_at is None
+
     protected = store.finalize_stale_running_task(
         "task-a",
         completed_at="2026-06-06T12:16:00+00:00",
@@ -793,6 +872,36 @@ def test_postgres_task_store_matches_runner_task_store_contract():
     assert cancel_race_current.status == "running"
     assert cancel_race_current.lease_expires_at == "2026-06-06T12:35:00+00:00"
     assert cancel_race_current.completed_at is None
+
+    store.create_task(
+        task_id="task-resume-race",
+        user_id="user-a",
+        query="resume race",
+        created_at="2026-06-06T12:25:00+00:00",
+    )
+    store.claim_queued_task(
+        "task-resume-race",
+        started_at="2026-06-06T12:26:00+00:00",
+        worker_id="worker-resume-race",
+        lease_expires_at="2026-06-06T12:27:00+00:00",
+    )
+    store.renew_task_lease(
+        "task-resume-race",
+        worker_id="worker-resume-race",
+        heartbeat_at="2026-06-06T12:28:01+00:00",
+        lease_expires_at="2026-06-06T12:40:00+00:00",
+    )
+    resume_race = store.resume_stale_running_task(
+        "task-resume-race",
+        resumed_at="2026-06-06T12:28:02+00:00",
+        warnings=["resume scheduled"],
+        lease_checked_at="2026-06-06T12:28:00+00:00",
+    )
+    resume_race_current = store.get_task("task-resume-race")
+    assert resume_race is None
+    assert resume_race_current.status == "running"
+    assert resume_race_current.lease_expires_at == "2026-06-06T12:40:00+00:00"
+    assert resume_race_current.completed_at is None
 
 
 def test_auth_adapter_accepts_trusted_headers_only():
@@ -1014,6 +1123,27 @@ class FakeRunnerPostgresConnection:
                 }
             )
             return FakeRunnerPostgresCursor([])
+
+        if "set status = 'queued'" in lowered and "and status = 'running'" in lowered:
+            metadata_update, task_id, checked_at = params
+            row = self.database.rows.get(task_id)
+            if not row or row["status"] != "running":
+                return FakeRunnerPostgresCursor([])
+            if (
+                "runner_task_id = task_id" in lowered
+                and row["runner_task_id"] != row["task_id"]
+            ):
+                return FakeRunnerPostgresCursor([])
+            if not _lease_allows_recovery(row, checked_at):
+                return FakeRunnerPostgresCursor([])
+            row["status"] = "queued"
+            row["archive_status"] = "pending"
+            row["completed_at"] = None
+            row["error"] = None
+            metadata = _metadata_dict(row)
+            metadata.update(json.loads(metadata_update))
+            row["metadata"] = metadata
+            return FakeRunnerPostgresCursor([row])
 
         if "set status = 'cancelled'" in lowered and "and status = 'running'" in lowered:
             archive_status, completed_at, error, metadata_update, task_id, checked_at = (

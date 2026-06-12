@@ -382,6 +382,56 @@ class TaskStore:
                 return None
         return self.get_task(task_id)
 
+    def resume_stale_running_task(
+        self,
+        task_id: str,
+        *,
+        resumed_at: str,
+        warnings: list[str] | None = None,
+        lease_checked_at: str | None = None,
+    ) -> TaskRecord | None:
+        checked_at = lease_checked_at or resumed_at
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE limira_runner_research_tasks
+                SET status = ?,
+                    archive_status = ?,
+                    archive_dir = ?,
+                    archive_zip_path = ?,
+                    completed_at = ?,
+                    error = ?,
+                    warnings = ?,
+                    worker_id = ?,
+                    lease_expires_at = ?,
+                    heartbeat_at = ?
+                WHERE task_id = ? AND status = ?
+                  AND (
+                      worker_id IS NULL
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at <= ?
+                  )
+                """,
+                (
+                    "queued",
+                    "pending",
+                    None,
+                    None,
+                    None,
+                    None,
+                    self._serialize_value(warnings or []),
+                    None,
+                    None,
+                    None,
+                    task_id,
+                    "running",
+                    checked_at,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_task(task_id)
+
     def cancel_stale_running_task(
         self,
         task_id: str,
@@ -727,6 +777,24 @@ class PostgresTaskStore:
           )
         RETURNING {TASK_COLUMNS}
     """
+    RESUME_STALE_RUNNING_TASK_SQL = f"""
+        UPDATE limira_research_tasks
+        SET status = 'queued',
+            archive_status = 'pending',
+            completed_at = NULL,
+            error = NULL,
+            metadata = metadata || CAST(%s AS jsonb)
+        WHERE task_id = %s
+          AND status = 'running'
+          AND runner_task_id = task_id
+          AND (
+              metadata->'runner_lease' IS NULL
+              OR metadata->'runner_lease' = 'null'::jsonb
+              OR NULLIF(metadata->'runner_lease'->>'lease_expires_at', '') IS NULL
+              OR NULLIF(metadata->'runner_lease'->>'lease_expires_at', '')::timestamptz <= %s::timestamptz
+          )
+        RETURNING {TASK_COLUMNS}
+    """
     CANCEL_STALE_RUNNING_TASK_SQL = f"""
         UPDATE limira_research_tasks
         SET status = 'cancelled',
@@ -1016,6 +1084,31 @@ class PostgresTaskStore:
             (
                 completed_at,
                 error,
+                _serialize_json(metadata_updates),
+                task_id,
+                checked_at,
+            ),
+        )
+        return self._row_to_record(row) if row else None
+
+    def resume_stale_running_task(
+        self,
+        task_id: str,
+        *,
+        resumed_at: str,
+        warnings: list[str] | None = None,
+        lease_checked_at: str | None = None,
+    ) -> TaskRecord | None:
+        metadata_updates = {
+            "archive_dir": None,
+            "archive_zip_path": None,
+            "warnings": warnings or [],
+            "runner_lease": None,
+        }
+        checked_at = lease_checked_at or resumed_at
+        row = self._fetch_one(
+            self.RESUME_STALE_RUNNING_TASK_SQL,
+            (
                 _serialize_json(metadata_updates),
                 task_id,
                 checked_at,
