@@ -42,6 +42,14 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
         "service-token-resume-secret123456",
         "raw-prompt-resume-secret123456",
         "model-internal-resume-secret123456",
+        "camel owner private value",
+        "plain api credential value",
+        "camel model internal text",
+        "camel raw prompt text",
+        "camel service token words",
+        "raw model output private text",
+        "model input transcript private text",
+        "raw model private text",
     ]
     store = TaskStore(tmp_path / "tasks.sqlite3")
     record = seed_running_task(
@@ -66,6 +74,11 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
                     "owner_user_id": secrets[0],
                     "api_key": secrets[1],
                     "raw_prompt": secrets[3],
+                    "ownerUserId": secrets[5],
+                    "apiKey": secrets[6],
+                    "modelInternal": secrets[7],
+                    "rawPrompt": secrets[8],
+                    "runnerServiceToken": secrets[9],
                 }
             ],
             "evidence_ledger": [
@@ -76,6 +89,9 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
                     "summary": "pre-resume evidence",
                     "content_hash": "b" * 32,
                     "service_token": secrets[2],
+                    "modelOutput": secrets[10],
+                    "modelInput": secrets[11],
+                    "rawModel": secrets[12],
                 }
             ],
             "executor_state": {
@@ -163,9 +179,20 @@ async def test_resumed_langgraph_archive_trace_includes_scrubbed_checkpoint_cont
     assert "owner_user_id" not in serialized_trace
     assert "raw_prompt" not in serialized_trace
     assert "model_internal" not in serialized_trace
-    for secret in secrets:
-        assert secret not in serialized_trace
 
     with zipfile.ZipFile(completed.archive_zip_path) as archive:
         zip_trace = json.loads(archive.read("trace.json").decode("utf-8"))
     assert zip_trace["events"] == trace["events"]
+    serialized_zip_trace = json.dumps(zip_trace, ensure_ascii=False)
+
+    for serialized in (serialized_trace, serialized_zip_trace):
+        assert "ownerUserId" not in serialized
+        assert "apiKey" not in serialized
+        assert "modelInternal" not in serialized
+        assert "rawPrompt" not in serialized
+        assert "runnerServiceToken" not in serialized
+        assert "modelOutput" not in serialized
+        assert "modelInput" not in serialized
+        assert "rawModel" not in serialized
+        for secret in secrets:
+            assert secret not in serialized
