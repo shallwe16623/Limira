@@ -66,6 +66,32 @@ DEFAULT_MODEL_NAME = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 MAX_REPLAY_EVENTS = 1000
 DURABLE_EVENT_POLL_INTERVAL_SECONDS = 0.05
+RESUME_ARCHIVE_CONTEXT_LEDGER_LIMIT = 50
+RESUME_ARCHIVE_CONTEXT_LIST_LIMIT = 20
+RESUME_ARCHIVE_CONTEXT_STRING_LIMIT = 500
+RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS = (
+    "owner",
+    "user_id",
+    "authorization",
+    "cookie",
+    "token",
+    "secret",
+    "api_key",
+    "prompt",
+    "model_internal",
+    "model_input",
+    "model_output",
+    "raw_model",
+)
+RESUME_ARCHIVE_EXECUTOR_STATE_KEYS = (
+    "node",
+    "research_graph_executor",
+    "resume_checkpoint_updated_at",
+    "recovery_reason",
+    "resume_queued_at",
+    "resume_status",
+    "resume_worker_started_at",
+)
 GRAPH_CHECKPOINT_PHASES = {
     "scope",
     "plan",
@@ -404,6 +430,9 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
             start_time=started_at,
         )
         writer_started = True
+        resume_archive_event = _resume_archive_context_event(record, started_at)
+        if resume_archive_event is not None:
+            writer.record_event(resume_archive_event)
         state = app[INIT_RENDER_STATE_KEY]()
         _write_task_checkpoint(
             app,
@@ -884,6 +913,146 @@ def _stream_task_context(record: TaskRecord) -> dict[str, Any]:
     return context
 
 
+def _resume_archive_context_event(
+    record: TaskRecord,
+    timestamp: str,
+) -> dict[str, Any] | None:
+    checkpoint = record.checkpoint if isinstance(record.checkpoint, dict) else None
+    if not _is_resumable_langgraph_checkpoint(checkpoint):
+        return None
+    payload = _resume_archive_context_payload(
+        checkpoint,
+        checkpoint_updated_at=record.checkpoint_updated_at,
+        worker_started_at=timestamp,
+    )
+    return {
+        "task_id": record.task_id,
+        "type": "resume_archive_context",
+        "timestamp": timestamp,
+        "payload": payload,
+    }
+
+
+def _resume_archive_context_payload(
+    checkpoint: dict[str, Any],
+    *,
+    checkpoint_updated_at: str | None,
+    worker_started_at: str,
+) -> dict[str, Any]:
+    source_ledger = checkpoint.get("source_ledger")
+    evidence_ledger = checkpoint.get("evidence_ledger")
+    executor_state = checkpoint.get("executor_state")
+    source_count = len(source_ledger) if isinstance(source_ledger, list) else 0
+    evidence_count = len(evidence_ledger) if isinstance(evidence_ledger, list) else 0
+    payload = {
+        "source_event_type": "runner_resume_checkpoint",
+        "resume_boundary": True,
+        "research_graph_executor": _checkpoint_research_graph_executor(checkpoint),
+        "checkpoint": {
+            "phase": _optional_operational_text(checkpoint.get("phase")),
+            "status": _optional_operational_text(checkpoint.get("status")),
+            "last_completed_node": _optional_operational_text(
+                checkpoint.get("last_completed_node")
+            ),
+            "current_node": _optional_operational_text(checkpoint.get("current_node")),
+            "current_research_unit": _optional_operational_text(
+                checkpoint.get("current_research_unit")
+            ),
+            "updated_at": _optional_operational_text(checkpoint_updated_at),
+            "completed_unit_ids": _checkpoint_string_list(
+                checkpoint.get("completed_unit_ids")
+            ),
+            "pending_unit_ids": _checkpoint_string_list(
+                checkpoint.get("pending_unit_ids")
+            ),
+            "resume_policy": _optional_operational_text(
+                checkpoint.get("resume_policy")
+            ),
+            "recoverable_reason": _optional_operational_text(
+                checkpoint.get("recoverable_reason")
+            ),
+        },
+        "source_ledger_count": source_count,
+        "evidence_ledger_count": evidence_count,
+        "source_ledger": _resume_archive_ledger_context(source_ledger),
+        "evidence_ledger": _resume_archive_ledger_context(evidence_ledger),
+        "executor_state": _resume_archive_executor_state(
+            executor_state,
+            worker_started_at=worker_started_at,
+        ),
+    }
+    return scrub_secrets(payload)
+
+
+def _resume_archive_ledger_context(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return [
+        _bounded_resume_archive_value(item)
+        for item in value[:RESUME_ARCHIVE_CONTEXT_LEDGER_LIMIT]
+    ]
+
+
+def _resume_archive_executor_state(
+    value: Any,
+    *,
+    worker_started_at: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    result = {
+        key: _bounded_resume_archive_value(value[key])
+        for key in RESUME_ARCHIVE_EXECUTOR_STATE_KEYS
+        if key in value
+    }
+    result["resume_worker_started_at"] = _bounded_resume_archive_string(
+        worker_started_at
+    )
+    return result
+
+
+def _bounded_resume_archive_value(value: Any, *, depth: int = 0) -> Any:
+    value = scrub_secrets(value)
+    if depth >= 4:
+        return _bounded_resume_archive_string(value)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = _bounded_resume_archive_key(key)
+            if not key_text or _resume_archive_context_key_is_forbidden(key_text):
+                continue
+            result[key_text] = _bounded_resume_archive_value(item, depth=depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_resume_archive_value(item, depth=depth + 1)
+            for item in list(value)[:RESUME_ARCHIVE_CONTEXT_LIST_LIMIT]
+        ]
+    if isinstance(value, str):
+        return _bounded_resume_archive_string(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _bounded_resume_archive_string(value)
+
+
+def _bounded_resume_archive_key(value: Any) -> str:
+    return str(value or "").strip()[:120]
+
+
+def _resume_archive_context_key_is_forbidden(key: str) -> bool:
+    normalized = key.lower()
+    return any(part in normalized for part in RESUME_ARCHIVE_CONTEXT_FORBIDDEN_KEY_PARTS)
+
+
+def _bounded_resume_archive_string(value: Any) -> str:
+    text = str(scrub_secrets(value or "")).strip()
+    if len(text) <= RESUME_ARCHIVE_CONTEXT_STRING_LIMIT:
+        return text
+    if RESUME_ARCHIVE_CONTEXT_STRING_LIMIT <= 3:
+        return text[:RESUME_ARCHIVE_CONTEXT_STRING_LIMIT]
+    return text[: RESUME_ARCHIVE_CONTEXT_STRING_LIMIT - 3].rstrip() + "..."
+
+
 def _worker_start_checkpoint_payload(
     record: TaskRecord,
     render_state: dict[str, Any],
@@ -1286,6 +1455,7 @@ def _resume_stale_langgraph_task(
     executor_state.update(
         {
             "recovery_reason": reason,
+            "resume_checkpoint_updated_at": record.checkpoint_updated_at,
             "resume_queued_at": resumed_at,
             "resume_status": "queued",
         }
