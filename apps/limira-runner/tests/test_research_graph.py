@@ -673,6 +673,53 @@ async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_check
     assert complete_checkpoint["current_research_unit"].startswith("unit-2-")
 
 
+async def _completed_upload_langgraph_resume_fixture(task_id: str):
+    upload_text = "Uploaded memo confirms the entity is listed under program X."
+    initial_state = build_initial_research_graph(
+        task_id=task_id,
+        query="Assess uploaded document evidence",
+        document_ids=["doc-upload"],
+        upload_scope={
+            "document_count": 1,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-upload"],
+            "context_only_document_ids": [],
+            "source_payloads": [
+                {
+                    "candidate_id": f"SRC-{task_id}",
+                    "document_id": "doc-upload",
+                    "chunk_id": f"UPLOAD-CHUNK-{task_id}",
+                    "filename": "resume.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "b" * 64,
+                    "text": upload_text,
+                    "text_char_count": len(upload_text),
+                }
+            ],
+        },
+        source_policy={"prefer_uploaded_documents": True},
+        max_units=1,
+    )
+    stream_queue = _CaptureQueue()
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id=task_id,
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+    checkpoints = [
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+    ]
+    return initial_state, result, stream_queue, checkpoints
+
+
 @pytest.mark.asyncio
 async def test_langgraph_resume_rebuilds_state_and_skips_completed_research_artifacts():
     _FakeOrchestrator.task_descriptions = []
@@ -757,6 +804,95 @@ async def test_langgraph_resume_rebuilds_state_and_skips_completed_research_arti
             "retrieved_source_collected",
             "evidence_collected",
         }
+        for item in resume_queue.items
+    )
+
+
+@pytest.mark.asyncio
+async def test_langgraph_resume_from_write_checkpoint_preserves_writer_output():
+    initial_state, original_result, _queue, checkpoints = (
+        await _completed_upload_langgraph_resume_fixture(
+            "task-langgraph-write-resume"
+        )
+    )
+    write_checkpoint = next(
+        checkpoint for checkpoint in checkpoints if checkpoint["phase"] == "write"
+    )
+    resumed_state = apply_langgraph_resume_checkpoint(initial_state, write_checkpoint)
+
+    assert resumed_state.resume_start_phase == ResearchPhase.RECONCILE
+    assert resumed_state.final_summary == original_result.final_summary
+    assert resumed_state.final_boxed_answer == original_result.final_boxed_answer
+
+    resume_queue = _CaptureQueue()
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=resumed_state,
+        orchestrator=_FakeOrchestrator(stream_queue=resume_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id="task-langgraph-write-resume",
+        is_final_retry=False,
+        stream_queue=resume_queue,
+    )
+
+    phase_events = [
+        item["data"]["phase"]
+        for item in resume_queue.items
+        if item.get("event") == "research_graph_phase"
+    ]
+    assert phase_events[0] == "reconcile"
+    assert result.final_summary == original_result.final_summary
+    assert result.final_boxed_answer == original_result.final_boxed_answer
+    assert not any(
+        item.get("type") == "report_section_generated"
+        for item in resume_queue.items
+    )
+
+
+@pytest.mark.asyncio
+async def test_langgraph_resume_from_reconcile_checkpoint_preserves_final_output():
+    initial_state, original_result, _queue, checkpoints = (
+        await _completed_upload_langgraph_resume_fixture(
+            "task-langgraph-reconcile-resume"
+        )
+    )
+    reconcile_checkpoint = next(
+        checkpoint for checkpoint in checkpoints if checkpoint["phase"] == "reconcile"
+    )
+    resumed_state = apply_langgraph_resume_checkpoint(
+        initial_state,
+        reconcile_checkpoint,
+    )
+
+    assert resumed_state.resume_start_phase == ResearchPhase.COMPLETE
+    assert resumed_state.final_summary == original_result.final_summary
+    assert resumed_state.final_boxed_answer == original_result.final_boxed_answer
+
+    resume_queue = _CaptureQueue()
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=resumed_state,
+        orchestrator=_FakeOrchestrator(stream_queue=resume_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id="task-langgraph-reconcile-resume",
+        is_final_retry=False,
+        stream_queue=resume_queue,
+    )
+
+    phase_events = [
+        item["data"]["phase"]
+        for item in resume_queue.items
+        if item.get("event") == "research_graph_phase"
+    ]
+    messages = [item for item in resume_queue.items if item.get("event") == "message"]
+    assert phase_events == ["complete"]
+    assert len(messages) == 1
+    assert messages[0]["data"]["delta"]["content"] == original_result.final_summary
+    assert result.final_summary == original_result.final_summary
+    assert result.final_boxed_answer == original_result.final_boxed_answer
+    assert result.final_boxed_answer != result.final_summary
+    assert not any(
+        item.get("type") == "report_section_generated"
         for item in resume_queue.items
     )
 

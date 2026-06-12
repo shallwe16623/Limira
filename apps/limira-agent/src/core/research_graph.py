@@ -318,6 +318,8 @@ class ResearchGraphState(BaseModel):
     claims: list[ResearchClaim] = Field(default_factory=list, max_length=500)
     verified_claims: list[VerifiedClaim] = Field(default_factory=list, max_length=500)
     report_sections: list[ReportSection] = Field(default_factory=list, max_length=100)
+    final_summary: str | None = Field(default=None, max_length=20_000)
+    final_boxed_answer: str | None = Field(default=None, max_length=10_000)
     warnings: list[str] = Field(default_factory=list, max_length=200)
     resume_from_checkpoint: bool = False
     resume_start_phase: ResearchPhase | None = None
@@ -1349,6 +1351,8 @@ class WriterNode(ResearchGraphNode):
                     *state.report_sections,
                     _report_section_from_artifact_event(report_event),
                 ],
+                "final_summary": final_summary,
+                "final_boxed_answer": final_boxed_answer,
             }
         )
         return ResearchGraphNodeOutput(
@@ -1404,7 +1408,13 @@ class ReconcilerNode(ResearchGraphNode):
             previous.final_summary,
             previous.final_boxed_answer,
         )
-        reconciled_state = state.model_copy(update={"phase": self.phase})
+        reconciled_state = state.model_copy(
+            update={
+                "phase": self.phase,
+                "final_summary": final_summary,
+                "final_boxed_answer": final_boxed_answer,
+            }
+        )
         return ResearchGraphNodeOutput(
             state=reconciled_state,
             executor_state={
@@ -1708,6 +1718,12 @@ def apply_langgraph_resume_checkpoint(
     ]
     restored_findings = _checkpoint_findings(evidence_entries)
     restored_verified_claims = _checkpoint_verified_claims(evidence_entries)
+    restored_report_sections = _checkpoint_report_sections(evidence_entries)
+    final_summary, final_boxed_answer = _checkpoint_final_outputs(
+        evidence_entries,
+        restored_report_sections,
+        restored_verified_claims,
+    )
     restored_claims = _merge_graph_claims(
         _claim_state_from_findings(restored_findings),
         _claim_state_from_verified_claims(restored_verified_claims),
@@ -1727,7 +1743,9 @@ def apply_langgraph_resume_checkpoint(
             "findings": restored_findings,
             "claims": restored_claims,
             "verified_claims": restored_verified_claims,
-            "report_sections": _checkpoint_report_sections(evidence_entries),
+            "report_sections": restored_report_sections,
+            "final_summary": final_summary,
+            "final_boxed_answer": final_boxed_answer,
             "resume_from_checkpoint": True,
             "resume_start_phase": resume_start_phase,
             "warnings": [
@@ -2007,6 +2025,33 @@ def _checkpoint_report_sections(entries: list[Any]) -> list[ReportSection]:
         except ValueError:
             continue
     return sections
+
+
+def _checkpoint_final_outputs(
+    entries: list[Any],
+    report_sections: list[ReportSection],
+    verified_claims: list[VerifiedClaim],
+) -> tuple[str | None, str | None]:
+    final_summary = None
+    final_boxed_answer = None
+    for entry in reversed(entries):
+        if not isinstance(entry, dict) or entry.get("ledger_type") != "report_section":
+            continue
+        final_summary = _optional_checkpoint_text(
+            entry.get("final_summary") or entry.get("markdown"),
+            20_000,
+        )
+        final_boxed_answer = _optional_checkpoint_text(
+            entry.get("final_boxed_answer"),
+            10_000,
+        )
+        if final_summary:
+            break
+    if final_summary is None and report_sections:
+        final_summary = report_sections[-1].markdown
+    if final_boxed_answer is None and verified_claims:
+        final_boxed_answer = verified_claims[0].claim
+    return final_summary, final_boxed_answer
 
 
 def _checkpoint_datetime(value: Any) -> datetime | None:
@@ -2580,6 +2625,15 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
             "section_id": section.section_id,
             "title": section.title,
             "markdown": _bounded_graph_text(section.markdown, 20_000),
+            "final_summary": _bounded_graph_text(state.final_summary, 20_000)
+            if state.final_summary
+            else None,
+            "final_boxed_answer": _bounded_graph_text(
+                state.final_boxed_answer,
+                10_000,
+            )
+            if state.final_boxed_answer
+            else None,
             "evidence_refs": list(section.evidence_refs),
             "source_event_type": section.source_event_type,
         }

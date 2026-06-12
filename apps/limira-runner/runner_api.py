@@ -396,12 +396,7 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
         _write_task_checkpoint(
             app,
             record.task_id,
-            {
-                "phase": "started",
-                "status": "running",
-                "event_count": 0,
-                "render_state": state,
-            },
+            _worker_start_checkpoint_payload(record, state, started_at),
             updated_at=started_at,
         )
 
@@ -865,6 +860,36 @@ def _stream_task_context(record: TaskRecord) -> dict[str, Any]:
     return context
 
 
+def _worker_start_checkpoint_payload(
+    record: TaskRecord,
+    render_state: dict[str, Any],
+    started_at: str,
+) -> dict[str, Any]:
+    checkpoint = record.checkpoint
+    if not _is_resumable_langgraph_checkpoint(checkpoint):
+        return {
+            "phase": "started",
+            "status": "running",
+            "event_count": 0,
+            "render_state": render_state,
+        }
+    resumed = dict(checkpoint or {})
+    executor_state = resumed.get("executor_state")
+    if not isinstance(executor_state, dict):
+        executor_state = {}
+    else:
+        executor_state = dict(executor_state)
+    executor_state.update(
+        {
+            "resume_worker_started_at": started_at,
+            "resume_status": "running",
+        }
+    )
+    resumed["status"] = "running"
+    resumed["executor_state"] = executor_state
+    return resumed
+
+
 def _checkpoint_research_graph_executor(
     checkpoint: dict[str, Any] | None,
 ) -> str | None:
@@ -1216,8 +1241,18 @@ def _resume_stale_langgraph_task(
     _write_task_checkpoint(app, record.task_id, checkpoint, updated_at=resumed_at)
     _clear_active_task(app, record.task_id)
     _clear_task_cancel(app, record.task_id)
-    _notify_task_finished(app, record.task_id)
+    _ensure_task_worker_if_loop_running(app, record.task_id)
     return _task_store(app).get_task(record.task_id) or resumed
+
+
+def _ensure_task_worker_if_loop_running(app: web.Application, task_id: str) -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    _ensure_task_worker(app, task_id)
+    worker = app[TASK_WORKERS_KEY].get(task_id)
+    return bool(worker and not worker.done())
 
 
 def _latest_heartbeat_at(

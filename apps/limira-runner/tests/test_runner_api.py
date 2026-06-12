@@ -18,6 +18,7 @@ from runner_api import (
     RENDER_MARKDOWN_KEY,
     STREAM_EVENTS_KEY,
     TASK_EVENT_LOG_KEY,
+    TASK_WORKERS_KEY,
     UPDATE_STATE_KEY,
     _checkpoint_envelope,
     _reconcile_task_if_stale,
@@ -116,6 +117,22 @@ class ContextCaptureStream:
             "event": "message",
             "data": {"delta": {"content": "context propagated"}},
         }
+
+
+class BlockingStream:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, task_id, query, context, disconnect_check=None):
+        assert task_id
+        assert query
+        assert isinstance(context, dict)
+        assert disconnect_check is not None
+        self.started.set()
+        await self.release.wait()
+        if False:
+            yield {}
 
 
 async def structured_secret_stream(task_id, query, _unused, disconnect_check=None):
@@ -700,6 +717,74 @@ def test_stale_recovery_requeues_resumable_langgraph_checkpoint(tmp_path):
     stream_context = _stream_task_context(resumed)
     assert stream_context["resume_checkpoint"]["phase"] == "research"
     assert stream_context["resume_checkpoint"]["current_node"] == "compress"
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_schedules_worker_and_preserves_resume_checkpoint(
+    tmp_path,
+):
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    blocking_stream = BlockingStream()
+    app = create_app(
+        task_store=store,
+        archive_root=tmp_path / "archives",
+        service_token="shared",
+        stream_events=blocking_stream.stream,
+        init_render_state=init_state,
+        update_state_with_event=update_state,
+        render_markdown=render_markdown,
+        clock=lambda: "2026-06-06T12:10:00+00:00",
+    )
+    record = seed_running_task(
+        store,
+        task_id="task-resumable-langgraph-worker",
+        worker_id="worker-resume",
+        lease_expires_at="2026-06-06T12:05:00+00:00",
+    )
+    checkpoint = _checkpoint_envelope(
+        {
+            "phase": "research",
+            "status": "running",
+            "current_research_unit": "unit-1",
+            "source_ledger": [{"ledger_type": "research_unit", "unit_id": "unit-1"}],
+            "evidence_ledger": [{"ledger_type": "evidence", "id": "EVID-001"}],
+            "executor_state": {"research_graph_executor": "langgraph"},
+            "research_graph_executor": "langgraph",
+            "last_completed_node": "research",
+            "current_node": "compress",
+            "completed_unit_ids": ["unit-1"],
+            "pending_unit_ids": [],
+            "resume_policy": "resume_from_checkpoint",
+            "recoverable_reason": "langgraph_checkpoint_resumable",
+        }
+    )
+    store.write_task_checkpoint(
+        record.task_id,
+        checkpoint=checkpoint,
+        updated_at="2026-06-06T12:04:00+00:00",
+    )
+    running = store.get_task(record.task_id)
+
+    resumed = _reconcile_task_if_stale(app, running)
+    await asyncio.wait_for(blocking_stream.started.wait(), timeout=1.0)
+
+    worker = app[TASK_WORKERS_KEY].get(record.task_id)
+    persisted_checkpoint = store.get_task_checkpoint(record.task_id)
+    active = store.get_task(record.task_id)
+
+    assert resumed.status == "queued"
+    assert worker is not None
+    assert not worker.done()
+    assert active.status == "running"
+    assert persisted_checkpoint["phase"] == "research"
+    assert persisted_checkpoint["status"] == "running"
+    assert persisted_checkpoint["resume_policy"] == "resume_from_checkpoint"
+    assert persisted_checkpoint["current_node"] == "compress"
+    assert persisted_checkpoint["source_ledger"] == checkpoint["source_ledger"]
+    assert persisted_checkpoint["evidence_ledger"] == checkpoint["evidence_ledger"]
+    assert persisted_checkpoint["executor_state"]["resume_status"] == "running"
+    worker.cancel()
+    await worker
 
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):

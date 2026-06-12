@@ -142,11 +142,10 @@ def _initial_previous_output(state: ResearchGraphState) -> ResearchGraphNodeOutp
     final_boxed_answer = None
     if (
         state.resume_from_checkpoint
-        and state.resume_start_phase == ResearchPhase.COMPLETE
-        and state.report_sections
+        and state.resume_start_phase in {ResearchPhase.RECONCILE, ResearchPhase.COMPLETE}
     ):
-        final_summary = state.report_sections[-1].markdown
-        final_boxed_answer = final_summary
+        final_summary = state.final_summary
+        final_boxed_answer = state.final_boxed_answer
     return ResearchGraphNodeOutput(
         state=state,
         final_summary=final_summary,
@@ -206,7 +205,11 @@ def _langgraph_complete_runner(
             previous.final_boxed_answer,
         )
         complete_state = previous.state.model_copy(
-            update={"phase": ResearchPhase.COMPLETE}
+            update={
+                "phase": ResearchPhase.COMPLETE,
+                "final_summary": final_summary,
+                "final_boxed_answer": final_boxed_answer,
+            }
         )
         complete_output = ResearchGraphNodeOutput(
             state=complete_state,
