@@ -555,6 +555,255 @@ class ResearchUnitNode(ResearchGraphNode):
         )
 
 
+class LangGraphResearchUnitNode(ResearchGraphNode):
+    phase = ResearchPhase.RESEARCH
+
+    async def run(
+        self,
+        state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
+        previous: ResearchGraphNodeOutput | None = None,
+    ) -> ResearchGraphNodeOutput:
+        retrieved_sources = list(state.retrieved_sources)
+        source_candidates = list(state.source_candidates)
+        evidence = list(state.evidence)
+        findings = list(state.findings)
+        artifact_events: list[dict[str, Any]] = []
+        unit_substeps: list[dict[str, Any]] = []
+        completed_unit_ids: list[str] = []
+        current_unit_id = None
+        legacy_adapter_calls = 0
+        upload_sources = UploadedDocumentSourceProvider(state.upload_sources).retrieve()
+
+        for unit_index, unit in enumerate(state.plan.research_units):
+            current_unit_id = unit.id
+            unit_candidates = self._search_candidates(
+                state,
+                unit,
+                unit_index,
+                upload_sources,
+            )
+            source_candidates.extend(unit_candidates)
+            artifact_events.extend(
+                _source_candidate_artifact_event(candidate)
+                for candidate in unit_candidates
+            )
+
+            unit_retrieved_sources: list[RetrievedSource] = []
+            fallback_summary = None
+            fallback_experience_summary = None
+            if not any(
+                candidate.source_type == "limira_upload"
+                and candidate.source_content_state == "content_bearing"
+                for candidate in unit_candidates
+            ):
+                fallback_summary, _boxed_answer, fallback_experience_summary = (
+                    await context.orchestrator.run_main_agent(
+                        task_description=research_unit_task_description(
+                            state,
+                            unit,
+                            context.original_task_description,
+                        ),
+                        task_file_name=context.task_file_name,
+                        task_id=context.task_id,
+                        is_final_retry=context.is_final_retry,
+                    )
+                )
+                legacy_adapter_calls += 1
+
+            for candidate in unit_candidates:
+                retrieved_source = self._retrieve_candidate(
+                    state=state,
+                    unit=unit,
+                    unit_index=unit_index,
+                    candidate=candidate,
+                    upload_sources=upload_sources,
+                    fallback_summary=fallback_summary,
+                )
+                if retrieved_source is None:
+                    continue
+                unit_retrieved_sources.append(retrieved_source)
+                retrieved_sources.append(retrieved_source)
+                artifact_events.append(_retrieved_source_artifact_event(retrieved_source))
+
+            unit_evidence: list[EvidenceItem] = []
+            for retrieved_index, retrieved_source in enumerate(unit_retrieved_sources):
+                evidence_item = _evidence_from_retrieved_source(
+                    state=state,
+                    unit=unit,
+                    retrieved_source=retrieved_source,
+                    index=retrieved_index,
+                )
+                unit_evidence.append(evidence_item)
+                evidence.append(evidence_item)
+                artifact_events.append(_evidence_artifact_event(evidence_item))
+
+            unit_findings = self._synthesize_findings(unit, unit_evidence, unit_index)
+            findings.extend(unit_findings)
+            completed_unit_ids.append(unit.id)
+            unit_substeps.append(
+                {
+                    "unit_id": unit.id,
+                    "steps": ["search", "retrieve", "promote", "synthesize"],
+                    "source_candidate_ids": [
+                        candidate.candidate_id for candidate in unit_candidates
+                    ],
+                    "snippet_only_candidate_ids": [
+                        candidate.candidate_id
+                        for candidate in unit_candidates
+                        if candidate.source_content_state == "snippet_only"
+                    ],
+                    "retrieved_source_ids": [
+                        source.id for source in unit_retrieved_sources
+                    ],
+                    "evidence_ids": [item.id for item in unit_evidence],
+                    "finding_ids": [finding.id for finding in unit_findings],
+                    "legacy_adapter_used": fallback_summary is not None,
+                    "fallback_experience_summary_present": (
+                        fallback_experience_summary is not None
+                    ),
+                }
+            )
+
+        completed_units = [
+            unit.model_copy(update={"status": "completed"})
+            for unit in state.plan.research_units
+        ]
+        researched_state = state.model_copy(
+            update={
+                "phase": self.phase,
+                "plan": state.plan.model_copy(
+                    update={"research_units": completed_units}
+                ),
+                "current_unit_id": current_unit_id,
+                "research_units": completed_units,
+                "source_candidates": source_candidates,
+                "retrieved_sources": retrieved_sources,
+                "evidence": evidence,
+                "findings": findings,
+            }
+        )
+        return ResearchGraphNodeOutput(
+            state=researched_state,
+            current_research_unit=current_unit_id,
+            executor_state={
+                "node": self.__class__.__name__,
+                "research_unit_count": len(completed_units),
+                "current_unit_id": current_unit_id,
+                "completed_unit_ids": completed_unit_ids,
+                "source_candidate_count": len(source_candidates),
+                "retrieved_source_count": len(retrieved_sources),
+                "evidence_count": len(evidence),
+                "finding_count": len(findings),
+                "unit_substeps": unit_substeps,
+                "resume_marker": "completed_unit_ids_available",
+                "legacy_adapter_calls": legacy_adapter_calls,
+                "context_only_upload_document_ids": list(
+                    state.context_only_upload_document_ids
+                ),
+            },
+            artifact_events=artifact_events,
+            failure_experience_summary=(
+                fallback_experience_summary if legacy_adapter_calls else None
+            ),
+        )
+
+    def _search_candidates(
+        self,
+        state: ResearchGraphState,
+        unit: ResearchUnit,
+        unit_index: int,
+        upload_sources: list[UploadedDocumentSource],
+    ) -> list[SourceCandidate]:
+        candidates = [_snippet_source_candidate_for_unit(state, unit, unit_index)]
+        matched_uploads = [
+            source
+            for source in upload_sources
+            if _upload_source_matches_unit(source, unit)
+        ]
+        if not matched_uploads and unit.source_policy.prefer_uploaded_documents:
+            matched_uploads = list(upload_sources)
+        candidates.extend(
+            _source_candidate_from_upload(source) for source in matched_uploads
+        )
+        if not matched_uploads:
+            candidates.append(
+                _legacy_adapter_source_candidate_for_unit(state, unit, unit_index)
+            )
+        return candidates
+
+    def _retrieve_candidate(
+        self,
+        *,
+        state: ResearchGraphState,
+        unit: ResearchUnit,
+        unit_index: int,
+        candidate: SourceCandidate,
+        upload_sources: list[UploadedDocumentSource],
+        fallback_summary: str | None,
+    ) -> RetrievedSource | None:
+        if candidate.source_content_state == "snippet_only":
+            return None
+        if candidate.source_type == "limira_upload":
+            upload_source = _upload_source_for_candidate(candidate, upload_sources)
+            if upload_source is None:
+                return None
+            return _retrieved_source_from_upload_for_unit(
+                state=state,
+                unit=unit,
+                upload_source=upload_source,
+                index=unit_index,
+            )
+        if candidate.source_type != "legacy_agent_adapter":
+            return None
+        research_summary = _required_output_text(
+            fallback_summary,
+            "research_graph_research_output_required",
+        )
+        research_summary = _bounded_graph_text(
+            research_summary,
+            GRAPH_SOURCE_SUMMARY_MAX_CHARS,
+        )
+        content_hash = _short_content_hash(research_summary)
+        return RetrievedSource(
+            id=retrieved_source_id_for_source(
+                task_id=state.task_id,
+                source=f"langgraph://{unit.id}/legacy_agent_adapter",
+                index=unit_index,
+            ),
+            url=f"graph://{unit.id}",
+            title=unit.question,
+            source_type="legacy_agent_adapter",
+            content_hash=content_hash,
+            quote_or_summary=research_summary,
+            tool_name="legacy_agent_adapter",
+            confidence=0.55,
+        )
+
+    def _synthesize_findings(
+        self,
+        unit: ResearchUnit,
+        evidence_items: list[EvidenceItem],
+        unit_index: int,
+    ) -> list[CompressedFinding]:
+        if not evidence_items:
+            return []
+        summary = _bounded_graph_text(
+            "\n\n".join(item.quote_or_summary for item in evidence_items),
+            GRAPH_FINDING_SUMMARY_MAX_CHARS,
+        )
+        confidence = max(item.confidence for item in evidence_items)
+        return [
+            CompressedFinding(
+                id=f"finding-langgraph-{unit_index + 1}-{unit.id}",
+                research_unit_id=unit.id,
+                summary=summary,
+                evidence_ids=[item.id for item in evidence_items],
+                confidence=confidence,
+            )
+        ]
+
+
 class EvidenceCompressorNode(ResearchGraphNode):
     phase = ResearchPhase.COMPRESS
 
@@ -566,7 +815,7 @@ class EvidenceCompressorNode(ResearchGraphNode):
     ) -> ResearchGraphNodeOutput:
         if not state.evidence:
             raise ValueError("research_graph_compressor_output_required")
-        findings = self._compress_findings(state)
+        findings = list(state.findings) or self._compress_findings(state)
         compressed_state = state.model_copy(
             update={
                 "phase": self.phase,
@@ -796,6 +1045,18 @@ def default_research_graph_nodes() -> list[ResearchGraphNode]:
         ScopeNode(),
         PlannerNode(),
         ResearchUnitNode(),
+        EvidenceCompressorNode(),
+        VerifierNode(),
+        WriterNode(),
+        ReconcilerNode(),
+    ]
+
+
+def default_langgraph_research_graph_nodes() -> list[ResearchGraphNode]:
+    return [
+        ScopeNode(),
+        PlannerNode(),
+        LangGraphResearchUnitNode(),
         EvidenceCompressorNode(),
         VerifierNode(),
         WriterNode(),
@@ -1142,6 +1403,11 @@ def evidence_id_for_source(*, task_id: str, source: str, index: int = 0) -> str:
     return f"EVID-{digest[:12]}"
 
 
+def _stable_prefixed_id(prefix: str, value: str) -> str:
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}-{digest}"
+
+
 def retrieved_source_id_for_source(
     *, task_id: str, source: str, index: int = 0
 ) -> str:
@@ -1445,6 +1711,36 @@ def _final_report_section_artifact_event(
     }
 
 
+def _source_candidate_artifact_event(candidate: SourceCandidate) -> dict[str, Any]:
+    retrieved_at = (
+        candidate.retrieved_at.isoformat() if candidate.retrieved_at else None
+    )
+    return {
+        "event": "source_candidate_collected",
+        "type": "source_candidate_collected",
+        "payload": {
+            "candidate_id": candidate.candidate_id,
+            "title": candidate.title,
+            "summary": candidate.summary,
+            "snippet": candidate.summary,
+            "source_type": candidate.source_type,
+            "source_state": candidate.source_state,
+            "source_content_state": candidate.source_content_state,
+            "retrieval_status": candidate.retrieval_status,
+            "url": candidate.url,
+            "document_id": candidate.document_id,
+            "attached_document_id": candidate.attached_document_id,
+            "chunk_id": candidate.chunk_id,
+            "filename": candidate.filename,
+            "retrieved_at": retrieved_at,
+            "content_hash": candidate.content_hash,
+            "confidence": candidate.confidence,
+            "candidate": True,
+            "source_event_type": candidate.source_event_type,
+        },
+    }
+
+
 def _source_candidate_from_upload(source: UploadedDocumentSource) -> SourceCandidate:
     return SourceCandidate(
         candidate_id=source.candidate_id,
@@ -1463,6 +1759,179 @@ def _source_candidate_from_upload(source: UploadedDocumentSource) -> SourceCandi
         confidence=0.55,
         source_event_type="research_graph_upload_source_provider",
     )
+
+
+def _snippet_source_candidate_for_unit(
+    state: ResearchGraphState,
+    unit: ResearchUnit,
+    unit_index: int,
+) -> SourceCandidate:
+    query = unit.search_queries[0] if unit.search_queries else unit.question
+    candidate_id = _stable_prefixed_id(
+        "SRC-SNIP",
+        f"{state.task_id}:{unit.id}:{query}:{unit_index}",
+    )
+    return SourceCandidate(
+        candidate_id=candidate_id,
+        title=f"Search snippet candidate for {unit.id}",
+        summary=f"Snippet-only candidate from query: {query}",
+        source_type="web_search",
+        source_state="source_candidate",
+        source_content_state="snippet_only",
+        retrieval_status="candidate_only",
+        url=f"search://{unit.id}/{unit_index + 1}",
+        confidence=0.25,
+        source_event_type="research_graph_search",
+    )
+
+
+def _legacy_adapter_source_candidate_for_unit(
+    state: ResearchGraphState,
+    unit: ResearchUnit,
+    unit_index: int,
+) -> SourceCandidate:
+    candidate_id = _stable_prefixed_id(
+        "SRC-LEGACY",
+        f"{state.task_id}:{unit.id}:legacy_agent_adapter:{unit_index}",
+    )
+    return SourceCandidate(
+        candidate_id=candidate_id,
+        title=f"Legacy adapter fallback for {unit.id}",
+        summary=unit.question,
+        source_type="legacy_agent_adapter",
+        source_state="source_candidate",
+        source_content_state="content_bearing",
+        retrieval_status="pending",
+        url=f"graph://{unit.id}",
+        confidence=0.4,
+        source_event_type="research_graph_legacy_adapter",
+    )
+
+
+def _retrieved_source_from_upload_for_unit(
+    *,
+    state: ResearchGraphState,
+    unit: ResearchUnit,
+    upload_source: UploadedDocumentSource,
+    index: int,
+) -> RetrievedSource:
+    return RetrievedSource(
+        id=retrieved_source_id_for_source(
+            task_id=state.task_id,
+            source=(
+                f"langgraph://{unit.id}/upload/"
+                f"{upload_source.document_id}/{upload_source.chunk_id}"
+            ),
+            index=index,
+        ),
+        document_id=upload_source.document_id,
+        chunk_id=upload_source.chunk_id,
+        title=_upload_source_title(upload_source),
+        source_type="limira_upload",
+        retrieved_at=upload_source.retrieved_at,
+        content_hash=upload_source.content_hash,
+        quote_or_summary=upload_source.text,
+        tool_name="uploaded_document_search",
+        confidence=0.8,
+    )
+
+
+def _evidence_from_retrieved_source(
+    *,
+    state: ResearchGraphState,
+    unit: ResearchUnit,
+    retrieved_source: RetrievedSource,
+    index: int,
+) -> EvidenceItem:
+    source_key = (
+        f"langgraph://{unit.id}/evidence/"
+        f"{retrieved_source.source_type}/{retrieved_source.id}"
+    )
+    return EvidenceItem(
+        id=evidence_id_for_source(
+            task_id=state.task_id,
+            source=source_key,
+            index=index,
+        ),
+        retrieved_source_id=retrieved_source.id,
+        url=retrieved_source.url,
+        document_id=retrieved_source.document_id,
+        chunk_id=retrieved_source.chunk_id,
+        title=retrieved_source.title,
+        source_type=retrieved_source.source_type,
+        retrieved_at=retrieved_source.retrieved_at,
+        content_hash=retrieved_source.content_hash,
+        quote_or_summary=retrieved_source.quote_or_summary,
+        claims=[retrieved_source.quote_or_summary],
+        confidence=retrieved_source.confidence,
+        tool_name=retrieved_source.tool_name,
+    )
+
+
+def _upload_source_for_candidate(
+    candidate: SourceCandidate,
+    upload_sources: list[UploadedDocumentSource],
+) -> UploadedDocumentSource | None:
+    for source in upload_sources:
+        if (
+            source.document_id == candidate.document_id
+            and source.chunk_id == candidate.chunk_id
+        ):
+            return source
+    return None
+
+
+def _upload_source_matches_unit(
+    source: UploadedDocumentSource,
+    unit: ResearchUnit,
+) -> bool:
+    terms = _unit_search_terms(unit)
+    if not terms:
+        return True
+    corpus = " ".join(
+        item
+        for item in (
+            source.text,
+            source.snippet or "",
+            source.filename or "",
+            source.document_id,
+        )
+        if item
+    ).lower()
+    return any(term in corpus for term in terms)
+
+
+def _unit_search_terms(unit: ResearchUnit) -> list[str]:
+    raw_text = " ".join([unit.question, *unit.search_queries])
+    terms = re.findall(r"[a-z0-9][a-z0-9_-]{3,}", raw_text.lower())
+    stop_words = {
+        "about",
+        "against",
+        "changed",
+        "claim",
+        "claims",
+        "company",
+        "context",
+        "core",
+        "facts",
+        "official",
+        "primary",
+        "question",
+        "recent",
+        "report",
+        "reports",
+        "research",
+        "source",
+        "sources",
+        "timeline",
+        "update",
+        "verification",
+        "verify",
+        "what",
+        "which",
+        "with",
+    }
+    return [term for term in dict.fromkeys(terms) if term not in stop_words][:20]
 
 
 def _claim_state_from_findings(findings: list[CompressedFinding]) -> list[ResearchClaim]:

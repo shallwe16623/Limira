@@ -383,8 +383,14 @@ async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_check
     assert final_state.current_unit_id.startswith("unit-2-")
     assert final_state.research_units == final_state.plan.research_units
     assert all(unit.status == "completed" for unit in final_state.research_units)
-    assert final_state.source_candidates[0].document_id == "doc-upload"
-    assert final_state.source_candidates[0].chunk_id == "UPLOAD-CHUNK-001"
+    upload_candidates = [
+        candidate
+        for candidate in final_state.source_candidates
+        if candidate.source_type == "limira_upload"
+    ]
+    assert upload_candidates
+    assert upload_candidates[0].document_id == "doc-upload"
+    assert upload_candidates[0].chunk_id == "UPLOAD-CHUNK-001"
     assert final_state.retrieved_sources
     assert final_state.evidence
     assert final_state.findings
@@ -425,6 +431,195 @@ async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_check
     assert complete_checkpoint["phase"] == "complete"
     assert complete_checkpoint["status"] == "completed"
     assert complete_checkpoint["current_research_unit"].startswith("unit-2-")
+
+
+@pytest.mark.asyncio
+async def test_langgraph_research_unit_decomposes_upload_retrieval_without_legacy_adapter():
+    _FakeOrchestrator.task_descriptions = []
+    upload_text = "Uploaded document evidence confirms program X exposure."
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-upload-decomposed",
+        query="Assess uploaded document evidence",
+        document_ids=["doc-upload"],
+        upload_scope={
+            "document_count": 1,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-upload"],
+            "source_payloads": [
+                {
+                    "candidate_id": "SRC-UPLOAD-DECOMPOSED",
+                    "document_id": "doc-upload",
+                    "chunk_id": "UPLOAD-CHUNK-DECOMPOSED",
+                    "filename": "memo.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "b" * 64,
+                    "text": upload_text,
+                }
+            ],
+        },
+        max_units=1,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id="task-langgraph-upload-decomposed",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    assert _FakeOrchestrator.task_descriptions == []
+    final_state = result.state
+    assert any(
+        candidate.source_content_state == "snippet_only"
+        for candidate in final_state.source_candidates
+    )
+    assert any(
+        candidate.source_type == "limira_upload"
+        and candidate.source_content_state == "content_bearing"
+        for candidate in final_state.source_candidates
+    )
+    assert all(
+        source.source_type != "web_search"
+        for source in final_state.retrieved_sources
+    )
+    assert all(item.source_type != "web_search" for item in final_state.evidence)
+    assert any(
+        source.source_type == "limira_upload"
+        for source in final_state.retrieved_sources
+    )
+    assert any(item.source_type == "limira_upload" for item in final_state.evidence)
+    assert final_state.findings
+
+    typed_events = [
+        (index, item.get("type"), item.get("payload", {}).get("source_type"))
+        for index, item in enumerate(stream_queue.items)
+        if item.get("type")
+    ]
+    upload_retrieved_index = next(
+        index
+        for index, event_type, source_type in typed_events
+        if event_type == "retrieved_source_collected" and source_type == "limira_upload"
+    )
+    upload_evidence_index = next(
+        index
+        for index, event_type, source_type in typed_events
+        if event_type == "evidence_collected" and source_type == "limira_upload"
+    )
+    assert upload_retrieved_index < upload_evidence_index
+
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    executor_state = research_checkpoint["executor_state"]
+    unit_id = final_state.plan.research_units[0].id
+    assert executor_state["node"] == "LangGraphResearchUnitNode"
+    assert research_checkpoint["current_research_unit"] == unit_id
+    assert executor_state["current_unit_id"] == unit_id
+    assert executor_state["completed_unit_ids"] == [unit_id]
+    assert executor_state["source_candidate_count"] >= 2
+    assert executor_state["retrieved_source_count"] == len(final_state.retrieved_sources)
+    assert executor_state["evidence_count"] == len(final_state.evidence)
+    assert executor_state["finding_count"] == len(final_state.findings)
+    assert executor_state["resume_marker"] == "completed_unit_ids_available"
+    assert executor_state["legacy_adapter_calls"] == 0
+    assert executor_state["unit_substeps"][0]["steps"] == [
+        "search",
+        "retrieve",
+        "promote",
+        "synthesize",
+    ]
+    assert executor_state["unit_substeps"][0]["snippet_only_candidate_ids"]
+    assert executor_state["unit_substeps"][0]["retrieved_source_ids"]
+    assert executor_state["unit_substeps"][0]["evidence_ids"]
+    assert executor_state["unit_substeps"][0]["finding_ids"]
+    assert executor_state["unit_substeps"][0]["legacy_adapter_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_langgraph_research_unit_uses_legacy_only_as_fallback_retriever():
+    _FakeOrchestrator.task_descriptions = []
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-legacy-fallback",
+        query="Verify a company designation with primary sources",
+        max_units=1,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        task_id="task-langgraph-legacy-fallback",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    assert len(_FakeOrchestrator.task_descriptions) == 1
+    assert "## Research Unit Node" in _FakeOrchestrator.task_descriptions[0]
+    assert "## Limira Research Workflow" not in _FakeOrchestrator.task_descriptions[0]
+    assert any(
+        candidate.source_type == "legacy_agent_adapter"
+        for candidate in result.state.source_candidates
+    )
+    assert any(
+        source.source_type == "legacy_agent_adapter"
+        for source in result.state.retrieved_sources
+    )
+    assert any(
+        item.source_type == "legacy_agent_adapter"
+        for item in result.state.evidence
+    )
+
+    typed_events = [
+        (index, item.get("type"), item.get("payload", {}).get("source_type"))
+        for index, item in enumerate(stream_queue.items)
+        if item.get("type")
+    ]
+    legacy_candidate_index = next(
+        index
+        for index, event_type, source_type in typed_events
+        if event_type == "source_candidate_collected"
+        and source_type == "legacy_agent_adapter"
+    )
+    legacy_retrieved_index = next(
+        index
+        for index, event_type, source_type in typed_events
+        if event_type == "retrieved_source_collected"
+        and source_type == "legacy_agent_adapter"
+    )
+    legacy_evidence_index = next(
+        index
+        for index, event_type, source_type in typed_events
+        if event_type == "evidence_collected"
+        and source_type == "legacy_agent_adapter"
+    )
+    assert legacy_candidate_index < legacy_retrieved_index < legacy_evidence_index
+
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    executor_state = research_checkpoint["executor_state"]
+    assert executor_state["legacy_adapter_calls"] == 1
+    assert executor_state["unit_substeps"][0]["legacy_adapter_used"] is True
+    assert executor_state["unit_substeps"][0]["steps"] == [
+        "search",
+        "retrieve",
+        "promote",
+        "synthesize",
+    ]
 
 
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():

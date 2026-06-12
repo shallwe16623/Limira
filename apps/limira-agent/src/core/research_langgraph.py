@@ -22,7 +22,7 @@ from .research_graph import (
     _emit_graph_error,
     _emit_graph_phase,
     _validate_graph_final_outputs,
-    default_research_graph_nodes,
+    default_langgraph_research_graph_nodes,
 )
 
 
@@ -81,7 +81,7 @@ def build_langgraph_research_graph(
 
     graph = StateGraph(LangGraphRuntimeState)
     node_names: list[str] = []
-    for node in default_research_graph_nodes():
+    for node in default_langgraph_research_graph_nodes():
         node_name = node.phase.value
         node_names.append(node_name)
         graph.add_node(
