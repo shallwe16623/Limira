@@ -1165,10 +1165,10 @@ async def test_completed_task_backfills_final_report_from_runner_archive_trace()
     }
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("trace.json", json.dumps(trace, ensure_ascii=False))
+        archive.writestr("report.md", "# runner execution log")
         archive.writestr("metadata.json", "{}")
         archive.writestr("report.html", "<!doctype html><main></main>")
-        archive.writestr("report.md", "# runner execution log")
-        archive.writestr("trace.json", json.dumps(trace, ensure_ascii=False))
     archive_client = FakeArchiveClient(archive_buffer.getvalue())
 
     task = repo.create_task(

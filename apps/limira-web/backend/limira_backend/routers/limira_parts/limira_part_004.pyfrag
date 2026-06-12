@@ -1310,14 +1310,33 @@ def _has_authoritative_final_report(reports: list[LimiraGeneratedReport]) -> boo
 def _read_runner_archive_members(
     archive_bytes: bytes,
 ) -> tuple[str, list[dict[str, Any]]]:
-    validate_archive_zip(archive_bytes)
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        names = archive.namelist()
+        if "report.md" not in names or "trace.json" not in names:
+            raise HTTPException(status_code=502, detail="invalid_runner_archive_members")
+        if any(name.startswith("/") or ".." in name.split("/") for name in names):
+            raise HTTPException(status_code=502, detail="unsafe_runner_archive_member")
+        if any(
+            name
+            not in {
+                "trace.json",
+                "report.md",
+                "metadata.json",
+                "report.html",
+            }
+            for name in names
+        ):
+            raise HTTPException(status_code=502, detail="invalid_runner_archive_members")
         report_markdown = _report_markdown_from_value(
             _decode_archive_text_member(archive.read("report.md"))
         ).strip()
         trace_payload = _parse_archive_json_member(
             _decode_archive_text_member(archive.read("trace.json"))
         )
+        if "metadata.json" in names:
+            _parse_archive_json_member(
+                _decode_archive_text_member(archive.read("metadata.json"))
+            )
     trace_events = []
     if isinstance(trace_payload, Mapping):
         raw_events = trace_payload.get("events")
