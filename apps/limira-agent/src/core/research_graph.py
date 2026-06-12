@@ -1469,7 +1469,7 @@ def build_initial_research_graph(
         ],
         verification_strategy=(
             "Cross-check high-impact claims against at least two independent sources "
-            "or mark the claim as weak/contextual."
+            "or mark the claim as weak or insufficient."
         ),
     )
     return ResearchGraphState(

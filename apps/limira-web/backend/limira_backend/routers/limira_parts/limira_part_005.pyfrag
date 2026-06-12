@@ -715,6 +715,10 @@ EVIDENCE_REF_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])(EVID-(?:\d{3,}|[0-9a-fA-F]{12}))(?![A-Za-z0-9_-])"
 )
 EVIDENCE_REF_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
+VERIFIED_CLAIM_SUPPORT_TYPES = frozenset(
+    {"supported", "contradicted", "insufficient", "weak", "invalid_ref"}
+)
+VERIFIED_CLAIM_REF_REQUIRED_TYPES = frozenset({"supported", "contradicted"})
 
 
 def _evidence_refs_from_markdown(markdown: str) -> list[str]:
@@ -910,14 +914,15 @@ def _validate_verified_claim_artifact(artifact: Mapping[str, Any]) -> list[str]:
         "verified_claim requires claim",
     )
     support_type = str(artifact.get("support_type") or "").strip()
-    if support_type not in {"supports", "contradicts", "contextual", "weak"}:
+    if support_type not in VERIFIED_CLAIM_SUPPORT_TYPES:
         errors.append(
-            "verified_claim requires support_type supports, contradicts, contextual, or weak"
+            "verified_claim requires support_type supported, contradicted, "
+            "insufficient, weak, or invalid_ref"
         )
     refs = _lifecycle_evidence_refs(artifact)
-    if not refs:
+    if support_type in VERIFIED_CLAIM_REF_REQUIRED_TYPES and not refs:
         errors.append("verified_claim requires evidence_ids or evidence_refs")
-    else:
+    if refs:
         errors.extend(_invalid_lifecycle_evidence_ref_errors(refs, "verified_claim"))
     return errors
 
@@ -1021,7 +1026,7 @@ def _record_unsupported_verified_claim_warning(
     )
     known = _known_evidence_ids(repo, task_id)
     missing = [ref for ref in refs if ref not in known]
-    if support_type == "supports" and refs and not missing:
+    if support_type == "supported" and refs and not missing:
         return
     _record_artifact_trace_event_once(
         repo,

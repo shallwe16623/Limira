@@ -24,6 +24,10 @@ ARTIFACT_EVENT_TYPES: dict[str, str] = {
 }
 
 SUPPORTED_ARTIFACT_TYPES = frozenset(ARTIFACT_EVENT_TYPES)
+VERIFIED_CLAIM_SUPPORT_TYPES = frozenset(
+    {"supported", "contradicted", "insufficient", "weak", "invalid_ref"}
+)
+VERIFIED_CLAIM_REF_REQUIRED_TYPES = frozenset({"supported", "contradicted"})
 
 SENSITIVE_KEY_PARTS = {
     "api_key",
@@ -457,12 +461,15 @@ def _validate_finding_payload(payload: dict[str, Any]) -> list[str]:
 def _validate_verified_claim_payload(payload: dict[str, Any]) -> list[str]:
     errors = _require_any(payload, ("claim",), "verified_claim requires claim")
     support_type = str(payload.get("support_type") or "").strip()
-    if support_type not in {"supports", "contradicts", "contextual", "weak"}:
-        errors.append("verified_claim requires support_type supports, contradicts, contextual, or weak")
+    if support_type not in VERIFIED_CLAIM_SUPPORT_TYPES:
+        errors.append(
+            "verified_claim requires support_type supported, contradicted, "
+            "insufficient, weak, or invalid_ref"
+        )
     evidence_refs = _evidence_refs_from_payload(payload)
-    if not evidence_refs:
+    if support_type in VERIFIED_CLAIM_REF_REQUIRED_TYPES and not evidence_refs:
         errors.append("verified_claim requires evidence_ids or evidence_refs")
-    else:
+    if evidence_refs:
         errors.extend(_invalid_evidence_ref_errors(evidence_refs, "verified_claim"))
     return errors
 

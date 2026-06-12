@@ -92,7 +92,7 @@ def test_record_research_artifact_accepts_lifecycle_finding_and_verified_claim()
         "verified_claim",
         {
             "claim": "Claim",
-            "support_type": "supports",
+            "support_type": "supported",
             "evidence_ids": ["EVID-abcdef123456"],
         },
         confidence=0.8,
@@ -102,7 +102,7 @@ def test_record_research_artifact_accepts_lifecycle_finding_and_verified_claim()
     assert finding["payload"]["finding_id"].startswith("FIND-")
     assert claim["type"] == "verified_claim_collected"
     assert claim["payload"]["claim_id"].startswith("CLAIM-")
-    assert claim["payload"]["support_type"] == "supports"
+    assert claim["payload"]["support_type"] == "supported"
 
 
 def test_record_research_artifact_preserves_public_evidence_refs_for_claims():
@@ -114,7 +114,7 @@ def test_record_research_artifact_preserves_public_evidence_refs_for_claims():
     )
     claim = record_research_artifact(
         "verified_claim",
-        {"claim": "Claim from public refs", "support_type": "supports"},
+        {"claim": "Claim from public refs", "support_type": "supported"},
         evidence_refs=["EVID-001"],
         confidence=0.8,
     )
@@ -125,6 +125,61 @@ def test_record_research_artifact_preserves_public_evidence_refs_for_claims():
     assert claim["type"] == "verified_claim_collected"
     assert claim["payload"]["evidence_refs"] == ["EVID-001"]
     assert claim["payload"]["evidence_ids"] == ["EVID-001"]
+
+
+def test_record_research_artifact_accepts_ac6_verified_claim_support_types():
+    contradicted = record_research_artifact(
+        "verified_claim",
+        {
+            "claim": "Claim contradicted by evidence.",
+            "support_type": "contradicted",
+        },
+        evidence_refs=["EVID-001", "EVID-002"],
+        confidence=0.8,
+    )
+    assert contradicted["type"] == "verified_claim_collected"
+    assert contradicted["payload"]["evidence_refs"] == ["EVID-001", "EVID-002"]
+
+    for support_type in ("insufficient", "weak", "invalid_ref"):
+        claim = record_research_artifact(
+            "verified_claim",
+            {
+                "claim": f"Claim classified as {support_type}.",
+                "support_type": support_type,
+            },
+            confidence=0.6,
+        )
+        assert claim["type"] == "verified_claim_collected"
+        assert claim["payload"]["support_type"] == support_type
+        assert "evidence_refs" not in claim["payload"]
+
+
+def test_record_research_artifact_rejects_stale_or_malformed_verified_claim_refs():
+    stale = record_research_artifact(
+        "verified_claim",
+        {
+            "claim": "Stale support type.",
+            "support_type": "supports",
+        },
+        evidence_refs=["EVID-001"],
+        confidence=0.8,
+    )
+    malformed = record_research_artifact(
+        "verified_claim",
+        {
+            "claim": "Invalid ref diagnostic still validates ref shape.",
+            "support_type": "invalid_ref",
+        },
+        evidence_refs=["EVID-1"],
+        confidence=0.8,
+    )
+
+    assert stale["type"] == "artifact_warning"
+    assert stale["payload"]["warning"] == "invalid_artifact_payload"
+    assert any("support_type supported" in error for error in stale["payload"]["errors"])
+    assert malformed["type"] == "artifact_warning"
+    assert malformed["payload"]["warning"] == "invalid_artifact_payload"
+    assert malformed["payload"]["errors"] == ["invalid evidence_ref: EVID-1"]
 
 
 def test_extract_evidence_refs_accepts_numeric_and_hash_ids_in_first_seen_order():

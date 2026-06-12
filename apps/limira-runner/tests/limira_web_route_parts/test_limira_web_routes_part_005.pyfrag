@@ -2409,6 +2409,92 @@ async def test_source_lifecycle_artifacts_are_separate_and_warn_on_weak_claim():
 
 
 @pytest.mark.asyncio
+async def test_supported_verified_claim_ingests_without_false_warning_and_rejects_bad_invalid_ref():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    research = FakeResearchClient(
+        events=[
+            {
+                "type": "evidence_collected",
+                "payload": {
+                    "evidence_id": "EVID-001",
+                    "title": "Evidence page",
+                    "summary": "Content-bearing evidence.",
+                    "source_type": "web_page_summary",
+                    "source_state": "evidence_item",
+                    "source_content_state": "content_bearing",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "c" * 32,
+                },
+            },
+            {
+                "type": "verified_claim_collected",
+                "payload": {
+                    "claim_id": "CLAIM-SUPPORTED",
+                    "claim": "This claim is supported.",
+                    "support_type": "supported",
+                    "evidence_refs": ["EVID-001"],
+                    "confidence": 0.95,
+                },
+            },
+            {
+                "type": "verified_claim_collected",
+                "payload": {
+                    "claim_id": "CLAIM-BAD-INVALID-REF",
+                    "claim": "Malformed refs remain invalid even on invalid_ref claims.",
+                    "support_type": "invalid_ref",
+                    "evidence_refs": ["EVID-1"],
+                    "confidence": 0.95,
+                },
+            },
+        ]
+    )
+
+    created = await limira.create_research_task(
+        {"query": "supported verified claim"},
+        request=None,
+        user=user,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+    response = await limira.get_task_events(
+        task_id,
+        user=user,
+        repo=repo,
+        research_client=research,
+        runtime_state=limira.InMemoryLimiraRuntimeState(),
+    )
+    _parse_sse_chunks([chunk async for chunk in response.body_iterator])
+
+    artifacts = await limira.get_task_artifacts(task_id, user=user, repo=repo)
+    assert [claim["claim_id"] for claim in artifacts["verified_claims"]] == [
+        "CLAIM-SUPPORTED"
+    ]
+    assert artifacts["verified_claims"][0]["support_type"] == "supported"
+    assert artifacts["verified_claims"][0]["evidence_refs"] == ["EVID-001"]
+
+    warnings = [
+        event["payload"]
+        for event in repo.get_artifact_trace_events(task_id)
+        if event["type"] == "artifact_warning"
+    ]
+    assert not any(
+        warning.get("warning") == "unsupported_high_confidence_claim"
+        and warning.get("local_artifact_id") == "CLAIM-SUPPORTED"
+        for warning in warnings
+    )
+    bad_ref_warnings = [
+        warning
+        for warning in warnings
+        if warning.get("warning") == "invalid_artifact_payload"
+        and warning.get("artifact_type") == "verified_claim"
+    ]
+    assert bad_ref_warnings
+    assert any("EVID-1" in error for error in bad_ref_warnings[-1]["errors"])
+
+
+@pytest.mark.asyncio
 async def test_valid_evidence_without_id_gets_generated_before_validation():
     repo = limira.InMemoryLimiraTaskRepository()
     user = limira.LimiraUser("user-a")
