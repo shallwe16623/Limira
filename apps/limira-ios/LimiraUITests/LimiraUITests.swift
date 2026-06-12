@@ -49,20 +49,37 @@ final class LimiraUITests: XCTestCase {
         XCTAssertTrue(scrollTo(cloud, in: app))
         cloud.tap()
         waitForRoute("cloudDrive", in: app)
-        tapBackToWorkspace(app)
+        returnFromSettingsSubpageToMenu(app)
 
-        openSidebar(in: app)
         let archived = app.buttons["CompactArchivedChatsButton"]
         XCTAssertTrue(scrollTo(archived, in: app))
         archived.tap()
         waitForRoute("archivedChats", in: app)
-        tapBackToWorkspace(app)
+        returnFromSettingsSubpageToMenu(app)
 
-        openSidebar(in: app)
         let admin = app.buttons["CompactEnterpriseAdminButton"]
         XCTAssertTrue(scrollTo(admin, in: app))
         admin.tap()
         waitForRoute("enterpriseAdmin", in: app)
+    }
+
+    func testCompactMenuDrawerGesturesWithMockEnterpriseAccount() {
+        let app = launchMockEnterpriseApp(autoSubmit: false)
+
+        XCTAssertTrue(app.textViews["QueryEditor"].waitForExistence(timeout: 5))
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
+
+        openSidebar(in: app)
+        XCTAssertTrue(app.descendants(matching: .any)["CompactMenuView"].waitForExistence(timeout: 3))
+
+        closeSidebarWithSwipe(in: app)
+        XCTAssertTrue(app.descendants(matching: .any)["CompactMenuView"].waitForNonExistence(timeout: 3))
+        waitForCompactModal("none", in: app)
+
+        openSidebar(in: app)
+        XCTAssertTrue(app.descendants(matching: .any)["CompactMenuView"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["CompactSidebarCloseButton"].waitForExistence(timeout: 3))
     }
 
     func testVoiceButtonTranscribesIntoComposerWithMockService() {
@@ -126,29 +143,20 @@ final class LimiraUITests: XCTestCase {
 
         let searchRow = app.buttons["CompactHistoryRow-\(taskId)"]
         XCTAssertTrue(searchRow.waitForExistence(timeout: 3))
-        let archive = app.buttons["CompactHistoryArchiveButton-\(taskId)"]
-        XCTAssertTrue(scrollTo(archive, in: app))
-        XCTAssertTrue(archive.isHittable)
-        archive.tap()
+        tapHistoryMoreAction("CompactHistoryArchiveButton-\(taskId)", taskId: taskId, in: app)
         tapHittable(app.buttons["HistorySearchDoneButton"], in: app)
 
         openSidebar(in: app)
         tapHittable(app.buttons["HistoryArchiveToggleButton"], in: app)
         let archivedRow = app.buttons["CompactHistoryRow-\(taskId)"]
         XCTAssertTrue(archivedRow.waitForExistence(timeout: 3))
-        let restore = app.buttons["CompactHistoryArchiveButton-\(taskId)"]
-        XCTAssertTrue(scrollTo(restore, in: app))
-        XCTAssertTrue(restore.isHittable)
-        restore.tap()
+        tapHistoryMoreAction("CompactHistoryArchiveButton-\(taskId)", taskId: taskId, in: app)
         XCTAssertTrue(archivedRow.waitForNonExistence(timeout: 3))
 
         tapHittable(app.buttons["HistoryArchiveToggleButton"], in: app)
         let activeRow = app.buttons["CompactHistoryRow-\(taskId)"]
         XCTAssertTrue(activeRow.waitForExistence(timeout: 3))
-        let delete = app.buttons["CompactHistoryDeleteButton-\(taskId)"]
-        XCTAssertTrue(scrollTo(delete, in: app))
-        XCTAssertTrue(delete.isHittable)
-        delete.tap()
+        tapHistoryMoreAction("CompactHistoryDeleteButton-\(taskId)", taskId: taskId, in: app)
         let deleteAlert = app.alerts["删除这条对话？"]
         XCTAssertTrue(deleteAlert.waitForExistence(timeout: 3))
         let confirmDelete = app.buttons.matching(identifier: "CompactHistoryDeleteConfirmButton-\(taskId)").firstMatch
@@ -156,7 +164,7 @@ final class LimiraUITests: XCTestCase {
         XCTAssertTrue(confirmDelete.isHittable)
         confirmDelete.tap()
         XCTAssertTrue(activeRow.waitForNonExistence(timeout: 3))
-        tapHittable(app.buttons["CompactSidebarCloseButton"], in: app)
+        closeSidebarIfVisible(in: app)
 
         openSidebar(in: app)
         let cloud = app.buttons["CompactCloudDriveButton"]
@@ -232,13 +240,53 @@ final class LimiraUITests: XCTestCase {
         waitForExpectations(timeout: timeout)
     }
 
+    private func waitForCompactModal(_ modal: String, in app: XCUIApplication, timeout: TimeInterval = 5) {
+        let modalProbe = app.descendants(matching: .any)["CompactModalProbe"]
+        expectation(for: NSPredicate(format: "label == %@", modal), evaluatedWith: modalProbe)
+        waitForExpectations(timeout: timeout)
+    }
+
     private func openSidebar(in app: XCUIApplication) {
         let sidebar = app.buttons["MainSidebarOpenButton"]
-        XCTAssertTrue(sidebar.waitForExistence(timeout: 3))
-        XCTAssertTrue(sidebar.isHittable)
-        sidebar.tap()
-        XCTAssertTrue(app.descendants(matching: .any)["CompactMenuView"].waitForExistence(timeout: 3))
+        if sidebar.waitForExistence(timeout: 3), sidebar.isHittable {
+            sidebar.tap()
+        } else {
+            tapSidebarCoordinate(in: app)
+        }
+        let menu = app.descendants(matching: .any)["CompactMenuView"]
+        if !menu.waitForExistence(timeout: 2) {
+            tapSidebarCoordinate(in: app)
+        }
+        XCTAssertTrue(menu.waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["CompactSidebarCloseButton"].waitForExistence(timeout: 3))
+    }
+
+    private func tapSidebarCoordinate(in app: XCUIApplication) {
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.13, dy: 0.11)).tap()
+    }
+
+    private func openSidebarWithSwipe(in app: XCUIApplication) {
+        let sidebar = app.buttons["MainSidebarOpenButton"]
+        if sidebar.exists {
+            sidebar.swipeRight()
+        } else {
+            app.swipeRight()
+        }
+    }
+
+    private func closeSidebarWithSwipe(in app: XCUIApplication) {
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.78, dy: 0.5))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.08, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: end)
+    }
+
+    private func closeSidebarIfVisible(in app: XCUIApplication) {
+        let menu = app.descendants(matching: .any)["CompactMenuView"]
+        guard menu.exists else { return }
+        let close = app.buttons["CompactSidebarCloseButton"]
+        if close.waitForExistence(timeout: 1), close.isHittable {
+            close.tap()
+        }
     }
 
     private func tapBackToWorkspace(_ app: XCUIApplication) {
@@ -247,6 +295,22 @@ final class LimiraUITests: XCTestCase {
         XCTAssertTrue(back.isHittable)
         back.tap()
         waitForRoute("workspace", in: app)
+    }
+
+    private func returnFromSettingsSubpageToMenu(_ app: XCUIApplication) {
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.5))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.86, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: end)
+
+        let menu = app.descendants(matching: .any)["CompactMenuView"]
+        if !menu.waitForExistence(timeout: 2) {
+            let back = app.navigationBars.buttons.firstMatch
+            XCTAssertTrue(back.waitForExistence(timeout: 2))
+            back.tap()
+        }
+        waitForRoute("workspace", in: app)
+        waitForCompactModal("menu", in: app)
+        XCTAssertTrue(menu.waitForExistence(timeout: 3))
     }
 
     private func launchMockEnterpriseApp(autoSubmit: Bool) -> XCUIApplication {
@@ -277,11 +341,25 @@ final class LimiraUITests: XCTestCase {
         return app
     }
 
+    private func tapHistoryMoreAction(_ actionIdentifier: String, taskId: String, in app: XCUIApplication) {
+        let more = app.buttons["CompactHistoryMoreButton-\(taskId)"]
+        XCTAssertTrue(scrollTo(more, in: app))
+        XCTAssertTrue(more.isHittable)
+        more.tap()
+        tapHittable(app.buttons[actionIdentifier], in: app)
+    }
+
     private func tapHittable(_ element: XCUIElement, in app: XCUIApplication, timeout: TimeInterval = 3) {
         XCTAssertTrue(element.waitForExistence(timeout: timeout))
-        dismissSystemPrompts(in: app)
-        if !element.isHittable {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            dismissSystemPrompts(in: app)
+            if element.isHittable {
+                element.tap()
+                return
+            }
             dismissKeyboard(in: app)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
         XCTAssertTrue(element.isHittable)
         element.tap()

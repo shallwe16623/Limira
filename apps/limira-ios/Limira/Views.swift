@@ -40,6 +40,7 @@ struct UITestProbeHost: View {
             probe("TaskStatusProbe", model.status)
             probe("SelectedArtifactTabProbe", model.selectedTab.rawValue)
             probe("CompactRouteProbe", model.compactRoute.rawValue)
+            probe("CompactModalProbe", model.compactPresentation.modal?.rawValue ?? "none")
             probe("CompactArtifactModeProbe", model.compactShowingArtifacts ? "artifacts" : "conversation")
             probe("VoiceStatusProbe", model.voiceMessage)
             probe("QueryDraftProbe", model.queryDraft)
@@ -490,6 +491,30 @@ struct CompactShellView: View {
                     compactDestination(destination)
                 }
         }
+        .overlay {
+            CompactMenuWindowPanInstaller(
+                isEnabled: {
+                    model.compactPresentation.path.isEmpty && model.compactPresentation.modal == nil
+                },
+                onOpen: {
+                    model.presentCompactMenu()
+                }
+            )
+            .frame(width: 1, height: 1)
+            .accessibilityHidden(true)
+        }
+        .overlay {
+            CompactMenuClosePanInstaller(
+                isEnabled: {
+                    model.isCompactModalPresented(.menu)
+                },
+                onClose: {
+                    model.dismissCompactModal()
+                }
+            )
+            .frame(width: 1, height: 1)
+            .accessibilityHidden(true)
+        }
         .background(Color(.systemBackground))
         .overlay(alignment: .bottom) {
             if model.compactPresentation.modal == nil {
@@ -498,9 +523,21 @@ struct CompactShellView: View {
                     .allowsHitTesting(false)
             }
         }
-        .fullScreenCover(isPresented: compactModalBinding(.menu)) {
-            CompactMenuView()
+        .overlay(alignment: .leading) {
+            if model.compactPresentation.path.isEmpty && model.compactPresentation.modal == nil {
+                CompactMenuOpenEdgeZone {
+                    model.presentCompactMenu()
+                }
+                .accessibilityHidden(true)
+            }
         }
+        .overlay {
+            if model.isCompactModalPresented(.menu) {
+                CompactMenuDrawerLayer()
+                    .transition(.opacity.combined(with: .move(edge: .leading)))
+            }
+        }
+        .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.9), value: model.compactPresentation.modal)
         .sheet(item: compactSheetBinding) { modal in
             switch modal {
             case .historyFiles:
@@ -558,13 +595,10 @@ struct CompactShellView: View {
         switch destination {
         case .cloudDrive:
             CompactCloudDriveView(previewURL: $previewURL)
-                .navigationBarHidden(true)
         case .archivedChats:
             CompactArchivedHistoryView()
-                .navigationBarHidden(true)
         case .enterpriseAdmin:
             CompactEnterpriseAdminView()
-                .navigationBarHidden(true)
         case .artifacts:
             CompactArtifactDestinationView(previewURL: $previewURL)
                 .navigationBarHidden(true)
@@ -586,6 +620,387 @@ struct CompactShellView: View {
             }
         case .failure(let error):
             model.statusMessage = error.localizedDescription
+        }
+    }
+}
+
+struct CompactMenuDrawerLayer: View {
+    @EnvironmentObject private var model: AppViewModel
+    @GestureState private var dragOffset: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { proxy in
+            let drawerWidth = min(proxy.size.width * 0.9, 392)
+            let windowInsets = CompactDeviceSafeArea.insets
+            let topInset = max(proxy.safeAreaInsets.top, windowInsets.top, 44)
+            let bottomInset = max(proxy.safeAreaInsets.bottom, windowInsets.bottom)
+            let offset = min(0, dragOffset)
+            let progress = max(0, min(1, 1 + offset / drawerWidth))
+
+            ZStack(alignment: .leading) {
+                Color.black
+                    .opacity(0.22 * progress)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                    .onTapGesture {
+                        model.dismissCompactModal()
+                    }
+                    .accessibilityIdentifier("CompactMenuScrim")
+                    .zIndex(1)
+
+                CompactMenuView(topSafeAreaInset: topInset, bottomSafeAreaInset: bottomInset)
+                    .frame(width: drawerWidth, height: proxy.size.height, alignment: .leading)
+                    .clipped()
+                    .offset(x: offset)
+                    .transition(.move(edge: .leading))
+                    .accessibilityAddTraits(.isModal)
+                    .zIndex(2)
+            }
+            .contentShape(Rectangle())
+            .gesture(closeGesture(width: drawerWidth))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+        .ignoresSafeArea()
+    }
+
+    private func closeGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 18, coordinateSpace: .global)
+            .updating($dragOffset) { value, state, _ in
+                guard value.translation.width < 0 else { return }
+                state = max(value.translation.width, -width)
+            }
+            .onEnded { value in
+                let shouldClose = value.translation.width < -72
+                    || value.predictedEndTranslation.width < -width * 0.35
+                if shouldClose {
+                    model.dismissCompactModal()
+                }
+            }
+    }
+}
+
+private enum CompactDeviceSafeArea {
+    static var insets: UIEdgeInsets {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first { $0.isKeyWindow }?
+            .safeAreaInsets ?? .zero
+    }
+}
+
+struct CompactMenuOpenEdgeZone: View {
+    var onOpen: () -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            CompactMenuEdgePanGrabber(onOpen: onOpen)
+                .frame(width: 44, height: proxy.size.height)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+        .frame(width: 44)
+        .frame(maxHeight: .infinity)
+        .ignoresSafeArea(edges: [.top, .bottom])
+        .zIndex(20)
+    }
+
+}
+
+struct CompactMenuEdgePanGrabber: UIViewRepresentable {
+    var onOpen: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onOpen: onOpen)
+    }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: .zero)
+        view.backgroundColor = UIColor.black.withAlphaComponent(0.001)
+        view.isUserInteractionEnabled = true
+        let recognizer = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        recognizer.cancelsTouchesInView = false
+        recognizer.delaysTouchesBegan = false
+        recognizer.delaysTouchesEnded = false
+        recognizer.delegate = context.coordinator
+        view.addGestureRecognizer(recognizer)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.onOpen = onOpen
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var onOpen: () -> Void
+        private var didOpen = false
+
+        init(onOpen: @escaping () -> Void) {
+            self.onOpen = onOpen
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            let translation = recognizer.translation(in: view)
+            let predictedX = translation.x + recognizer.velocity(in: view).x * 0.08
+            switch recognizer.state {
+            case .began:
+                didOpen = false
+            case .changed, .ended:
+                let movedRight = translation.x > 12 || predictedX > 24
+                let mostlyHorizontal = abs(translation.y) < 180
+                if !didOpen && movedRight && mostlyHorizontal {
+                    didOpen = true
+                    DispatchQueue.main.async {
+                        self.onOpen()
+                    }
+                }
+            case .cancelled, .failed:
+                didOpen = false
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let view = gestureRecognizer.view,
+                  let pan = gestureRecognizer as? UIPanGestureRecognizer else {
+                return true
+            }
+            let velocity = pan.velocity(in: view)
+            return velocity.x > 40 && abs(velocity.x) > abs(velocity.y) * 1.2
+        }
+    }
+}
+
+struct CompactMenuWindowPanInstaller: UIViewRepresentable {
+    var isEnabled: () -> Bool
+    var onOpen: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(isEnabled: isEnabled, onOpen: onOpen)
+    }
+
+    func makeUIView(context: Context) -> InstallingView {
+        let view = InstallingView(frame: .zero)
+        view.onWindowChange = { [weak coordinator = context.coordinator] window in
+            coordinator?.install(on: window)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: InstallingView, context: Context) {
+        context.coordinator.isEnabled = isEnabled
+        context.coordinator.onOpen = onOpen
+        context.coordinator.install(on: uiView.window)
+    }
+
+    static func dismantleUIView(_ uiView: InstallingView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class InstallingView: UIView {
+        var onWindowChange: ((UIWindow?) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            onWindowChange?(window)
+        }
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var isEnabled: () -> Bool
+        var onOpen: () -> Void
+        private weak var installedWindow: UIWindow?
+        private weak var edgeRecognizer: UIScreenEdgePanGestureRecognizer?
+        private var didOpen = false
+
+        init(isEnabled: @escaping () -> Bool, onOpen: @escaping () -> Void) {
+            self.isEnabled = isEnabled
+            self.onOpen = onOpen
+        }
+
+        func install(on window: UIWindow?) {
+            guard installedWindow !== window else { return }
+            uninstall()
+            guard let window else { return }
+
+            let edgeRecognizer = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+            edgeRecognizer.edges = .left
+            configure(edgeRecognizer)
+            window.addGestureRecognizer(edgeRecognizer)
+
+            self.installedWindow = window
+            self.edgeRecognizer = edgeRecognizer
+        }
+
+        func uninstall() {
+            if let edgeRecognizer, let installedWindow {
+                installedWindow.removeGestureRecognizer(edgeRecognizer)
+            }
+            edgeRecognizer = nil
+            installedWindow = nil
+        }
+
+        private func configure(_ recognizer: UIPanGestureRecognizer) {
+            recognizer.cancelsTouchesInView = false
+            recognizer.delaysTouchesBegan = false
+            recognizer.delaysTouchesEnded = false
+            recognizer.delegate = self
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard isEnabled(), let view = recognizer.view else { return }
+            let translation = recognizer.translation(in: view)
+            let predictedX = translation.x + recognizer.velocity(in: view).x * 0.08
+            switch recognizer.state {
+            case .began:
+                didOpen = false
+            case .changed, .ended:
+                let mostlyHorizontal = abs(translation.y) < 180
+                let isEdgeSwipe = recognizer is UIScreenEdgePanGestureRecognizer
+                let movedRight = isEdgeSwipe
+                    ? (translation.x > 8 || predictedX > 18)
+                    : (translation.x > 24 || predictedX > 48)
+                if !didOpen && mostlyHorizontal && movedRight {
+                    didOpen = true
+                    DispatchQueue.main.async {
+                        self.onOpen()
+                    }
+                }
+            case .cancelled, .failed:
+                didOpen = false
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard isEnabled(), let view = gestureRecognizer.view else { return false }
+            if gestureRecognizer is UIScreenEdgePanGestureRecognizer {
+                return true
+            }
+            let location = gestureRecognizer.location(in: view)
+            let velocity = (gestureRecognizer as? UIPanGestureRecognizer)?.velocity(in: view) ?? .zero
+            let isRightward = velocity.x > 80
+            let isMostlyHorizontal = abs(velocity.x) > abs(velocity.y) * 1.4
+            return location.x <= 28 && isRightward && isMostlyHorizontal
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+    }
+}
+
+struct CompactMenuClosePanInstaller: UIViewRepresentable {
+    var isEnabled: () -> Bool
+    var onClose: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(isEnabled: isEnabled, onClose: onClose)
+    }
+
+    func makeUIView(context: Context) -> InstallingView {
+        let view = InstallingView(frame: .zero)
+        view.onWindowChange = { [weak coordinator = context.coordinator] window in
+            coordinator?.install(on: window)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: InstallingView, context: Context) {
+        context.coordinator.isEnabled = isEnabled
+        context.coordinator.onClose = onClose
+        context.coordinator.install(on: uiView.window)
+    }
+
+    static func dismantleUIView(_ uiView: InstallingView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class InstallingView: UIView {
+        var onWindowChange: ((UIWindow?) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            onWindowChange?(window)
+        }
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var isEnabled: () -> Bool
+        var onClose: () -> Void
+        private weak var installedWindow: UIWindow?
+        private weak var recognizer: UIPanGestureRecognizer?
+        private var didClose = false
+
+        init(isEnabled: @escaping () -> Bool, onClose: @escaping () -> Void) {
+            self.isEnabled = isEnabled
+            self.onClose = onClose
+        }
+
+        func install(on window: UIWindow?) {
+            guard installedWindow !== window else { return }
+            uninstall()
+            guard let window else { return }
+
+            let recognizer = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+            recognizer.cancelsTouchesInView = false
+            recognizer.delaysTouchesBegan = false
+            recognizer.delaysTouchesEnded = false
+            recognizer.delegate = self
+            window.addGestureRecognizer(recognizer)
+
+            installedWindow = window
+            self.recognizer = recognizer
+        }
+
+        func uninstall() {
+            if let recognizer, let installedWindow {
+                installedWindow.removeGestureRecognizer(recognizer)
+            }
+            recognizer = nil
+            installedWindow = nil
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            guard isEnabled(), let view = recognizer.view else { return }
+            let translation = recognizer.translation(in: view)
+            let predictedX = translation.x + recognizer.velocity(in: view).x * 0.08
+            switch recognizer.state {
+            case .began:
+                didClose = false
+            case .changed, .ended:
+                let movedLeft = translation.x < -36 || predictedX < -64
+                let mostlyHorizontal = abs(translation.x) > abs(translation.y) * 1.25
+                if !didClose && movedLeft && mostlyHorizontal {
+                    didClose = true
+                    DispatchQueue.main.async {
+                        self.onClose()
+                    }
+                }
+            case .cancelled, .failed:
+                didClose = false
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard isEnabled(), let view = gestureRecognizer.view,
+                  let pan = gestureRecognizer as? UIPanGestureRecognizer else {
+                return false
+            }
+            let velocity = pan.velocity(in: view)
+            return velocity.x < -80 && abs(velocity.x) > abs(velocity.y) * 1.25
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
         }
     }
 }
@@ -646,20 +1061,8 @@ struct CompactWorkspaceHeader: View {
 
     var body: some View {
         HStack(spacing: 18) {
-            Button(action: openSidebar) {
-                ZStack {
-                    Rectangle()
-                        .fill(Color(.systemBackground).opacity(0.001))
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 22, weight: .semibold))
-                }
+            CompactSidebarHandle(openSidebar: openSidebar)
                 .frame(width: 52, height: 52)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.primary)
-            .accessibilityLabel("打开侧边栏")
-            .accessibilityIdentifier("MainSidebarOpenButton")
 
             Text("limira OSINT")
                 .font(.title3.weight(.bold))
@@ -669,7 +1072,89 @@ struct CompactWorkspaceHeader: View {
         }
         .padding(.horizontal, 20)
         .frame(height: 64)
+        .contentShape(Rectangle())
+        .simultaneousGesture(openSidebarDrag, including: .all)
         .background(Color(.systemBackground))
+    }
+
+    private var openSidebarDrag: some Gesture {
+        DragGesture(minimumDistance: 16, coordinateSpace: .global)
+            .onEnded { value in
+                let movedRight = value.translation.width > 44 || value.predictedEndTranslation.width > 88
+                let mostlyHorizontal = abs(value.translation.height) < 80
+                if movedRight && mostlyHorizontal {
+                    openSidebar()
+                }
+            }
+    }
+}
+
+struct CompactSidebarHandle: UIViewRepresentable {
+    var openSidebar: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(openSidebar: openSidebar)
+    }
+
+    func makeUIView(context: Context) -> UIButton {
+        let button = UIButton(type: .system)
+        let image = UIImage(systemName: "line.3.horizontal", withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold))
+        button.setImage(image, for: .normal)
+        button.tintColor = .label
+        button.backgroundColor = .clear
+        button.accessibilityLabel = "打开侧边栏"
+        button.accessibilityIdentifier = "MainSidebarOpenButton"
+        button.addTarget(context.coordinator, action: #selector(Coordinator.handleTap), for: .touchUpInside)
+
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        pan.cancelsTouchesInView = false
+        pan.delaysTouchesBegan = false
+        pan.delaysTouchesEnded = false
+        pan.delegate = context.coordinator
+        button.addGestureRecognizer(pan)
+        return button
+    }
+
+    func updateUIView(_ uiView: UIButton, context: Context) {
+        context.coordinator.openSidebar = openSidebar
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var openSidebar: () -> Void
+        private var didOpen = false
+
+        init(openSidebar: @escaping () -> Void) {
+            self.openSidebar = openSidebar
+        }
+
+        @objc func handleTap() {
+            openSidebar()
+        }
+
+        @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
+            let view = recognizer.view
+            let translation = recognizer.translation(in: view)
+            let predictedX = translation.x + recognizer.velocity(in: view).x * 0.08
+            switch recognizer.state {
+            case .began:
+                didOpen = false
+            case .changed, .ended:
+                let movedRight = translation.x > 18 || predictedX > 36
+                let mostlyHorizontal = abs(translation.y) < 90
+                if !didOpen && movedRight && mostlyHorizontal {
+                    didOpen = true
+                    openSidebar()
+                }
+            case .cancelled, .failed:
+                didOpen = false
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
     }
 }
 
@@ -716,43 +1201,562 @@ struct CompactMessageTimeline: View {
     @EnvironmentObject private var model: AppViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 22) {
             ForEach(model.messages.suffix(80)) { message in
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: icon(for: message.role))
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(color(for: message.role))
-                            .frame(width: 28, height: 28)
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(message.text)
-                                .font(.body)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            CompactMessageActions(message: message)
-                            if message.isReport {
-                                CompactReportControls(message: message)
-                            }
-                        }
-                    }
-                }
+                CompactMessageRow(message: message)
             }
         }
         .accessibilityIdentifier("MessageTimeline")
     }
+}
 
-    private func icon(for role: AppMessage.Role) -> String {
-        switch role {
-        case .user: return "person.fill"
-        case .assistant: return "sparkles"
-        case .system: return "gearshape"
-        case .error: return "exclamationmark.triangle.fill"
+struct CompactMessageRow: View {
+    var message: AppMessage
+
+    var body: some View {
+        switch message.role {
+        case .user:
+            userMessage
+        case .error:
+            statusMessage(tint: .red, icon: "exclamationmark.triangle.fill")
+        case .system:
+            statusMessage(tint: .secondary, icon: "info.circle")
+        case .assistant:
+            assistantMessage
         }
     }
 
-    private func color(for role: AppMessage.Role) -> Color {
-        role == .error ? .red : .accentColor
+    private var userMessage: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            Text(message.text)
+                .font(.body)
+                .lineSpacing(4)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .frame(maxWidth: 310, alignment: .trailing)
+            CompactMessageActions(message: message)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.leading, 44)
+    }
+
+    private var assistantMessage: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if message.isReport {
+                ReportMessageBody(markdown: message.text)
+            } else {
+                Text(message.text)
+                    .font(.body)
+                    .lineSpacing(5)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            CompactMessageActions(message: message)
+            if message.isReport {
+                CompactReportControls(message: message)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func statusMessage(tint: Color, icon: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(tint)
+            Text(message.text)
+                .font(.callout)
+                .foregroundStyle(tint)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground).opacity(0.75))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+struct ReportMessageBody: View {
+    var markdown: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MarkdownBodyText(markdown: markdown)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct MarkdownBodyText: View {
+    var markdown: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(ReportMarkdownParser.parse(markdown).enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: ReportMarkdownBlock) -> some View {
+        switch block {
+        case .heading(let level, let text):
+            InlineMarkdownText(text: text)
+                .font(font(forHeadingLevel: level))
+                .lineSpacing(3)
+                .padding(.top, level <= 2 ? 4 : 0)
+        case .paragraph(let text):
+            InlineMarkdownText(text: text)
+                .font(.body)
+                .lineSpacing(5)
+        case .unorderedList(let items):
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("•")
+                            .font(.body.weight(.semibold))
+                        InlineMarkdownText(text: item)
+                            .font(.body)
+                            .lineSpacing(4)
+                    }
+                }
+            }
+        case .orderedList(let items):
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(index + 1).")
+                            .font(.body.weight(.semibold))
+                            .monospacedDigit()
+                            .frame(minWidth: 24, alignment: .trailing)
+                        InlineMarkdownText(text: item)
+                            .font(.body)
+                            .lineSpacing(4)
+                    }
+                }
+            }
+        case .quote(let text):
+            HStack(alignment: .top, spacing: 10) {
+                Rectangle()
+                    .fill(Color(.separator))
+                    .frame(width: 3)
+                InlineMarkdownText(text: text)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(4)
+            }
+        case .horizontalRule:
+            Divider()
+                .padding(.vertical, 4)
+        case .table(let headers, let rows):
+            ReportMarkdownTable(headers: headers, rows: rows)
+        case .code(let text):
+            Text(text)
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+    }
+
+    private func font(forHeadingLevel level: Int) -> Font {
+        switch level {
+        case 1:
+            return .title3.weight(.semibold)
+        case 2:
+            return .headline.weight(.semibold)
+        case 3:
+            return .subheadline.weight(.semibold)
+        default:
+            return .body.weight(.semibold)
+        }
+    }
+}
+
+struct InlineMarkdownSegment: Equatable {
+    var text: String
+    var isBold = false
+    var isItalic = false
+    var isCode = false
+}
+
+enum InlineMarkdownParser {
+    static func parse(_ text: String) -> [InlineMarkdownSegment] {
+        var segments: [InlineMarkdownSegment] = []
+        var buffer = ""
+        var index = text.startIndex
+        var isBold = false
+        var isItalic = false
+        var isCode = false
+
+        func flush() {
+            guard !buffer.isEmpty else { return }
+            segments.append(
+                InlineMarkdownSegment(
+                    text: buffer,
+                    isBold: isBold,
+                    isItalic: isItalic,
+                    isCode: isCode
+                )
+            )
+            buffer = ""
+        }
+
+        while index < text.endIndex {
+            if text[index] == "\\" {
+                let next = text.index(after: index)
+                if next < text.endIndex {
+                    buffer.append(text[next])
+                    index = text.index(after: next)
+                    continue
+                }
+            }
+
+            if hasDelimiter("`", in: text, at: index) {
+                let next = text.index(after: index)
+                if isCode || containsDelimiter("`", in: text, after: next) {
+                    flush()
+                    isCode.toggle()
+                    index = next
+                    continue
+                }
+            }
+
+            if !isCode, hasDelimiter("**", in: text, at: index) {
+                let next = text.index(index, offsetBy: 2)
+                if isBold || containsDelimiter("**", in: text, after: next) {
+                    flush()
+                    isBold.toggle()
+                    index = next
+                    continue
+                }
+            }
+
+            if !isCode, hasDelimiter("__", in: text, at: index) {
+                let next = text.index(index, offsetBy: 2)
+                if isBold || containsDelimiter("__", in: text, after: next) {
+                    flush()
+                    isBold.toggle()
+                    index = next
+                    continue
+                }
+            }
+
+            if !isCode, text[index] == "*" {
+                let next = text.index(after: index)
+                if isItalic || containsDelimiter("*", in: text, after: next) {
+                    flush()
+                    isItalic.toggle()
+                    index = next
+                    continue
+                }
+            }
+
+            buffer.append(text[index])
+            index = text.index(after: index)
+        }
+
+        flush()
+        return segments
+    }
+
+    private static func hasDelimiter(_ delimiter: String, in text: String, at index: String.Index) -> Bool {
+        text[index...].hasPrefix(delimiter)
+    }
+
+    private static func containsDelimiter(_ delimiter: String, in text: String, after index: String.Index) -> Bool {
+        index < text.endIndex && text[index...].range(of: delimiter) != nil
+    }
+}
+
+struct InlineMarkdownText: View {
+    var text: String
+
+    var body: some View {
+        renderedText
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var renderedText: Text {
+        InlineMarkdownParser.parse(text).reduce(Text("")) { partial, segment in
+            var piece = Text(segment.text)
+            if segment.isCode {
+                piece = piece.monospaced()
+            }
+            if segment.isBold {
+                piece = piece.bold()
+            }
+            if segment.isItalic {
+                piece = piece.italic()
+            }
+            return partial + piece
+        }
+    }
+}
+
+struct ReportMarkdownTable: View {
+    var headers: [String]
+    var rows: [[String]]
+
+    private var columnCount: Int {
+        max(headers.count, rows.map(\.count).max() ?? 0)
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                tableRow(headers, isHeader: true)
+                Divider()
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    tableRow(row, isHeader: false)
+                    Divider()
+                }
+            }
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.45), lineWidth: 1)
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func tableRow(_ cells: [String], isHeader: Bool) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(0..<columnCount, id: \.self) { index in
+                InlineMarkdownText(text: cell(at: index, in: cells))
+                    .font(isHeader ? .subheadline.weight(.semibold) : .callout)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 9)
+                    .frame(width: width(forColumn: index), alignment: .leading)
+                    .background(isHeader ? Color(.secondarySystemBackground) : Color(.systemBackground))
+            }
+        }
+    }
+
+    private func cell(at index: Int, in cells: [String]) -> String {
+        index < cells.count ? cells[index] : ""
+    }
+
+    private func width(forColumn index: Int) -> CGFloat {
+        if columnCount >= 4 {
+            switch index {
+            case 0:
+                return 136
+            case 1, 2:
+                return 82
+            default:
+                return 176
+            }
+        }
+        return columnCount <= 2 ? 156 : 124
+    }
+}
+
+enum ReportMarkdownBlock: Equatable {
+    case heading(level: Int, text: String)
+    case paragraph(String)
+    case unorderedList([String])
+    case orderedList([String])
+    case quote(String)
+    case horizontalRule
+    case table(headers: [String], rows: [[String]])
+    case code(String)
+}
+
+enum ReportMarkdownParser {
+    static func parse(_ markdown: String) -> [ReportMarkdownBlock] {
+        let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        var blocks: [ReportMarkdownBlock] = []
+        var index = 0
+
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if trimmed.isEmpty {
+                index += 1
+                continue
+            }
+
+            if isFence(trimmed) {
+                let fence = String(trimmed.prefix(3))
+                var codeLines: [String] = []
+                index += 1
+                while index < lines.count && !lines[index].trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(fence) {
+                    codeLines.append(lines[index])
+                    index += 1
+                }
+                if index < lines.count {
+                    index += 1
+                }
+                blocks.append(.code(codeLines.joined(separator: "\n")))
+                continue
+            }
+
+            if let heading = parseHeading(trimmed) {
+                blocks.append(.heading(level: heading.level, text: heading.text))
+                index += 1
+                continue
+            }
+
+            if isHorizontalRule(trimmed) {
+                blocks.append(.horizontalRule)
+                index += 1
+                continue
+            }
+
+            if index + 1 < lines.count, isTableSeparator(lines[index + 1]) {
+                let headers = splitTableRow(line)
+                index += 2
+                var rows: [[String]] = []
+                while index < lines.count {
+                    let rowLine = lines[index]
+                    let rowTrimmed = rowLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard rowTrimmed.contains("|"), !rowTrimmed.isEmpty else { break }
+                    rows.append(splitTableRow(rowLine))
+                    index += 1
+                }
+                blocks.append(.table(headers: headers, rows: rows))
+                continue
+            }
+
+            if let item = parseUnorderedListItem(trimmed) {
+                var items = [item]
+                index += 1
+                while index < lines.count, let next = parseUnorderedListItem(lines[index].trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    items.append(next)
+                    index += 1
+                }
+                blocks.append(.unorderedList(items))
+                continue
+            }
+
+            if let item = parseOrderedListItem(trimmed) {
+                var items = [item]
+                index += 1
+                while index < lines.count, let next = parseOrderedListItem(lines[index].trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    items.append(next)
+                    index += 1
+                }
+                blocks.append(.orderedList(items))
+                continue
+            }
+
+            if trimmed.hasPrefix(">") {
+                var quoteLines = [trimmed.removingPrefix(">").trimmingCharacters(in: .whitespaces)]
+                index += 1
+                while index < lines.count {
+                    let next = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard next.hasPrefix(">") else { break }
+                    quoteLines.append(next.removingPrefix(">").trimmingCharacters(in: .whitespaces))
+                    index += 1
+                }
+                blocks.append(.quote(quoteLines.joined(separator: "\n")))
+                continue
+            }
+
+            var paragraphLines = [trimmed]
+            index += 1
+            while index < lines.count {
+                let next = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                if next.isEmpty
+                    || isFence(next)
+                    || parseHeading(next) != nil
+                    || isHorizontalRule(next)
+                    || parseUnorderedListItem(next) != nil
+                    || parseOrderedListItem(next) != nil
+                    || next.hasPrefix(">")
+                    || (index + 1 < lines.count && isTableSeparator(lines[index + 1])) {
+                    break
+                }
+                paragraphLines.append(next)
+                index += 1
+            }
+            blocks.append(.paragraph(paragraphLines.joined(separator: "\n")))
+        }
+
+        return blocks
+    }
+
+    private static func isFence(_ line: String) -> Bool {
+        line.hasPrefix("```") || line.hasPrefix("~~~")
+    }
+
+    private static func parseHeading(_ line: String) -> (level: Int, text: String)? {
+        let level = line.prefix(while: { $0 == "#" }).count
+        guard level > 0, level <= 6 else { return nil }
+        let rest = line.dropFirst(level)
+        guard rest.first == " " || rest.first == "\t" else { return nil }
+        return (level, String(rest).trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func isHorizontalRule(_ line: String) -> Bool {
+        let compact = line.replacingOccurrences(of: " ", with: "")
+        guard compact.count >= 3, let first = compact.first, ["-", "*", "_"].contains(first) else { return false }
+        return compact.allSatisfy { $0 == first }
+    }
+
+    private static func parseUnorderedListItem(_ line: String) -> String? {
+        for prefix in ["- ", "* ", "+ ", "• "] where line.hasPrefix(prefix) {
+            return line.removingPrefix(prefix).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    private static func parseOrderedListItem(_ line: String) -> String? {
+        guard let dot = line.firstIndex(of: ".") else { return nil }
+        let number = line[..<dot]
+        guard !number.isEmpty, number.allSatisfy(\.isNumber) else { return nil }
+        let rest = line[line.index(after: dot)...]
+        guard rest.first == " " || rest.first == "\t" else { return nil }
+        return String(rest).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = splitTableRow(line)
+        guard !cells.isEmpty else { return false }
+        return cells.allSatisfy { cell in
+            let compact = cell.replacingOccurrences(of: " ", with: "")
+            guard compact.count >= 3 else { return false }
+            let trimmed = compact.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return trimmed.count >= 3 && trimmed.allSatisfy { $0 == "-" }
+        }
+    }
+
+    private static func splitTableRow(_ line: String) -> [String] {
+        var row = line.trimmingCharacters(in: .whitespaces)
+        if row.hasPrefix("|") {
+            row.removeFirst()
+        }
+        if row.hasSuffix("|") {
+            row.removeLast()
+        }
+        return row
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+}
+
+private extension String {
+    func removingPrefix(_ prefix: String) -> String {
+        hasPrefix(prefix) ? String(dropFirst(prefix.count)) : self
     }
 }
 
@@ -1137,6 +2141,8 @@ struct CompactSidebarSheet: View {
 
 struct CompactMenuView: View {
     @EnvironmentObject private var model: AppViewModel
+    var topSafeAreaInset: CGFloat = 0
+    var bottomSafeAreaInset: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1156,7 +2162,7 @@ struct CompactMenuView: View {
                 .accessibilityIdentifier("CompactSidebarCloseButton")
             }
             .padding(.horizontal, 20)
-            .padding(.top, 18)
+            .padding(.top, 18 + topSafeAreaInset)
             .padding(.bottom, 12)
 
             Divider()
@@ -1203,15 +2209,30 @@ struct CompactMenuView: View {
                             }
                             .buttonStyle(.plain)
                             Spacer()
-                            Button("搜索") {
+                            Button {
                                 model.presentCompactHistorySearch()
+                            } label: {
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .frame(width: 34, height: 34)
                             }
-                            .font(.subheadline)
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("搜索")
                             .accessibilityIdentifier("HistorySearchButton")
-                            Button(model.showArchivedHistory ? "当前" : "已归档") {
+                            Button {
                                 Task { await model.toggleHistoryArchiveFilter() }
+                            } label: {
+                                Text(model.showArchivedHistory ? "当前" : "归档")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 30)
+                                    .background(Color(.tertiarySystemFill))
+                                    .clipShape(Capsule())
                             }
-                            .font(.subheadline)
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(model.showArchivedHistory ? "显示当前对话" : "显示已归档对话")
                             .accessibilityIdentifier("HistoryArchiveToggleButton")
                         }
 
@@ -1224,14 +2245,13 @@ struct CompactMenuView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.vertical, 18)
                             } else {
-                                VStack(alignment: .leading, spacing: 0) {
+                                VStack(alignment: .leading, spacing: 4) {
                                     ForEach(source) { task in
                                         CompactTaskHistoryRow(
                                             task: task,
                                             archivedList: model.showArchivedHistory || task.historyArchived == true,
                                             closeAction: { model.dismissCompactModal() }
                                         )
-                                        Divider()
                                     }
                                 }
                             }
@@ -1264,12 +2284,15 @@ struct CompactMenuView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 20)
-            .padding(.vertical, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 16 + bottomSafeAreaInset)
             .background(Color(.systemBackground))
             .overlay(alignment: .top) {
                 Divider()
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("CompactMenuView")
         .background {
             Color(.systemGroupedBackground)
             AccessibilityProbe(id: "CompactMenuView")
@@ -1312,20 +2335,20 @@ struct CompactSettingsMenu: View {
 
             CompactSettingsButton(title: "管理云盘", systemImage: "externaldrive", identifier: "CompactCloudDriveButton") {
                 Task {
-                    await model.openCompactRoute(.cloudDrive)
+                    await model.openCompactRoute(.cloudDrive, returnTarget: .menu)
                 }
             }
 
             CompactSettingsButton(title: "已归档对话", systemImage: "archivebox", identifier: "CompactArchivedChatsButton") {
                 Task {
-                    await model.openCompactRoute(.archivedChats)
+                    await model.openCompactRoute(.archivedChats, returnTarget: .menu)
                 }
             }
 
             if model.user?.isEnterpriseAdmin == true {
                 CompactSettingsButton(title: "单位管理", systemImage: "building.2", identifier: "CompactEnterpriseAdminButton") {
                     Task {
-                        await model.openCompactRoute(.enterpriseAdmin)
+                        await model.openCompactRoute(.enterpriseAdmin, returnTarget: .menu)
                     }
                 }
             }
@@ -1376,7 +2399,7 @@ struct CompactTaskHistoryRow: View {
     var closeAction: (() -> Void)?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             Button {
                 Task {
                     await model.selectTask(task)
@@ -1385,19 +2408,26 @@ struct CompactTaskHistoryRow: View {
                 }
             } label: {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(task.query)
+                    Text(titleText)
+                        .font(.callout.weight(isSelected ? .semibold : .regular))
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
-                    Text("\(task.status) · \(task.archiveStatus ?? "pending")")
-                        .font(.caption)
+                        .multilineTextAlignment(.leading)
+                        .truncationMode(.tail)
+                    Text(metaText)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .contentShape(Rectangle())
             .accessibilityIdentifier("CompactHistoryRow-\(task.taskId)")
 
-            HStack {
-                Button(archivedList || task.historyArchived == true ? "恢复" : "归档") {
+            Menu {
+                Button(archiveActionTitle) {
                     Task {
                         if archivedList || task.historyArchived == true {
                             await model.restore(task)
@@ -1407,15 +2437,27 @@ struct CompactTaskHistoryRow: View {
                     }
                 }
                 .accessibilityIdentifier("CompactHistoryArchiveButton-\(task.taskId)")
+
                 Button("删除", role: .destructive) {
                     confirmDelete = true
                 }
                 .accessibilityIdentifier("CompactHistoryDeleteButton-\(task.taskId)")
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
-            .font(.caption)
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .accessibilityLabel("更多")
+            .accessibilityIdentifier("CompactHistoryMoreButton-\(task.taskId)")
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? Color(.tertiarySystemFill) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .contentShape(Rectangle())
         .alert("删除这条对话？", isPresented: $confirmDelete) {
                 Button("取消", role: .cancel) {}
@@ -1427,6 +2469,53 @@ struct CompactTaskHistoryRow: View {
             } message: {
                 Text("删除后无法从 iOS 端恢复。")
             }
+    }
+
+    private var isSelected: Bool {
+        model.selectedTask?.taskId == task.taskId
+    }
+
+    private var titleText: String {
+        let value = task.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? "未命名研究" : value
+    }
+
+    private var archiveActionTitle: String {
+        archivedList || task.historyArchived == true ? "恢复" : "归档"
+    }
+
+    private var metaText: String {
+        "\(localizedTaskStatus(task.status)) · \(localizedArchiveStatus(task.archiveStatus ?? "pending"))"
+    }
+
+    private func localizedTaskStatus(_ status: String) -> String {
+        switch status.lowercased() {
+        case "completed":
+            return "已完成"
+        case "cancelled", "canceled":
+            return "已取消"
+        case "failed", "error":
+            return "失败"
+        case "running", "in_progress", "processing":
+            return "运行中"
+        case "queued", "pending":
+            return "排队中"
+        default:
+            return status
+        }
+    }
+
+    private func localizedArchiveStatus(_ status: String) -> String {
+        switch status.lowercased() {
+        case "ready":
+            return "归档就绪"
+        case "pending":
+            return "归档等待"
+        case "failed", "error":
+            return "归档失败"
+        default:
+            return status
+        }
     }
 }
 
@@ -1550,13 +2639,6 @@ struct CompactCloudDriveView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            CompactUtilityHeader(title: "管理云盘", subtitle: "线上文件与云空间") {
-                Task {
-                    await model.loadStorage()
-                    await model.loadCloudFiles()
-                }
-            }
-            Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if let storage = model.storage {
@@ -1591,6 +2673,23 @@ struct CompactCloudDriveView: View {
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .navigationTitle("管理云盘")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task {
+                        await model.loadStorage()
+                        await model.loadCloudFiles()
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityLabel("刷新")
+                .accessibilityIdentifier("CompactRouteRefreshButton")
             }
         }
         .background {
@@ -1649,23 +2748,34 @@ struct CompactArchivedHistoryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            CompactUtilityHeader(title: "已归档对话", subtitle: "恢复或删除历史研究") {
-                Task { await model.loadTasks(archived: true) }
-            }
-            Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if model.archivedTasks.isEmpty {
                         ContentUnavailableView("暂无已归档对话", systemImage: "archivebox")
                             .frame(maxWidth: .infinity, minHeight: 360)
                     } else {
-                        ForEach(model.archivedTasks) { task in
-                            CompactTaskHistoryRow(task: task, archivedList: true)
-                            Divider()
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(model.archivedTasks) { task in
+                                CompactTaskHistoryRow(task: task, archivedList: true)
+                            }
                         }
                     }
                 }
                 .padding(20)
+            }
+        }
+        .navigationTitle("已归档对话")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await model.loadTasks(archived: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityLabel("刷新")
+                .accessibilityIdentifier("CompactRouteRefreshButton")
             }
         }
         .background {
@@ -1681,10 +2791,6 @@ struct CompactEnterpriseAdminView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            CompactUtilityHeader(title: "单位管理", subtitle: "成员与 usage") {
-                Task { await model.loadEnterpriseAdmin() }
-            }
-            Divider()
             ScrollView {
                 if model.user?.isEnterpriseAdmin == true {
                     EnterpriseAdminPanel()
@@ -1693,6 +2799,20 @@ struct CompactEnterpriseAdminView: View {
                     ContentUnavailableView("当前账号没有单位管理权限", systemImage: "lock")
                         .frame(maxWidth: .infinity, minHeight: 420)
                 }
+            }
+        }
+        .navigationTitle("单位管理")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await model.loadEnterpriseAdmin() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityLabel("刷新")
+                .accessibilityIdentifier("CompactRouteRefreshButton")
             }
         }
         .background {
@@ -2121,7 +3241,7 @@ struct ArtifactTabsView: View {
 
             switch model.selectedTab {
             case .evidence:
-                ArtifactList(title: "证据", items: model.artifacts.evidence)
+                EvidenceArtifactList(items: model.artifacts.evidence)
             case .entities:
                 ArtifactList(title: "实体", items: model.artifacts.entities)
             case .graph:
@@ -2148,6 +3268,85 @@ struct ArtifactTabsView: View {
         if compact && !tabs.contains(model.selectedTab) {
             model.selectedTab = .evidence
         }
+    }
+}
+
+struct EvidenceArtifactList: View {
+    @Environment(\.openURL) private var openURL
+    var items: [ResearchArtifact]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("证据")
+                .font(.headline)
+            if items.isEmpty {
+                ContentUnavailableView("暂无证据", systemImage: "tray")
+            } else {
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    EvidenceArtifactCard(item: item, fallbackIndex: index) { url in
+                        openURL(url)
+                    }
+                }
+            }
+        }
+        .accessibilityIdentifier("ArtifactList-证据")
+    }
+}
+
+struct EvidenceArtifactCard: View {
+    var item: ResearchArtifact
+    var fallbackIndex: Int
+    var open: (URL) -> Void
+
+    private var identifier: String {
+        item.evidenceIdentifier.nonEmpty ?? "EVID-\(String(format: "%03d", fallbackIndex + 1))"
+    }
+
+    private var metaItems: [String] {
+        [
+            identifier,
+            item.confidence.map { "置信度 \($0)" },
+            item.publishedAt
+        ].compactMap { $0?.nonEmpty }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(item.title)
+                .font(.headline)
+                .fixedSize(horizontal: false, vertical: true)
+            if !metaItems.isEmpty {
+                Text(metaItems.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            if !item.evidenceSummary.isEmpty {
+                MarkdownBodyText(markdown: item.evidenceSummary)
+                    .font(.callout)
+            } else {
+                Text(jsonSummary(item.fields))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            if let url = item.sourceURL {
+                Button {
+                    open(url)
+                } label: {
+                    Label("打开来源", systemImage: "safari")
+                        .font(.subheadline.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("EvidenceOpenSourceButton")
+            } else {
+                Text("未提供来源链接")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -2290,11 +3489,9 @@ struct ReportMarkdownView: View {
             if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 ContentUnavailableView("暂无报告", systemImage: "doc.text")
             } else {
-                Text(markdown)
-                    .font(.body.monospaced())
-                    .textSelection(.enabled)
+                MarkdownBodyText(markdown: markdown)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+                    .padding(12)
                     .background(.background)
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
             }

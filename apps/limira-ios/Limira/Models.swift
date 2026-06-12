@@ -353,6 +353,47 @@ struct ResearchArtifact: Codable, Identifiable, Hashable {
         fields.string("source", "url", "confidence", "published_at", "type") ?? ""
     }
 
+    var evidenceIdentifier: String {
+        fields.string("evidence_id", "ref_id", "id", "ref") ?? id
+    }
+
+    var evidenceSummary: String {
+        fields.string("summary", "key_findings", "snippet", "text", "description") ?? ""
+    }
+
+    var confidence: String? {
+        fields.string("confidence")
+    }
+
+    var publishedAt: String? {
+        fields.string("published_at", "publishedAt", "date")
+    }
+
+    var sourceURLString: String? {
+        if let value = fields.string("url", "source_url", "sourceUrl", "link", "href") {
+            return value
+        }
+        return fields["source_urls"]?.arrayValue?
+            .compactMap { $0.stringValue?.nonEmpty }
+            .first
+    }
+
+    var sourceURL: URL? {
+        guard var value = sourceURLString?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        if value.hasPrefix("www.") {
+            value = "https://\(value)"
+        }
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            return nil
+        }
+        return url
+    }
+
     init(fields: [String: JSONValue]) {
         self.fields = fields
     }
@@ -433,6 +474,8 @@ struct LimiraStreamEvent: Codable, Identifiable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case event
+        case eventType = "event_type"
+        case eventName = "event_name"
         case type
         case status
         case message
@@ -453,6 +496,8 @@ struct LimiraStreamEvent: Codable, Identifiable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         event = try container.decodeIfPresent(String.self, forKey: .event)
+            ?? container.decodeIfPresent(String.self, forKey: .eventType)
+            ?? container.decodeIfPresent(String.self, forKey: .eventName)
             ?? container.decodeIfPresent(String.self, forKey: .type)
             ?? "task_update"
         type = try container.decodeIfPresent(String.self, forKey: .type)
@@ -609,10 +654,16 @@ enum CompactShellModal: String, Identifiable {
     var id: String { rawValue }
 }
 
+enum CompactShellReturnTarget: String, Equatable {
+    case workspace
+    case menu
+}
+
 struct CompactShellPresentation: Equatable {
     var path: [CompactShellDestination] = []
     var modal: CompactShellModal?
     var artifactTaskId: String?
+    var returnTarget: CompactShellReturnTarget = .workspace
 
     var currentDestination: CompactShellDestination? {
         path.last
@@ -634,9 +685,10 @@ struct CompactShellPresentation: Equatable {
         modal = nil
     }
 
-    mutating func showDestination(_ destination: CompactShellDestination?) {
+    mutating func showDestination(_ destination: CompactShellDestination?, returnTarget: CompactShellReturnTarget = .workspace) {
         path = destination.map { [$0] } ?? []
         modal = nil
+        self.returnTarget = destination == nil ? .workspace : returnTarget
         if destination != .artifacts {
             artifactTaskId = nil
         }
@@ -646,12 +698,14 @@ struct CompactShellPresentation: Equatable {
         path = [.artifacts]
         modal = nil
         artifactTaskId = taskId
+        returnTarget = .workspace
     }
 
     mutating func resetToWorkspace() {
         path = []
         modal = nil
         artifactTaskId = nil
+        returnTarget = .workspace
     }
 }
 

@@ -3,6 +3,356 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
+enum ReportMarkdownExtractor {
+    private static let titleFields = ["title", "section_title", "heading", "name", "label", "report_title"]
+    private static let textFields = ["markdown", "body", "content", "text", "summary", "report", "final_report", "final_report_markdown"]
+    private static let sectionFields = ["sections", "report_sections", "items"]
+    private static let nestedFields = ["payload", "result", "data", "artifact", "report", "final_report"]
+    private static let ignoredFallbackFields: Set<String> = [
+        "id",
+        "artifact_id",
+        "section_id",
+        "task_id",
+        "report_id",
+        "created_at",
+        "updated_at",
+        "type",
+        "report_type"
+    ]
+
+    static func markdown(from buckets: ArtifactBuckets) -> String {
+        buckets.reportSections.enumerated().compactMap { index, artifact -> String? in
+            let value = JSONValue.object(artifact.fields)
+            guard var body = reportText(from: value, includeTitle: false)?.nonEmpty else {
+                return nil
+            }
+            if let title = reportTitle(from: value, index: index), !startsWithMarkdownHeading(body) {
+                body = "## \(title)\n\n\(body)"
+            }
+            return body
+        }
+        .joined(separator: "\n\n")
+    }
+
+    static func markdown(from value: JSONValue, includeTitle: Bool = true) -> String? {
+        reportText(from: value, includeTitle: includeTitle)?.nonEmpty
+    }
+
+    private static func reportTitle(from value: JSONValue, index: Int?) -> String? {
+        if let title = reportField(from: value, fields: titleFields)?.nonEmpty {
+            return title
+        }
+        if case .object(let object) = value,
+           let reportType = stringValue(for: "report_type", in: object)?.nonEmpty {
+            return reportType
+                .replacingOccurrences(of: "_", with: " ")
+                .capitalized
+        }
+        guard let index else { return nil }
+        return "报告章节 \(index + 1)"
+    }
+
+    private static func reportText(from value: JSONValue, includeTitle: Bool = true, depth: Int = 0) -> String? {
+        guard depth < 8 else { return nil }
+
+        if let wrapper = reportWrapper(from: value, depth: depth) {
+            if let sections = firstArray(in: wrapper, keys: sectionFields) {
+                let sectionMarkdown = sections.enumerated().compactMap { offset, section -> String? in
+                    guard var body = reportText(from: section, includeTitle: false, depth: depth + 1)?.nonEmpty else {
+                        return nil
+                    }
+                    if let title = reportTitle(from: section, index: offset), !startsWithMarkdownHeading(body) {
+                        body = "## \(title)\n\n\(body)"
+                    }
+                    return body
+                }
+                .joined(separator: "\n\n")
+                if !sectionMarkdown.isEmpty {
+                    return sectionMarkdown
+                }
+            }
+
+            if let direct = firstValue(in: wrapper, keys: textFields),
+               let directText = reportText(from: direct, includeTitle: includeTitle, depth: depth + 1)?.nonEmpty {
+                return directText
+            }
+
+            for key in nestedFields {
+                guard let nested = lookupValue(for: key, in: wrapper) else { continue }
+                if let text = reportText(from: nested, includeTitle: includeTitle, depth: depth + 1)?.nonEmpty {
+                    return text
+                }
+            }
+
+            return structuredFallbackMarkdown(from: wrapper, includeTitle: includeTitle, depth: depth)
+        }
+
+        switch value {
+        case .string(let text):
+            return cleanedPlainText(text)
+        case .array(let values):
+            let text = values.compactMap {
+                reportText(from: $0, includeTitle: includeTitle, depth: depth + 1)?.nonEmpty
+            }
+            .joined(separator: "\n\n")
+            return text.nonEmpty
+        default:
+            return value.stringValue?.nonEmpty
+        }
+    }
+
+    private static func reportField(from value: JSONValue, fields: [String], depth: Int = 0) -> String? {
+        guard depth < 8 else { return nil }
+        if let wrapper = reportWrapper(from: value, depth: depth) {
+            if let direct = firstValue(in: wrapper, keys: fields),
+               let text = reportText(from: direct, includeTitle: false, depth: depth + 1)?.nonEmpty {
+                return text
+            }
+            for key in nestedFields {
+                guard let nested = lookupValue(for: key, in: wrapper) else { continue }
+                if let text = reportField(from: nested, fields: fields, depth: depth + 1)?.nonEmpty {
+                    return text
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func reportWrapper(from value: JSONValue, depth: Int) -> [String: JSONValue]? {
+        switch value {
+        case .object(let object):
+            return object
+        case .string(let text):
+            guard let parsed = parsedReportObject(from: text), containsReportSignal(parsed) else {
+                return nil
+            }
+            return parsed
+        default:
+            return nil
+        }
+    }
+
+    private static func structuredFallbackMarkdown(from object: [String: JSONValue], includeTitle: Bool, depth: Int) -> String? {
+        var sections: [String] = []
+        if includeTitle, let title = firstText(in: object, keys: titleFields)?.nonEmpty {
+            sections.append("# \(title)")
+        }
+
+        let bodyParts = object.sorted(by: { $0.key < $1.key }).compactMap { key, value -> String? in
+            let normalizedKey = key.lowercased()
+            guard !titleFields.contains(normalizedKey),
+                  !ignoredFallbackFields.contains(normalizedKey),
+                  !sectionFields.contains(normalizedKey),
+                  !nestedFields.contains(normalizedKey) else {
+                return nil
+            }
+            guard let text = reportText(from: value, includeTitle: false, depth: depth + 1)?.nonEmpty else {
+                return nil
+            }
+            let label = key.replacingOccurrences(of: "_", with: " ").capitalized
+            return "### \(label)\n\n\(text)"
+        }
+        sections.append(contentsOf: bodyParts)
+        return sections.joined(separator: "\n\n").nonEmpty
+    }
+
+    private static func firstText(in object: [String: JSONValue], keys: [String]) -> String? {
+        firstValue(in: object, keys: keys).flatMap { reportText(from: $0, includeTitle: false, depth: 1) }
+    }
+
+    private static func firstArray(in object: [String: JSONValue], keys: [String]) -> [JSONValue]? {
+        for key in keys {
+            if let array = lookupValue(for: key, in: object)?.arrayValue {
+                return array
+            }
+        }
+        return nil
+    }
+
+    private static func firstValue(in object: [String: JSONValue], keys: [String]) -> JSONValue? {
+        for key in keys {
+            if let value = lookupValue(for: key, in: object) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func lookupValue(for key: String, in object: [String: JSONValue]) -> JSONValue? {
+        if let value = object[key] {
+            return value
+        }
+        let lowercased = key.lowercased()
+        return object.first { $0.key.lowercased() == lowercased }?.value
+    }
+
+    private static func stringValue(for key: String, in object: [String: JSONValue]) -> String? {
+        lookupValue(for: key, in: object)?.stringValue
+    }
+
+    private static func parsedReportObject(from text: String) -> [String: JSONValue]? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        for candidate in [trimmed, embeddedJSONObjectText(in: trimmed)].compactMap({ $0 }) {
+            guard let data = candidate.data(using: .utf8),
+                  let value = try? JSONDecoder().decode(JSONValue.self, from: data),
+                  case .object(let object) = value else {
+                continue
+            }
+            return object
+        }
+        return nil
+    }
+
+    private static func embeddedJSONObjectText(in text: String) -> String? {
+        guard let start = text.firstIndex(of: "{") else { return nil }
+        var depth = 0
+        var isEscaped = false
+        var isInsideString = false
+        var index = start
+        while index < text.endIndex {
+            let character = text[index]
+            if isInsideString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    isInsideString = false
+                }
+            } else if character == "\"" {
+                isInsideString = true
+            } else if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    return String(text[start...index])
+                }
+            }
+            index = text.index(after: index)
+        }
+        return nil
+    }
+
+    private static func containsReportSignal(_ object: [String: JSONValue]) -> Bool {
+        let keys = Set(object.keys.map { $0.lowercased() })
+        return keys.contains { key in
+            titleFields.contains(key)
+                || textFields.contains(key)
+                || sectionFields.contains(key)
+                || nestedFields.contains(key)
+        }
+    }
+
+    private static func startsWithMarkdownHeading(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#")
+    }
+
+    private static func cleanedPlainText(_ text: String) -> String? {
+        let trimmed = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let markdown = htmlFragmentMarkdown(from: trimmed)?.nonEmpty {
+            return markdown
+        }
+        return trimmed.nonEmpty
+    }
+
+    private static func htmlFragmentMarkdown(from text: String) -> String? {
+        guard text.range(of: #"<\s*/?\s*[A-Za-z][^>]*>"#, options: .regularExpression) != nil else {
+            return nil
+        }
+
+        var html = decodeHTMLEntities(text)
+        html = replaceAnchorTags(in: html)
+        html = html.replacingOccurrences(of: #"<\s*br\s*/?\s*>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+        html = html.replacingOccurrences(of: #"</\s*(div|p|section|article|header|footer|li|ul|ol|h[1-6])\s*>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+        html = html.replacingOccurrences(of: #"<\s*(div|p|section|article|header|footer|li|ul|ol|h[1-6])\b[^>]*>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+        html = stripHTMLTags(from: html)
+        html = html
+            .replacingOccurrences(of: "🔍", with: "")
+            .replacingOccurrences(of: "🌐", with: "")
+        let cleanedLines = html
+            .components(separatedBy: .newlines)
+            .map { normalizeHTMLLine($0) }
+            .compactMap(\.nonEmpty)
+        return cleanedLines.joined(separator: "\n").nonEmpty
+    }
+
+    private static func replaceAnchorTags(in html: String) -> String {
+        let pattern = #"<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return html
+        }
+        var result = html
+        let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+        for match in matches.reversed() where match.numberOfRanges >= 3 {
+            guard let matchRange = Range(match.range(at: 0), in: result),
+                  let urlRange = Range(match.range(at: 1), in: html),
+                  let titleRange = Range(match.range(at: 2), in: html) else {
+                continue
+            }
+            let url = decodeHTMLEntities(String(html[urlRange])).trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = normalizeHTMLLine(stripHTMLTags(from: String(html[titleRange]))).nonEmpty ?? url
+            let replacement = "\n- \(title)\n  \(url)\n"
+            result.replaceSubrange(matchRange, with: replacement)
+        }
+        return result
+    }
+
+    private static func stripHTMLTags(from text: String) -> String {
+        decodeHTMLEntities(
+            text.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+        )
+    }
+
+    private static func normalizeHTMLLine(_ line: String) -> String {
+        var normalized = line
+            .replacingOccurrences(of: "\u{00a0}", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        while normalized.contains("  ") {
+            normalized = normalized.replacingOccurrences(of: "  ", with: " ")
+        }
+        normalized = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.hasPrefix("= ") {
+            normalized.removeFirst(2)
+        }
+        return normalized
+    }
+
+    private static func decodeHTMLEntities(_ text: String) -> String {
+        var decoded = text
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+
+        guard let regex = try? NSRegularExpression(pattern: #"&#(x?[0-9A-Fa-f]+);"#) else {
+            return decoded
+        }
+        let matches = regex.matches(in: decoded, range: NSRange(decoded.startIndex..., in: decoded))
+        for match in matches.reversed() where match.numberOfRanges >= 2 {
+            guard let fullRange = Range(match.range(at: 0), in: decoded),
+                  let valueRange = Range(match.range(at: 1), in: decoded) else {
+                continue
+            }
+            let raw = String(decoded[valueRange])
+            let radix = raw.lowercased().hasPrefix("x") ? 16 : 10
+            let digits = radix == 16 ? String(raw.dropFirst()) : raw
+            guard let scalarValue = UInt32(digits, radix: radix),
+                  let scalar = UnicodeScalar(scalarValue) else {
+                continue
+            }
+            decoded.replaceSubrange(fullRange, with: String(Character(scalar)))
+        }
+        return decoded
+    }
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var authScope: AuthScope = .enterprise
@@ -336,10 +686,18 @@ final class AppViewModel: ObservableObject {
     }
 
     func setCompactDestinationPath(_ path: [CompactShellDestination]) {
+        let returnTarget = compactPresentation.returnTarget
         let normalizedPath = path.count > 1 ? Array(path.suffix(1)) : path
         if normalizedPath.last == .enterpriseAdmin, user?.isEnterpriseAdmin != true {
             compactPresentation.resetToWorkspace()
             statusMessage = "当前账号没有单位管理权限。"
+            return
+        }
+        if normalizedPath.isEmpty {
+            compactPresentation.path = []
+            compactPresentation.artifactTaskId = nil
+            compactPresentation.returnTarget = .workspace
+            compactPresentation.modal = returnTarget == .menu ? .menu : nil
             return
         }
         compactPresentation.path = normalizedPath
@@ -349,16 +707,16 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func openCompactRoute(_ route: CompactWorkspaceRoute) async {
+    func openCompactRoute(_ route: CompactWorkspaceRoute, returnTarget: CompactShellReturnTarget = .workspace) async {
         switch route {
         case .workspace:
             compactPresentation.resetToWorkspace()
         case .cloudDrive:
-            compactPresentation.showDestination(.cloudDrive)
+            compactPresentation.showDestination(.cloudDrive, returnTarget: returnTarget)
             await loadCloudFiles()
             await loadStorage()
         case .archivedChats:
-            compactPresentation.showDestination(.archivedChats)
+            compactPresentation.showDestination(.archivedChats, returnTarget: returnTarget)
             await loadTasks(archived: true)
         case .enterpriseAdmin:
             guard user?.isEnterpriseAdmin == true else {
@@ -366,7 +724,7 @@ final class AppViewModel: ObservableObject {
                 statusMessage = "当前账号没有单位管理权限。"
                 return
             }
-            compactPresentation.showDestination(.enterpriseAdmin)
+            compactPresentation.showDestination(.enterpriseAdmin, returnTarget: returnTarget)
             await loadEnterpriseAdmin()
         }
     }
@@ -426,11 +784,13 @@ final class AppViewModel: ObservableObject {
         selectedArtifactTaskId = task.taskId
         status = task.status
         archiveStatus = task.archiveStatus ?? "pending"
+        finalReportMarkdown = ""
+        artifacts = ArtifactBuckets()
+        eventLogs = []
         messages = conversationMessages(from: task)
-        await loadArtifacts()
+        await hydrateConversationHistory(for: task)
         await loadUploads()
         await loadReports()
-        await loadEventLogs()
         if !terminalStatuses.contains(task.status) {
             connectStream(taskId: task.taskId)
         }
@@ -497,33 +857,37 @@ final class AppViewModel: ObservableObject {
     }
 
     func handleStreamEvent(_ event: LimiraStreamEvent) {
-        if let publicStatus = event.publicStatus {
+        let normalizedEvent = normalizedStreamEvent(event)
+        if let publicStatus = event.publicStatus ?? normalizedEvent.status {
             status = publicStatus
         }
         if let archive = event.raw["archive_status"]?.stringValue
             ?? event.data?.string("archive_status")
-            ?? event.data?["data"]?.objectValue?.string("archive_status") {
+            ?? event.data?["data"]?.objectValue?.string("archive_status")
+            ?? normalizedEvent.data.string("archive_status") {
             archiveStatus = archive
         }
 
-        switch event.event {
+        switch normalizedEvent.eventType {
         case "heartbeat":
             break
         case "tool_call":
-            handleToolCall(event)
+            handleToolCall(event, eventData: normalizedEvent.data)
         case "error":
             status = "failed"
             messages.append(AppMessage(role: .error, text: event.displayText, taskId: selectedTask?.taskId))
         case "end_of_workflow":
             status = "completed"
-            messages.append(AppMessage(role: .assistant, text: "工作流已完成。", taskId: selectedTask?.taskId))
+            if !upsertReportMessageFromEventData(normalizedEvent.data, taskId: selectedTask?.taskId) {
+                messages.append(AppMessage(role: .assistant, text: "工作流已完成。", taskId: selectedTask?.taskId))
+            }
         case let value where value.hasPrefix("start_of_"):
             messages.append(AppMessage(role: .assistant, text: startMessage(for: value, event: event), taskId: selectedTask?.taskId))
         case let value where artifactEvents.contains(value):
             messages.append(AppMessage(role: .assistant, text: "\(eventLabel(value))：研究成果已更新。", taskId: selectedTask?.taskId))
             Task { await loadArtifacts() }
         default:
-            messages.append(AppMessage(role: .assistant, text: "\(eventLabel(event.event))：\(event.displayText)", taskId: selectedTask?.taskId))
+            messages.append(AppMessage(role: .assistant, text: "\(eventLabel(normalizedEvent.eventType))：\(event.displayText)", taskId: selectedTask?.taskId))
         }
 
         if terminalStatuses.contains(status) {
@@ -547,7 +911,7 @@ final class AppViewModel: ObservableObject {
             let report = reportMarkdown(from: loadedArtifacts)
             if !report.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 finalReportMarkdown = report
-                upsertReportMessage(report, taskId: taskId, artifacts: loadedArtifacts)
+                upsertReportMessage(report, taskId: taskId, artifacts: loadedArtifacts, insertAfterTaskId: taskId)
             }
         } catch {
             statusMessage = displayError(error)
@@ -558,6 +922,7 @@ final class AppViewModel: ObservableObject {
         guard let taskId = selectedTask?.taskId else { return }
         do {
             eventLogs = try await service.loadEventLogs(taskId: taskId).events
+            restoreReportFromEventLogs(taskId: taskId)
         } catch {
             eventLogs = []
         }
@@ -864,18 +1229,148 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func handleToolCall(_ event: LimiraStreamEvent) {
-        let data = event.data ?? event.payload ?? [:]
-        let toolName = data.string("tool_name", "name") ?? "tool"
+    private func handleToolCall(_ event: LimiraStreamEvent, eventData: [String: JSONValue]? = nil) {
+        let data = eventData ?? normalizedStreamEvent(event).data
+        let toolName = data.string("tool_name", "toolName", "tool", "name") ?? "tool"
         if toolName == "show_text",
-           let input = data["tool_input"]?.objectValue,
-           let text = input.string("text") {
-            finalReportMarkdown = text
-            upsertReportMessage(text, taskId: selectedTask?.taskId, artifacts: artifacts)
+           let input = toolInput(from: data),
+           let report = reportMarkdown(fromEventValue: .object(input)) {
+            finalReportMarkdown = report
+            upsertReportMessage(report, taskId: selectedTask?.taskId, artifacts: artifacts, insertAfterTaskId: selectedTask?.taskId)
             return
         }
-        let target = data["tool_input"]?.objectValue?.string("url").map { " · \($0)" } ?? ""
+        let target = toolInput(from: data)?.string("url").map { " · \($0)" } ?? ""
         messages.append(AppMessage(role: .assistant, text: "调用工具：\(toolName)\(target)", taskId: selectedTask?.taskId))
+    }
+
+    private struct NormalizedStreamEvent {
+        var eventType: String
+        var data: [String: JSONValue]
+        var status: String?
+    }
+
+    private func normalizedStreamEvent(_ event: LimiraStreamEvent) -> NormalizedStreamEvent {
+        let payload = event.payload ?? event.raw
+        let data = event.data ?? event.payload ?? [:]
+        let nested = data["data"]?.objectValue ?? [:]
+        let embeddedEventType = data.string("event", "event_type", "eventName", "event_name", "type")
+            ?? nested.string("event", "event_type", "eventName", "event_name", "type")
+            ?? payload.string("event", "event_type", "eventName", "event_name", "type")
+        let eventType = event.event == "task_update"
+            ? (embeddedEventType ?? "task_update")
+            : (event.event.nonEmpty ?? embeddedEventType ?? "task_update")
+        let eventData = data.string("event", "event_type", "eventName", "event_name", "type") == eventType && !nested.isEmpty ? nested : data
+        let status = event.status
+            ?? data.string("status")
+            ?? nested.string("status")
+            ?? eventData.string("status")
+            ?? payload.string("status")
+        return NormalizedStreamEvent(eventType: eventType, data: eventData, status: status)
+    }
+
+    @discardableResult
+    private func upsertReportMessageFromEventData(_ data: [String: JSONValue], taskId: String?) -> Bool {
+        guard let report = reportMarkdown(fromEventData: data) else {
+            return false
+        }
+        finalReportMarkdown = report
+        upsertReportMessage(report, taskId: taskId, artifacts: artifacts, insertAfterTaskId: taskId)
+        return true
+    }
+
+    private func reportMarkdown(fromEventData data: [String: JSONValue]) -> String? {
+        for key in ["text", "markdown", "content", "body", "summary", "report", "final_report", "final_report_markdown"] {
+            guard let value = lookupValue(key, in: data),
+                  let report = reportMarkdown(fromEventValue: value) else {
+                continue
+            }
+            return report
+        }
+        for key in ["payload", "result", "data", "artifact"] {
+            guard let nested = lookupValue(key, in: data),
+                  let report = reportMarkdown(fromEventValue: nested) else {
+                continue
+            }
+            return report
+        }
+        return nil
+    }
+
+    private func restoreReportFromEventLogs(taskId: String) {
+        guard let report = reportMarkdown(fromEventLogs: eventLogs) else { return }
+        finalReportMarkdown = report
+        upsertReportMessage(report, taskId: taskId, artifacts: artifacts, insertAfterTaskId: taskId)
+    }
+
+    private func reportMarkdown(fromEventLogs logs: [[String: JSONValue]]) -> String? {
+        for rawEvent in logs.reversed() {
+            let event = streamEvent(from: rawEvent)
+            let normalized = normalizedStreamEvent(event)
+            if normalized.eventType == "tool_call" {
+                let data = normalized.data
+                let toolName = data.string("tool_name", "toolName", "tool", "name") ?? "tool"
+                if toolName == "show_text",
+                   let input = toolInput(from: data),
+                   let report = reportMarkdown(fromEventValue: .object(input)) {
+                    return report
+                }
+            }
+            if let report = reportMarkdown(fromEventData: normalized.data) {
+                return report
+            }
+        }
+        return nil
+    }
+
+    private func streamEvent(from raw: [String: JSONValue]) -> LimiraStreamEvent {
+        guard let data = try? JSONEncoder().encode(raw),
+              let event = try? JSONDecoder().decode(LimiraStreamEvent.self, from: data) else {
+            return LimiraStreamEvent(event: raw.string("event", "event_type", "eventName", "event_name", "type") ?? "task_update", data: raw, raw: raw)
+        }
+        return event
+    }
+
+    private func toolInput(from data: [String: JSONValue]) -> [String: JSONValue]? {
+        for key in ["tool_input", "toolInput", "input", "arguments", "args", "parameters"] {
+            guard let value = lookupValue(key, in: data) else { continue }
+            if let object = objectValue(from: value) {
+                return object
+            }
+        }
+        for key in ["payload", "result", "data"] {
+            guard let nested = lookupValue(key, in: data),
+                  let object = objectValue(from: nested) else {
+                continue
+            }
+            if let direct = toolInput(from: object) {
+                return direct
+            }
+        }
+        return nil
+    }
+
+    private func reportMarkdown(fromEventValue value: JSONValue) -> String? {
+        ReportMarkdownExtractor.markdown(from: value, includeTitle: true)
+            ?? value.stringValue?.nonEmpty
+    }
+
+    private func objectValue(from value: JSONValue) -> [String: JSONValue]? {
+        if let object = value.objectValue {
+            return object
+        }
+        guard let text = value.stringValue?.nonEmpty,
+              let data = text.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let object = decoded.objectValue else {
+            return nil
+        }
+        return object
+    }
+
+    private func lookupValue(_ key: String, in object: [String: JSONValue]) -> JSONValue? {
+        if let value = object[key] { return value }
+        let lowercased = key.lowercased()
+        return object.first { $0.key.lowercased() == lowercased }?.value
     }
 
     private func startMessage(for eventType: String, event: LimiraStreamEvent) -> String {
@@ -903,31 +1398,64 @@ final class AppViewModel: ObservableObject {
     }
 
     private func conversationMessages(from task: LimiraTask) -> [AppMessage] {
-        let members = task.conversationMembers?.isEmpty == false ? task.conversationMembers! : [task]
-        return members.flatMap { member in
+        conversationMembers(for: task).flatMap { member in
             [
-                AppMessage(role: .user, text: member.query),
+                AppMessage(role: .user, text: member.query, taskId: member.taskId),
                 AppMessage(role: .assistant, text: "任务 \(member.taskId)：\(member.status)", taskId: member.taskId)
             ]
         }
     }
 
-    private func reportMarkdown(from buckets: ArtifactBuckets) -> String {
-        buckets.reportSections.compactMap { artifact -> String? in
-            let title = artifact.fields.string("title", "section_title")
-            let body = artifact.fields.string("markdown", "body", "text", "content", "summary")
-            guard let body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return nil
-            }
-            if let title, !body.hasPrefix("#") {
-                return "## \(title)\n\n\(body)"
-            }
-            return body
-        }
-        .joined(separator: "\n\n")
+    private func conversationMembers(for task: LimiraTask) -> [LimiraTask] {
+        let members = task.conversationMembers?.filter { !$0.taskId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? []
+        return members.isEmpty ? [task] : members
     }
 
-    private func upsertReportMessage(_ markdown: String, taskId: String?, artifacts: ArtifactBuckets) {
+    private func hydrateConversationHistory(for task: LimiraTask) async {
+        for member in conversationMembers(for: task) {
+            let taskId = member.taskId
+            do {
+                let loadedArtifacts = try await service.loadArtifacts(taskId: taskId)
+                if taskId == task.taskId {
+                    artifacts = loadedArtifacts
+                    selectedArtifactTaskId = taskId
+                }
+                let artifactReport = reportMarkdown(from: loadedArtifacts).nonEmpty
+                let eventReport = artifactReport == nil ? await reportMarkdownFromEventLogs(taskId: taskId) : nil
+                if let report = artifactReport ?? eventReport {
+                    if taskId == task.taskId {
+                        finalReportMarkdown = report
+                    }
+                    upsertReportMessage(report, taskId: taskId, artifacts: loadedArtifacts, insertAfterTaskId: taskId)
+                }
+            } catch {
+                if taskId == task.taskId {
+                    statusMessage = displayError(error)
+                }
+            }
+        }
+    }
+
+    private func reportMarkdownFromEventLogs(taskId: String) async -> String? {
+        do {
+            let logs = try await service.loadEventLogs(taskId: taskId).events
+            if selectedTask?.taskId == taskId {
+                eventLogs = logs
+            }
+            return reportMarkdown(fromEventLogs: logs)
+        } catch {
+            if selectedTask?.taskId == taskId {
+                eventLogs = []
+            }
+            return nil
+        }
+    }
+
+    private func reportMarkdown(from buckets: ArtifactBuckets) -> String {
+        ReportMarkdownExtractor.markdown(from: buckets)
+    }
+
+    private func upsertReportMessage(_ markdown: String, taskId: String?, artifacts: ArtifactBuckets, insertAfterTaskId: String? = nil) {
         let text = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let counts = Dictionary(uniqueKeysWithValues: compactArtifactTabs().map { ($0.rawValue, artifactCount(for: $0, artifacts: artifacts)) })
@@ -935,7 +1463,13 @@ final class AppViewModel: ObservableObject {
             messages[index].text = text
             messages[index].artifactCounts = counts
         } else {
-            messages.append(AppMessage(role: .assistant, text: text, taskId: taskId, isReport: true, artifactCounts: counts))
+            let message = AppMessage(role: .assistant, text: text, taskId: taskId, isReport: true, artifactCounts: counts)
+            if let insertAfterTaskId,
+               let index = messages.lastIndex(where: { $0.taskId == insertAfterTaskId && !$0.isReport }) {
+                messages.insert(message, at: messages.index(after: index))
+            } else {
+                messages.append(message)
+            }
         }
     }
 
@@ -1057,6 +1591,10 @@ final class MockVoiceRecorder: VoiceRecording {
 
 final class MockLimiraService: LimiraServicing {
     let tokenStore: TokenStoring = MemoryTokenStore()
+    var mockReportSectionsEnabled = true
+    var mockEventLogs: [[String: JSONValue]] = [["event": .string("mock")]]
+    var mockEventLogsByTaskId: [String: [[String: JSONValue]]] = [:]
+    var mockArtifactsByTaskId: [String: ArtifactBuckets] = [:]
     private var deletedTaskIds: Set<String> = []
     private var mockUploadedDocuments: [LimiraUploadedDocument] = []
     private var mockTask = LimiraTask(
@@ -1154,22 +1692,25 @@ final class MockLimiraService: LimiraServicing {
     }
 
     func loadArtifacts(taskId: String) async throws -> ArtifactBuckets {
-        let data = """
-        {
-          "evidence": [{"evidence_id":"EVID-001","title":"Mock source","url":"https://limira-inc.com","confidence":"high"}],
-          "entities": [{"entity_id":"ENT-001","name":"Limira"}],
-          "relations": [{"relation_id":"REL-001","source":"Limira","target":"SF server"}],
-          "timeline_events": [{"event_id":"TL-001","title":"iOS smoke","date":"2026-06-10"}],
-          "map_features": [{"id":"MAP-001","title":"San Francisco","geometry":{"type":"Point","coordinates":[-122.4194,37.7749]}}],
-          "verifications": [{"id":"VER-001","summary":"Mock verified"}],
-          "report_sections": [{"section_id":"REPORT-001","title":"Mock report","markdown":"# Mock report\\nSSE and artifacts are connected."}]
+        if let buckets = mockArtifactsByTaskId[taskId] {
+            return buckets
         }
-        """.data(using: .utf8)!
-        return try JSONDecoder().decode(ArtifactBuckets.self, from: data)
+        var buckets = ArtifactBuckets()
+        buckets.evidence = [ResearchArtifact(fields: ["evidence_id": .string("EVID-001"), "title": .string("Mock source"), "url": .string("https://limira-inc.com"), "confidence": .string("high")])]
+        buckets.entities = [ResearchArtifact(fields: ["entity_id": .string("ENT-001"), "name": .string("Limira")])]
+        buckets.relations = [ResearchArtifact(fields: ["relation_id": .string("REL-001"), "source": .string("Limira"), "target": .string("SF server")])]
+        buckets.timelineEvents = [ResearchArtifact(fields: ["event_id": .string("TL-001"), "title": .string("iOS smoke"), "date": .string("2026-06-10")])]
+        buckets.mapFeatures = [ResearchArtifact(fields: ["id": .string("MAP-001"), "title": .string("San Francisco"), "geometry": .object(["type": .string("Point"), "coordinates": .array([.number(-122.4194), .number(37.7749)])])])]
+        buckets.verifications = [ResearchArtifact(fields: ["id": .string("VER-001"), "summary": .string("Mock verified")])]
+        if mockReportSectionsEnabled {
+            buckets.reportSections = [ResearchArtifact(fields: ["section_id": .string("REPORT-001"), "title": .string("Mock report"), "markdown": .string("# Mock report\nSSE and artifacts are connected.")])]
+        }
+        return buckets
     }
 
     func loadEventLogs(taskId: String) async throws -> EventLogsResponse {
-        EventLogsResponse(taskId: taskId, count: 1, events: [["event": .string("mock")]], adminView: nil)
+        let logs = mockEventLogsByTaskId[taskId] ?? mockEventLogs
+        return EventLogsResponse(taskId: taskId, count: logs.count, events: logs, adminView: nil)
     }
 
     func loadReports(taskId: String) async throws -> [LimiraGeneratedReport] {

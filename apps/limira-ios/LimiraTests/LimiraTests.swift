@@ -225,6 +225,289 @@ final class LimiraTests: XCTestCase {
         XCTAssertFalse(model.compactArtifactTabs().contains(.report))
     }
 
+    @MainActor
+    func testToolCallShowTextFromNestedJSONStringUpsertsFinalReport() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        model.selectedTask = try await service.startResearch(query: "movie values", scenario: nil, conversationId: nil, documentIds: [])
+
+        model.handleStreamEvent(
+            LimiraStreamEvent(
+                event: "task_update",
+                status: "running",
+                data: [
+                    "event": .string("tool_call"),
+                    "tool_name": .string("show_text"),
+                    "tool_input": .string(##"{"text":"# Final answer\nYoung audiences are split."}"##)
+                ]
+            )
+        )
+
+        XCTAssertEqual(model.finalReportMarkdown, "# Final answer\nYoung audiences are split.")
+        XCTAssertEqual(model.messages.last?.isReport, true)
+        XCTAssertEqual(model.messages.last?.text, "# Final answer\nYoung audiences are split.")
+    }
+
+    @MainActor
+    func testSelectTaskRestoresFinalReportFromEventLogsWhenArtifactsDoNotContainReportSections() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        service.mockEventLogs = [
+            [
+                "event": .string("task_update"),
+                "data": .object([
+                    "event": .string("tool_call"),
+                    "tool_name": .string("show_text"),
+                    "tool_input": .string(##"{"text":"# Restored final answer\nThe web answer should also appear on iOS."}"##)
+                ])
+            ]
+        ]
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        let task = try await service.startResearch(query: "restore report", scenario: nil, conversationId: nil, documentIds: [])
+
+        await model.selectTask(task)
+
+        XCTAssertEqual(model.finalReportMarkdown, "# Restored final answer\nThe web answer should also appear on iOS.")
+        XCTAssertEqual(model.messages.last?.isReport, true)
+        XCTAssertEqual(model.messages.last?.taskId, task.taskId)
+    }
+
+    @MainActor
+    func testSelectTaskRestoresEventTypeToolCallLogs() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        service.mockEventLogs = [
+            [
+                "event_type": .string("tool_call"),
+                "payload": .object([
+                    "toolName": .string("show_text"),
+                    "toolInput": .string(##"{"text":"# Restored from event_type\nThis mirrors live event logs."}"##)
+                ])
+            ]
+        ]
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        let task = try await service.startResearch(query: "restore event type", scenario: nil, conversationId: nil, documentIds: [])
+
+        await model.selectTask(task)
+
+        XCTAssertEqual(model.finalReportMarkdown, "# Restored from event_type\nThis mirrors live event logs.")
+        XCTAssertEqual(model.messages.last?.isReport, true)
+        XCTAssertEqual(model.messages.last?.taskId, task.taskId)
+    }
+
+    @MainActor
+    func testSelectTaskHydratesConversationMemberReportAfterMatchingStatus() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        service.mockEventLogsByTaskId = [
+            "task-cancelled": [],
+            "task-completed": [
+                [
+                    "event_type": .string("tool_call"),
+                    "payload": .object([
+                        "tool_name": .string("show_text"),
+                        "tool_input": .string(##"{"text":"# Completed conversation report\nThe completed member should render in place."}"##)
+                    ])
+                ]
+            ]
+        ]
+        let cancelled = LimiraTask(
+            taskId: "task-cancelled",
+            conversationId: "conversation-1",
+            query: "first attempt",
+            status: "cancelled",
+            archiveStatus: nil,
+            historyArchived: false,
+            scenario: nil,
+            error: nil,
+            modelSummary: nil,
+            downloadUrl: nil,
+            eventsUrl: nil,
+            artifactsUrl: nil,
+            conversationMembers: nil,
+            conversationCount: nil,
+            uploadedDocuments: nil
+        )
+        let completed = LimiraTask(
+            taskId: "task-completed",
+            conversationId: "conversation-1",
+            query: "second attempt",
+            status: "completed",
+            archiveStatus: "ready",
+            historyArchived: false,
+            scenario: nil,
+            error: nil,
+            modelSummary: nil,
+            downloadUrl: nil,
+            eventsUrl: nil,
+            artifactsUrl: nil,
+            conversationMembers: nil,
+            conversationCount: nil,
+            uploadedDocuments: nil
+        )
+        let conversation = LimiraTask(
+            taskId: completed.taskId,
+            conversationId: "conversation-1",
+            query: completed.query,
+            status: completed.status,
+            archiveStatus: completed.archiveStatus,
+            historyArchived: false,
+            scenario: nil,
+            error: nil,
+            modelSummary: nil,
+            downloadUrl: nil,
+            eventsUrl: nil,
+            artifactsUrl: nil,
+            conversationMembers: [cancelled, completed],
+            conversationCount: 2,
+            uploadedDocuments: nil
+        )
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+
+        await model.selectTask(conversation)
+
+        let statusIndex = try XCTUnwrap(model.messages.firstIndex { $0.text.contains("任务 task-completed") })
+        let reportIndex = try XCTUnwrap(model.messages.firstIndex { $0.isReport && $0.taskId == completed.taskId })
+        XCTAssertGreaterThan(reportIndex, statusIndex)
+        XCTAssertEqual(model.messages[reportIndex].text, "# Completed conversation report\nThe completed member should render in place.")
+        XCTAssertEqual(model.finalReportMarkdown, "# Completed conversation report\nThe completed member should render in place.")
+    }
+
+    func testResearchArtifactEvidenceSourceURLHelpers() {
+        let item = ResearchArtifact(fields: [
+            "evidence_id": .string("EVID-777"),
+            "title": .string("Source title"),
+            "source_url": .string("https://example.com/report"),
+            "summary": .string("Useful source summary."),
+            "confidence": .string("high"),
+            "published_at": .string("2026-06-12")
+        ])
+
+        XCTAssertEqual(item.evidenceIdentifier, "EVID-777")
+        XCTAssertEqual(item.evidenceSummary, "Useful source summary.")
+        XCTAssertEqual(item.confidence, "high")
+        XCTAssertEqual(item.publishedAt, "2026-06-12")
+        XCTAssertEqual(item.sourceURL?.absoluteString, "https://example.com/report")
+    }
+
+    func testReportMarkdownExtractorUnwrapsStringifiedReportJSON() throws {
+        let data = """
+        {
+          "report_sections": [
+            {
+              "section_id": "REPORT-RAW",
+              "title": "Raw container",
+              "markdown": "{\\"title\\":\\"Executive summary\\",\\"markdown\\":\\"# Executive summary\\\\n\\\\n- Export controls changed.\\\\n- Semiconductor supply chains are exposed.\\"}"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let buckets = try JSONDecoder().decode(ArtifactBuckets.self, from: data)
+        let markdown = ReportMarkdownExtractor.markdown(from: buckets)
+
+        XCTAssertTrue(markdown.contains("# Executive summary"))
+        XCTAssertTrue(markdown.contains("- Export controls changed."))
+        XCTAssertFalse(markdown.contains("\\\"markdown\\\""))
+        XCTAssertFalse(markdown.contains("Raw container"))
+    }
+
+    func testReportMarkdownExtractorBuildsNestedSections() throws {
+        let data = """
+        {
+          "report_sections": [
+            {
+              "section_id": "REPORT-NESTED",
+              "content": {
+                "sections": [
+                  {"title": "Findings", "text": "First finding."},
+                  {"section_title": "Risks", "summary": "Second finding."}
+                ]
+              }
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let buckets = try JSONDecoder().decode(ArtifactBuckets.self, from: data)
+        let markdown = ReportMarkdownExtractor.markdown(from: buckets)
+
+        XCTAssertTrue(markdown.contains("## Findings"))
+        XCTAssertTrue(markdown.contains("First finding."))
+        XCTAssertTrue(markdown.contains("## Risks"))
+        XCTAssertTrue(markdown.contains("Second finding."))
+        XCTAssertFalse(markdown.contains("section_id"))
+    }
+
+    func testReportMarkdownExtractorSanitizesToolHTMLFragments() throws {
+        let data = """
+        {
+          "report_sections": [
+            {
+              "section_id": "REPORT-HTML",
+              "markdown": "执行结果<div class=\\"search-card\\"><div class=\\"search-header\\"><span class=\\"search-icon\\">🔍</span><span class=\\"search-query\\">Search: \\"US company Indian agency factory worker data collection training embodied AI\\"</span></div><div class=\\"search-count\\">= Found 10 results</div><div class=\\"search-results\\"><a href=\\"https://www.youtube.com/watch?v=0nS6i5uZJp0\\" target=\\"_blank\\" class=\\"search-result-item\\"><span class=\\"result-icon\\">🌐</span><span class=\\"result-title\\">Meet the factory workers training A.I. to replace themselves - YouTube</span></a><a href=\\"https://www.reddit.com/r/GenAI4all/comments/1sijyds/indian_factory_workers_wear_headmounted_cameras/\\" target=\\"_blank\\" class=\\"search-result-item\\"><span class=\\"result-icon\\">🌐</span><span class=\\"result-title\\">Indian factory workers wear headmounted cameras</span></a></div></div>"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let buckets = try JSONDecoder().decode(ArtifactBuckets.self, from: data)
+        let markdown = ReportMarkdownExtractor.markdown(from: buckets)
+
+        XCTAssertTrue(markdown.contains("执行结果"))
+        XCTAssertTrue(markdown.contains("Search:"))
+        XCTAssertTrue(markdown.contains("Found 10 results"))
+        XCTAssertTrue(markdown.contains("Meet the factory workers training A.I. to replace themselves - YouTube"))
+        XCTAssertTrue(markdown.contains("https://www.youtube.com/watch?v=0nS6i5uZJp0"))
+        XCTAssertFalse(markdown.contains("<div"))
+        XCTAssertFalse(markdown.contains("class="))
+        XCTAssertFalse(markdown.contains("</span>"))
+    }
+
+    func testReportMarkdownParserKeepsBlockStructureAndTables() {
+        let markdown = """
+        # 美国人对制裁中国的态度：系统性研究报告
+
+        报告日期：2026年6月10日
+        研究方法：基于多项权威民调机构数据分析
+
+        ---
+
+        ## 二、关键数据速览
+
+        | 情境/制裁类型 | 支持率 | 反对率 | 数据来源与时间 |
+        | --- | ---: | ---: | --- |
+        | 台湾危机中对华经济外交制裁 | 71% | — | Chicago Council, 2025年秋 |
+        | 对华高科技出口管制 | 68%-69% | — | Chicago Council/Ipsos |
+        """
+
+        let blocks = ReportMarkdownParser.parse(markdown)
+
+        XCTAssertEqual(blocks.first, .heading(level: 1, text: "美国人对制裁中国的态度：系统性研究报告"))
+        XCTAssertTrue(blocks.contains(.horizontalRule))
+        XCTAssertTrue(blocks.contains(.heading(level: 2, text: "二、关键数据速览")))
+        guard case .table(let headers, let rows) = blocks.last else {
+            return XCTFail("Expected final block to be a table.")
+        }
+        XCTAssertEqual(headers, ["情境/制裁类型", "支持率", "反对率", "数据来源与时间"])
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0][1], "71%")
+    }
+
+    func testInlineMarkdownParserHandlesQuotedChineseBoldAndItalic() {
+        let text = #"Reddit r/rs_x（2025年）的讨论中，有年轻观众尖锐指出电影展示的是一种**"被宠坏的生活" (coddled life)，那些"富人子女觉得自己被承诺可以拥有的生活"** [3]。*The Avocado* 提到了**"可疑的同意" (dubious consent)**。"#
+
+        let segments = InlineMarkdownParser.parse(text)
+        let rendered = segments.map(\.text).joined()
+
+        XCTAssertFalse(rendered.contains("**"))
+        XCTAssertFalse(rendered.contains("*The Avocado*"))
+        XCTAssertTrue(segments.contains { $0.isBold && $0.text.contains("被宠坏的生活") })
+        XCTAssertTrue(segments.contains { $0.isBold && $0.text.contains("可疑的同意") })
+        XCTAssertTrue(segments.contains { $0.isItalic && $0.text == "The Avocado" })
+    }
+
     func testBinaryDownloadWritesSuggestedFile() async throws {
         let client = LimiraAPIClient(
             baseURL: URL(string: "https://limira-inc.com")!,
