@@ -388,6 +388,7 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "dom.mainSidebarOpenButton.addEventListener('click', () => {\n\t\tsetSidebarOverlayOpen(true);" in app
     assert "dom.sidebarOverlayBackdrop.addEventListener('click', () => {\n\t\tsetSidebarOverlayOpen(false);" in app
     assert "function setSidebarOverlayOpen(open)" in app
+
     assert "dom.workspace.classList.toggle('sidebar-overlay-open', Boolean(state.sidebarOverlayOpen));" in app
     assert "dom.sidebarOverlayBackdrop?.classList.toggle('hidden', !state.sidebarOverlayOpen);" in app
     assert "dom.mainSidebarOpenButton?.classList.toggle('hidden', !state.sidebarCollapsed || state.sidebarOverlayOpen);" in app
@@ -447,7 +448,9 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function renderHistorySearchModal()" in app
     assert "function searchTaskHistory()" in app
     assert "function loadTaskHistory()" in app
-    assert "state.taskHistory = collapseCurrentConversationHistory(Array.isArray(data.tasks) ? data.tasks : []);" in app
+    assert "const tasks = Array.isArray(data.tasks) ? data.tasks : [];" in app
+    assert "observeTaskLifecycles(tasks);" in app
+    assert "state.taskHistory = collapseCurrentConversationHistory(tasks);" in app
     assert "async function loadTaskProgressRecords()" in app
     assert "function rebuildThinkingFromProgressRecords(records)" in app
     assert "function thinkingStepsFromProgressRecords(records, taskId)" in app
@@ -598,6 +601,28 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     restore_workspace_block = app[app.index("function restoreWorkspace()") : app.index("function saveWorkspace()")]
     assert "dom.queryInput.value = state.query" not in restore_workspace_block
     assert LEGACY_AUTH_PREFIX not in app
+
+
+def test_limira_standalone_frontend_exposes_async_task_stop_and_unread_completion_ui():
+    app = _read(LIMIRA_STANDALONE_APP)
+    index = _read(LIMIRA_STANDALONE_INDEX)
+    styles = _read(LIMIRA_STANDALONE_STYLES)
+
+    assert 'id="submitResearchButton"' in index
+    assert 'aria-label="发送"' in index
+    assert "const STOP_BUTTON_ICON" in app
+    assert "send-stop-icon" in app
+    assert "function cancelCurrentTask()" in app
+    assert "/cancel" in app
+    assert "function isTaskExecutionActive()" in app
+    assert "ACTIVE_TASK_REFRESH_INTERVAL_MS" in app
+    assert "function ensureActiveTaskRefresh()" in app
+    assert "function refreshActiveTaskSnapshot()" in app
+    assert "unreadCompletedTaskIds" in app
+    assert "historyTaskHasUnreadCompletion(task)" in app
+    assert "history-unread-dot" in app
+    assert ".send-button.running" in styles
+    assert ".history-unread-dot" in styles
 
 
 def test_limira_standalone_frontend_exposes_real_voice_input_paths():

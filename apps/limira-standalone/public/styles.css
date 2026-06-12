@@ -501,8 +501,22 @@ label {
 	min-width: 0;
 }
 .history-entry.active .history-title { font-weight: 500; }
+.history-title-row {
+	display: flex;
+	align-items: center;
+	gap: 0.35rem;
+	min-width: 0;
+}
 .history-title { font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .history-meta { font-size: 0.7rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-unread-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: var(--radius-full);
+	background: #2563eb;
+	box-shadow: 0 0 0 2px var(--surface);
+	flex: 0 0 auto;
+}
 .history-actions {
 	display: flex;
 	align-items: center;
@@ -1579,6 +1593,16 @@ label {
 }
 .send-button:hover:not(:disabled) {
 	background: var(--text-secondary);
+}
+.send-button.running {
+	background: var(--danger);
+	color: white;
+}
+.send-button.running:hover:not(:disabled) {
+	background: #b91c1c;
+}
+.send-stop-icon {
+	display: block;
 }
 .send-button:disabled {
 	background: var(--border);

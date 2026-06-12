@@ -869,6 +869,13 @@ class RunnerResearchClientProtocol(Protocol):
         user: LimiraUser,
     ) -> dict[str, Any]: ...
 
+    async def cancel_task(
+        self,
+        *,
+        task: LimiraTask,
+        user: LimiraUser,
+    ) -> dict[str, Any]: ...
+
 
 class LimiraRuntimeState(Protocol):
     async def get_task_runtime(

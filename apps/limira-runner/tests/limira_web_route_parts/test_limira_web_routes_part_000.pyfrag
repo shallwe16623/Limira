@@ -108,6 +108,7 @@ class FakeResearchClient:
         runner_task_id="runner-task-a",
         events=None,
         status_payload=None,
+        cancel_payload=None,
         stream_exception=None,
     ):
         self.runner_task_id = runner_task_id
@@ -117,10 +118,17 @@ class FakeResearchClient:
             "status": "completed",
             "archive_status": "ready",
         }
+        self.cancel_payload = cancel_payload or {
+            "task_id": runner_task_id,
+            "status": "cancelled",
+            "archive_status": "failed",
+            "cancel_requested": True,
+        }
         self.stream_exception = stream_exception
         self.create_calls = []
         self.stream_calls = []
         self.status_calls = []
+        self.cancel_calls = []
 
     async def create_research_task(self, *, query, scenario, user):
         self.create_calls.append(
@@ -147,6 +155,10 @@ class FakeResearchClient:
     async def get_task_status(self, *, task, user):
         self.status_calls.append({"task": task, "user": user})
         return dict(self.status_payload)
+
+    async def cancel_task(self, *, task, user):
+        self.cancel_calls.append({"task": task, "user": user})
+        return dict(self.cancel_payload)
 
 
 @pytest.mark.asyncio
@@ -189,6 +201,50 @@ async def test_create_research_uses_limira_namespace_and_rejects_body_user_id():
             research_client=research,
         )
     assert rejected.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_cancel_research_task_proxies_runner_and_remains_owner_scoped():
+    repo = limira.InMemoryLimiraTaskRepository()
+    research = FakeResearchClient()
+    owner = limira.LimiraUser("user-a")
+    outsider = limira.LimiraUser("user-b")
+
+    created = await limira.create_research_task(
+        {"query": "stop this research"},
+        request=None,
+        user=owner,
+        repo=repo,
+        research_client=research,
+    )
+    task_id = created["task_id"]
+
+    with pytest.raises(HTTPException) as rejected:
+        await limira.cancel_research_task(
+            task_id,
+            user=outsider,
+            repo=repo,
+            research_client=research,
+        )
+    assert rejected.value.status_code == 404
+    assert research.cancel_calls == []
+
+    payload = await limira.cancel_research_task(
+        task_id,
+        user=owner,
+        repo=repo,
+        research_client=research,
+    )
+
+    assert payload["task_id"] == task_id
+    assert payload["status"] == "cancelled"
+    assert payload["archive_status"] == "failed"
+    assert payload["cancel_requested"] is True
+    assert repo.get_task(task_id).status == "cancelled"
+    assert len(research.cancel_calls) == 1
+    assert research.cancel_calls[0]["task"].runner_task_id == "runner-task-a"
+    assert research.cancel_calls[0]["user"] == owner
+    _assert_no_browser_leak(payload)
 
 
 @pytest.mark.asyncio

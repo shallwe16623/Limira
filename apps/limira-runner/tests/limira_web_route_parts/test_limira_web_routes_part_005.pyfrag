@@ -1586,6 +1586,7 @@ def test_limira_router_defines_required_browser_facing_paths():
         ("/scenarios", "GET"),
         ("/research", "POST"),
         ("/tasks/{task_id}", "GET"),
+        ("/tasks/{task_id}/cancel", "POST"),
         ("/tasks/{task_id}/events", "GET"),
         ("/tasks/{task_id}/event-logs", "GET"),
         ("/tasks/{task_id}/artifacts", "GET"),

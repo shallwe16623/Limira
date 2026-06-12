@@ -230,6 +230,29 @@ class RunnerResearchClient:
             raise HTTPException(status_code=502, detail="runner_task_status_failed")
         return response.json()
 
+    async def cancel_task(
+        self,
+        *,
+        task: LimiraTask,
+        user: LimiraUser,
+    ) -> dict[str, Any]:
+        if not self.runner_url:
+            raise HTTPException(status_code=503, detail="runner_url_not_configured")
+        if not task.runner_task_id:
+            raise HTTPException(status_code=500, detail="runner_task_id_missing")
+
+        url = f"{self.runner_url}/limira-runner/tasks/{task.runner_task_id}/cancel"
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                url,
+                headers=runner_service_headers(user, self.service_token),
+            )
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="runner_task_not_found")
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="runner_task_cancel_failed")
+        return response.json()
+
 
 class RunnerArchiveClient:
     def __init__(
@@ -885,6 +908,57 @@ async def get_task(
 ) -> dict[str, Any]:
     task = _get_owned_task(repo, task_id, user)
     return _assert_browser_safe(task.public_dict())
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_research_task(
+    task_id: str,
+    user: LimiraUser = Depends(get_current_limira_user),
+    repo: LimiraTaskRepository = Depends(get_task_repository),
+    research_client: RunnerResearchClientProtocol = Depends(get_research_client),
+) -> dict[str, Any]:
+    task = _get_owned_task(repo, task_id, user)
+    if task.status in FINAL_TASK_STATUSES:
+        return _assert_browser_safe(
+            {
+                **task.public_dict(),
+                "cancel_requested": False,
+            }
+        )
+    if not task.runner_task_id:
+        cancelled = repo.update_task(
+            task.task_id,
+            status="cancelled",
+            archive_status="failed",
+            error="cancelled_before_runner_task_created",
+        )
+        return _assert_browser_safe(
+            {
+                **cancelled.public_dict(),
+                "cancel_requested": True,
+            }
+        )
+
+    try:
+        runner_status = await research_client.cancel_task(task=task, user=user)
+    except HTTPException as exc:
+        public_detail = _public_error_text(
+            exc.detail,
+            fallback="runner_task_cancel_failed",
+        ) or "runner_task_cancel_failed"
+        raise HTTPException(status_code=exc.status_code, detail=public_detail) from exc
+
+    current = _apply_authoritative_runner_status(
+        repo,
+        task.task_id,
+        scrub_limira_secrets(runner_status),
+    )
+    return _assert_browser_safe(
+        {
+            **current.public_dict(),
+            "cancel_requested": bool(runner_status.get("cancel_requested", True)),
+        }
+    )
 
 
 @router.post("/tasks/{task_id}/history/archive")

@@ -16,9 +16,13 @@ const artifactEvents = new Set([
 const STORAGE_KEY = 'limiraStandaloneWorkspace:v2';
 const LEGACY_STORAGE_KEYS = ['limiraStandaloneWorkspace:v1'];
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'limiraSidebarCollapsed:v1';
+const TASK_UI_STATE_STORAGE_KEY = 'limiraTaskUiState:v1';
 const MAX_STORED_MESSAGES = 100;
 const MAX_THINKING_STEPS = 120;
 const MAX_HISTORY_TASKS = 30;
+const ACTIVE_TASK_REFRESH_INTERVAL_MS = 5000;
+const SEND_BUTTON_ICON = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M7 11L12 6L17 11M12 18V7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+const STOP_BUTTON_ICON = '<svg class="send-stop-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8.25" stroke="currentColor" stroke-width="2"></circle><rect x="9" y="9" width="6" height="6" rx="1.2" fill="currentColor"></rect></svg>';
 const STATUS_LABELS = {
 	ready: '就绪',
 	starting: '启动中',
@@ -80,6 +84,7 @@ const DIRECT_EXTERNAL_EVIDENCE_HOSTS = [
 ];
 const artifactSnapshotLoads = new Set();
 const thinkingHistoryLoads = new Set();
+const persistedTaskUiState = loadTaskUiPersistence();
 
 const state = {
 	authScope: 'personal',
@@ -120,6 +125,8 @@ const state = {
 	artifactTaskId: '',
 	activeTab: CONVERSATION_VIEW,
 	isSubmitting: false,
+	isCancellingTask: false,
+	isRefreshingActiveTask: false,
 	isUploading: false,
 	currentUpload: null,
 	isSearching: false,
@@ -143,6 +150,8 @@ const state = {
 	uploadResults: [],
 	taskHistory: [],
 	archivedTaskHistory: [],
+	taskStatusById: persistedTaskUiState.taskStatusById,
+	unreadCompletedTaskIds: persistedTaskUiState.unreadCompletedTaskIds,
 	isVoiceRecording: false,
 	isVoiceTranscribing: false,
 	voiceRecognition: null,
@@ -157,7 +166,8 @@ const state = {
 	sandboxPreviewUrl: '',
 	sandboxPreviewTitle: '',
 	sandboxPreviewSummary: '',
-	eventSource: null
+	eventSource: null,
+	activeTaskRefreshTimer: null
 };
 
 const dom = {};
@@ -414,7 +424,11 @@ function bindEvents() {
 	dom.refreshHistoryButton.addEventListener('click', () => void loadTaskHistory());
 	dom.researchForm.addEventListener('submit', (event) => {
 		event.preventDefault();
-		void submitResearch();
+		if (isTaskExecutionActive()) {
+			void cancelCurrentTask();
+		} else {
+			void submitResearch();
+		}
 	});
 	dom.queryInput.addEventListener('input', () => {
 		resizeQueryInput();
@@ -1017,6 +1031,158 @@ function setUser(user) {
 	}
 }
 
+function loadTaskUiPersistence() {
+	let saved = null;
+	try {
+		saved = JSON.parse(localStorage.getItem(TASK_UI_STATE_STORAGE_KEY) || 'null');
+	} catch {
+		localStorage.removeItem(TASK_UI_STATE_STORAGE_KEY);
+	}
+	const rawStatuses = saved && typeof saved.taskStatusById === 'object' && !Array.isArray(saved.taskStatusById)
+		? saved.taskStatusById
+		: {};
+	return {
+		taskStatusById: Object.fromEntries(
+			Object.entries(rawStatuses)
+				.map(([taskId, status]) => [String(taskId || '').trim(), normalizedTaskStatus(status)])
+				.filter(([taskId, status]) => taskId && status)
+				.slice(-300)
+		),
+		unreadCompletedTaskIds: normalizedTaskIdArray(saved?.unreadCompletedTaskIds).slice(-120)
+	};
+}
+
+function normalizedTaskIdArray(values) {
+	const ids = [];
+	for (const value of Array.isArray(values) ? values : []) {
+		const taskId = String(value || '').trim();
+		if (taskId && !ids.includes(taskId)) {
+			ids.push(taskId);
+		}
+	}
+	return ids;
+}
+
+function normalizedTaskStatus(status) {
+	return String(status || '').trim().toLowerCase();
+}
+
+function saveTaskUiPersistence() {
+	try {
+		localStorage.setItem(
+			TASK_UI_STATE_STORAGE_KEY,
+			JSON.stringify({
+				taskStatusById: Object.fromEntries(Object.entries(state.taskStatusById).slice(-300)),
+				unreadCompletedTaskIds: state.unreadCompletedTaskIds.slice(-120)
+			})
+		);
+	} catch {
+		// The live UI can continue without persisted unread markers.
+	}
+}
+
+function clearTaskUiPersistence() {
+	state.taskStatusById = {};
+	state.unreadCompletedTaskIds = [];
+	localStorage.removeItem(TASK_UI_STATE_STORAGE_KEY);
+}
+
+function taskAndConversationMembers(task) {
+	if (!task || typeof task !== 'object') {
+		return [];
+	}
+	const members = Array.isArray(task.conversation_members) ? task.conversation_members : [];
+	return [task, ...members].filter((item) => item && typeof item === 'object');
+}
+
+function taskIdsForHistoryEntry(task) {
+	return normalizedTaskIdArray(taskAndConversationMembers(task).map((item) => item.task_id));
+}
+
+function isTaskExecutionActive() {
+	return Boolean(state.taskId) && !terminalStatuses.has(normalizedTaskStatus(state.status));
+}
+
+function isTaskViewed(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	return Boolean(normalizedTaskId) && (
+		normalizedTaskId === state.taskId ||
+		normalizedTaskId === state.artifactTaskId ||
+		isCurrentConversationTaskId(normalizedTaskId)
+	);
+}
+
+function markTaskIdsViewed(taskIds) {
+	let changed = false;
+	for (const taskId of normalizedTaskIdArray(taskIds)) {
+		if (!state.unreadCompletedTaskIds.includes(taskId)) {
+			continue;
+		}
+		state.unreadCompletedTaskIds = state.unreadCompletedTaskIds.filter((id) => id !== taskId);
+		changed = true;
+	}
+	if (changed) {
+		saveTaskUiPersistence();
+		renderHistory();
+	}
+	return changed;
+}
+
+function markHistoryTaskViewed(task) {
+	return markTaskIdsViewed(taskIdsForHistoryEntry(task));
+}
+
+function observeTaskLifecycle(task, options = {}) {
+	let changed = false;
+	const forceViewed = Boolean(options.markViewed);
+	for (const item of taskAndConversationMembers(task)) {
+		const taskId = String(item.task_id || '').trim();
+		const status = normalizedTaskStatus(item.status);
+		if (!taskId || !status) {
+			continue;
+		}
+		const previousStatus = state.taskStatusById[taskId] || '';
+		const viewed = forceViewed || isTaskViewed(taskId);
+		if (
+			previousStatus &&
+			previousStatus !== 'completed' &&
+			status === 'completed' &&
+			!viewed &&
+			!state.unreadCompletedTaskIds.includes(taskId)
+		) {
+			state.unreadCompletedTaskIds = [...state.unreadCompletedTaskIds, taskId].slice(-120);
+			changed = true;
+		}
+		if (state.taskStatusById[taskId] !== status) {
+			state.taskStatusById[taskId] = status;
+			changed = true;
+		}
+		if (viewed && state.unreadCompletedTaskIds.includes(taskId)) {
+			state.unreadCompletedTaskIds = state.unreadCompletedTaskIds.filter((id) => id !== taskId);
+			changed = true;
+		}
+	}
+	if (changed) {
+		saveTaskUiPersistence();
+	}
+	return changed;
+}
+
+function observeTaskLifecycles(tasks) {
+	let changed = false;
+	for (const task of Array.isArray(tasks) ? tasks : []) {
+		changed = observeTaskLifecycle(task) || changed;
+	}
+	if (changed) {
+		renderHistory();
+	}
+	return changed;
+}
+
+function historyTaskHasUnreadCompletion(task) {
+	return taskIdsForHistoryEntry(task).some((taskId) => state.unreadCompletedTaskIds.includes(taskId));
+}
+
 async function resumeWorkspace() {
 	if (state.savedUserId && state.user?.id && state.savedUserId !== state.user.id) {
 		clearWorkspaceStorage();
@@ -1028,17 +1194,21 @@ async function resumeWorkspace() {
 	}
 	if (!state.taskId) {
 		await loadUploads();
+		ensureActiveTaskRefresh();
 		return;
 	}
 	try {
 		await refreshTask();
 		await loadTaskProgressRecords();
+		await refreshTask();
 		await loadArtifacts();
 		await loadUploads();
 		await loadTaskHistory();
 		if (!terminalStatuses.has(state.status)) {
 			connectStream();
 		}
+		markTaskIdsViewed([state.taskId, ...state.conversationTaskIds]);
+		ensureActiveTaskRefresh();
 	} catch (error) {
 		addMessage(
 			'error',
@@ -1055,6 +1225,7 @@ async function resumeWorkspace() {
 		renderReportControls();
 		await loadUploads();
 		await loadTaskHistory();
+		ensureActiveTaskRefresh();
 	}
 }
 
@@ -1070,12 +1241,14 @@ async function refreshTask() {
 	state.restoreBlocked = false;
 	state.status = task.status || state.status;
 	updateArchiveState(task);
+	observeTaskLifecycle(task, { markViewed: isTaskViewed(task.task_id) });
 	mergeTaskHistory(task, {
 		suppressIfCurrentConversation: isCurrentConversationTaskId(task.task_id)
 			&& task.task_id !== state.conversationRootTaskId
 	});
 	saveWorkspace();
 	renderStatus();
+	ensureActiveTaskRefresh();
 }
 
 async function loadTaskHistory() {
@@ -1098,7 +1271,9 @@ async function loadTaskHistory() {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
-		state.taskHistory = collapseCurrentConversationHistory(Array.isArray(data.tasks) ? data.tasks : []);
+		const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+		observeTaskLifecycles(tasks);
+		state.taskHistory = collapseCurrentConversationHistory(tasks);
 		if (dom.historyMessage) {
 			dom.historyMessage.textContent = state.taskHistory.length
 				? ''
@@ -1135,6 +1310,7 @@ async function loadArchivedTaskHistory() {
 			return;
 		}
 		state.archivedTaskHistory = Array.isArray(data.tasks) ? data.tasks : [];
+		observeTaskLifecycles(state.archivedTaskHistory);
 		if (dom.archivedHistoryMessage) {
 			dom.archivedHistoryMessage.textContent = state.archivedTaskHistory.length
 				? ''
@@ -1218,9 +1394,13 @@ function renderHistory() {
 			const taskId = String(task.task_id || '');
 			const active = taskId && isActiveHistoryTask(taskId);
 			const archived = Boolean(task.history_archived || state.showArchivedHistory);
+			const unread = historyTaskHasUnreadCompletion(task);
 			return `<article class="history-entry${active ? ' active' : ''}">
 				<button type="button" class="history-item" data-task-id="${escapeAttr(taskId)}">
-					<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
+					<span class="history-title-row">
+						<span class="history-title">${escapeHtml(taskHistoryTitle(task))}</span>
+						${unread ? '<span class="history-unread-dot" aria-label="有已完成未读任务"></span>' : ''}
+					</span>
 					<span class="history-meta">${escapeHtml(taskHistoryMeta(task))}</span>
 				</button>
 				<div class="history-actions">
@@ -1545,6 +1725,8 @@ async function selectHistoryTask(taskId) {
 	for (const member of members) {
 		rememberTaskThinkingSteps(member.task_id, historyThinkingSteps(member));
 	}
+	markHistoryTaskViewed(cached);
+	markTaskIdsViewed(members.map((member) => member.task_id));
 	setQueryInputValue('', { syncState: false });
 	saveWorkspace();
 	renderShell();
@@ -1552,11 +1734,13 @@ async function selectHistoryTask(taskId) {
 		await hydrateConversationHistory(members);
 		await refreshTask();
 		await loadTaskProgressRecords();
+		await refreshTask();
 		await loadArtifacts();
 		await loadUploads();
 		if (!terminalStatuses.has(state.status)) {
 			connectStream();
 		}
+		ensureActiveTaskRefresh();
 	} catch (error) {
 		if (isAuthoritativeRestoreRejection(error)) {
 			clearRestoredTaskState();
@@ -1564,6 +1748,7 @@ async function selectHistoryTask(taskId) {
 			renderShell();
 		}
 		addMessage('error', `无法加载历史任务：${errorMessage(error)}`);
+		ensureActiveTaskRefresh();
 	}
 }
 
@@ -1626,6 +1811,7 @@ function startNewChat() {
 	setQueryInputValue('');
 	saveWorkspace();
 	renderShell();
+	ensureActiveTaskRefresh();
 	void loadUploads();
 }
 
@@ -1664,6 +1850,7 @@ function mergeTaskHistory(task, options = {}) {
 		return;
 	}
 	const taskId = String(task.task_id);
+	observeTaskLifecycle(task, { markViewed: isTaskViewed(taskId) });
 	if (options.suppressIfCurrentConversation && isCurrentConversationTaskId(taskId) && taskId !== state.conversationRootTaskId) {
 		state.taskHistory = collapseCurrentConversationHistory(state.taskHistory);
 		renderHistory();
@@ -1955,9 +2142,11 @@ function rememberTaskThinkingSteps(taskId = state.taskId, steps = state.thinking
 
 function clearWorkspaceStorage() {
 	localStorage.removeItem(STORAGE_KEY);
+	clearTaskUiPersistence();
 }
 
 function resetWorkspaceState() {
+	stopActiveTaskRefresh();
 	bumpWorkspaceGeneration();
 	state.savedUserId = state.user?.id || '';
 	state.taskId = '';
@@ -1969,6 +2158,8 @@ function resetWorkspaceState() {
 	state.archiveDownloadUrl = '';
 	state.restoreBlocked = false;
 	state.isSubmitting = false;
+	state.isCancellingTask = false;
+	state.isRefreshingActiveTask = false;
 	state.isUploading = false;
 	state.currentUpload = null;
 	state.isSearching = false;
@@ -1999,6 +2190,7 @@ async function signOut() {
 	} catch {
 		// Local cleanup still matters if the server session is already gone.
 	}
+	stopActiveTaskRefresh();
 	state.eventSource?.close();
 	state.eventSource = null;
 	state.restoreBlocked = false;
@@ -2016,6 +2208,10 @@ async function signOut() {
 }
 
 async function submitResearch() {
+	if (isTaskExecutionActive()) {
+		await cancelCurrentTask();
+		return;
+	}
 	const query = dom.queryInput.value.trim();
 	if (!query || state.isSubmitting) {
 		return;
@@ -2119,6 +2315,7 @@ async function submitResearch() {
 		renderTabs();
 		renderUploads();
 		connectStream();
+		ensureActiveTaskRefresh();
 		await loadArtifacts();
 		await loadUploads();
 		await loadTaskHistory();
@@ -2139,6 +2336,78 @@ async function submitResearch() {
 		if (isCurrentAsyncContext(context)) {
 			state.isSubmitting = false;
 			renderStatus();
+			ensureActiveTaskRefresh();
+		}
+	}
+}
+
+async function cancelCurrentTask() {
+	if (!isTaskExecutionActive() || state.isCancellingTask) {
+		return;
+	}
+	const context = captureAsyncContext();
+	state.isCancellingTask = true;
+	addThinkingStep({
+		kind: 'status',
+		title: '正在中断任务',
+		detail: '已向服务器发送中断请求。',
+		status: 'active'
+	});
+	renderStatus();
+	saveWorkspace();
+	try {
+		const task = await api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/cancel`, {
+			method: 'POST'
+		});
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		state.status = task.status || state.status;
+		updateArchiveState(task);
+		observeTaskLifecycle(task, { markViewed: true });
+		mergeTaskHistory(task, {
+			suppressIfCurrentConversation: isCurrentConversationTaskId(task.task_id)
+				&& task.task_id !== state.conversationRootTaskId
+		});
+		if (terminalStatuses.has(state.status)) {
+			completeActiveThinkingSteps();
+			addThinkingStep({
+				kind: 'done',
+				title: '任务已中断',
+				detail: '服务器已确认停止当前任务。',
+				status: 'done'
+			});
+			state.eventSource?.close();
+			state.eventSource = null;
+		} else {
+			addThinkingStep({
+				kind: 'status',
+				title: '中断请求已送达',
+				detail: '任务正在等待 runner 停止当前执行步骤。',
+				status: 'active'
+			});
+		}
+		await loadTaskProgressRecords();
+		await refreshTask();
+		await loadArtifacts();
+		await loadTaskHistory();
+	} catch (error) {
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		addThinkingStep({
+			kind: 'error',
+			title: '中断请求失败',
+			detail: errorMessage(error),
+			status: 'error'
+		});
+		addMessage('error', `中断任务失败：${errorMessage(error)}`);
+	} finally {
+		if (isCurrentAsyncContext(context)) {
+			state.isCancellingTask = false;
+			renderStatus();
+			saveWorkspace();
+			ensureActiveTaskRefresh();
 		}
 	}
 }
@@ -2164,8 +2433,65 @@ function connectStream() {
 			state.status = 'stream reconnecting';
 			saveWorkspace();
 			renderStatus();
+			ensureActiveTaskRefresh();
 		}
 	};
+	ensureActiveTaskRefresh();
+}
+
+function ensureActiveTaskRefresh() {
+	const active = isTaskExecutionActive();
+	if (!active) {
+		stopActiveTaskRefresh();
+		return;
+	}
+	if (state.activeTaskRefreshTimer) {
+		return;
+	}
+	state.activeTaskRefreshTimer = window.setInterval(() => {
+		void refreshActiveTaskSnapshot();
+	}, ACTIVE_TASK_REFRESH_INTERVAL_MS);
+}
+
+function stopActiveTaskRefresh() {
+	if (!state.activeTaskRefreshTimer) {
+		return;
+	}
+	window.clearInterval(state.activeTaskRefreshTimer);
+	state.activeTaskRefreshTimer = null;
+}
+
+async function refreshActiveTaskSnapshot() {
+	if (!isTaskExecutionActive() || state.isRefreshingActiveTask) {
+		ensureActiveTaskRefresh();
+		return;
+	}
+	state.isRefreshingActiveTask = true;
+	const context = captureAsyncContext();
+	try {
+		await loadTaskProgressRecords();
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		await refreshTask();
+		if (!isCurrentAsyncContext(context)) {
+			return;
+		}
+		if (terminalStatuses.has(state.status)) {
+			state.eventSource?.close();
+			state.eventSource = null;
+			await loadArtifacts();
+			await loadUploads();
+		}
+		await loadTaskHistory();
+	} catch {
+		// EventSource remains the primary live path; polling is only a recovery path.
+	} finally {
+		if (isCurrentAsyncContext(context)) {
+			state.isRefreshingActiveTask = false;
+			ensureActiveTaskRefresh();
+		}
+	}
 }
 
 function normalizeStreamPayload(payload) {
@@ -2197,6 +2523,7 @@ function handleStreamEvent(payload) {
 	if (eventType === 'heartbeat') {
 		saveWorkspace();
 		renderStatus();
+		ensureActiveTaskRefresh();
 		return;
 	}
 
@@ -2256,11 +2583,18 @@ function handleStreamEvent(payload) {
 	}
 
 	if (terminalStatuses.has(state.status)) {
+		observeTaskLifecycle(
+			{ task_id: state.taskId, status: state.status, archive_status: state.archiveStatus },
+			{ markViewed: true }
+		);
 		state.eventSource?.close();
 		state.eventSource = null;
+		stopActiveTaskRefresh();
 		void loadArtifacts();
 		void loadUploads();
 		void loadTaskHistory();
+	} else {
+		ensureActiveTaskRefresh();
 	}
 
 	renderStatus();
@@ -3085,7 +3419,22 @@ function renderStatus() {
 				state.restoreBlocked ? ' · 待恢复确认' : ''
 			}`
 		: '暂无任务';
-	dom.submitResearchButton.disabled = state.isSubmitting;
+	renderSubmitButton();
+}
+
+function renderSubmitButton() {
+	if (!dom.submitResearchButton) {
+		return;
+	}
+	const stopMode = isTaskExecutionActive() || state.isCancellingTask || state.isSubmitting;
+	dom.submitResearchButton.classList.toggle('running', stopMode);
+	dom.submitResearchButton.innerHTML = stopMode ? STOP_BUTTON_ICON : SEND_BUTTON_ICON;
+	const label = stopMode ? (state.isCancellingTask ? '正在中断' : '中断当前任务') : '发送';
+	dom.submitResearchButton.title = label;
+	dom.submitResearchButton.setAttribute('aria-label', label);
+	dom.submitResearchButton.disabled = stopMode
+		? !state.taskId || state.isCancellingTask
+		: state.isSubmitting;
 }
 
 function renderMessages(options = {}) {
