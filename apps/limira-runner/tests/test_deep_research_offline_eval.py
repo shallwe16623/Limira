@@ -1114,6 +1114,58 @@ async def test_offline_eval_case_same_entity_background_is_not_supported():
 
 
 @pytest.mark.asyncio
+async def test_offline_eval_case_same_entity_status_mismatch_is_not_supported():
+    state = build_initial_research_graph(
+        task_id="case-status-mismatch-does-not-support-claim",
+        query="Assess Entity A listing",
+        max_units=1,
+    )
+    state = state.model_copy(
+        update={
+            "phase": ResearchPhase.COMPRESS,
+            "evidence": [
+                _offline_evidence(
+                    "EVID-001",
+                    "Entity A applied for program X and remains under review.",
+                )
+            ],
+            "findings": [
+                CompressedFinding(
+                    id="finding-status-mismatch",
+                    research_unit_id="unit-1-background",
+                    summary="Entity A is listed under program X.",
+                    evidence_ids=["EVID-001"],
+                    confidence=0.8,
+                )
+            ],
+        }
+    )
+
+    verify_output = await VerifierNode().run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    write_output = await WriterNode().run(
+        verify_output.state,
+        _offline_graph_context(),
+        verify_output,
+    )
+    claim = verify_output.state.verified_claims[0]
+
+    assert claim.support_type in {"weak", "insufficient"}
+    assert {detail.support_type for detail in claim.evidence_details} == {"unrelated"}
+    assert "Entity A is listed" not in _markdown_section(
+        write_output.final_summary,
+        "Key Findings",
+    )
+    assert "Entity A is listed" in _markdown_section(
+        write_output.final_summary,
+        "Uncertainties",
+    )
+
+
+@pytest.mark.asyncio
 async def test_offline_eval_case_stale_current_evidence_is_not_supported():
     state = build_initial_research_graph(
         task_id="case-stale-current-evidence",

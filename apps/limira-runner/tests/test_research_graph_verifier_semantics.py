@@ -128,6 +128,38 @@ async def test_verifier_does_not_support_same_entity_background_evidence():
 
 
 @pytest.mark.asyncio
+async def test_verifier_does_not_support_same_entity_status_mismatch():
+    state = _state_with_finding(
+        claim="Entity A is listed under program X.",
+        evidence=[
+            _evidence(
+                "EVID-001",
+                "Entity A applied for program X and remains under review.",
+            )
+        ],
+        evidence_ids=["EVID-001"],
+    )
+
+    claim, verify_output = await _verify(state)
+    write_output = await WriterNode().run(
+        verify_output.state,
+        _context(state.task_id),
+        verify_output,
+    )
+
+    assert claim.support_type in {"weak", "insufficient"}
+    assert {detail.support_type for detail in claim.evidence_details} == {"unrelated"}
+    assert "Entity A is listed" not in write_output.final_summary.split(
+        "## Evidence Table",
+        1,
+    )[0]
+    assert write_output.final_boxed_answer == (
+        "The available evidence is insufficient to provide a settled answer."
+    )
+    assert write_output.artifact_events[-1]["payload"]["evidence_refs"] == []
+
+
+@pytest.mark.asyncio
 async def test_verifier_downgrades_stale_current_claim_evidence():
     state = _state_with_finding(
         claim="Entity A is currently listed under program X in 2026.",

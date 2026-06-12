@@ -39,6 +39,38 @@ CURRENT_CLAIM_MARKERS = (
     "latest",
     "still",
 )
+DECISIVE_CLAIM_MARKERS = (
+    "listed",
+    "listing",
+    "designated",
+    "sanctioned",
+    "subject to",
+    "confirmed",
+    "current",
+    "currently",
+    "must",
+    "should",
+    "higher than",
+    "lower than",
+    "more than",
+    "less than",
+)
+NON_SUPPORTING_STATUS_MARKERS = (
+    "applied",
+    "application",
+    "under review",
+    "pending",
+    "proposed",
+    "considered",
+    "candidate",
+    "awaiting",
+    "may be",
+    "possible",
+    "potential",
+    "eligibility",
+    "nominated",
+    "evaluated",
+)
 ENTAILMENT_STOP_WORDS = {
     "a",
     "an",
@@ -295,6 +327,11 @@ def _evidence_directly_supports_claim(
         normalized_evidence = _normalized_text(evidence_text)
         if not normalized_evidence:
             continue
+        if _has_non_supporting_status_mismatch(
+            normalized_claim,
+            normalized_evidence,
+        ):
+            continue
         if (
             len(normalized_claim) >= 24
             and normalized_claim in normalized_evidence
@@ -303,14 +340,58 @@ def _evidence_directly_supports_claim(
             and normalized_evidence in normalized_claim
         ):
             return True
-        evidence_terms = set(_significant_terms(normalized_evidence))
-        if not claim_terms or not evidence_terms:
-            continue
-        overlap = set(claim_terms) & evidence_terms
-        required = max(2, int(len(set(claim_terms)) * 0.55))
-        if len(overlap) >= required:
+        if _claim_requires_decisive_support(normalized_claim):
+            if not _decisive_support_markers_align(
+                normalized_claim,
+                normalized_evidence,
+            ):
+                continue
+            return _term_overlap_supports_claim(claim_terms, normalized_evidence)
+        if _term_overlap_supports_claim(claim_terms, normalized_evidence):
             return True
     return False
+
+
+def _term_overlap_supports_claim(
+    claim_terms: list[str],
+    normalized_evidence: str,
+) -> bool:
+    evidence_terms = set(_significant_terms(normalized_evidence))
+    if not claim_terms or not evidence_terms:
+        return False
+    overlap = set(claim_terms) & evidence_terms
+    required = max(2, int(len(set(claim_terms)) * 0.55))
+    return len(overlap) >= required
+
+
+def _claim_requires_decisive_support(normalized_claim: str) -> bool:
+    return (
+        _evidence_polarity(normalized_claim) != "neutral"
+        or any(marker in normalized_claim for marker in DECISIVE_CLAIM_MARKERS)
+    )
+
+
+def _decisive_support_markers_align(
+    normalized_claim: str,
+    normalized_evidence: str,
+) -> bool:
+    claim_polarity = _evidence_polarity(normalized_claim)
+    evidence_polarity = _evidence_polarity(normalized_evidence)
+    if claim_polarity in {"positive", "negative"}:
+        return claim_polarity == evidence_polarity
+    return any(
+        marker in normalized_claim and marker in normalized_evidence
+        for marker in DECISIVE_CLAIM_MARKERS
+    )
+
+
+def _has_non_supporting_status_mismatch(
+    normalized_claim: str,
+    normalized_evidence: str,
+) -> bool:
+    if not _claim_requires_decisive_support(normalized_claim):
+        return False
+    return any(marker in normalized_evidence for marker in NON_SUPPORTING_STATUS_MARKERS)
 
 
 def _evidence_is_background_only(evidence_text: str) -> bool:
