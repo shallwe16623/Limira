@@ -23,6 +23,7 @@ from .research_graph import (
     _emit_graph_phase,
     _validate_graph_final_outputs,
     default_langgraph_research_graph_nodes,
+    parse_evidence_strict_mode,
 )
 
 
@@ -46,15 +47,23 @@ async def execute_langgraph_research(
     task_id: str,
     is_final_retry: bool,
     stream_queue: Any | None,
+    evidence_strict_mode: Any | None = None,
 ) -> ResearchGraphExecutionResult:
     """Run the LangGraph-backed executor using the existing graph contract."""
 
+    strict_mode = parse_evidence_strict_mode(
+        state.evidence_strict_mode
+        if evidence_strict_mode is None
+        else evidence_strict_mode
+    )
+    state = state.model_copy(update={"evidence_strict_mode": strict_mode})
     context = ResearchGraphExecutionContext(
         orchestrator=orchestrator,
         original_task_description=original_task_description,
         task_file_name=task_file_name,
         task_id=task_id,
         is_final_retry=is_final_retry,
+        evidence_strict_mode=strict_mode,
     )
     graph = build_langgraph_research_graph(context=context, stream_queue=stream_queue)
     runtime = await graph.ainvoke(

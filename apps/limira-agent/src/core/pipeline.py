@@ -35,6 +35,7 @@ from .research_graph import (
     execute_research_graph,
     graph_bootstrap_events,
     graph_task_description,
+    parse_evidence_strict_mode,
 )
 
 
@@ -111,6 +112,7 @@ async def execute_task_pipeline(
 
     try:
         graph_executor = _research_graph_executor(cfg)
+        evidence_strict_mode = _evidence_strict_mode(cfg)
         graph_state = build_initial_research_graph(
             task_id=task_id,
             query=task_description,
@@ -118,6 +120,7 @@ async def execute_task_pipeline(
             document_ids=_context_string_list(research_context, "document_ids"),
             upload_scope=_context_mapping(research_context, "upload_scope"),
             source_policy=_context_mapping(research_context, "source_policy"),
+            evidence_strict_mode=evidence_strict_mode,
         )
         if stream_queue is not None:
             await stream_queue.put(_research_graph_executor_event(task_id, graph_executor))
@@ -151,6 +154,7 @@ async def execute_task_pipeline(
                 task_id=task_id,
                 is_final_retry=is_final_retry,
                 stream_queue=stream_queue,
+                evidence_strict_mode=evidence_strict_mode,
             )
             final_summary = graph_result.final_summary
             final_boxed_answer = graph_result.final_boxed_answer
@@ -165,6 +169,7 @@ async def execute_task_pipeline(
                 task_id=task_id,
                 is_final_retry=is_final_retry,
                 stream_queue=stream_queue,
+                evidence_strict_mode=evidence_strict_mode,
             )
             final_summary = graph_result.final_summary
             final_boxed_answer = graph_result.final_boxed_answer
@@ -298,6 +303,17 @@ def _research_graph_executor(cfg: DictConfig) -> str:
     )
 
 
+def _evidence_strict_mode(cfg: DictConfig):
+    explicit = OmegaConf.select(cfg, "limira.evidence.strict", default=None)
+    if explicit is None:
+        explicit = OmegaConf.select(
+            cfg,
+            "agent.research_graph.evidence_strict",
+            default=None,
+        )
+    return parse_evidence_strict_mode(explicit)
+
+
 def _load_langgraph_executor():
     try:
         from .research_langgraph import execute_langgraph_research
@@ -347,6 +363,7 @@ def _should_emit_pipeline_error_event(error: Exception) -> bool:
     return text.startswith(
         (
             "invalid_research_graph_executor",
+            "invalid_evidence_strict_mode",
             "langgraph_executor_unavailable",
             "langgraph_executor_not_implemented",
         )

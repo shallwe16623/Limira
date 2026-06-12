@@ -18,9 +18,33 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 EVIDENCE_ID_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
+EVIDENCE_ID_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(EVID-[A-Za-z0-9_-]+)(?![A-Za-z0-9_-])"
+)
 GRAPH_CONTENT_HASH_CHARS = 32
 GRAPH_SOURCE_SUMMARY_MAX_CHARS = 20_000
 GRAPH_FINDING_SUMMARY_MAX_CHARS = 10_000
+
+
+class EvidenceStrictMode(StrEnum):
+    WARN = "warn"
+    BLOCK = "block"
+
+
+def parse_evidence_strict_mode(value: Any = None) -> EvidenceStrictMode:
+    if value is None or value == "":
+        return EvidenceStrictMode.WARN
+    if isinstance(value, EvidenceStrictMode):
+        return value
+    mode = str(value).strip().lower()
+    if mode == EvidenceStrictMode.WARN.value:
+        return EvidenceStrictMode.WARN
+    if mode == EvidenceStrictMode.BLOCK.value:
+        return EvidenceStrictMode.BLOCK
+    raise ValueError(
+        "invalid_evidence_strict_mode: "
+        f"{value!r}; expected one of block, warn"
+    )
 
 
 class ResearchPhase(StrEnum):
@@ -235,6 +259,7 @@ class ResearchGraphState(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
     scenario: str | None = Field(default=None, max_length=1_000)
     source_policy: SourcePolicy = Field(default_factory=SourcePolicy)
+    evidence_strict_mode: EvidenceStrictMode = EvidenceStrictMode.WARN
     upload_scope: ResearchUploadScope = Field(default_factory=ResearchUploadScope)
     phase: ResearchPhase = ResearchPhase.SCOPE
     brief: ResearchBrief
@@ -279,6 +304,7 @@ class ResearchGraphExecutionContext(BaseModel):
     task_file_name: str | None = None
     task_id: str = "default_task"
     is_final_retry: bool = False
+    evidence_strict_mode: EvidenceStrictMode = EvidenceStrictMode.WARN
 
 
 class ResearchGraphNodeOutput(BaseModel):
@@ -291,6 +317,17 @@ class ResearchGraphNodeOutput(BaseModel):
     final_summary: str | None = None
     final_boxed_answer: str | None = None
     failure_experience_summary: Any = None
+
+
+@dataclass(frozen=True)
+class EvidenceReferenceValidation:
+    evidence_refs: list[str]
+    unresolved_refs: list[str]
+    invalid_refs: list[str]
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(self.unresolved_refs or self.invalid_refs)
 
 
 class ResearchGraphNode:
@@ -1190,9 +1227,31 @@ class WriterNode(ResearchGraphNode):
             state,
             final_summary=final_summary,
         )
+        validation = validate_report_evidence_refs(
+            markdown=final_summary,
+            evidence_refs=report_event["payload"].get("evidence_refs"),
+            known_evidence_ids={evidence.id for evidence in state.evidence},
+        )
+        report_event["payload"]["evidence_refs"] = validation.evidence_refs
+        if (
+            context.evidence_strict_mode == EvidenceStrictMode.BLOCK
+            and validation.has_errors
+        ):
+            raise ValueError(_strict_evidence_block_error(validation))
+        evidence_warning_events = _evidence_reference_warning_events(
+            state=state,
+            validation=validation,
+            artifact_type="report_section",
+            local_artifact_id=report_event["payload"]["section_id"],
+            source_event_type=report_event["payload"]["source_event_type"],
+        )
         written_state = state.model_copy(
             update={
                 "phase": self.phase,
+                "warnings": [
+                    *state.warnings,
+                    *_evidence_reference_warning_strings(validation),
+                ],
                 "report_sections": [
                     *state.report_sections,
                     _report_section_from_artifact_event(report_event),
@@ -1205,8 +1264,12 @@ class WriterNode(ResearchGraphNode):
                 "node": self.__class__.__name__,
                 "verified_claim_count": len(state.verified_claims),
                 "final_summary_length": len(final_summary),
+                "evidence_strict_mode": context.evidence_strict_mode.value,
+                "evidence_ref_warnings": [
+                    event["payload"] for event in evidence_warning_events
+                ],
             },
-            artifact_events=[report_event],
+            artifact_events=[*evidence_warning_events, report_event],
             final_summary=final_summary,
             final_boxed_answer=final_boxed_answer,
             failure_experience_summary=(
@@ -1294,6 +1357,7 @@ def build_initial_research_graph(
     document_ids: list[str] | None = None,
     upload_scope: dict[str, Any] | None = None,
     source_policy: dict[str, Any] | None = None,
+    evidence_strict_mode: Any = EvidenceStrictMode.WARN,
     max_units: int = 4,
 ) -> ResearchGraphState:
     """Create a deterministic graph seed before model-assisted planning.
@@ -1313,6 +1377,7 @@ def build_initial_research_graph(
         upload_document_ids,
     )
     policy = _source_policy_from_context(source_policy)
+    strict_mode = parse_evidence_strict_mode(evidence_strict_mode)
     scenario_text = _bounded_optional_text(scenario, 1_000)
     brief = ResearchBrief(
         original_query=normalized_query,
@@ -1359,6 +1424,7 @@ def build_initial_research_graph(
         query=normalized_query,
         scenario=scenario_text,
         source_policy=policy,
+        evidence_strict_mode=strict_mode,
         upload_scope=upload_scope_state,
         phase=ResearchPhase.PLAN,
         brief=brief,
@@ -1469,6 +1535,7 @@ async def execute_research_graph(
     task_id: str = "default_task",
     is_final_retry: bool = False,
     stream_queue: Any = None,
+    evidence_strict_mode: Any | None = None,
 ) -> ResearchGraphExecutionResult:
     """Run the feature-flagged serial graph executor.
 
@@ -1477,12 +1544,19 @@ async def execute_research_graph(
     prompt rather than the full graph plan.
     """
 
+    strict_mode = parse_evidence_strict_mode(
+        state.evidence_strict_mode
+        if evidence_strict_mode is None
+        else evidence_strict_mode
+    )
+    state = state.model_copy(update={"evidence_strict_mode": strict_mode})
     context = ResearchGraphExecutionContext(
         orchestrator=orchestrator,
         original_task_description=original_task_description,
         task_file_name=task_file_name,
         task_id=task_id,
         is_final_retry=is_final_retry,
+        evidence_strict_mode=strict_mode,
     )
     current_output = ResearchGraphNodeOutput(state=state)
     error_state = state
@@ -1935,6 +2009,134 @@ def _final_report_section_artifact_event(
             "source_event_type": "research_graph",
         },
     }
+
+
+def validate_report_evidence_refs(
+    *,
+    markdown: Any,
+    evidence_refs: Any,
+    known_evidence_ids: set[str],
+) -> EvidenceReferenceValidation:
+    candidate_refs = _report_evidence_ref_candidates(markdown, evidence_refs)
+    valid_refs: list[str] = []
+    invalid_refs: list[str] = []
+    seen_valid: set[str] = set()
+    seen_invalid: set[str] = set()
+    for evidence_ref in candidate_refs:
+        if EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_ref):
+            if evidence_ref not in seen_valid:
+                seen_valid.add(evidence_ref)
+                valid_refs.append(evidence_ref)
+            continue
+        if evidence_ref.startswith("EVID-") and evidence_ref not in seen_invalid:
+            seen_invalid.add(evidence_ref)
+            invalid_refs.append(evidence_ref)
+    unresolved_refs = [
+        evidence_ref
+        for evidence_ref in valid_refs
+        if evidence_ref not in known_evidence_ids
+    ]
+    return EvidenceReferenceValidation(
+        evidence_refs=valid_refs,
+        unresolved_refs=unresolved_refs,
+        invalid_refs=invalid_refs,
+    )
+
+
+def _report_evidence_ref_candidates(markdown: Any, evidence_refs: Any) -> list[str]:
+    refs: list[str] = []
+    raw_refs = [evidence_refs] if isinstance(evidence_refs, str) else evidence_refs or []
+    for evidence_ref in raw_refs:
+        text = str(evidence_ref or "").strip()
+        if text.startswith("EVID-"):
+            refs.append(text)
+    refs.extend(
+        match.group(1)
+        for match in EVIDENCE_ID_TOKEN_PATTERN.finditer(str(markdown or ""))
+    )
+    return refs
+
+
+def _evidence_reference_warning_events(
+    *,
+    state: ResearchGraphState,
+    validation: EvidenceReferenceValidation,
+    artifact_type: str,
+    local_artifact_id: str,
+    source_event_type: str,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if validation.invalid_refs:
+        events.append(
+            _artifact_warning_event(
+                state=state,
+                warning="invalid_evidence_refs",
+                artifact_type=artifact_type,
+                local_artifact_id=local_artifact_id,
+                evidence_refs=validation.invalid_refs,
+                source_event_type=source_event_type,
+            )
+        )
+    if validation.unresolved_refs:
+        events.append(
+            _artifact_warning_event(
+                state=state,
+                warning="unresolved_evidence_refs",
+                artifact_type=artifact_type,
+                local_artifact_id=local_artifact_id,
+                evidence_refs=validation.unresolved_refs,
+                source_event_type=source_event_type,
+            )
+        )
+    return events
+
+
+def _artifact_warning_event(
+    *,
+    state: ResearchGraphState,
+    warning: str,
+    artifact_type: str,
+    local_artifact_id: str,
+    evidence_refs: list[str],
+    source_event_type: str,
+) -> dict[str, Any]:
+    return {
+        "event": "artifact_warning",
+        "type": "artifact_warning",
+        "payload": {
+            "task_id": state.task_id,
+            "warning": warning,
+            "artifact_type": artifact_type,
+            "local_artifact_id": local_artifact_id,
+            "evidence_refs": list(evidence_refs),
+            "source_event_type": source_event_type,
+        },
+    }
+
+
+def _evidence_reference_warning_strings(
+    validation: EvidenceReferenceValidation,
+) -> list[str]:
+    warnings: list[str] = []
+    if validation.invalid_refs:
+        warnings.append(f"invalid_evidence_refs={','.join(validation.invalid_refs[:20])}")
+    if validation.unresolved_refs:
+        warnings.append(
+            f"unresolved_evidence_refs={','.join(validation.unresolved_refs[:20])}"
+        )
+    return warnings
+
+
+def _strict_evidence_block_error(validation: EvidenceReferenceValidation) -> str:
+    parts = []
+    if validation.invalid_refs:
+        parts.append(f"invalid_evidence_refs={','.join(validation.invalid_refs[:20])}")
+    if validation.unresolved_refs:
+        parts.append(
+            f"unresolved_evidence_refs={','.join(validation.unresolved_refs[:20])}"
+        )
+    detail = "; ".join(parts) if parts else "evidence_refs_invalid"
+    return f"research_graph_evidence_strict_block: {detail}"
 
 
 def _source_candidate_artifact_event(candidate: SourceCandidate) -> dict[str, Any]:

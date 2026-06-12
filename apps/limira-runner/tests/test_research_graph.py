@@ -6,6 +6,7 @@ from src.core import pipeline as pipeline_module
 from src.core import research_graph as research_graph_module
 from src.core import research_langgraph as research_langgraph_module
 from src.core.research_graph import (
+    EvidenceStrictMode,
     LangGraphResearchUnitNode,
     ResearchGraphExecutionContext,
     ResearchGraphExecutionResult,
@@ -21,6 +22,8 @@ from src.core.research_graph import (
     evidence_id_for_source,
     graph_bootstrap_events,
     graph_task_description,
+    parse_evidence_strict_mode,
+    validate_report_evidence_refs,
 )
 
 
@@ -91,7 +94,12 @@ class _MissingFinalOutputOrchestrator:
         return self.__class__.outputs
 
 
-def _pipeline_cfg(*, graph_enabled: bool = False, graph_executor: str | None = None):
+def _pipeline_cfg(
+    *,
+    graph_enabled: bool = False,
+    graph_executor: str | None = None,
+    evidence_strict: str | None = None,
+):
     agent_cfg = {
         "keep_tool_result": True,
         "main_agent": {"max_turns": 1},
@@ -101,23 +109,24 @@ def _pipeline_cfg(*, graph_enabled: bool = False, graph_executor: str | None = N
         agent_cfg["research_graph"] = {"enabled": True}
     if graph_executor is not None:
         agent_cfg.setdefault("research_graph", {})["executor"] = graph_executor
-    return OmegaConf.create(
-        {
-            "llm": {
-                "provider": "openai-compatible",
-                "base_url": "https://llm.test",
-                "model_name": "test-model",
-                "temperature": 0,
-                "top_p": 1,
-                "min_p": 0,
-                "top_k": 0,
-                "max_tokens": 4096,
-                "repetition_penalty": 1,
-                "async_client": False,
-            },
-            "agent": agent_cfg,
-        }
-    )
+    config = {
+        "llm": {
+            "provider": "openai-compatible",
+            "base_url": "https://llm.test",
+            "model_name": "test-model",
+            "temperature": 0,
+            "top_p": 1,
+            "min_p": 0,
+            "top_k": 0,
+            "max_tokens": 4096,
+            "repetition_penalty": 1,
+            "async_client": False,
+        },
+        "agent": agent_cfg,
+    }
+    if evidence_strict is not None:
+        config["limira"] = {"evidence": {"strict": evidence_strict}}
+    return OmegaConf.create(config)
 
 
 def test_research_graph_state_contains_ac2_contract_fields():
@@ -144,6 +153,27 @@ def test_research_graph_state_contains_ac2_contract_fields():
     assert required_fields <= set(ResearchGraphState.model_fields)
 
 
+def test_evidence_strict_mode_parser_and_report_ref_validation():
+    assert parse_evidence_strict_mode(None) == EvidenceStrictMode.WARN
+    assert parse_evidence_strict_mode("warn") == EvidenceStrictMode.WARN
+    assert parse_evidence_strict_mode("block") == EvidenceStrictMode.BLOCK
+    with pytest.raises(ValueError, match="invalid_evidence_strict_mode"):
+        parse_evidence_strict_mode("silent")
+
+    validation = validate_report_evidence_refs(
+        markdown=(
+            "Known [EVID-001], missing [EVID-999], malformed [EVID-abc], "
+            "and truncated EVID-abcdef1234567."
+        ),
+        evidence_refs=["EVID-001", "EVID-999", "EVID-abc"],
+        known_evidence_ids={"EVID-001"},
+    )
+
+    assert validation.evidence_refs == ["EVID-001", "EVID-999"]
+    assert validation.unresolved_refs == ["EVID-999"]
+    assert validation.invalid_refs == ["EVID-abc", "EVID-abcdef1234567"]
+
+
 def test_initial_research_graph_creates_bounded_scope_and_plan():
     state = build_initial_research_graph(
         task_id="task-graph",
@@ -156,6 +186,7 @@ def test_initial_research_graph_creates_bounded_scope_and_plan():
     assert state.task_id == "task-graph"
     assert state.query == "Track BYD Section 1260H list status."
     assert state.scenario == "sanctions_export_controls"
+    assert state.evidence_strict_mode == EvidenceStrictMode.WARN
     assert state.brief.original_query == "Track BYD Section 1260H list status."
     assert "sanctions_export_controls" in state.brief.scope
     assert len(state.plan.research_units) == 3
@@ -1125,6 +1156,8 @@ async def test_pipeline_routes_to_explicit_langgraph_executor(tmp_path, monkeypa
         raise AssertionError("serial executor should not run")
 
     async def fake_langgraph_executor(**kwargs):
+        assert kwargs["evidence_strict_mode"] == EvidenceStrictMode.BLOCK
+        assert kwargs["state"].evidence_strict_mode == EvidenceStrictMode.BLOCK
         await kwargs["stream_queue"].put(
             {
                 "event": "test_langgraph_executor_used",
@@ -1151,7 +1184,7 @@ async def test_pipeline_routes_to_explicit_langgraph_executor(tmp_path, monkeypa
     stream_queue = _CaptureQueue()
 
     result = await pipeline_module.execute_task_pipeline(
-        cfg=_pipeline_cfg(graph_executor="langgraph"),
+        cfg=_pipeline_cfg(graph_executor="langgraph", evidence_strict="block"),
         task_id="task-pipeline-explicit-langgraph",
         task_description="Verify a company designation with primary sources",
         task_file_name="",
@@ -1195,6 +1228,32 @@ async def test_pipeline_rejects_invalid_graph_executor(tmp_path, monkeypatch):
     assert _FakeOrchestrator.task_descriptions == []
     assert stream_queue.items[-1]["event"] == "error"
     assert "invalid_research_graph_executor" in stream_queue.items[-1]["data"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_invalid_evidence_strict_mode(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True, evidence_strict="silent"),
+        task_id="task-pipeline-invalid-evidence-strict",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "invalid_evidence_strict_mode" in result[0]
+    assert result[1] == ""
+    assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[-1]["event"] == "error"
+    assert "invalid_evidence_strict_mode" in stream_queue.items[-1]["data"]["error"]
 
 
 @pytest.mark.asyncio
@@ -1883,6 +1942,134 @@ async def test_feature_flagged_graph_executor_rejects_verified_claim_without_val
         item.get("type") == "verified_claim_collected"
         for item in stream_queue.items
     )
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_warns_for_missing_report_refs(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    def compose_report_with_bad_refs(self, state):
+        known_ref = state.verified_claims[0].evidence_ids[0]
+        return (
+            f"## Answer\nKnown {known_ref}; missing EVID-999; malformed EVID-abc.",
+            "Strict-mode warn answer",
+        )
+
+    monkeypatch.setattr(
+        research_graph_module.WriterNode,
+        "_compose_report",
+        compose_report_with_bad_refs,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True),
+        task_id="task-pipeline-evidence-strict-warn",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == "Strict-mode warn answer"
+    warnings = [
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "artifact_warning"
+    ]
+    assert [
+        warning["warning"]
+        for warning in warnings
+        if warning["artifact_type"] == "report_section"
+    ] == ["invalid_evidence_refs", "unresolved_evidence_refs"]
+    assert warnings[-2]["evidence_refs"] == ["EVID-abc"]
+    assert warnings[-1]["evidence_refs"] == ["EVID-999"]
+    report_payload = next(
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "report_section_generated"
+    )
+    assert "EVID-999" in report_payload["evidence_refs"]
+    assert "EVID-abc" not in report_payload["evidence_refs"]
+    write_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "write"
+    )
+    assert write_checkpoint["executor_state"]["evidence_strict_mode"] == "warn"
+    assert len(write_checkpoint["executor_state"]["evidence_ref_warnings"]) == 2
+    complete_checkpoint = [
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+    ][-1]
+    assert complete_checkpoint["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_feature_flagged_graph_executor_blocks_missing_report_refs(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    def compose_report_with_bad_refs(self, state):
+        known_ref = state.verified_claims[0].evidence_ids[0]
+        return (
+            f"## Answer\nKnown {known_ref}; missing EVID-999; malformed EVID-abc.",
+            "Strict-mode block answer",
+        )
+
+    monkeypatch.setattr(
+        research_graph_module.WriterNode,
+        "_compose_report",
+        compose_report_with_bad_refs,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True, evidence_strict="block"),
+        task_id="task-pipeline-evidence-strict-block",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[1] == ""
+    assert "research_graph_evidence_strict_block" in result[0]
+    assert "EVID-999" in result[0]
+    assert "EVID-abc" in result[0]
+    error_events = [
+        item for item in stream_queue.items if item.get("event") == "error"
+    ]
+    assert error_events[-1]["data"]["phase"] == "write"
+    assert "research_graph_evidence_strict_block" in error_events[-1]["data"]["error"]
+    assert not any(
+        item.get("type") == "report_section_generated"
+        for item in stream_queue.items
+    )
+    assert not any(
+        item.get("type") == "artifact_warning"
+        for item in stream_queue.items
+    )
+    assert [
+        item["data"]["phase"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+    ] == ["scope", "plan", "research", "compress", "verify"]
 
 
 @pytest.mark.asyncio
