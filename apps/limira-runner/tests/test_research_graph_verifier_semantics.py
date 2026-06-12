@@ -160,6 +160,39 @@ async def test_verifier_does_not_support_same_entity_status_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_verifier_supports_mixed_history_with_confirmed_status():
+    state = _state_with_finding(
+        claim="Entity A is listed under program X.",
+        evidence=[
+            _evidence(
+                "EVID-001",
+                "Entity A applied for program X in January and was confirmed "
+                "listed under program X in June 2026.",
+            )
+        ],
+        evidence_ids=["EVID-001"],
+    )
+
+    claim, verify_output = await _verify(state)
+    write_output = await WriterNode().run(
+        verify_output.state,
+        _context(state.task_id),
+        verify_output,
+    )
+
+    assert claim.support_type == "supported"
+    assert {detail.support_type for detail in claim.evidence_details} == {"direct"}
+    assert "Entity A is listed" in write_output.final_boxed_answer
+    assert "Entity A is listed" in write_output.final_summary.split(
+        "## Evidence Table",
+        1,
+    )[0]
+    assert write_output.artifact_events[-1]["payload"]["evidence_refs"] == [
+        "EVID-001"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_verifier_downgrades_stale_current_claim_evidence():
     state = _state_with_finding(
         claim="Entity A is currently listed under program X in 2026.",

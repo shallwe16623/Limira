@@ -391,7 +391,12 @@ def _has_non_supporting_status_mismatch(
 ) -> bool:
     if not _claim_requires_decisive_support(normalized_claim):
         return False
-    return any(marker in normalized_evidence for marker in NON_SUPPORTING_STATUS_MARKERS)
+    if not any(marker in normalized_evidence for marker in NON_SUPPORTING_STATUS_MARKERS):
+        return False
+    return not _decisive_support_markers_align(
+        normalized_claim,
+        normalized_evidence,
+    )
 
 
 def _evidence_is_background_only(evidence_text: str) -> bool:
