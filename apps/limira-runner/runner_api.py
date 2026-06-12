@@ -53,6 +53,7 @@ TRANSPORT_CLOSING_KEY = web.AppKey("transport_closing", object)
 CANCELLED_TASKS_KEY = web.AppKey("cancelled_tasks", set[str])
 ACTIVE_TASKS_KEY = web.AppKey("active_tasks", set[str])
 TASK_WORKERS_KEY = web.AppKey("task_workers", dict[str, asyncio.Task])
+PENDING_STARTUP_WORKERS_KEY = web.AppKey("pending_startup_workers", set[str])
 TASK_EVENT_LOG_KEY = web.AppKey("task_event_log", dict[str, list[dict[str, Any]]])
 RUNNER_WORKER_ID_KEY = web.AppKey("runner_worker_id", str)
 TASK_SUBSCRIBERS_KEY = web.AppKey(
@@ -136,9 +137,11 @@ def create_app(
     app[CANCELLED_TASKS_KEY] = set()
     app[ACTIVE_TASKS_KEY] = set()
     app[TASK_WORKERS_KEY] = {}
+    app[PENDING_STARTUP_WORKERS_KEY] = set()
     app[TASK_EVENT_LOG_KEY] = {}
     app[RUNNER_WORKER_ID_KEY] = f"runner-{uuid.uuid4()}"
     app[TASK_SUBSCRIBERS_KEY] = {}
+    app.on_startup.append(_start_pending_task_workers)
     _reconcile_stale_running_tasks(app)
 
     app.router.add_post("/limira-runner/research", start_research)
@@ -1241,7 +1244,8 @@ def _resume_stale_langgraph_task(
     _write_task_checkpoint(app, record.task_id, checkpoint, updated_at=resumed_at)
     _clear_active_task(app, record.task_id)
     _clear_task_cancel(app, record.task_id)
-    _ensure_task_worker_if_loop_running(app, record.task_id)
+    if not _ensure_task_worker_if_loop_running(app, record.task_id):
+        _queue_task_worker_on_startup(app, record.task_id)
     return _task_store(app).get_task(record.task_id) or resumed
 
 
@@ -1253,6 +1257,19 @@ def _ensure_task_worker_if_loop_running(app: web.Application, task_id: str) -> b
     _ensure_task_worker(app, task_id)
     worker = app[TASK_WORKERS_KEY].get(task_id)
     return bool(worker and not worker.done())
+
+
+def _queue_task_worker_on_startup(app: web.Application, task_id: str) -> None:
+    app[PENDING_STARTUP_WORKERS_KEY].add(task_id)
+
+
+async def _start_pending_task_workers(app: web.Application) -> None:
+    pending = sorted(app[PENDING_STARTUP_WORKERS_KEY])
+    app[PENDING_STARTUP_WORKERS_KEY].clear()
+    for task_id in pending:
+        record = _task_store(app).get_task(task_id)
+        if record and record.status == "queued":
+            _ensure_task_worker(app, task_id)
 
 
 def _latest_heartbeat_at(
