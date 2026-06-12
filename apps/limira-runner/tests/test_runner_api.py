@@ -1033,6 +1033,68 @@ async def test_runner_api_cancel_finalizes_running_task_without_active_worker(tm
 
 
 @pytest.mark.asyncio
+async def test_runner_api_status_finalizes_running_task_without_active_worker(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        seeded = seed_queued_task(store)
+        task_id = seeded.task_id
+        claimed = store.claim_queued_task(
+            task_id,
+            started_at="2026-06-06T12:30:00+00:00",
+        )
+        assert claimed is not None
+        assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        assert status_response.status == 200
+        status_payload = await status_response.json()
+
+        assert status_payload["status"] == "cancelled"
+        assert status_payload["archive_status"] == "ready"
+        assert status_payload["download_url"] == (
+            f"/limira-runner/tasks/{task_id}/archive.zip"
+        )
+        record = store.get_task(task_id)
+        assert record.status == "cancelled"
+        assert record.completed_at is not None
+        assert_zip_members(record.archive_zip_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_events_finalizes_running_task_without_active_worker(tmp_path):
+    client, store = await make_client(tmp_path)
+    try:
+        seeded = seed_queued_task(store)
+        task_id = seeded.task_id
+        claimed = store.claim_queued_task(
+            task_id,
+            started_at="2026-06-06T12:30:00+00:00",
+        )
+        assert claimed is not None
+        assert task_id not in client.server.app[ACTIVE_TASKS_KEY]
+
+        events_response = await client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        await asyncio.wait_for(events_response.text(), timeout=1)
+
+        record = store.get_task(task_id)
+        assert record.status == "cancelled"
+        assert record.archive_status == "ready"
+        assert record.completed_at is not None
+        assert_zip_members(record.archive_zip_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_runner_api_cancel_endpoint_finalizes_queued_task(tmp_path):
     client, store = await make_client(tmp_path)
     try:

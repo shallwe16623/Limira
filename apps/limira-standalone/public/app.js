@@ -152,6 +152,7 @@ const state = {
 	archivedTaskHistory: [],
 	taskStatusById: persistedTaskUiState.taskStatusById,
 	unreadCompletedTaskIds: persistedTaskUiState.unreadCompletedTaskIds,
+	lastEventIdByTaskId: {},
 	isVoiceRecording: false,
 	isVoiceTranscribing: false,
 	voiceRecognition: null,
@@ -2052,6 +2053,7 @@ function restoreWorkspace() {
 		saved.thinkingCollapsedByTaskId && typeof saved.thinkingCollapsedByTaskId === 'object'
 			? saved.thinkingCollapsedByTaskId
 			: {};
+	state.lastEventIdByTaskId = normalizeLastEventIdsByTaskId(saved.lastEventIdByTaskId);
 	rememberTaskThinkingSteps(state.taskId);
 	state.artifacts = saved.artifacts && typeof saved.artifacts === 'object'
 		? normalizeArtifacts(saved.artifacts)
@@ -2079,6 +2081,7 @@ function saveWorkspace() {
 		thinkingSteps: state.thinkingSteps.slice(-MAX_THINKING_STEPS),
 		thinkingStepsByTaskId: savedThinkingStepsByTaskId(),
 		thinkingCollapsedByTaskId: state.thinkingCollapsedByTaskId,
+		lastEventIdByTaskId: savedLastEventIdsByTaskId(),
 		artifacts: state.artifacts,
 		uploads: state.uploads
 	};
@@ -2098,6 +2101,61 @@ function saveWorkspace() {
 			// A private or quota-limited browser can still use the live page.
 		}
 	}
+}
+
+function normalizeLastEventIdsByTaskId(value) {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return {};
+	}
+	return Object.fromEntries(
+		Object.entries(value)
+			.map(([taskId, eventId]) => [String(taskId || '').trim(), normalizedLastEventId(eventId)])
+			.filter(([taskId, eventId]) => taskId && eventId)
+			.slice(-300)
+	);
+}
+
+function savedLastEventIdsByTaskId() {
+	return Object.fromEntries(Object.entries(state.lastEventIdByTaskId || {}).slice(-300));
+}
+
+function normalizedLastEventId(eventId) {
+	const value = String(eventId || '').trim();
+	if (!value || value.length > 256) {
+		return '';
+	}
+	return /^(redis:\d+-\d+|eventlog:[A-Za-z0-9_.:-]+)$/.test(value) ? value : '';
+}
+
+function rememberLastEventId(taskId, eventId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	const normalizedEventId = normalizedLastEventId(eventId);
+	if (!normalizedTaskId || !normalizedEventId) {
+		return;
+	}
+	state.lastEventIdByTaskId = {
+		...state.lastEventIdByTaskId,
+		[normalizedTaskId]: normalizedEventId
+	};
+}
+
+function forgetLastEventId(taskId) {
+	const normalizedTaskId = String(taskId || '').trim();
+	if (!normalizedTaskId || !state.lastEventIdByTaskId?.[normalizedTaskId]) {
+		return;
+	}
+	const next = { ...state.lastEventIdByTaskId };
+	delete next[normalizedTaskId];
+	state.lastEventIdByTaskId = next;
+}
+
+function taskEventsUrl(taskId) {
+	const encodedTaskId = encodeURIComponent(taskId);
+	const lastEventId = normalizedLastEventId(state.lastEventIdByTaskId?.[taskId]);
+	if (!lastEventId) {
+		return `/api/limira/tasks/${encodedTaskId}/events`;
+	}
+	return `/api/limira/tasks/${encodedTaskId}/events?last_event_id=${encodeURIComponent(lastEventId)}`;
 }
 
 function normalizeThinkingStepsByTaskId(value) {
@@ -2288,6 +2346,7 @@ async function submitResearch() {
 			return;
 		}
 		state.taskId = task.task_id || '';
+		forgetLastEventId(state.taskId);
 		const responseConversationId = String(task.conversation_id || '').trim();
 		rememberCurrentConversationTask(
 			state.taskId,
@@ -2418,11 +2477,12 @@ function connectStream() {
 	}
 	const context = captureAsyncContext();
 	state.eventSource?.close();
-	state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`);
+	state.eventSource = new EventSource(taskEventsUrl(state.taskId));
 	state.eventSource.onmessage = (event) => {
 		if (!isCurrentAsyncContext(context)) {
 			return;
 		}
+		rememberLastEventId(state.taskId, event.lastEventId);
 		handleStreamEvent(parseJson(event.data));
 	};
 	state.eventSource.onerror = () => {
@@ -2802,10 +2862,18 @@ function shouldSuppressStatusThinkingStep(eventType, eventData, data, payload) {
 		return false;
 	}
 	const detail =
-		eventThinkingDetail(eventData) ||
-		eventThinkingDetail(data) ||
-		eventThinkingDetail(payload);
+		statusThinkingDetail(eventData) ||
+		statusThinkingDetail(data) ||
+		statusThinkingDetail(payload);
 	return !detail;
+}
+
+function statusThinkingDetail(data) {
+	if (!data || typeof data !== 'object') {
+		return '';
+	}
+	const value = data.message || data.summary || data.title || data.warning || data.error || '';
+	return truncateText(typeof value === 'string' ? value : stringifyCompact(value), 280);
 }
 
 function thinkingStepForLoggedToolCall(data, time) {
@@ -5540,9 +5608,22 @@ function appendThinkingStep({ kind = 'task', title, detail = '', status = 'activ
 		time: time || now()
 	};
 	const next = state.thinkingSteps.filter((item) => item.kind !== 'ready');
+	const duplicate = next.some((item) => thinkingStepSignature(item) === thinkingStepSignature(step));
+	if (duplicate) {
+		return false;
+	}
 	state.thinkingSteps = [...next, step].slice(-MAX_THINKING_STEPS);
 	rememberTaskThinkingSteps();
 	return true;
+}
+
+function thinkingStepSignature(step) {
+	return [
+		String(step?.kind || '').trim(),
+		String(step?.title || '').trim(),
+		String(step?.detail || '').trim(),
+		String(step?.meta || '').trim()
+	].join('\u001f');
 }
 
 function addThinkingStep({ kind = 'task', title, detail = '', status = 'active', meta = '' }) {

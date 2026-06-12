@@ -180,6 +180,7 @@ async def get_task_status(request: web.Request) -> web.Response:
     record = _get_authorized_task(request, auth)
     if not record:
         return _not_found()
+    record = _finalize_running_task_without_worker_if_needed(request, record)
     return web.json_response(_task_response(record))
 
 
@@ -209,6 +210,7 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
     record = _get_authorized_task(request, auth)
     if not record:
         raise web.HTTPNotFound(text=json.dumps({"error": "not_found"}))
+    record = _finalize_running_task_without_worker_if_needed(request, record)
 
     response = web.StreamResponse(
         status=200,
@@ -535,7 +537,21 @@ def _clear_active_task(app: web.Application, task_id: str) -> None:
 
 
 def _task_has_active_worker(app: web.Application, task_id: str) -> bool:
-    return task_id in app[ACTIVE_TASKS_KEY]
+    if task_id in app[ACTIVE_TASKS_KEY]:
+        return True
+    worker = app[TASK_WORKERS_KEY].get(task_id)
+    return bool(worker and not worker.done())
+
+
+def _finalize_running_task_without_worker_if_needed(
+    request: web.Request,
+    record: TaskRecord,
+) -> TaskRecord:
+    if record.status != "running":
+        return record
+    if _task_has_active_worker(request.app, record.task_id):
+        return record
+    return _finalize_running_without_worker_cancellation(request, record)
 
 
 def _transport_closing(request: web.Request) -> bool:

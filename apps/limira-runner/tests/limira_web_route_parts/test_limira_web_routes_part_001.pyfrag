@@ -1629,6 +1629,22 @@ def test_limira_runtime_state_factory_requires_redis_or_explicit_memory(monkeypa
     runtime_state = limira.create_limira_runtime_state_from_env(redis_client=redis)
     assert isinstance(runtime_state, limira.RedisLimiraRuntimeState)
     assert runtime_state.redis_client is redis
+    assert runtime_state.event_stream_maxlen == limira.LIMIRA_TASK_EVENT_STREAM_MAXLEN
+
+    monkeypatch.setenv("LIMIRA_TASK_EVENT_STREAM_MAXLEN", "123")
+    runtime_state = limira.create_limira_runtime_state_from_env(redis_client=redis)
+    assert runtime_state.event_stream_maxlen == 123
+    asyncio.run(
+        runtime_state.append_task_event_stream(
+            "task-maxlen",
+            {"task_id": "task-maxlen", "type": "status", "payload": {"status": "running"}},
+        )
+    )
+    assert redis.xadd_calls[-1]["maxlen"] == 123
+    monkeypatch.setenv("LIMIRA_TASK_EVENT_STREAM_MAXLEN", "0")
+    with pytest.raises(RuntimeError, match="limira_task_event_stream_maxlen_invalid"):
+        limira.create_limira_runtime_state_from_env(redis_client=redis)
+    monkeypatch.delenv("LIMIRA_TASK_EVENT_STREAM_MAXLEN", raising=False)
 
     monkeypatch.setenv("LIMIRA_RUNTIME_STATE_BACKEND", "memory")
     monkeypatch.delenv("LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE", raising=False)

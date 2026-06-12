@@ -663,14 +663,46 @@ def _format_scrape_results(tool_input: dict, tool_output: dict) -> str:
     return "\n".join(lines)
 
 
+def _looks_like_final_report_markdown(markdown: str) -> bool:
+    import re
+
+    text = str(markdown or "").strip()
+    if not text:
+        return False
+    if re.match(r"(?is)^#\s*final\s+answer\b", text):
+        return True
+    if len(text) < 800:
+        return False
+    has_top_heading = re.search(r"(?m)^#\s+\S", text) is not None
+    section_count = len(re.findall(r"(?m)^##\s+\S", text))
+    lower_text = text.lower()
+    report_word = any(
+        marker in text
+        for marker in (
+            "最终报告",
+            "调查报告",
+            "研究报告",
+            "详尽调查报告",
+            "综合报告",
+            "智库分析报告",
+        )
+    ) or any(
+        marker in lower_text
+        for marker in ("final report", "investigation report", "research report")
+    )
+    return has_top_heading and section_count >= 2 and report_word
+
+
 def _render_markdown(state: dict) -> str:
     lines = []
-    final_summary_lines = []  # Collect final summary content separately
+    final_summary_lines = []
+    final_report_lines = []
+    error_lines = []
 
     # Render errors first if any
     if state.get("errors"):
         for err in state["errors"]:
-            lines.append(f'<div class="error-block">❌ {err}</div>')
+            error_lines.append(f"> Error: {err}")
 
     # Render all agents' content
     for agent_id in state.get("agent_order", []):
@@ -689,6 +721,8 @@ def _render_markdown(state: dict) -> str:
                     if is_final_summary:
                         final_summary_lines.append(content)
                     else:
+                        if _looks_like_final_report_markdown(content):
+                            final_report_lines.append(content)
                         lines.append(content)
                 continue
 
@@ -758,9 +792,10 @@ def _render_markdown(state: dict) -> str:
 
             # Other tools - show as compact card
             if has_input or has_output:
-                target_lines = final_summary_lines if is_final_summary else lines
-                target_lines.append('<div class="tool-card">')
-                target_lines.append(f'<div class="tool-header">🔧 {tool_name}</div>')
+                if is_final_summary:
+                    continue
+                lines.append('<div class="tool-card">')
+                lines.append(f'<div class="tool-header">🔧 {tool_name}</div>')
                 if has_input:
                     # Show brief input summary
                     if isinstance(tool_input, dict):
@@ -770,17 +805,19 @@ def _render_markdown(state: dict) -> str:
                             else f"{k}: {v}"
                             for k, v in list(tool_input.items())[:2]
                         )
-                        target_lines.append(f'<div class="tool-brief">{brief}</div>')
+                        lines.append(f'<div class="tool-brief">{brief}</div>')
                 if has_output:
-                    target_lines.append('<div class="tool-status">✓ Done</div>')
-                target_lines.append("</div>")
+                    lines.append('<div class="tool-status">✓ Done</div>')
+                lines.append("</div>")
 
-    # Add final summary with Markdown-based styling (no HTML wrapper to preserve Markdown rendering)
     if final_summary_lines:
-        lines.append("\n\n---\n\n")  # Markdown horizontal rule as divider
-        lines.append("## 📋 Research Summary\n\n")
-        lines.extend(final_summary_lines)
+        return "\n".join(final_summary_lines).strip()
 
+    if final_report_lines:
+        return "\n".join(final_report_lines).strip()
+
+    if error_lines:
+        lines = [*error_lines, "", *lines]
     return "\n".join(lines) if lines else "*Waiting to start research...*"
 
 

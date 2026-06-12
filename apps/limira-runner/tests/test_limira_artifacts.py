@@ -2,7 +2,12 @@ import json
 
 from limira_tools.limira_artifacts import record_research_artifact, scrub_secrets
 from limira_tools.limira_evidence import ToolEvidenceLedger
-from pipeline_helpers import expand_stream_message
+from pipeline_helpers import (
+    _init_render_state,
+    _render_markdown,
+    _update_state_with_event,
+    expand_stream_message,
+)
 
 
 SCMP_URL = (
@@ -194,3 +199,152 @@ def test_expand_stream_message_appends_derived_evidence_after_filtered_tool_even
         ensure_ascii=False,
     )
     assert expanded[1]["payload"]["source_event_type"] == "tool_evidence_ledger"
+
+
+def test_render_markdown_uses_final_summary_without_intermediate_html_cards():
+    state = _init_render_state()
+    for message in [
+        {
+            "event": "start_of_agent",
+            "data": {"agent_id": "agent-main", "agent_name": "main"},
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "search-1",
+                "tool_name": "google_search",
+                "tool_input": {"q": "US China summit"},
+            },
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "search-1",
+                "tool_name": "google_search",
+                "tool_input": {
+                    "result": json.dumps(
+                        {
+                            "organic": [
+                                {
+                                    "title": "Search result that should stay out",
+                                    "link": "https://example.test/result",
+                                }
+                            ]
+                        }
+                    )
+                },
+            },
+        },
+        {
+            "event": "end_of_agent",
+            "data": {"agent_id": "agent-main", "agent_name": "main"},
+        },
+        {
+            "event": "start_of_agent",
+            "data": {"agent_id": "agent-final", "agent_name": "Final Summary"},
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "final-tool",
+                "tool_name": "record_research_artifact",
+                "tool_input": {"artifact_type": "evidence"},
+            },
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "final-text",
+                "tool_name": "show_text",
+                "tool_input": {"text": "# Final answer\n\nOnly the final report body."},
+            },
+        },
+        {
+            "event": "end_of_agent",
+            "data": {"agent_id": "agent-final", "agent_name": "Final Summary"},
+        },
+    ]:
+        _update_state_with_event(state, message)
+
+    markdown = _render_markdown(state)
+
+    assert markdown == "# Final answer\n\nOnly the final report body."
+    assert "<div" not in markdown
+    assert "search-card" not in markdown
+    assert "tool-card" not in markdown
+    assert "Search result that should stay out" not in markdown
+
+
+def test_render_markdown_uses_main_final_report_when_final_summary_has_no_body():
+    state = _init_render_state()
+    final_report = (
+        "# 智库分析报告：美国意见领袖涉华言论\n\n"
+        "这是一份完整研究报告，应作为归档正文，而不是前面的检索过程。\n\n"
+        "## 一、核心判断\n\n"
+        "报告正文第一部分，包含足够长的综合分析。"
+        + ("补充事实、证据和判断。" * 80)
+        + "\n\n## 二、风险评估\n\n"
+        "报告正文第二部分，继续展开分析。"
+        + ("补充风险、争议和后续观察点。" * 80)
+    )
+    for message in [
+        {
+            "event": "start_of_agent",
+            "data": {"agent_id": "agent-main", "agent_name": "main"},
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "search-1",
+                "tool_name": "google_search",
+                "tool_input": {"q": "US China summit"},
+            },
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "search-1",
+                "tool_name": "google_search",
+                "tool_input": {
+                    "result": json.dumps(
+                        {
+                            "organic": [
+                                {
+                                    "title": "Intermediate search result",
+                                    "link": "https://example.test/result",
+                                }
+                            ]
+                        }
+                    )
+                },
+            },
+        },
+        {
+            "event": "tool_call",
+            "data": {
+                "tool_call_id": "main-final",
+                "tool_name": "show_text",
+                "tool_input": {"text": final_report},
+            },
+        },
+        {
+            "event": "end_of_agent",
+            "data": {"agent_id": "agent-main", "agent_name": "main"},
+        },
+        {
+            "event": "start_of_agent",
+            "data": {"agent_id": "agent-final", "agent_name": "Final Summary"},
+        },
+        {
+            "event": "end_of_agent",
+            "data": {"agent_id": "agent-final", "agent_name": "Final Summary"},
+        },
+    ]:
+        _update_state_with_event(state, message)
+
+    markdown = _render_markdown(state)
+
+    assert markdown == final_report
+    assert "<div" not in markdown
+    assert "search-card" not in markdown
+    assert "Intermediate search result" not in markdown

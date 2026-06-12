@@ -9,6 +9,97 @@
     return clean
 
 
+def _stream_event_is_terminal(event: Mapping[str, Any]) -> bool:
+    payload = event.get("payload")
+    if event.get("type") == "error":
+        return True
+    if isinstance(payload, Mapping):
+        if payload.get("terminal") is True:
+            return True
+        status = payload.get("status")
+        data = payload.get("data")
+        if not status and isinstance(data, Mapping):
+            status = data.get("status")
+        return status in FINAL_TASK_STATUSES
+    return False
+
+
+def _runtime_snapshot_is_closed(runtime_snapshot: Mapping[str, Any]) -> bool:
+    if runtime_snapshot.get("terminal") is True:
+        return True
+    if runtime_snapshot.get("status") in FINAL_TASK_STATUSES:
+        return True
+    return runtime_snapshot.get("stream_state") == "closed"
+
+
+async def _safe_task_runtime_snapshot(
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+) -> dict[str, Any] | None:
+    try:
+        return await runtime_state.get_task_runtime(task_id)
+    except Exception:
+        log.warning(
+            "Failed to read limira runtime state for task event observer",
+            extra={"task_id": task_id},
+            exc_info=True,
+        )
+        return None
+
+
+def _live_stream_reconnecting_event(task: LimiraTask) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": {
+            "status": task.status,
+            "archive_status": task.archive_status,
+            "status_source": "limira",
+            "warning": "live_stream_reconnecting",
+        },
+    }
+
+
+def _task_event_stream_entries_from_redis(
+    raw_streams: Any,
+    expected_key: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    entries: list[tuple[str, dict[str, Any]]] = []
+    if not raw_streams:
+        return entries
+    for raw_key, raw_entries in raw_streams:
+        if _decode_redis_text(raw_key) != expected_key:
+            continue
+        for raw_id, raw_fields in raw_entries:
+            fields = _redis_stream_fields(raw_fields)
+            event_json = fields.get("event")
+            if event_json is None:
+                continue
+            event = _json_loads(event_json)
+            if isinstance(event, dict):
+                entries.append((_decode_redis_text(raw_id), event))
+    return entries
+
+
+def _redis_stream_fields(raw_fields: Any) -> dict[str, str]:
+    if hasattr(raw_fields, "items"):
+        return {
+            _decode_redis_text(field): _decode_redis_text(value)
+            for field, value in raw_fields.items()
+        }
+    if isinstance(raw_fields, (list, tuple)):
+        fields: dict[str, str] = {}
+        for index in range(0, len(raw_fields), 2):
+            try:
+                fields[_decode_redis_text(raw_fields[index])] = _decode_redis_text(
+                    raw_fields[index + 1]
+                )
+            except IndexError:
+                break
+        return fields
+    return {}
+
+
 def _safe_object_segment(value: str, *, fallback: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "-", str(value)).strip(".-/")
     return safe[:120] or fallback

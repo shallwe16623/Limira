@@ -455,6 +455,10 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "function rebuildThinkingFromProgressRecords(records)" in app
     assert "function thinkingStepsFromProgressRecords(records, taskId)" in app
     assert "function appendProgressRecordThinkingStep(record)" in app
+    assert "function statusThinkingDetail(data)" in app
+    assert "data.message || data.summary || data.title || data.warning || data.error" in app
+    assert "function thinkingStepSignature(step)" in app
+    assert "const duplicate = next.some((item) => thinkingStepSignature(item) === thinkingStepSignature(step));" in app
     assert "thinkingStepsByTaskId: {}" in app
     assert "thinkingCollapsedByTaskId: {}" in app
     assert "function renderTaskThinkingPanel(message)" in app
@@ -519,7 +523,11 @@ def test_limira_standalone_frontend_exposes_native_task_history_controls():
     assert "method: 'DELETE'" in app
     assert "/api/limira/tasks/${encodeURIComponent(state.taskId)}" in app
     assert "api(`/api/limira/tasks/${encodeURIComponent(state.taskId)}/event-logs`)" in app
-    assert "state.eventSource = new EventSource(`/api/limira/tasks/${state.taskId}/events`)" in app
+    assert "state.eventSource = new EventSource(taskEventsUrl(state.taskId))" in app
+    assert "function taskEventsUrl(taskId)" in app
+    assert "last_event_id=${encodeURIComponent(lastEventId)}" in app
+    assert "rememberLastEventId(state.taskId, event.lastEventId);" in app
+    assert "lastEventIdByTaskId: savedLastEventIdsByTaskId()" in app
     assert "message.kind === 'report' && String(message.taskId || '') === taskId" in app
     assert "function conversationMembersForTask(task, fallbackTaskId)" in app
     assert "function hydrateConversationHistory(members)" in app

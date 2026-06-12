@@ -25,7 +25,7 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -86,6 +86,9 @@ LIMIRA_RUNTIME_STATE_BACKEND_ENV = "LIMIRA_RUNTIME_STATE_BACKEND"
 LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE_ENV = "LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE"
 LIMIRA_RUNTIME_STATE_KEY_PREFIX_ENV = "LIMIRA_RUNTIME_STATE_KEY_PREFIX"
 LIMIRA_RUNTIME_STATE_TTL_SECONDS_ENV = "LIMIRA_RUNTIME_STATE_TTL_SECONDS"
+LIMIRA_TASK_EVENT_STREAM_MAXLEN_ENV = "LIMIRA_TASK_EVENT_STREAM_MAXLEN"
+LIMIRA_TASK_EVENT_STREAM_MAXLEN = 2000
+LIMIRA_TASK_EVENT_SUBSCRIBER_QUEUE_SIZE = 256
 LIMIRA_OBJECT_STORAGE_BACKEND_ENV = "LIMIRA_OBJECT_STORAGE_BACKEND"
 LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE_ENV = "LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE"
 LIMIRA_OBJECT_STORAGE_PATH_ENV = "LIMIRA_OBJECT_STORAGE_PATH"
@@ -906,6 +909,134 @@ class LimiraRuntimeState(Protocol):
         fields: dict[str, Any],
     ) -> bool: ...
 
+    async def append_task_event_stream(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> str | None: ...
+
+    async def read_task_event_stream(
+        self,
+        task_id: str,
+        *,
+        last_id: str,
+        block_ms: int,
+        count: int,
+    ) -> list[tuple[str, dict[str, Any]]]: ...
+
+
+def _close_slow_event_subscriber(
+    queue: asyncio.Queue[dict[str, Any] | None],
+) -> None:
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    try:
+        queue.put_nowait(None)
+    except asyncio.QueueFull:
+        pass
+
+
+class LimiraTaskEventBroadcast:
+    def __init__(self) -> None:
+        self._producer_active = False
+        self._subscribers: set[asyncio.Queue[dict[str, Any] | None]] = set()
+        self._lock = asyncio.Lock()
+
+    async def try_start_producer(self) -> bool:
+        async with self._lock:
+            if self._producer_active:
+                return False
+            self._producer_active = True
+            return True
+
+    async def subscribe(self) -> asyncio.Queue[dict[str, Any] | None] | None:
+        async with self._lock:
+            if not self._producer_active:
+                return None
+            queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+                maxsize=LIMIRA_TASK_EVENT_SUBSCRIBER_QUEUE_SIZE
+            )
+            self._subscribers.add(queue)
+            return queue
+
+    async def unsubscribe(
+        self,
+        queue: asyncio.Queue[dict[str, Any] | None],
+    ) -> None:
+        async with self._lock:
+            self._subscribers.discard(queue)
+
+    async def publish(self, event: dict[str, Any]) -> None:
+        async with self._lock:
+            subscribers = tuple(self._subscribers)
+        dropped: list[asyncio.Queue[dict[str, Any] | None]] = []
+        for queue in subscribers:
+            try:
+                queue.put_nowait(dict(event))
+            except asyncio.QueueFull:
+                dropped.append(queue)
+        if not dropped:
+            return
+        async with self._lock:
+            for queue in dropped:
+                self._subscribers.discard(queue)
+        for queue in dropped:
+            _close_slow_event_subscriber(queue)
+
+    async def finish(self) -> None:
+        async with self._lock:
+            self._producer_active = False
+            subscribers = tuple(self._subscribers)
+            self._subscribers.clear()
+        for queue in subscribers:
+            queue.put_nowait(None)
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
+
+    @property
+    def producer_active(self) -> bool:
+        return self._producer_active
+
+
+class LimiraTaskEventBroadcaster:
+    def __init__(self) -> None:
+        self._broadcasts: dict[str, LimiraTaskEventBroadcast] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, task_id: str) -> LimiraTaskEventBroadcast:
+        async with self._lock:
+            broadcast = self._broadcasts.get(task_id)
+            if broadcast is None:
+                broadcast = LimiraTaskEventBroadcast()
+                self._broadcasts[task_id] = broadcast
+            return broadcast
+
+    def subscriber_count(self, task_id: str) -> int:
+        broadcast = self._broadcasts.get(task_id)
+        return 0 if broadcast is None else broadcast.subscriber_count
+
+    async def finish(
+        self,
+        task_id: str,
+        broadcast: LimiraTaskEventBroadcast,
+    ) -> None:
+        await broadcast.finish()
+        async with self._lock:
+            if (
+                self._broadcasts.get(task_id) is broadcast
+                and not broadcast.producer_active
+                and broadcast.subscriber_count == 0
+            ):
+                self._broadcasts.pop(task_id, None)
+
+
+_TASK_EVENT_BROADCASTER = LimiraTaskEventBroadcaster()
+
 
 @dataclass(frozen=True)
 class LimiraStoredObject:
@@ -1511,6 +1642,23 @@ class InMemoryLimiraRuntimeState:
         task_state["stream_state"] = "closed"
         return True
 
+    async def append_task_event_stream(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> str | None:
+        return None
+
+    async def read_task_event_stream(
+        self,
+        task_id: str,
+        *,
+        last_id: str,
+        block_ms: int,
+        count: int,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        return []
+
 
 class RedisLimiraRuntimeState:
     TRY_OPEN_STREAM_SCRIPT = """
@@ -1545,12 +1693,14 @@ class RedisLimiraRuntimeState:
         *,
         key_prefix: str = "limira:runtime",
         ttl_seconds: int = 86_400,
+        event_stream_maxlen: int = LIMIRA_TASK_EVENT_STREAM_MAXLEN,
     ) -> None:
         if redis_client is None:
             raise RuntimeError("limira_redis_runtime_state_missing")
         self.redis_client = redis_client
         self.key_prefix = key_prefix.rstrip(":")
         self.ttl_seconds = ttl_seconds
+        self.event_stream_maxlen = event_stream_maxlen
 
     async def get_task_runtime(
         self,
@@ -1623,6 +1773,44 @@ class RedisLimiraRuntimeState:
 
     def task_key(self, task_id: str) -> str:
         return f"{self.key_prefix}:task:{task_id}"
+
+    def task_event_stream_key(self, task_id: str) -> str:
+        return f"{self.task_key(task_id)}:events"
+
+    async def append_task_event_stream(
+        self,
+        task_id: str,
+        event: dict[str, Any],
+    ) -> str | None:
+        key = self.task_event_stream_key(task_id)
+        event_id = await _maybe_await(
+            self.redis_client.xadd(
+                key,
+                {"event": _json_dumps(event)},
+                maxlen=self.event_stream_maxlen,
+                approximate=True,
+            )
+        )
+        await _maybe_await(self.redis_client.expire(key, self.ttl_seconds))
+        return _decode_redis_text(event_id)
+
+    async def read_task_event_stream(
+        self,
+        task_id: str,
+        *,
+        last_id: str,
+        block_ms: int,
+        count: int,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        key = self.task_event_stream_key(task_id)
+        raw_streams = await _maybe_await(
+            self.redis_client.xread(
+                {key: last_id},
+                count=max(1, count),
+                block=max(0, block_ms),
+            )
+        )
+        return _task_event_stream_entries_from_redis(raw_streams, key)
 
 
 class InMemoryLimiraObjectStorage:

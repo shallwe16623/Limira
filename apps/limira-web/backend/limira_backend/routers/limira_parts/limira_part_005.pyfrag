@@ -1,3 +1,46 @@
+def _apply_authoritative_runner_status(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    runner_status: dict[str, Any],
+) -> LimiraTask:
+    current = repo.get_task(task_id)
+    if not current:
+        raise KeyError(task_id)
+
+    status = runner_status.get("status")
+    if status not in {"queued", "running", "completed", "failed", "cancelled"}:
+        return current
+
+    updates: dict[str, Any] = {"status": status}
+    archive_status = runner_status.get("archive_status")
+    if archive_status in {"pending", "ready", "failed"}:
+        updates["archive_status"] = archive_status
+    elif status == "completed":
+        updates["archive_status"] = "ready"
+    elif status in {"failed", "cancelled"}:
+        updates["archive_status"] = "failed"
+    if runner_status.get("error"):
+        updates["error"] = _public_error_text(
+            runner_status["error"],
+            fallback="runner_task_failed",
+        )
+    return repo.update_task(task_id, **updates)
+
+
+def _terminal_status_event(task: LimiraTask, *, reason: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": task.status,
+        "archive_status": task.archive_status,
+        "terminal": True,
+    }
+    if task.error:
+        payload["error"] = _public_error_text(
+            task.error,
+            fallback="limira_task_failed",
+        )
+    if reason:
+        payload["reason"] = _public_reason_text(reason)
+    return {
         "task_id": task.task_id,
         "type": "status",
         "payload": payload,
@@ -11,7 +54,306 @@ async def _record_stream_event(
     event: dict[str, Any],
 ) -> None:
     _record_task_event_log(repo, task_id, event)
-    await _record_runtime_event(runtime_state, task_id, event)
+    try:
+        await _record_runtime_event(runtime_state, task_id, event)
+    except Exception:
+        log.warning(
+            "Failed to update limira runtime event state",
+            extra={"task_id": task_id},
+            exc_info=True,
+        )
+
+
+async def _emit_stream_event(
+    repo: LimiraTaskRepository,
+    runtime_state: LimiraRuntimeState,
+    broadcast: LimiraTaskEventBroadcast,
+    task_id: str,
+    event: dict[str, Any],
+) -> bytes:
+    safe_event = _assert_browser_safe(event)
+    await _record_stream_event(repo, runtime_state, task_id, safe_event)
+    redis_event_id = await _append_task_event_stream(runtime_state, task_id, safe_event)
+    stream_event = _stream_event_with_sse_id(
+        safe_event,
+        event_id=_sse_id_from_redis_stream_id(redis_event_id) or _new_stream_event_id(task_id),
+    )
+    await broadcast.publish(stream_event)
+    return _sse_bytes(stream_event)
+
+
+async def _append_task_event_stream(
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+    event: dict[str, Any],
+) -> str | None:
+    try:
+        return await runtime_state.append_task_event_stream(task_id, event)
+    except Exception:
+        log.warning(
+            "Failed to append limira task event stream",
+            extra={"task_id": task_id},
+            exc_info=True,
+        )
+        return None
+
+
+async def _read_task_event_stream(
+    runtime_state: LimiraRuntimeState,
+    task_id: str,
+    *,
+    last_id: str,
+    block_ms: int,
+    count: int,
+) -> list[tuple[str, dict[str, Any]]] | None:
+    try:
+        return await runtime_state.read_task_event_stream(
+            task_id,
+            last_id=last_id,
+            block_ms=block_ms,
+            count=count,
+        )
+    except Exception:
+        log.warning(
+            "Failed to read limira task event stream",
+            extra={"task_id": task_id},
+            exc_info=True,
+        )
+        return None
+
+
+def _task_event_from_log(task_id: str, event_log: Mapping[str, Any]) -> dict[str, Any]:
+    event = {
+        "task_id": task_id,
+        "type": str(event_log.get("event_type") or "runner_event"),
+        "payload": event_log.get("payload") if isinstance(event_log.get("payload"), dict) else {},
+    }
+    event_log_id = event_log.get("event_log_id")
+    if event_log_id:
+        event["_limira_sse_id"] = f"eventlog:{event_log_id}"
+    return event
+
+
+def _is_user_visible_stream_event_log(event_log: Mapping[str, Any]) -> bool:
+    payload = event_log.get("payload")
+    if isinstance(payload, Mapping) and payload.get("reason") == "stream_already_open":
+        return False
+    return True
+
+
+def _replayed_stream_events(
+    repo: LimiraTaskRepository,
+    task_id: str,
+    *,
+    limit: int = 500,
+    last_event_id: str | None = None,
+) -> list[dict[str, Any]]:
+    cursor_kind, cursor_value = _task_event_cursor(last_event_id)
+    if cursor_kind == "redis":
+        return []
+    replay_events: list[dict[str, Any]] = []
+    cursor_seen = cursor_kind != "eventlog"
+    for event_log in repo.list_task_event_logs(task_id, limit=limit):
+        if not _is_user_visible_stream_event_log(event_log):
+            continue
+        event_log_id = str(event_log.get("event_log_id") or "")
+        if not cursor_seen:
+            cursor_seen = event_log_id == cursor_value
+            continue
+        replay_events.append(_task_event_from_log(task_id, event_log))
+    return replay_events
+
+
+def _observer_status_event_from_runtime(
+    task: LimiraTask,
+    runtime_snapshot: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    status = str(runtime_snapshot.get("status") or task.status or "")
+    if not status:
+        return None
+    archive_status = str(runtime_snapshot.get("archive_status") or task.archive_status or "")
+    payload: dict[str, Any] = {
+        "status": status,
+        "archive_status": archive_status,
+        "status_source": "limira_runtime_state",
+    }
+    if runtime_snapshot.get("terminal") is not None:
+        payload["terminal"] = bool(runtime_snapshot["terminal"])
+    elif status in FINAL_TASK_STATUSES:
+        payload["terminal"] = True
+    if runtime_snapshot.get("error"):
+        payload["error"] = _public_error_text(
+            runtime_snapshot["error"],
+            fallback="limira_task_failed",
+        )
+    return {
+        "task_id": task.task_id,
+        "type": "status",
+        "payload": payload,
+    }
+
+
+async def _observe_active_broadcast_events(
+    task: LimiraTask,
+    repo: LimiraTaskRepository,
+    runtime_state: LimiraRuntimeState,
+    broadcast: LimiraTaskEventBroadcast,
+    *,
+    last_event_id: str | None = None,
+) -> AsyncIterator[bytes]:
+    queue = await broadcast.subscribe()
+    seen_signatures: set[str] = set()
+    for replay_event in _replayed_stream_events(
+        repo,
+        task.task_id,
+        last_event_id=last_event_id,
+    ):
+        seen_signatures.add(_event_signature(replay_event))
+        yield _sse_bytes(_assert_browser_safe(replay_event))
+
+    if queue is None:
+        async for chunk in _observe_runtime_task_event_stream(
+            task,
+            repo,
+            runtime_state,
+            seen_signatures,
+            last_event_id=last_event_id,
+        ):
+            yield chunk
+        return
+
+    async for chunk in _redis_cursor_backfill_events(
+        task,
+        runtime_state,
+        seen_signatures,
+        last_event_id=last_event_id,
+    ):
+        yield chunk
+
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            signature = _event_signature(event)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            yield _sse_bytes(_assert_browser_safe(event))
+    finally:
+        await broadcast.unsubscribe(queue)
+
+
+async def _redis_cursor_backfill_events(
+    task: LimiraTask,
+    runtime_state: LimiraRuntimeState,
+    seen_signatures: set[str],
+    *,
+    last_event_id: str | None,
+) -> AsyncIterator[bytes]:
+    cursor_kind, cursor_value = _task_event_cursor(last_event_id)
+    if cursor_kind != "redis":
+        return
+    stream_events = await _read_task_event_stream(
+        runtime_state,
+        task.task_id,
+        last_id=cursor_value,
+        block_ms=0,
+        count=500,
+    )
+    if not stream_events:
+        return
+    for event_id, event in stream_events:
+        stream_event = _stream_event_with_sse_id(
+            event,
+            event_id=_sse_id_from_redis_stream_id(event_id) or _new_stream_event_id(task.task_id),
+        )
+        signature = _event_signature(stream_event)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        yield _sse_bytes(_assert_browser_safe(stream_event))
+        if _stream_event_is_terminal(stream_event):
+            return
+
+
+async def _observe_runtime_task_event_stream(
+    task: LimiraTask,
+    repo: LimiraTaskRepository,
+    runtime_state: LimiraRuntimeState,
+    seen_signatures: set[str],
+    *,
+    last_event_id: str | None = None,
+) -> AsyncIterator[bytes]:
+    runtime_snapshot = await _safe_task_runtime_snapshot(runtime_state, task.task_id)
+    if runtime_snapshot is None:
+        yield _sse_bytes(
+            _assert_browser_safe(
+                _live_stream_reconnecting_event(repo.get_task(task.task_id) or task)
+            )
+        )
+        return
+    runtime_event = _observer_status_event_from_runtime(task, runtime_snapshot)
+    if runtime_event and _event_signature(runtime_event) not in seen_signatures:
+        seen_signatures.add(_event_signature(runtime_event))
+        yield _sse_bytes(_assert_browser_safe(runtime_event))
+
+    current = repo.get_task(task.task_id) or task
+    if current.status != "running":
+        return
+
+    _cursor_kind, cursor_value = _task_event_cursor(last_event_id)
+    last_id = cursor_value if _cursor_kind == "redis" else "0-0"
+    while True:
+        stream_events = await _read_task_event_stream(
+            runtime_state,
+            task.task_id,
+            last_id=last_id,
+            block_ms=5000,
+            count=50,
+        )
+        if stream_events is None:
+            yield _sse_bytes(
+                _assert_browser_safe(
+                    _live_stream_reconnecting_event(repo.get_task(task.task_id) or current)
+                )
+            )
+            return
+        if stream_events:
+            for event_id, event in stream_events:
+                last_id = event_id
+                stream_event = _stream_event_with_sse_id(
+                    event,
+                    event_id=_sse_id_from_redis_stream_id(event_id) or _new_stream_event_id(task.task_id),
+                )
+                signature = _event_signature(stream_event)
+                if signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+                yield _sse_bytes(_assert_browser_safe(stream_event))
+                if _stream_event_is_terminal(stream_event):
+                    return
+            continue
+
+        runtime_snapshot = await _safe_task_runtime_snapshot(runtime_state, task.task_id)
+        if runtime_snapshot is None:
+            yield _sse_bytes(
+                _assert_browser_safe(
+                    _live_stream_reconnecting_event(repo.get_task(task.task_id) or current)
+                )
+            )
+            return
+        runtime_event = _observer_status_event_from_runtime(task, runtime_snapshot)
+        if _runtime_snapshot_is_closed(runtime_snapshot):
+            if runtime_event and _event_signature(runtime_event) not in seen_signatures:
+                yield _sse_bytes(_assert_browser_safe(runtime_event))
+            return
+        current = repo.get_task(task.task_id) or current
+        if current.status in FINAL_TASK_STATUSES:
+            terminal_event = _terminal_status_event(current)
+            if _event_signature(terminal_event) not in seen_signatures:
+                yield _sse_bytes(_assert_browser_safe(terminal_event))
+            return
 
 
 def _record_task_event_log(
@@ -805,8 +1147,66 @@ def _artifact_trace_event_from_warning(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _new_stream_event_id(task_id: str) -> str:
+    return f"{_safe_object_segment(task_id, fallback='task')}-{uuid.uuid4().hex}"
+
+
+def _sse_id_from_redis_stream_id(redis_stream_id: str | None) -> str | None:
+    if not redis_stream_id:
+        return None
+    redis_stream_id = str(redis_stream_id).strip()
+    if re.fullmatch(r"\d+-\d+", redis_stream_id) is None:
+        return None
+    return f"redis:{redis_stream_id}"
+
+
+def _task_event_cursor(last_event_id: str | None) -> tuple[str | None, str]:
+    value = str(last_event_id or "").strip()[:256]
+    if not value:
+        return None, ""
+    if value.startswith("redis:"):
+        redis_id = value.removeprefix("redis:").strip()
+        if re.fullmatch(r"\d+-\d+", redis_id):
+            return "redis", redis_id
+        return None, ""
+    if value.startswith("eventlog:"):
+        event_log_id = value.removeprefix("eventlog:").strip()
+        if event_log_id:
+            return "eventlog", event_log_id
+    return None, ""
+
+
+def _last_event_id_from_request(
+    *,
+    query_last_event_id: str | None,
+    header_last_event_id: str | None,
+) -> str | None:
+    query_value = str(query_last_event_id or "").strip()
+    if query_value:
+        return query_value[:256]
+    header_value = str(header_last_event_id or "").strip()
+    return header_value[:256] or None
+
+
+def _stream_event_with_sse_id(
+    event: Mapping[str, Any],
+    *,
+    event_id: str,
+) -> dict[str, Any]:
+    stream_event = dict(event)
+    stream_event["_limira_sse_id"] = str(event_id)
+    return stream_event
+
+
+def _public_sse_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in event.items() if str(key) != "_limira_sse_id"}
+
+
 def _sse_bytes(event: dict[str, Any]) -> bytes:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+    event_id = event.get("_limira_sse_id")
+    public_event = _public_sse_event(event)
+    id_line = f"id: {event_id}\n" if event_id else ""
+    return f"{id_line}data: {json.dumps(public_event, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 async def _iter_sse_json(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
@@ -1267,6 +1667,18 @@ def _runtime_state_ttl_seconds(value: Any) -> int:
     if ttl_seconds <= 0:
         raise RuntimeError("limira_runtime_state_ttl_seconds_invalid")
     return ttl_seconds
+
+
+def _task_event_stream_maxlen(value: Any) -> int:
+    if value in (None, ""):
+        return LIMIRA_TASK_EVENT_STREAM_MAXLEN
+    try:
+        maxlen = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("limira_task_event_stream_maxlen_invalid") from None
+    if maxlen <= 0:
+        raise RuntimeError("limira_task_event_stream_maxlen_invalid")
+    return maxlen
 
 
 def _list_of_strings(value: Any) -> list[str]:

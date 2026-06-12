@@ -50,6 +50,9 @@ def create_limira_runtime_state_from_env(
             ttl_seconds=_runtime_state_ttl_seconds(
                 env.get(LIMIRA_RUNTIME_STATE_TTL_SECONDS_ENV)
             ),
+            event_stream_maxlen=_task_event_stream_maxlen(
+                env.get(LIMIRA_TASK_EVENT_STREAM_MAXLEN_ENV)
+            ),
         )
 
     if backend in {"memory", "in-memory", "in_memory"}:
@@ -1023,6 +1026,12 @@ def _owned_conversation_tasks(
 @router.get("/tasks/{task_id}/events")
 async def get_task_events(
     task_id: str,
+    last_event_id: str | None = Query(default=None, max_length=256),
+    last_event_id_header: str | None = Header(
+        default=None,
+        alias="Last-Event-ID",
+        max_length=256,
+    ),
     user: LimiraUser = Depends(get_current_limira_user),
     repo: LimiraTaskRepository = Depends(get_task_repository),
     research_client: RunnerResearchClientProtocol = Depends(get_research_client),
@@ -1042,6 +1051,10 @@ async def get_task_events(
             object_storage,
             pdf_exporter,
             archive_client,
+            last_event_id=_last_event_id_from_request(
+                query_last_event_id=last_event_id,
+                header_last_event_id=last_event_id_header,
+            ),
         ),
         media_type="text/event-stream",
     )
@@ -1064,6 +1077,7 @@ async def get_task_event_logs(
             admin_user_id="",
         )
         for event in repo.list_task_event_logs(task.task_id, limit=limit)
+        if _is_user_visible_stream_event_log(event)
     ]
     return _assert_browser_safe(
         {

@@ -1603,6 +1603,8 @@ async def _limira_event_stream(
     object_storage: Any = None,
     pdf_exporter: Any = None,
     archive_client: Any = None,
+    *,
+    last_event_id: str | None = None,
 ) -> AsyncIterator[bytes]:
     completion_assets_generated = False
 
@@ -1635,6 +1637,19 @@ async def _limira_event_stream(
         yield _sse_bytes(_assert_browser_safe(terminal_event))
         return
 
+    broadcast = await _TASK_EVENT_BROADCASTER.get(task.task_id)
+    producer_started = await broadcast.try_start_producer()
+    if not producer_started:
+        async for chunk in _observe_active_broadcast_events(
+            current,
+            repo,
+            runtime_state,
+            broadcast,
+            last_event_id=last_event_id,
+        ):
+            yield chunk
+        return
+
     stream_id = str(uuid.uuid4())
     opened = await runtime_state.try_open_stream(
         task.task_id,
@@ -1646,10 +1661,15 @@ async def _limira_event_stream(
         },
     )
     if not opened:
-        runtime_snapshot = await runtime_state.get_task_runtime(task.task_id)
-        active_event = _active_stream_status_event(current, runtime_snapshot)
-        _record_task_event_log(repo, task.task_id, active_event)
-        yield _sse_bytes(_assert_browser_safe(active_event))
+        await _TASK_EVENT_BROADCASTER.finish(task.task_id, broadcast)
+        async for chunk in _observe_active_broadcast_events(
+            current,
+            repo,
+            runtime_state,
+            broadcast,
+            last_event_id=last_event_id,
+        ):
+            yield chunk
         return
 
     current = repo.update_task(task.task_id, status="running")
@@ -1696,27 +1716,42 @@ async def _limira_event_stream(
             )
             if applied_status == "completed":
                 for asset_event in await completion_asset_events():
-                    await _record_stream_event(
+                    yield await _emit_stream_event(
                         repo,
                         runtime_state,
+                        broadcast,
                         task.task_id,
                         asset_event,
                     )
-                    yield _sse_bytes(_assert_browser_safe(asset_event))
-            await _record_stream_event(repo, runtime_state, task.task_id, event)
+            yield await _emit_stream_event(
+                repo,
+                runtime_state,
+                broadcast,
+                task.task_id,
+                event,
+            )
             if applied_status in FINAL_TASK_STATUSES:
                 await runtime_state.update_task_runtime(
                     task.task_id,
                     {"terminal": True},
                 )
 
-            yield _sse_bytes(_assert_browser_safe(event))
             if warning:
-                await _record_stream_event(repo, runtime_state, task.task_id, warning)
-                yield _sse_bytes(_assert_browser_safe(warning))
+                yield await _emit_stream_event(
+                    repo,
+                    runtime_state,
+                    broadcast,
+                    task.task_id,
+                    warning,
+                )
             if final_report_event:
-                await _record_stream_event(repo, runtime_state, task.task_id, final_report_event)
-                yield _sse_bytes(_assert_browser_safe(final_report_event))
+                yield await _emit_stream_event(
+                    repo,
+                    runtime_state,
+                    broadcast,
+                    task.task_id,
+                    final_report_event,
+                )
             if applied_status in FINAL_TASK_STATUSES:
                 stream_close_reason = f"terminal_{applied_status}"
                 break
@@ -1731,19 +1766,24 @@ async def _limira_event_stream(
             if status_event:
                 if _event_payload_status(status_event) == "completed":
                     for asset_event in await completion_asset_events():
-                        await _record_stream_event(
+                        yield await _emit_stream_event(
                             repo,
                             runtime_state,
+                            broadcast,
                             task.task_id,
                             asset_event,
                         )
-                        yield _sse_bytes(_assert_browser_safe(asset_event))
-                await _record_stream_event(repo, runtime_state, task.task_id, status_event)
+                yield await _emit_stream_event(
+                    repo,
+                    runtime_state,
+                    broadcast,
+                    task.task_id,
+                    status_event,
+                )
                 stream_close_reason = _stream_close_reason_from_event(
                     status_event,
                     stream_close_reason,
                 )
-                yield _sse_bytes(_assert_browser_safe(status_event))
     except RunnerStreamConflict as exc:
         stream_close_reason = "runner_stream_conflict"
         status_event = await _authoritative_runner_status_event(
@@ -1756,19 +1796,24 @@ async def _limira_event_stream(
         if status_event:
             if _event_payload_status(status_event) == "completed":
                 for asset_event in await completion_asset_events():
-                    await _record_stream_event(
+                    yield await _emit_stream_event(
                         repo,
                         runtime_state,
+                        broadcast,
                         task.task_id,
                         asset_event,
                     )
-                    yield _sse_bytes(_assert_browser_safe(asset_event))
-            await _record_stream_event(repo, runtime_state, task.task_id, status_event)
+            yield await _emit_stream_event(
+                repo,
+                runtime_state,
+                broadcast,
+                task.task_id,
+                status_event,
+            )
             stream_close_reason = _stream_close_reason_from_event(
                 status_event,
                 stream_close_reason,
             )
-            yield _sse_bytes(_assert_browser_safe(status_event))
     except asyncio.CancelledError:
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
@@ -1800,16 +1845,21 @@ async def _limira_event_stream(
         if current and current.status in FINAL_TASK_STATUSES:
             if current.status == "completed":
                 for asset_event in await completion_asset_events():
-                    await _record_stream_event(
+                    yield await _emit_stream_event(
                         repo,
                         runtime_state,
+                        broadcast,
                         task.task_id,
                         asset_event,
                     )
-                    yield _sse_bytes(_assert_browser_safe(asset_event))
             terminal_event = _terminal_status_event(current)
-            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
-            yield _sse_bytes(_assert_browser_safe(terminal_event))
+            yield await _emit_stream_event(
+                repo,
+                runtime_state,
+                broadcast,
+                task.task_id,
+                terminal_event,
+            )
             return
         public_error = _public_error_text(
             exc.detail,
@@ -1826,24 +1876,34 @@ async def _limira_event_stream(
             "type": "error",
             "payload": {"error": public_error},
         }
-        await _record_stream_event(repo, runtime_state, task.task_id, error_event)
-        yield _sse_bytes(_assert_browser_safe(error_event))
+        yield await _emit_stream_event(
+            repo,
+            runtime_state,
+            broadcast,
+            task.task_id,
+            error_event,
+        )
     except Exception as exc:
         stream_close_reason = "limira_event_proxy_failed"
         current = repo.get_task(task.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
             if current.status == "completed":
                 for asset_event in await completion_asset_events():
-                    await _record_stream_event(
+                    yield await _emit_stream_event(
                         repo,
                         runtime_state,
+                        broadcast,
                         task.task_id,
                         asset_event,
                     )
-                    yield _sse_bytes(_assert_browser_safe(asset_event))
             terminal_event = _terminal_status_event(current)
-            await _record_stream_event(repo, runtime_state, task.task_id, terminal_event)
-            yield _sse_bytes(_assert_browser_safe(terminal_event))
+            yield await _emit_stream_event(
+                repo,
+                runtime_state,
+                broadcast,
+                task.task_id,
+                terminal_event,
+            )
             return
         repo.update_task(
             task.task_id,
@@ -1856,15 +1916,23 @@ async def _limira_event_stream(
             "type": "error",
             "payload": {"error": "limira_event_proxy_failed"},
         }
-        await _record_stream_event(repo, runtime_state, task.task_id, error_event)
-        yield _sse_bytes(_assert_browser_safe(error_event))
-    finally:
-        await _mark_runtime_stream_closed(
+        yield await _emit_stream_event(
+            repo,
             runtime_state,
+            broadcast,
             task.task_id,
-            stream_close_reason,
-            stream_id=stream_id,
+            error_event,
         )
+    finally:
+        try:
+            await _mark_runtime_stream_closed(
+                runtime_state,
+                task.task_id,
+                stream_close_reason,
+                stream_id=stream_id,
+            )
+        finally:
+            await _TASK_EVENT_BROADCASTER.finish(task.task_id, broadcast)
 
 
 async def _authoritative_runner_status_event(
@@ -1916,70 +1984,3 @@ async def _authoritative_runner_status_event(
         "type": "status",
         "payload": payload,
     }
-
-
-def _apply_authoritative_runner_status(
-    repo: LimiraTaskRepository,
-    task_id: str,
-    runner_status: dict[str, Any],
-) -> LimiraTask:
-    current = repo.get_task(task_id)
-    if not current:
-        raise KeyError(task_id)
-
-    status = runner_status.get("status")
-    if status not in {"queued", "running", "completed", "failed", "cancelled"}:
-        return current
-
-    updates: dict[str, Any] = {"status": status}
-    archive_status = runner_status.get("archive_status")
-    if archive_status in {"pending", "ready", "failed"}:
-        updates["archive_status"] = archive_status
-    elif status == "completed":
-        updates["archive_status"] = "ready"
-    elif status in {"failed", "cancelled"}:
-        updates["archive_status"] = "failed"
-    if runner_status.get("error"):
-        updates["error"] = _public_error_text(
-            runner_status["error"],
-            fallback="runner_task_failed",
-        )
-    return repo.update_task(task_id, **updates)
-
-
-def _terminal_status_event(task: LimiraTask, *, reason: str | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "status": task.status,
-        "archive_status": task.archive_status,
-        "terminal": True,
-    }
-    if task.error:
-        payload["error"] = _public_error_text(
-            task.error,
-            fallback="limira_task_failed",
-        )
-    if reason:
-        payload["reason"] = _public_reason_text(reason)
-    return {
-        "task_id": task.task_id,
-        "type": "status",
-        "payload": payload,
-    }
-
-
-def _active_stream_status_event(
-    task: LimiraTask,
-    runtime_snapshot: dict[str, Any],
-) -> dict[str, Any]:
-    status = runtime_snapshot.get("status") or task.status
-    archive_status = runtime_snapshot.get("archive_status") or task.archive_status
-    payload: dict[str, Any] = {
-        "status": status,
-        "archive_status": archive_status,
-        "stream_state": runtime_snapshot.get("stream_state") or "open",
-        "status_source": "limira_runtime_state",
-        "reason": "stream_already_open",
-    }
-    if runtime_snapshot.get("terminal") is not None:
-        payload["terminal"] = bool(runtime_snapshot["terminal"])
-    return {

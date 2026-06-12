@@ -67,7 +67,6 @@ No further tool calls are allowed.
 ## Requirements
 - **Language**: Write the entire response in **{target_language}**.
 - **Focus**: Directly answer the original question above. Do not just summarize gathered information — provide a clear, actionable answer.
-- **Response Length**: Match the complexity of your response to the question. For simple or short questions, provide a concise and direct answer without unnecessary elaboration. For complex questions, provide a detailed and structured report.
 - Use clear and structured Markdown formatting when appropriate.
 - Use appropriate Markdown headings (e.g., #, ##, ###) only when the content warrants structure.
 - Present key findings in an organized, concise, and readable way.
@@ -77,6 +76,7 @@ No further tool calls are allowed.
   - **In-Text**: Use the format `[ID]`, where `ID` is a **numeric identifier only** (digits 0–9), e.g. `[1]`, `[2]`.
   - **References Section(if has any sources)**: At the very end, add "References" (or equivalent in {target_language}). Format: [ID] TITLE/SECTION_TITLE. <URL>/<FILENAME>.
 - Do NOT mention tools, tool calls, or internal reasoning steps.
+- Do NOT include raw tool transcripts, search/scrape cards, or HTML UI snippets unless the user explicitly asks for implementation details.
 - Focus solely on delivering a professional, easy-to-read response that answers the user's original question.
 
 ## Original Question (for reference)

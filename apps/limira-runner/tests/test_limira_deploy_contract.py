@@ -128,6 +128,9 @@ def test_limira_compose_defines_stack_contract():
     ]
     assert "LIMIRA_ALLOW_IN_MEMORY_REPOSITORY" not in web["environment"]
     assert web["environment"]["LIMIRA_RUNTIME_STATE_BACKEND"] == "redis"
+    assert web["environment"]["LIMIRA_TASK_EVENT_STREAM_MAXLEN"] == (
+        "${LIMIRA_TASK_EVENT_STREAM_MAXLEN:-2000}"
+    )
     assert "LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE" not in web["environment"]
     assert web["environment"]["LIMIRA_OBJECT_STORAGE_BACKEND"] == "s3"
     assert web["environment"]["LIMIRA_OBJECT_BUCKET"] == "${MINIO_BUCKET:-limira-artifacts}"
@@ -228,6 +231,7 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
     assert env["LIMIRA_DATABASE_URL"] == ""
     assert env["LIMIRA_ALLOW_IN_MEMORY_REPOSITORY"] == "false"
     assert env["LIMIRA_RUNTIME_STATE_BACKEND"] == "redis"
+    assert env["LIMIRA_TASK_EVENT_STREAM_MAXLEN"] == "2000"
     assert env["LIMIRA_ALLOW_IN_MEMORY_RUNTIME_STATE"] == "false"
     assert env["LIMIRA_OBJECT_STORAGE_BACKEND"] == "s3"
     assert env["LIMIRA_ALLOW_IN_MEMORY_OBJECT_STORAGE"] == "false"

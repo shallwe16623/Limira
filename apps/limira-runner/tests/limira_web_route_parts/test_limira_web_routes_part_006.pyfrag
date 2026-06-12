@@ -422,9 +422,16 @@ def _limira_asgi_app():
 class FakeRedisClient:
     def __init__(self):
         self.hashes = {}
+        self.streams = {}
+        self.stream_conditions = {}
+        self.stream_sequences = {}
+        self.fail_hgetall = False
+        self.fail_xread = False
         self.hset_calls = []
         self.expire_calls = []
         self.eval_calls = []
+        self.xadd_calls = []
+        self.xread_calls = []
 
     async def hset(self, key, *, mapping):
         self.hset_calls.append({"key": key, "mapping": dict(mapping)})
@@ -432,6 +439,8 @@ class FakeRedisClient:
         return len(mapping)
 
     async def hgetall(self, key):
+        if self.fail_hgetall:
+            raise RuntimeError("redis_hgetall_unavailable")
         return dict(self.hashes.get(key, {}))
 
     async def expire(self, key, seconds):
@@ -468,6 +477,71 @@ class FakeRedisClient:
             await self.expire(key, ttl_seconds)
             return 1
         raise AssertionError(f"unexpected redis eval script: {script}")
+
+    async def xadd(self, key, fields, *, maxlen=None, approximate=True):
+        self.xadd_calls.append(
+            {
+                "key": key,
+                "fields": dict(fields),
+                "maxlen": maxlen,
+                "approximate": approximate,
+            }
+        )
+        sequence = self.stream_sequences.get(key, 0) + 1
+        self.stream_sequences[key] = sequence
+        event_id = f"{sequence}-0"
+        stream = self.streams.setdefault(key, [])
+        stream.append((event_id, dict(fields)))
+        if maxlen is not None and len(stream) > maxlen:
+            del stream[: len(stream) - int(maxlen)]
+        condition = self._stream_condition(key)
+        async with condition:
+            condition.notify_all()
+        return event_id
+
+    async def xread(self, streams, *, count=None, block=None):
+        if self.fail_xread:
+            raise RuntimeError("redis_xread_unavailable")
+        self.xread_calls.append({"streams": dict(streams), "count": count, "block": block})
+        deadline = None if block is None else asyncio.get_running_loop().time() + (block / 1000)
+        while True:
+            response = []
+            for key, last_id in streams.items():
+                entries = [
+                    (event_id, dict(fields))
+                    for event_id, fields in self.streams.get(key, [])
+                    if _redis_stream_id_after(event_id, last_id)
+                ]
+                if count is not None:
+                    entries = entries[: int(count)]
+                if entries:
+                    response.append((key, entries))
+            if response or not block:
+                return response
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return []
+            conditions = [self._stream_condition(key) for key in streams]
+            async with conditions[0]:
+                try:
+                    await asyncio.wait_for(conditions[0].wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return []
+
+    def _stream_condition(self, key):
+        condition = self.stream_conditions.get(key)
+        if condition is None:
+            condition = asyncio.Condition()
+            self.stream_conditions[key] = condition
+        return condition
+
+
+def _redis_stream_id_after(event_id, last_id):
+    def parts(value):
+        major, _, minor = str(value or "0-0").partition("-")
+        return int(major or 0), int(minor or 0)
+
+    return parts(event_id) > parts(last_id)
 
 
 class FakeS3Client:
