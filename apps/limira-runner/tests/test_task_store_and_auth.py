@@ -200,17 +200,12 @@ def test_task_store_replays_latest_event_window_in_append_order(tmp_path):
         query="window",
         created_at="2026-06-06T12:00:00+00:00",
     )
-    for index in range(MAX_REPLAY_EVENTS + 5):
-        store.append_task_event(
-            "task-window",
-            {
-                "task_id": "task-window",
-                "type": "message",
-                "timestamp": "2026-06-06T12:01:00+00:00",
-                "payload": {"index": index},
-            },
-            created_at="2026-06-06T12:01:00+00:00",
-        )
+    _append_indexed_events(
+        store,
+        "task-window",
+        range(MAX_REPLAY_EVENTS + 5),
+        timestamp="2026-06-06T12:01:00+00:00",
+    )
 
     events = store.list_task_events("task-window", limit=MAX_REPLAY_EVENTS)
 
@@ -227,6 +222,20 @@ class _CaptureSseResponse:
         self.chunks.append(data)
 
 
+def _append_indexed_events(store, task_id, indexes, *, timestamp):
+    for index in indexes:
+        store.append_task_event(
+            task_id,
+            {
+                "task_id": task_id,
+                "type": "message",
+                "timestamp": timestamp,
+                "payload": {"index": index},
+            },
+            created_at=timestamp,
+        )
+
+
 @pytest.mark.asyncio
 async def test_runner_durable_event_tail_uses_stable_cursor_after_replay_window(tmp_path):
     store = TaskStore(tmp_path / "tasks.sqlite3")
@@ -237,31 +246,21 @@ async def test_runner_durable_event_tail_uses_stable_cursor_after_replay_window(
         query="window cursor",
         created_at="2026-06-06T12:00:00+00:00",
     )
-    for index in range(MAX_REPLAY_EVENTS + 5):
-        store.append_task_event(
-            task_id,
-            {
-                "task_id": task_id,
-                "type": "message",
-                "timestamp": "2026-06-06T12:01:00+00:00",
-                "payload": {"index": index},
-            },
-            created_at="2026-06-06T12:01:00+00:00",
-        )
+    _append_indexed_events(
+        store,
+        task_id,
+        range(MAX_REPLAY_EVENTS + 5),
+        timestamp="2026-06-06T12:01:00+00:00",
+    )
     app = create_app(task_store=store)
     replay_records = _task_event_records_snapshot(app, task_id)
     cursor = replay_records[-1]["cursor"]
-    for index in range(MAX_REPLAY_EVENTS + 5, MAX_REPLAY_EVENTS + 7):
-        store.append_task_event(
-            task_id,
-            {
-                "task_id": task_id,
-                "type": "message",
-                "timestamp": "2026-06-06T12:02:00+00:00",
-                "payload": {"index": index},
-            },
-            created_at="2026-06-06T12:02:00+00:00",
-        )
+    _append_indexed_events(
+        store,
+        task_id,
+        range(MAX_REPLAY_EVENTS + 5, MAX_REPLAY_EVENTS + 7),
+        timestamp="2026-06-06T12:02:00+00:00",
+    )
     response = _CaptureSseResponse()
 
     next_cursor = await _write_new_durable_events(app, response, task_id, cursor)

@@ -274,9 +274,8 @@ async def stream_task_events(request: web.Request) -> web.StreamResponse:
         if record.status == "queued":
             _ensure_task_worker(request.app, record.task_id)
         replay_records = _task_event_records_snapshot(request.app, record.task_id)
-        replay_events = [_durable_record_event(record) for record in replay_records]
-        for event in replay_events:
-            await _write_sse(response, event)
+        for replay_record in replay_records:
+            await _write_sse(response, _durable_record_event(replay_record))
         current = _task_store(request.app).get_task(record.task_id)
         if current and current.status in FINAL_TASK_STATUSES:
             return response
@@ -651,9 +650,8 @@ def _task_event_records_snapshot(
 ) -> list[dict[str, Any]]:
     durable_records = _list_durable_task_event_records(app, task_id)
     if durable_records:
-        app[TASK_EVENT_LOG_KEY][task_id] = [
-            _durable_record_event(record) for record in durable_records
-        ][-MAX_REPLAY_EVENTS:]
+        durable_events = [_durable_record_event(record) for record in durable_records]
+        app[TASK_EVENT_LOG_KEY][task_id] = durable_events[-MAX_REPLAY_EVENTS:]
         return durable_records
     return [
         {"cursor": None, "event": event}
@@ -1078,23 +1076,14 @@ def _append_durable_task_event(
     appender(task_id, event, created_at=str(event.get("timestamp") or app[CLOCK_KEY]()))
 
 
-def _list_durable_task_events(
-    app: web.Application,
-    task_id: str,
-) -> list[dict[str, Any]]:
-    return [
-        _durable_record_event(record)
-        for record in _list_durable_task_event_records(app, task_id)
-    ]
-
-
 def _list_durable_task_event_records(
     app: web.Application,
     task_id: str,
     *,
     after_cursor: Any = None,
 ) -> list[dict[str, Any]]:
-    record_lister = getattr(_task_store(app), "list_task_event_records", None)
+    store = _task_store(app)
+    record_lister = getattr(store, "list_task_event_records", None)
     if record_lister is not None:
         return [
             _durable_event_record(item)
@@ -1104,7 +1093,7 @@ def _list_durable_task_event_records(
                 after_cursor=after_cursor,
             )
         ]
-    lister = getattr(_task_store(app), "list_task_events", None)
+    lister = getattr(store, "list_task_events", None)
     if lister is None:
         return []
     if after_cursor is not None:
