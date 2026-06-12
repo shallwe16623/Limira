@@ -17,54 +17,47 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if !model.statusMessage.isEmpty {
-                Text(model.statusMessage)
-                    .font(.footnote)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(.regularMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .padding()
-                    .accessibilityIdentifier("StatusMessage")
+            if model.user == nil {
+                StatusToastView(text: model.statusMessage)
+                    .accessibilityHidden(true)
+                    .allowsHitTesting(false)
             }
         }
-        .overlay(alignment: .topLeading) {
+        .background(alignment: .topLeading) {
             if AppConfiguration.isUITestProbeEnabled {
-                VStack {
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityIdentifier("TaskStatusProbe")
-                        .accessibilityLabel(model.status)
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityIdentifier("SelectedArtifactTabProbe")
-                        .accessibilityLabel(model.selectedTab.rawValue)
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityIdentifier("CompactRouteProbe")
-                        .accessibilityLabel(model.compactRoute.rawValue)
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityIdentifier("CompactArtifactModeProbe")
-                        .accessibilityLabel(model.compactShowingArtifacts ? "artifacts" : "conversation")
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityIdentifier("VoiceStatusProbe")
-                        .accessibilityLabel(model.voiceMessage)
-                    Color.clear
-                        .frame(width: 1, height: 1)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityIdentifier("QueryDraftProbe")
-                        .accessibilityLabel(model.queryDraft)
-                }
-                .allowsHitTesting(false)
+                UITestProbeHost()
             }
         }
+    }
+}
+
+struct UITestProbeHost: View {
+    @EnvironmentObject private var model: AppViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            probe("StatusMessage", model.statusMessage)
+            probe("TaskStatusProbe", model.status)
+            probe("SelectedArtifactTabProbe", model.selectedTab.rawValue)
+            probe("CompactRouteProbe", model.compactRoute.rawValue)
+            probe("CompactArtifactModeProbe", model.compactShowingArtifacts ? "artifacts" : "conversation")
+            probe("VoiceStatusProbe", model.voiceMessage)
+            probe("QueryDraftProbe", model.queryDraft)
+        }
+        .frame(width: 1, height: 7, alignment: .topLeading)
+        .allowsHitTesting(false)
+        .accessibilitySortPriority(-1)
+    }
+
+    private func probe(_ id: String, _ label: String) -> some View {
+        Text(label.isEmpty ? " " : label)
+            .font(.system(size: 1))
+            .foregroundStyle(.clear)
+            .lineLimit(1)
+            .frame(width: 1, height: 1)
+            .accessibilityElement(children: .ignore)
+            .accessibilityIdentifier(id)
+            .accessibilityLabel(label)
     }
 }
 
@@ -446,7 +439,7 @@ struct MainWorkspaceView: View {
 
     var body: some View {
         if horizontalSizeClass == .compact {
-            CompactChatWorkspaceView(previewURL: $previewURL)
+            CompactShellView(previewURL: $previewURL)
             .quickLookPreview($previewURL)
         } else {
             NavigationSplitView {
@@ -455,93 +448,126 @@ struct MainWorkspaceView: View {
                 WorkspaceDetailContent(previewURL: $previewURL)
                     .navigationTitle(model.selectedTask?.query.nonEmpty ?? "工作台")
             }
+            .overlay(alignment: .bottom) {
+                StatusToastView(text: model.statusMessage)
+                    .accessibilityHidden(true)
+                    .allowsHitTesting(false)
+            }
             .quickLookPreview($previewURL)
         }
     }
 }
 
-struct CompactChatWorkspaceView: View {
-    @EnvironmentObject private var model: AppViewModel
-    @Binding var previewURL: URL?
-    @State private var sidebarPresented = false
-    @State private var historyFilesPresented = false
-    @State private var fileImporterPresented = false
+struct StatusToastView: View {
+    var text: String
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            Group {
-                switch model.compactRoute {
-                case .workspace:
-                    VStack(spacing: 0) {
-                        CompactWorkspaceHeader {
-                            sidebarPresented = true
-                        }
-                        Divider()
-                        if model.compactShowingArtifacts {
-                            ScrollView {
-                                VStack(alignment: .leading, spacing: 16) {
-                                    ArtifactTabsView(compact: true, showBackButton: true)
-                                    if let file = model.downloadedFile {
-                                        DownloadPanel(file: file, previewURL: $previewURL)
-                                    }
-                                }
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 24)
-                            }
-                            .scrollDismissesKeyboard(.interactively)
-                        } else {
-                            ScrollView {
-                                CompactConversationCanvas(previewURL: $previewURL)
-                                    .padding(.horizontal, 20)
-                                    .padding(.bottom, 220)
-                            }
-                            .scrollDismissesKeyboard(.interactively)
-                            .safeAreaInset(edge: .bottom) {
-                                CompactComposer(
-                                    uploadAction: { fileImporterPresented = true },
-                                    historyAction: { historyFilesPresented = true }
-                                )
-                            }
-                        }
-                    }
-                case .cloudDrive:
-                    CompactCloudDriveView(previewURL: $previewURL)
-                case .archivedChats:
-                    CompactArchivedHistoryView()
-                case .enterpriseAdmin:
-                    CompactEnterpriseAdminView()
-                }
+        Group {
+            if !text.isEmpty {
+                Text(text)
+                    .font(.footnote)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.regularMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .padding()
+                    .accessibilityIdentifier("StatusToast")
             }
+        }
+        .allowsHitTesting(false)
+    }
+}
 
-            if sidebarPresented {
-                Color.black.opacity(0.18)
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        sidebarPresented = false
-                    }
-                    .transition(.opacity)
+struct CompactShellView: View {
+    @EnvironmentObject private var model: AppViewModel
+    @Binding var previewURL: URL?
 
-                GeometryReader { proxy in
-                    CompactSidebarDrawer(isPresented: $sidebarPresented)
-                        .frame(width: min(proxy.size.width * 0.88, 360))
-                        .frame(maxHeight: .infinity)
-                        .background(Color(.systemBackground))
-                        .transition(.move(edge: .leading))
+    var body: some View {
+        NavigationStack(path: compactPathBinding) {
+            CompactWorkspaceScreen(previewURL: $previewURL)
+                .navigationBarHidden(true)
+                .navigationDestination(for: CompactShellDestination.self) { destination in
+                    compactDestination(destination)
                 }
-            }
         }
         .background(Color(.systemBackground))
-        .animation(.easeInOut(duration: 0.18), value: sidebarPresented)
-        .sheet(isPresented: $historyFilesPresented) {
-            CompactHistoryFilesSheet()
-                .presentationDetents([.medium, .large])
+        .overlay(alignment: .bottom) {
+            if model.compactPresentation.modal == nil {
+                StatusToastView(text: model.statusMessage)
+                    .accessibilityHidden(true)
+                    .allowsHitTesting(false)
+            }
         }
-        .sheet(isPresented: $model.historySearchPresented) {
-            CompactHistorySearchSheet()
-                .presentationDetents([.medium, .large])
+        .fullScreenCover(isPresented: compactModalBinding(.menu)) {
+            CompactMenuView()
         }
-        .fileImporter(isPresented: $fileImporterPresented, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+        .sheet(item: compactSheetBinding) { modal in
+            switch modal {
+            case .historyFiles:
+                CompactHistoryFilesSheet()
+                    .presentationDetents([.medium, .large])
+            case .historySearch:
+                CompactHistorySearchSheet()
+                    .presentationDetents([.medium, .large])
+            case .menu, .fileImporter:
+                EmptyView()
+            }
+        }
+        .fileImporter(isPresented: compactModalBinding(.fileImporter), allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+            model.dismissCompactModal()
             handleImport(result)
+        }
+    }
+
+    private var compactPathBinding: Binding<[CompactShellDestination]> {
+        Binding(
+            get: { model.compactPresentation.path },
+            set: { model.setCompactDestinationPath($0) }
+        )
+    }
+
+    private var compactSheetBinding: Binding<CompactShellModal?> {
+        Binding(
+            get: {
+                switch model.compactPresentation.modal {
+                case .historyFiles, .historySearch:
+                    return model.compactPresentation.modal
+                case .menu, .fileImporter, nil:
+                    return nil
+                }
+            },
+            set: { model.setCompactModal($0) }
+        )
+    }
+
+    private func compactModalBinding(_ modal: CompactShellModal) -> Binding<Bool> {
+        Binding(
+            get: { model.isCompactModalPresented(modal) },
+            set: { isPresented in
+                if isPresented {
+                    model.setCompactModal(modal)
+                } else if model.isCompactModalPresented(modal) {
+                    model.dismissCompactModal()
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func compactDestination(_ destination: CompactShellDestination) -> some View {
+        switch destination {
+        case .cloudDrive:
+            CompactCloudDriveView(previewURL: $previewURL)
+                .navigationBarHidden(true)
+        case .archivedChats:
+            CompactArchivedHistoryView()
+                .navigationBarHidden(true)
+        case .enterpriseAdmin:
+            CompactEnterpriseAdminView()
+                .navigationBarHidden(true)
+        case .artifacts:
+            CompactArtifactDestinationView(previewURL: $previewURL)
+                .navigationBarHidden(true)
         }
     }
 
@@ -564,19 +590,74 @@ struct CompactChatWorkspaceView: View {
     }
 }
 
+struct CompactWorkspaceScreen: View {
+    @EnvironmentObject private var model: AppViewModel
+    @Binding var previewURL: URL?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            CompactWorkspaceHeader {
+                model.presentCompactMenu()
+            }
+            Divider()
+            ScrollView {
+                CompactConversationCanvas(previewURL: $previewURL)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 16)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .bottom) {
+                CompactComposer(
+                    uploadAction: { model.presentCompactFileImporter() },
+                    historyAction: { model.presentCompactHistoryFiles() }
+                )
+            }
+        }
+        .background(Color(.systemBackground))
+    }
+}
+
+struct CompactArtifactDestinationView: View {
+    @EnvironmentObject private var model: AppViewModel
+    @Binding var previewURL: URL?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                ArtifactTabsView(compact: true, showBackButton: true)
+                if let file = model.downloadedFile {
+                    DownloadPanel(file: file, previewURL: $previewURL)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 24)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .background {
+            Color(.systemBackground)
+            AccessibilityProbe(id: "CompactArtifactDestinationView")
+                .allowsHitTesting(false)
+        }
+    }
+}
+
 struct CompactWorkspaceHeader: View {
     var openSidebar: () -> Void
 
     var body: some View {
         HStack(spacing: 18) {
             Button(action: openSidebar) {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 22, weight: .semibold))
-                    .frame(width: 52, height: 52)
-                    .contentShape(Rectangle())
+                ZStack {
+                    Rectangle()
+                        .fill(Color(.systemBackground).opacity(0.001))
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 22, weight: .semibold))
+                }
+                .frame(width: 52, height: 52)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .foregroundStyle(.primary)
-            .simultaneousGesture(TapGesture().onEnded { _ in openSidebar() })
             .accessibilityLabel("打开侧边栏")
             .accessibilityIdentifier("MainSidebarOpenButton")
 
@@ -721,11 +802,11 @@ struct CompactReportControls: View {
                     } label: {
                         Text("\(tab.rawValue) \(count(for: tab))")
                             .font(.subheadline.weight(.medium))
-                            .frame(maxWidth: .infinity, minHeight: 34)
+                            .frame(maxWidth: .infinity, minHeight: 44)
                             .background(Color(.secondarySystemBackground))
                             .clipShape(Capsule())
                     }
-                    .frame(minHeight: 44)
+                    .buttonStyle(.plain)
                     .contentShape(Rectangle())
                     .accessibilityIdentifier("CompactArtifactControl-\(tab.rawValue)")
                 }
@@ -734,11 +815,11 @@ struct CompactReportControls: View {
                 } label: {
                     Label(archiveTitle, systemImage: "archivebox")
                         .font(.subheadline.weight(.medium))
-                        .frame(maxWidth: .infinity, minHeight: 34)
+                        .frame(maxWidth: .infinity, minHeight: 44)
                         .background(Color(.secondarySystemBackground))
                         .clipShape(Capsule())
                 }
-                .frame(minHeight: 44)
+                .buttonStyle(.plain)
                 .contentShape(Rectangle())
                 .accessibilityIdentifier("DownloadArchiveButton")
             }
@@ -935,11 +1016,16 @@ struct CompactVoiceButton: View {
         Button {
             Task { await model.toggleVoiceInput() }
         } label: {
-            Image(systemName: iconName)
-                .font(.system(size: 21, weight: .medium))
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
+            ZStack {
+                Circle()
+                    .fill(Color(.systemBackground).opacity(0.001))
+                Image(systemName: iconName)
+                    .font(.system(size: 21, weight: .medium))
+            }
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .frame(width: 44, height: 44)
         .contentShape(Rectangle())
         .foregroundStyle(model.isVoiceRecording ? .red : .secondary)
@@ -1045,9 +1131,8 @@ struct CompactSidebarSheet: View {
     }
 }
 
-struct CompactSidebarDrawer: View {
+struct CompactMenuView: View {
     @EnvironmentObject private var model: AppViewModel
-    @Binding var isPresented: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1056,7 +1141,7 @@ struct CompactSidebarDrawer: View {
                     .font(.headline)
                 Spacer()
                 Button {
-                    isPresented = false
+                    model.dismissCompactModal()
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 16, weight: .semibold))
@@ -1070,32 +1155,33 @@ struct CompactSidebarDrawer: View {
             .padding(.top, 18)
             .padding(.bottom, 12)
 
+            Divider()
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(spacing: 0) {
-                    Button {
-                        Task {
-                            await model.startNewChat()
-                            isPresented = false
-                        }
-                    } label: {
-                        Label("新研究", systemImage: "square.and.pencil")
+                        Button {
+                            Task { await model.startNewChat() }
+                        } label: {
+                            Label("新研究", systemImage: "square.and.pencil")
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                        }
+                        .contentShape(Rectangle())
                             .padding(.vertical, 14)
-                    .accessibilityIdentifier("NewConversationButton")
+                        .accessibilityIdentifier("NewConversationButton")
 
                         Divider()
 
-                    Button {
-                        Task { await model.refreshSignedInData() }
-                    } label: {
-                        Label("刷新", systemImage: "arrow.clockwise")
+                        Button {
+                            Task { await model.refreshSignedInData() }
+                        } label: {
+                            Label("刷新", systemImage: "arrow.clockwise")
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                        }
+                        .contentShape(Rectangle())
                             .padding(.vertical, 14)
+                        .accessibilityIdentifier("CompactMenuRefreshButton")
                     }
-                    .buttonStyle(.plain)
                     .foregroundStyle(Color.accentColor)
                     .padding(.horizontal, 18)
                     .background(Color(.secondarySystemBackground))
@@ -1114,7 +1200,7 @@ struct CompactSidebarDrawer: View {
                             .buttonStyle(.plain)
                             Spacer()
                             Button("搜索") {
-                                model.historySearchPresented = true
+                                model.presentCompactHistorySearch()
                             }
                             .font(.subheadline)
                             .accessibilityIdentifier("HistorySearchButton")
@@ -1139,7 +1225,7 @@ struct CompactSidebarDrawer: View {
                                         CompactTaskHistoryRow(
                                             task: task,
                                             archivedList: model.showArchivedHistory || task.historyArchived == true,
-                                            closeAction: { isPresented = false }
+                                            closeAction: { model.dismissCompactModal() }
                                         )
                                         Divider()
                                     }
@@ -1149,15 +1235,23 @@ struct CompactSidebarDrawer: View {
                     }
                     .padding(.horizontal, 18)
 
-                    CompactSettingsMenu(isPresented: $isPresented)
+                    CompactSettingsMenu()
                         .padding(.horizontal, 18)
 
                     Spacer(minLength: 24)
                 }
                 .padding(.bottom, 24)
             }
-
-            VStack(alignment: .leading, spacing: 6) {
+        }
+        .safeAreaInset(edge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                if !model.statusMessage.isEmpty {
+                    Text(model.statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 4)
+                        .accessibilityIdentifier("CompactMenuStatusMessage")
+                }
                 Text(model.user?.displayName ?? "")
                     .font(.headline)
                 Text(accountText)
@@ -1172,8 +1266,11 @@ struct CompactSidebarDrawer: View {
                 Divider()
             }
         }
-        .ignoresSafeArea(edges: .bottom)
-        .shadow(color: Color.black.opacity(0.16), radius: 20, x: 10, y: 0)
+        .background {
+            Color(.systemGroupedBackground)
+            AccessibilityProbe(id: "CompactMenuView")
+                .allowsHitTesting(false)
+        }
     }
 
     private var accountText: String {
@@ -1185,7 +1282,6 @@ struct CompactSidebarDrawer: View {
 
 struct CompactSettingsMenu: View {
     @EnvironmentObject private var model: AppViewModel
-    @Binding var isPresented: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1210,25 +1306,22 @@ struct CompactSettingsMenu: View {
 
             Divider()
 
-            CompactSettingsButton(title: "管理云盘", systemImage: "externaldrive") {
+            CompactSettingsButton(title: "管理云盘", systemImage: "externaldrive", identifier: "CompactCloudDriveButton") {
                 Task {
                     await model.openCompactRoute(.cloudDrive)
-                    isPresented = false
                 }
             }
 
-            CompactSettingsButton(title: "已归档对话", systemImage: "archivebox") {
+            CompactSettingsButton(title: "已归档对话", systemImage: "archivebox", identifier: "CompactArchivedChatsButton") {
                 Task {
                     await model.openCompactRoute(.archivedChats)
-                    isPresented = false
                 }
             }
 
             if model.user?.isEnterpriseAdmin == true {
-                CompactSettingsButton(title: "单位管理", systemImage: "building.2") {
+                CompactSettingsButton(title: "单位管理", systemImage: "building.2", identifier: "CompactEnterpriseAdminButton") {
                     Task {
                         await model.openCompactRoute(.enterpriseAdmin)
-                        isPresented = false
                     }
                 }
             }
@@ -1238,13 +1331,13 @@ struct CompactSettingsMenu: View {
             Button(role: .destructive) {
                 Task {
                     await model.signOut()
-                    isPresented = false
                 }
             } label: {
                 Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityIdentifier("CompactSignOutButton")
         }
         .padding(18)
         .background(Color(.secondarySystemBackground))
@@ -1255,6 +1348,7 @@ struct CompactSettingsMenu: View {
 struct CompactSettingsButton: View {
     var title: String
     var systemImage: String
+    var identifier: String
     var action: () -> Void
 
     var body: some View {
@@ -1262,9 +1356,10 @@ struct CompactSettingsButton: View {
             Label(title, systemImage: systemImage)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .buttonStyle(.plain)
         .foregroundStyle(.primary)
         .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .accessibilityIdentifier(identifier)
     }
 }
 
@@ -1294,7 +1389,8 @@ struct CompactTaskHistoryRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityIdentifier("CompactHistoryRow-\(task.taskId)")
 
             HStack {
                 Button(archivedList || task.historyArchived == true ? "恢复" : "归档") {
@@ -1306,14 +1402,17 @@ struct CompactTaskHistoryRow: View {
                         }
                     }
                 }
+                .accessibilityIdentifier("CompactHistoryArchiveButton-\(task.taskId)")
                 Button("删除", role: .destructive) {
                     confirmDelete = true
                 }
+                .accessibilityIdentifier("CompactHistoryDeleteButton-\(task.taskId)")
             }
             .font(.caption)
             .buttonStyle(.borderless)
         }
         .padding(.vertical, 4)
+        .contentShape(Rectangle())
         .alert("删除这条对话？", isPresented: $confirmDelete) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive) {
@@ -1400,8 +1499,9 @@ struct CompactUtilityHeader: View {
                     .font(.system(size: 18, weight: .semibold))
                     .frame(width: 40, height: 40)
             }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
             .accessibilityLabel("返回工作台")
+            .accessibilityIdentifier("CompactRouteBackButton")
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
@@ -1421,8 +1521,9 @@ struct CompactUtilityHeader: View {
                         .font(.system(size: 18, weight: .semibold))
                         .frame(width: 40, height: 40)
                 }
-                .buttonStyle(.plain)
+                .contentShape(Rectangle())
                 .accessibilityLabel("刷新")
+                .accessibilityIdentifier("CompactRouteRefreshButton")
             }
         }
         .padding(.horizontal, 18)
@@ -1480,8 +1581,11 @@ struct CompactCloudDriveView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .background(Color(.systemBackground))
-        .accessibilityIdentifier("CompactCloudDriveView")
+        .background {
+            Color(.systemBackground)
+            AccessibilityProbe(id: "CompactCloudDriveView")
+                .allowsHitTesting(false)
+        }
     }
 }
 
@@ -1544,8 +1648,11 @@ struct CompactArchivedHistoryView: View {
                 .padding(20)
             }
         }
-        .background(Color(.systemBackground))
-        .accessibilityIdentifier("CompactArchivedHistoryView")
+        .background {
+            Color(.systemBackground)
+            AccessibilityProbe(id: "CompactArchivedHistoryView")
+                .allowsHitTesting(false)
+        }
     }
 }
 
@@ -1568,8 +1675,11 @@ struct CompactEnterpriseAdminView: View {
                 }
             }
         }
-        .background(Color(.systemBackground))
-        .accessibilityIdentifier("CompactEnterpriseAdminView")
+        .background {
+            Color(.systemBackground)
+            AccessibilityProbe(id: "CompactEnterpriseAdminView")
+                .allowsHitTesting(false)
+        }
     }
 }
 

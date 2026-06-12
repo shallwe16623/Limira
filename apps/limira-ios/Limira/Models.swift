@@ -578,6 +578,83 @@ enum CompactWorkspaceRoute: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum CompactShellDestination: String, CaseIterable, Hashable, Identifiable {
+    case cloudDrive
+    case archivedChats
+    case enterpriseAdmin
+    case artifacts
+
+    var id: String { rawValue }
+
+    var route: CompactWorkspaceRoute {
+        switch self {
+        case .cloudDrive:
+            return .cloudDrive
+        case .archivedChats:
+            return .archivedChats
+        case .enterpriseAdmin:
+            return .enterpriseAdmin
+        case .artifacts:
+            return .workspace
+        }
+    }
+}
+
+enum CompactShellModal: String, Identifiable {
+    case menu
+    case historyFiles
+    case historySearch
+    case fileImporter
+
+    var id: String { rawValue }
+}
+
+struct CompactShellPresentation: Equatable {
+    var path: [CompactShellDestination] = []
+    var modal: CompactShellModal?
+    var artifactTaskId: String?
+
+    var currentDestination: CompactShellDestination? {
+        path.last
+    }
+
+    var route: CompactWorkspaceRoute {
+        currentDestination?.route ?? .workspace
+    }
+
+    var isShowingArtifacts: Bool {
+        currentDestination == .artifacts
+    }
+
+    mutating func present(_ modal: CompactShellModal) {
+        self.modal = modal
+    }
+
+    mutating func dismissModal() {
+        modal = nil
+    }
+
+    mutating func showDestination(_ destination: CompactShellDestination?) {
+        path = destination.map { [$0] } ?? []
+        modal = nil
+        if destination != .artifacts {
+            artifactTaskId = nil
+        }
+    }
+
+    mutating func showArtifacts(taskId: String?) {
+        path = [.artifacts]
+        modal = nil
+        artifactTaskId = taskId
+    }
+
+    mutating func resetToWorkspace() {
+        path = []
+        modal = nil
+        artifactTaskId = nil
+    }
+}
+
 enum AuthScope: String, CaseIterable, Identifiable {
     case personal = "个人"
     case enterprise = "企业"

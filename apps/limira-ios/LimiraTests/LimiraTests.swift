@@ -135,6 +135,90 @@ final class LimiraTests: XCTestCase {
     }
 
     @MainActor
+    func testCompactPresentationClearsModalsWhenOpeningDestinations() async throws {
+        let service = MockLimiraService()
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        model.user = try await service.signInEnterprise(organizationId: "builtin-limira", identifier: "admin", password: "password")
+
+        model.presentCompactMenu()
+        XCTAssertEqual(model.compactPresentation.modal, .menu)
+
+        await model.openCompactRoute(.cloudDrive)
+        XCTAssertEqual(model.compactPresentation.path, [.cloudDrive])
+        XCTAssertNil(model.compactPresentation.modal)
+        XCTAssertEqual(model.compactRoute, .cloudDrive)
+        XCTAssertFalse(model.compactShowingArtifacts)
+
+        model.presentCompactHistoryFiles()
+        XCTAssertEqual(model.compactPresentation.modal, .historyFiles)
+        await model.openCompactRoute(.archivedChats)
+        XCTAssertEqual(model.compactPresentation.path, [.archivedChats])
+        XCTAssertNil(model.compactPresentation.modal)
+
+        model.presentCompactHistorySearch()
+        XCTAssertEqual(model.compactPresentation.modal, .historySearch)
+        await model.openCompactRoute(.enterpriseAdmin)
+        XCTAssertEqual(model.compactPresentation.path, [.enterpriseAdmin])
+        XCTAssertNil(model.compactPresentation.modal)
+    }
+
+    @MainActor
+    func testCompactStartNewChatResetsPresentationAndDraftState() async throws {
+        let service = MockLimiraService()
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        model.user = try await service.signInEnterprise(organizationId: "builtin-limira", identifier: "admin", password: "password")
+        model.selectedTask = try await service.startResearch(query: "old", scenario: nil, conversationId: nil, documentIds: [])
+        model.messages = [AppMessage(role: .user, text: "old")]
+        model.selectedDocumentIds = ["mock-cloud-doc"]
+        model.queryDraft = "draft"
+        model.downloadedFile = DownloadedFile(url: URL(fileURLWithPath: "/tmp/mock.txt"), filename: "mock.txt", contentType: "text/plain")
+        model.compactPresentation.showArtifacts(taskId: "mock-task")
+        model.presentCompactHistoryFiles()
+
+        await model.startNewChat()
+
+        XCTAssertTrue(model.compactPresentation.path.isEmpty)
+        XCTAssertNil(model.compactPresentation.modal)
+        XCTAssertNil(model.compactPresentation.artifactTaskId)
+        XCTAssertEqual(model.compactRoute, .workspace)
+        XCTAssertFalse(model.compactShowingArtifacts)
+        XCTAssertNil(model.selectedTask)
+        XCTAssertTrue(model.messages.isEmpty)
+        XCTAssertTrue(model.selectedDocumentIds.isEmpty)
+        XCTAssertEqual(model.queryDraft, "")
+        XCTAssertNil(model.downloadedFile)
+    }
+
+    @MainActor
+    func testCompactEnterpriseAdminRequiresAdminRole() async throws {
+        let service = MockLimiraService()
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        model.user = LimiraUser(
+            id: "member-user",
+            email: "member@limira.local",
+            username: "member",
+            name: "Member",
+            role: "user",
+            emailVerified: true,
+            accountType: "enterprise",
+            organizationId: "builtin-limira",
+            organizationRole: "member",
+            dailyResearchLimit: nil,
+            token: nil,
+            tokenType: nil,
+            organization: nil
+        )
+
+        model.presentCompactMenu()
+        await model.openCompactRoute(.enterpriseAdmin)
+
+        XCTAssertTrue(model.compactPresentation.path.isEmpty)
+        XCTAssertNil(model.compactPresentation.modal)
+        XCTAssertEqual(model.compactRoute, .workspace)
+        XCTAssertTrue(model.statusMessage.contains("单位管理权限"))
+    }
+
+    @MainActor
     func testCompactArtifactTabsOmitReport() {
         let model = AppViewModel(service: MockLimiraService(), voiceRecorder: MockVoiceRecorder())
         XCTAssertEqual(model.compactArtifactTabs(), [.evidence, .entities, .graph, .timeline, .map])

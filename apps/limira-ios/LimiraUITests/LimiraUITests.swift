@@ -7,6 +7,8 @@ final class LimiraUITests: XCTestCase {
 
         let editor = app.textViews["QueryEditor"]
         XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
         let status = app.descendants(matching: .any)["TaskStatusProbe"]
         XCTAssertTrue(status.waitForExistence(timeout: 5))
         expectation(for: NSPredicate(format: "label == %@", "completed"), evaluatedWith: status)
@@ -14,7 +16,8 @@ final class LimiraUITests: XCTestCase {
 
         let evidence = app.buttons["CompactArtifactControl-证据"]
         XCTAssertTrue(scrollTo(evidence, in: app))
-        forceTap(evidence)
+        XCTAssertTrue(evidence.isHittable)
+        evidence.tap()
         let artifactMode = app.descendants(matching: .any)["CompactArtifactModeProbe"]
         expectation(for: NSPredicate(format: "label == %@", "artifacts"), evaluatedWith: artifactMode)
         waitForExpectations(timeout: 5)
@@ -29,6 +32,8 @@ final class LimiraUITests: XCTestCase {
 
         let editor = app.textViews["QueryEditor"]
         XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
         XCTAssertTrue(app.staticTexts["limira OSINT"].waitForExistence(timeout: 5))
 
         let status = app.descendants(matching: .any)["TaskStatusProbe"]
@@ -40,21 +45,21 @@ final class LimiraUITests: XCTestCase {
         XCTAssertTrue(sidebar.waitForExistence(timeout: 3))
         openSidebar(in: app)
 
-        let cloud = app.buttons["管理云盘"]
+        let cloud = app.buttons["CompactCloudDriveButton"]
         XCTAssertTrue(scrollTo(cloud, in: app))
         cloud.tap()
         waitForRoute("cloudDrive", in: app)
         tapBackToWorkspace(app)
 
         openSidebar(in: app)
-        let archived = app.buttons["已归档对话"]
+        let archived = app.buttons["CompactArchivedChatsButton"]
         XCTAssertTrue(scrollTo(archived, in: app))
         archived.tap()
         waitForRoute("archivedChats", in: app)
         tapBackToWorkspace(app)
 
         openSidebar(in: app)
-        let admin = app.buttons["单位管理"]
+        let admin = app.buttons["CompactEnterpriseAdminButton"]
         XCTAssertTrue(scrollTo(admin, in: app))
         admin.tap()
         waitForRoute("enterpriseAdmin", in: app)
@@ -65,14 +70,19 @@ final class LimiraUITests: XCTestCase {
 
         let editor = app.textViews["QueryEditor"]
         XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
         let voice = app.buttons["VoiceInputButton"]
         XCTAssertTrue(voice.waitForExistence(timeout: 3))
 
-        forceTap(voice)
+        XCTAssertTrue(voice.isHittable)
+        voice.tap()
         let voiceStatus = app.descendants(matching: .any)["VoiceStatusProbe"]
         expectation(for: NSPredicate(format: "label CONTAINS %@", "正在录音"), evaluatedWith: voiceStatus)
         waitForExpectations(timeout: 5)
-        forceTap(app.buttons["VoiceInputButton"])
+        let stopVoice = app.buttons["VoiceInputButton"]
+        XCTAssertTrue(stopVoice.isHittable)
+        stopVoice.tap()
 
         let queryProbe = app.descendants(matching: .any)["QueryDraftProbe"]
         expectation(for: NSPredicate(format: "label CONTAINS %@", "mock speech"), evaluatedWith: queryProbe)
@@ -115,11 +125,14 @@ final class LimiraUITests: XCTestCase {
         passwordField.tap()
         passwordField.typeText(password)
 
-        forceTap(app.buttons["SignInButton"])
+        dismissKeyboard(in: app)
+        tapHittable(app.buttons["SignInButton"], in: app)
         _ = app.keyboards.firstMatch.waitForNonExistence(timeout: 2)
 
         let editor = app.textViews["QueryEditor"]
         XCTAssertTrue(editor.waitForExistence(timeout: 45))
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
 
         guard runResearch else { return }
 
@@ -133,10 +146,6 @@ final class LimiraUITests: XCTestCase {
         XCTAssertTrue(tabPicker.waitForExistence(timeout: 30))
     }
 
-    private func forceTap(_ element: XCUIElement) {
-        element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-    }
-
     private func waitForRoute(_ route: String, in app: XCUIApplication, timeout: TimeInterval = 5) {
         let routeProbe = app.descendants(matching: .any)["CompactRouteProbe"]
         expectation(for: NSPredicate(format: "label == %@", route), evaluatedWith: routeProbe)
@@ -146,13 +155,16 @@ final class LimiraUITests: XCTestCase {
     private func openSidebar(in app: XCUIApplication) {
         let sidebar = app.buttons["MainSidebarOpenButton"]
         XCTAssertTrue(sidebar.waitForExistence(timeout: 3))
-        forceTap(sidebar)
+        XCTAssertTrue(sidebar.isHittable)
+        sidebar.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["CompactMenuView"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["CompactSidebarCloseButton"].waitForExistence(timeout: 3))
     }
 
     private func tapBackToWorkspace(_ app: XCUIApplication) {
-        let back = app.buttons["返回工作台"]
+        let back = app.buttons["CompactRouteBackButton"]
         XCTAssertTrue(back.waitForExistence(timeout: 3))
+        XCTAssertTrue(back.isHittable)
         back.tap()
         waitForRoute("workspace", in: app)
     }
@@ -178,9 +190,48 @@ final class LimiraUITests: XCTestCase {
         password.tap()
         password.typeText("password")
 
-        forceTap(app.buttons["SignInButton"])
-        _ = app.keyboards.firstMatch.waitForNonExistence(timeout: 2)
+        dismissKeyboard(in: app)
+        tapHittable(app.buttons["SignInButton"], in: app)
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
         return app
+    }
+
+    private func tapHittable(_ element: XCUIElement, in app: XCUIApplication, timeout: TimeInterval = 3) {
+        XCTAssertTrue(element.waitForExistence(timeout: timeout))
+        dismissSystemPrompts(in: app)
+        if !element.isHittable {
+            dismissKeyboard(in: app)
+        }
+        XCTAssertTrue(element.isHittable)
+        element.tap()
+    }
+
+    private func dismissSystemPrompts(in app: XCUIApplication) {
+        let deadline = Date().addingTimeInterval(1.0)
+        repeat {
+            for title in ["以后", "Not Now"] {
+                let button = app.buttons[title]
+                if button.exists {
+                    button.tap()
+                    return
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+    }
+
+    private func dismissKeyboard(in app: XCUIApplication) {
+        guard app.keyboards.firstMatch.exists else { return }
+        let returnButton = app.keyboards.buttons["return"]
+        if returnButton.exists {
+            returnButton.tap()
+            _ = app.keyboards.firstMatch.waitForNonExistence(timeout: 1)
+        }
+        if app.keyboards.firstMatch.exists {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)).tap()
+            _ = app.keyboards.firstMatch.waitForNonExistence(timeout: 1)
+        }
     }
 
     @discardableResult

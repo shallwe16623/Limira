@@ -27,12 +27,9 @@ final class AppViewModel: ObservableObject {
     @Published var enterpriseMembers: [LimiraUser] = []
     @Published var enterpriseUsage: EnterpriseUsageResponse?
     @Published var selectedTab: ArtifactTab = .evidence
-    @Published var compactRoute: CompactWorkspaceRoute = .workspace
-    @Published var compactShowingArtifacts = false
-    @Published var selectedArtifactTaskId: String?
+    @Published var compactPresentation = CompactShellPresentation()
     @Published var historyExpanded = true
     @Published var showArchivedHistory = false
-    @Published var historySearchPresented = false
     @Published var historySearchResults: [LimiraTask] = []
     @Published var isSearchingHistory = false
     @Published var isVoiceRecording = false
@@ -89,6 +86,23 @@ final class AppViewModel: ObservableObject {
 
     deinit {
         streamTask?.cancel()
+    }
+
+    var compactRoute: CompactWorkspaceRoute {
+        compactPresentation.route
+    }
+
+    var compactShowingArtifacts: Bool {
+        compactPresentation.isShowingArtifacts
+    }
+
+    var selectedArtifactTaskId: String? {
+        get { compactPresentation.artifactTaskId }
+        set { compactPresentation.artifactTaskId = newValue }
+    }
+
+    var historySearchPresented: Bool {
+        compactPresentation.modal == .historySearch
     }
 
     func boot() async {
@@ -214,9 +228,7 @@ final class AppViewModel: ObservableObject {
             reports = []
             status = "ready"
             archiveStatus = "pending"
-            compactRoute = .workspace
-            compactShowingArtifacts = false
-            selectedArtifactTaskId = nil
+            compactPresentation.resetToWorkspace()
             selectedDocumentIds = []
             queryDraft = ""
             voiceMessage = ""
@@ -291,30 +303,74 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func presentCompactMenu() {
+        compactPresentation.present(.menu)
+    }
+
+    func presentCompactHistoryFiles() {
+        compactPresentation.present(.historyFiles)
+    }
+
+    func presentCompactHistorySearch() {
+        compactPresentation.present(.historySearch)
+    }
+
+    func presentCompactFileImporter() {
+        compactPresentation.present(.fileImporter)
+    }
+
+    func dismissCompactModal() {
+        compactPresentation.dismissModal()
+    }
+
+    func setCompactModal(_ modal: CompactShellModal?) {
+        compactPresentation.modal = modal
+    }
+
+    func isCompactModalPresented(_ modal: CompactShellModal) -> Bool {
+        compactPresentation.modal == modal
+    }
+
+    func setCompactDestinationPath(_ path: [CompactShellDestination]) {
+        let normalizedPath = path.count > 1 ? Array(path.suffix(1)) : path
+        if normalizedPath.last == .enterpriseAdmin, user?.isEnterpriseAdmin != true {
+            compactPresentation.resetToWorkspace()
+            statusMessage = "当前账号没有单位管理权限。"
+            return
+        }
+        compactPresentation.path = normalizedPath
+        compactPresentation.dismissModal()
+        if normalizedPath.last != .artifacts {
+            compactPresentation.artifactTaskId = nil
+        }
+    }
+
     func openCompactRoute(_ route: CompactWorkspaceRoute) async {
-        compactRoute = route
-        compactShowingArtifacts = false
         switch route {
         case .workspace:
-            break
+            compactPresentation.resetToWorkspace()
         case .cloudDrive:
+            compactPresentation.showDestination(.cloudDrive)
             await loadCloudFiles()
             await loadStorage()
         case .archivedChats:
+            compactPresentation.showDestination(.archivedChats)
             await loadTasks(archived: true)
         case .enterpriseAdmin:
-            if user?.isEnterpriseAdmin == true {
-                await loadEnterpriseAdmin()
+            guard user?.isEnterpriseAdmin == true else {
+                compactPresentation.resetToWorkspace()
+                statusMessage = "当前账号没有单位管理权限。"
+                return
             }
+            compactPresentation.showDestination(.enterpriseAdmin)
+            await loadEnterpriseAdmin()
         }
     }
 
     func startNewChat() async {
         streamTask?.cancel()
         streamTask = nil
-        compactRoute = .workspace
-        compactShowingArtifacts = false
-        selectedArtifactTaskId = nil
+        compactPresentation.resetToWorkspace()
         selectedTask = nil
         messages = []
         artifacts = ArtifactBuckets()
@@ -361,8 +417,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func selectTask(_ task: LimiraTask) async {
-        compactRoute = .workspace
-        compactShowingArtifacts = false
+        compactPresentation.resetToWorkspace()
         selectedTask = task
         selectedArtifactTaskId = task.taskId
         status = task.status
@@ -407,7 +462,9 @@ final class AppViewModel: ObservableObject {
                 reports = []
                 finalReportMarkdown = ""
                 selectedArtifactTaskId = nil
-                compactShowingArtifacts = false
+                if compactPresentation.isShowingArtifacts {
+                    compactPresentation.resetToWorkspace()
+                }
             }
         }
     }
@@ -700,10 +757,8 @@ final class AppViewModel: ObservableObject {
 
     func openArtifacts(tab: ArtifactTab, taskId: String? = nil) async {
         selectedTab = tab
-        compactShowingArtifacts = true
-        compactRoute = .workspace
         let targetTaskId = taskId?.nonEmpty ?? selectedTask?.taskId
-        selectedArtifactTaskId = targetTaskId
+        compactPresentation.showArtifacts(taskId: targetTaskId)
         guard let targetTaskId, targetTaskId != selectedTask?.taskId else { return }
         do {
             artifacts = try await service.loadArtifacts(taskId: targetTaskId)
@@ -714,10 +769,8 @@ final class AppViewModel: ObservableObject {
 
     func activateCompactArtifacts(tab: ArtifactTab, taskId: String? = nil) {
         selectedTab = tab
-        compactShowingArtifacts = true
-        compactRoute = .workspace
         let targetTaskId = taskId?.nonEmpty ?? selectedTask?.taskId
-        selectedArtifactTaskId = targetTaskId
+        compactPresentation.showArtifacts(taskId: targetTaskId)
         guard let targetTaskId, targetTaskId != selectedTask?.taskId else { return }
         Task {
             do {
@@ -729,7 +782,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func backToConversation() {
-        compactShowingArtifacts = false
+        compactPresentation.resetToWorkspace()
     }
 
     func artifactCount(for tab: ArtifactTab, artifacts: ArtifactBuckets? = nil) -> Int {
