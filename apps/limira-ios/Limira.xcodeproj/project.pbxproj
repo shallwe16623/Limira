@@ -1,0 +1,534 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		10F000000000000000000201 /* LimiraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000101 /* LimiraApp.swift */; };
+		10F000000000000000000202 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000102 /* Models.swift */; };
+		10F000000000000000000203 /* Networking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000103 /* Networking.swift */; };
+		10F000000000000000000204 /* AppViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000104 /* AppViewModel.swift */; };
+		10F000000000000000000205 /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000105 /* Views.swift */; };
+		10F000000000000000000211 /* LimiraTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000111 /* LimiraTests.swift */; };
+		10F000000000000000000212 /* LimiraUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10F000000000000000000112 /* LimiraUITests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		10F000000000000000000301 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 10F000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 10F000000000000000000010;
+			remoteInfo = Limira;
+		};
+		10F000000000000000000302 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 10F000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 10F000000000000000000010;
+			remoteInfo = Limira;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		10F000000000000000000101 /* LimiraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LimiraApp.swift; sourceTree = "<group>"; };
+		10F000000000000000000102 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		10F000000000000000000103 /* Networking.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Networking.swift; sourceTree = "<group>"; };
+		10F000000000000000000104 /* AppViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppViewModel.swift; sourceTree = "<group>"; };
+		10F000000000000000000105 /* Views.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views.swift; sourceTree = "<group>"; };
+		10F000000000000000000106 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		10F000000000000000000111 /* LimiraTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LimiraTests.swift; sourceTree = "<group>"; };
+		10F000000000000000000112 /* LimiraUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LimiraUITests.swift; sourceTree = "<group>"; };
+		10F000000000000000000120 /* Limira.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Limira.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		10F000000000000000000121 /* LimiraTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LimiraTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		10F000000000000000000122 /* LimiraUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LimiraUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		10F000000000000000000041 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
+		10F000000000000000000051 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
+		10F000000000000000000061 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		10F000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				10F000000000000000000004 /* Limira */,
+				10F000000000000000000005 /* LimiraTests */,
+				10F000000000000000000006 /* LimiraUITests */,
+				10F000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		10F000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				10F000000000000000000120 /* Limira.app */,
+				10F000000000000000000121 /* LimiraTests.xctest */,
+				10F000000000000000000122 /* LimiraUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		10F000000000000000000004 /* Limira */ = {
+			isa = PBXGroup;
+			children = (
+				10F000000000000000000101 /* LimiraApp.swift */,
+				10F000000000000000000102 /* Models.swift */,
+				10F000000000000000000103 /* Networking.swift */,
+				10F000000000000000000104 /* AppViewModel.swift */,
+				10F000000000000000000105 /* Views.swift */,
+				10F000000000000000000106 /* Info.plist */,
+			);
+			path = Limira;
+			sourceTree = "<group>";
+		};
+		10F000000000000000000005 /* LimiraTests */ = {
+			isa = PBXGroup;
+			children = (
+				10F000000000000000000111 /* LimiraTests.swift */,
+			);
+			path = LimiraTests;
+			sourceTree = "<group>";
+		};
+		10F000000000000000000006 /* LimiraUITests */ = {
+			isa = PBXGroup;
+			children = (
+				10F000000000000000000112 /* LimiraUITests.swift */,
+			);
+			path = LimiraUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		10F000000000000000000010 /* Limira */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 10F000000000000000000021 /* Build configuration list for PBXNativeTarget "Limira" */;
+			buildPhases = (
+				10F000000000000000000040 /* Sources */,
+				10F000000000000000000041 /* Frameworks */,
+				10F000000000000000000042 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Limira;
+			productName = Limira;
+			productReference = 10F000000000000000000120 /* Limira.app */;
+			productType = "com.apple.product-type.application";
+		};
+		10F000000000000000000011 /* LimiraTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 10F000000000000000000022 /* Build configuration list for PBXNativeTarget "LimiraTests" */;
+			buildPhases = (
+				10F000000000000000000050 /* Sources */,
+				10F000000000000000000051 /* Frameworks */,
+				10F000000000000000000052 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				10F000000000000000000303 /* PBXTargetDependency */,
+			);
+			name = LimiraTests;
+			productName = LimiraTests;
+			productReference = 10F000000000000000000121 /* LimiraTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		10F000000000000000000012 /* LimiraUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 10F000000000000000000023 /* Build configuration list for PBXNativeTarget "LimiraUITests" */;
+			buildPhases = (
+				10F000000000000000000060 /* Sources */,
+				10F000000000000000000061 /* Frameworks */,
+				10F000000000000000000062 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				10F000000000000000000304 /* PBXTargetDependency */,
+			);
+			name = LimiraUITests;
+			productName = LimiraUITests;
+			productReference = 10F000000000000000000122 /* LimiraUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		10F000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					10F000000000000000000010 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					10F000000000000000000011 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 10F000000000000000000010;
+					};
+					10F000000000000000000012 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 10F000000000000000000010;
+					};
+				};
+			};
+			buildConfigurationList = 10F000000000000000000020 /* Build configuration list for PBXProject "Limira" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				zh-Hans,
+			);
+			mainGroup = 10F000000000000000000002;
+			productRefGroup = 10F000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				10F000000000000000000010 /* Limira */,
+				10F000000000000000000011 /* LimiraTests */,
+				10F000000000000000000012 /* LimiraUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		10F000000000000000000042 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
+		10F000000000000000000052 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
+		10F000000000000000000062 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		10F000000000000000000040 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				10F000000000000000000201 /* LimiraApp.swift in Sources */,
+				10F000000000000000000202 /* Models.swift in Sources */,
+				10F000000000000000000203 /* Networking.swift in Sources */,
+				10F000000000000000000204 /* AppViewModel.swift in Sources */,
+				10F000000000000000000205 /* Views.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		10F000000000000000000050 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				10F000000000000000000211 /* LimiraTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		10F000000000000000000060 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				10F000000000000000000212 /* LimiraUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		10F000000000000000000303 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 10F000000000000000000010 /* Limira */; targetProxy = 10F000000000000000000301 /* PBXContainerItemProxy */; };
+		10F000000000000000000304 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 10F000000000000000000010 /* Limira */; targetProxy = 10F000000000000000000302 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		10F000000000000000000030 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+			};
+			name = Debug;
+		};
+		10F000000000000000000031 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		10F000000000000000000032 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Limira/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.limira.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		10F000000000000000000033 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Limira/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.limira.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		10F000000000000000000034 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.limira.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Limira.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Limira";
+			};
+			name = Debug;
+		};
+		10F000000000000000000035 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.limira.ios.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Limira.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Limira";
+			};
+			name = Release;
+		};
+		10F000000000000000000036 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.limira.ios.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = Limira;
+			};
+			name = Debug;
+		};
+		10F000000000000000000037 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.limira.ios.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = Limira;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		10F000000000000000000020 /* Build configuration list for PBXProject "Limira" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				10F000000000000000000030 /* Debug */,
+				10F000000000000000000031 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		10F000000000000000000021 /* Build configuration list for PBXNativeTarget "Limira" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				10F000000000000000000032 /* Debug */,
+				10F000000000000000000033 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		10F000000000000000000022 /* Build configuration list for PBXNativeTarget "LimiraTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				10F000000000000000000034 /* Debug */,
+				10F000000000000000000035 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		10F000000000000000000023 /* Build configuration list for PBXNativeTarget "LimiraUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				10F000000000000000000036 /* Debug */,
+				10F000000000000000000037 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 10F000000000000000000001 /* Project object */;
+}

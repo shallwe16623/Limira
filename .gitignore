@@ -218,6 +218,11 @@ data/
 
 # Limira local runtime artifacts
 *.sqlite
+
+# Xcode user-local state
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
 data/limira-pdf-debug/
 limira-pdf-debug/
 *.sqlite3
