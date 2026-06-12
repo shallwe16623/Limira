@@ -740,6 +740,70 @@ async def test_langgraph_uploaded_document_retriever_searches_by_unit_query_term
 
 
 @pytest.mark.asyncio
+async def test_langgraph_upload_retriever_rejects_out_of_scope_source_payloads():
+    _FakeOrchestrator.task_descriptions = []
+    unowned_text = "Unowned upload payload claims program X exposure is confirmed."
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-upload-scope",
+        query="Investigate program X exposure",
+        document_ids=["doc-owned"],
+        upload_scope={
+            "document_count": 2,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-owned", "doc-unowned"],
+            "source_payloads": [
+                {
+                    "candidate_id": "SRC-UPLOAD-UNOWNED",
+                    "document_id": "doc-unowned",
+                    "chunk_id": "UPLOAD-CHUNK-UNOWNED",
+                    "filename": "unowned.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:02:00+00:00",
+                    "content_hash": "e" * 64,
+                    "text": unowned_text,
+                }
+            ],
+        },
+        source_policy={"prefer_uploaded_documents": True},
+        max_units=1,
+    )
+    assert initial_state.upload_scope.retrieved_document_ids == ["doc-owned"]
+    assert initial_state.upload_scope.source_payload_count == 0
+    assert initial_state.upload_scope.source_payload_refs == []
+    assert initial_state.upload_sources == []
+
+    stream_queue = _CaptureQueue()
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Investigate program X exposure",
+        task_file_name="",
+        task_id="task-langgraph-upload-scope",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    assert {
+        candidate.document_id
+        for candidate in result.state.source_candidates
+        if candidate.source_type == "limira_upload"
+    } == set()
+    assert {
+        source.document_id
+        for source in result.state.retrieved_sources
+        if source.source_type == "limira_upload"
+    } == set()
+    assert {
+        item.document_id
+        for item in result.state.evidence
+        if item.source_type == "limira_upload"
+    } == set()
+    assert unowned_text not in result.final_summary
+    assert "doc-unowned" not in repr(stream_queue.items)
+
+
+@pytest.mark.asyncio
 async def test_langgraph_retriever_order_respects_source_policy_priorities():
     _FakeOrchestrator.task_descriptions = []
     initial_state = build_initial_research_graph(

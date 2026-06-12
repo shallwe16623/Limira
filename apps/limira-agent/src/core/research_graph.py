@@ -2599,11 +2599,14 @@ def _upload_context_summary(
 ) -> dict[str, Any]:
     if not isinstance(upload_scope, dict):
         return {}
-    retrieved_ids = _upload_context_document_ids(
-        upload_scope.get("retrieved_document_ids")
+    scoped_document_ids = set(upload_document_ids)
+    retrieved_ids = _upload_context_document_ids_in_scope(
+        upload_scope.get("retrieved_document_ids"),
+        scoped_document_ids,
     )
-    context_only_ids = _upload_context_document_ids(
-        upload_scope.get("context_only_document_ids")
+    context_only_ids = _upload_context_document_ids_in_scope(
+        upload_scope.get("context_only_document_ids"),
+        scoped_document_ids,
     )
     status = str(upload_scope.get("retrieval_status") or "").strip()
     if not status and upload_document_ids:
@@ -2618,12 +2621,17 @@ def _upload_context_summary(
         "retrieved_document_ids": retrieved_ids,
         "context_only_document_ids": context_only_ids,
         "source_payloads": _upload_context_source_payloads(
-            upload_scope.get("source_payloads")
+            upload_scope.get("source_payloads"),
+            allowed_document_ids=scoped_document_ids & set(retrieved_ids),
         ),
     }
 
 
-def _upload_context_source_payloads(value: Any) -> list[dict[str, Any]]:
+def _upload_context_source_payloads(
+    value: Any,
+    *,
+    allowed_document_ids: set[str],
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     payloads: list[dict[str, Any]] = []
@@ -2635,7 +2643,12 @@ def _upload_context_source_payloads(value: Any) -> list[dict[str, Any]]:
         text = str(item.get("text") or item.get("snippet") or "").strip()
         chunk_id = str(item.get("chunk_id") or "").strip()
         dedupe_key = (document_id, chunk_id, text)
-        if not document_id or not text or dedupe_key in seen:
+        if (
+            not document_id
+            or document_id not in allowed_document_ids
+            or not text
+            or dedupe_key in seen
+        ):
             continue
         seen.add(dedupe_key)
         payloads.append(
@@ -2665,6 +2678,16 @@ def _upload_context_source_payloads(value: Any) -> list[dict[str, Any]]:
 
 def _upload_context_document_ids(value: Any) -> list[str]:
     return _normalized_upload_document_ids(value)
+
+
+def _upload_context_document_ids_in_scope(value: Any, allowed_ids: set[str]) -> list[str]:
+    if not allowed_ids:
+        return []
+    return [
+        document_id
+        for document_id in _upload_context_document_ids(value)
+        if document_id in allowed_ids
+    ]
 
 
 def _normalized_upload_document_ids(value: Any) -> list[str]:
