@@ -493,6 +493,7 @@ async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
                     "<script>window.evil=true</script></head>"
                     '<body onload="steal()">'
                     "<article id=\"original\">Original archived page body.</article>"
+                    '<img alt="inline" src="data:image/png;base64,QUJD">'
                     '<a href="javascript:alert(1)">bad link</a>'
                     "</body></html>"
                 ),
@@ -559,7 +560,7 @@ async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
     assert snapshot["evidence_id"] == "EVID-001"
     assert snapshot["url"] == "https://example.test/port"
     assert snapshot["page_snapshot_available"] is True
-    assert snapshot["page_snapshot_source"] == "fetched_url"
+    assert snapshot["page_snapshot_source"] == "http"
     assert snapshot["summary_source"] == "task_event_log"
     assert snapshot["page_status_code"] == 200
     page_html = members[snapshot["page_member_name"]]
@@ -570,6 +571,7 @@ async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
     assert "<script" not in page_html.lower()
     assert "onload=" not in page_html.lower()
     assert "javascript:alert" not in page_html.lower()
+    assert 'src="data:image/png;base64,QUJD"' in page_html
     assert 'href="#"' in page_html
     assert "Port authority bulletin" in summary_html
     assert "https://example.test/port" in summary_html
@@ -582,6 +584,63 @@ async def test_archive_download_includes_evidence_web_snapshots(monkeypatch):
     assert task.archive_object_key in storage.objects
     assert storage.objects[task.archive_object_key]["data"] == archive_response.body
     _assert_no_browser_leak(members)
+
+
+@pytest.mark.asyncio
+async def test_evidence_snapshot_resource_inliner_embeds_css_and_images(monkeypatch):
+    class SnapshotAssetHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_GET(self):
+            if self.path == "/style.css":
+                self.send_response(200)
+                self.send_header("content-type", "text/css; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b".headline{color:red;background:url('/bg.png')}")
+                return
+            if self.path == "/bg.png":
+                self.send_response(200)
+                self.send_header("content-type", "image/png")
+                self.end_headers()
+                self.wfile.write(b"BGDATA")
+                return
+            if self.path == "/pic.png":
+                self.send_response(200)
+                self.send_header("content-type", "image/png")
+                self.end_headers()
+                self.wfile.write(b"PICDATA")
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SnapshotAssetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/page.html"
+        monkeypatch.setattr(limira, "_snapshot_url_fetch_allowed", lambda _url: True)
+
+        inlined = await limira._inline_snapshot_resources(
+            (
+                '<!doctype html><html><head><link rel="stylesheet" href="/style.css">'
+                '</head><body><h1 class="headline">Snapshot</h1>'
+                '<img alt="pic" src="/pic.png"></body></html>'
+            ),
+            base_url=base_url,
+            timeout_seconds=2.0,
+            max_bytes=200_000,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert "data-limira-inlined-from" in inlined
+    assert ".headline{color:red" in inlined
+    assert "url(data:image/png;base64,QkdEQVRB)" in inlined
+    assert 'src="data:image/png;base64,UElDREFUQQ=="' in inlined
+    assert "<link" not in inlined.lower()
 
 
 @pytest.mark.asyncio

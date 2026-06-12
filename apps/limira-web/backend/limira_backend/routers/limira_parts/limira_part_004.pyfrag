@@ -358,6 +358,11 @@ def _build_evidence_snapshot_members(
         page_snapshot_available = page_snapshot is not None and bool(
             page_snapshot.html.strip()
         )
+        page_snapshot_source = (
+            page_snapshot.snapshot_source
+            if page_snapshot_available and page_snapshot is not None
+            else "unavailable"
+        )
         entry = {
             "evidence_id": evidence_id,
             "title": _evidence_title(evidence, evidence_id),
@@ -366,9 +371,7 @@ def _build_evidence_snapshot_members(
             "page_member_name": page_member_name,
             "summary_member_name": summary_member_name,
             "page_snapshot_available": page_snapshot_available,
-            "page_snapshot_source": (
-                "fetched_url" if page_snapshot_available else "unavailable"
-            ),
+            "page_snapshot_source": page_snapshot_source,
             "summary_source": snapshot_source,
         }
         if page_snapshot is not None:
@@ -567,6 +570,19 @@ async def _fetch_evidence_page_snapshots(
         minimum=10_000,
     )
     snapshots: dict[str, EvidencePageSnapshot] = {}
+    if _env_bool(ARCHIVE_SNAPSHOT_RENDERED_ENV, default=True):
+        snapshots.update(
+            await _fetch_rendered_evidence_page_snapshots(
+                urls,
+                timeout_seconds=timeout_seconds,
+                max_bytes=max_bytes,
+            )
+        )
+
+    remaining_urls = [url for url in urls if url not in snapshots]
+    if not remaining_urls:
+        return snapshots
+
     timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 1.5))
     headers = {
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
@@ -577,15 +593,179 @@ async def _fetch_evidence_page_snapshots(
         follow_redirects=True,
         headers=headers,
     ) as client:
-        for url in urls:
+        for url in remaining_urls:
             snapshot = await _fetch_single_evidence_page_snapshot(
                 client,
                 url,
                 max_bytes=max_bytes,
+                timeout_seconds=timeout_seconds,
             )
             if snapshot is not None:
                 snapshots[url] = snapshot
     return snapshots
+
+
+async def _fetch_rendered_evidence_page_snapshots(
+    urls: list[str],
+    *,
+    timeout_seconds: float,
+    max_bytes: int,
+) -> dict[str, EvidencePageSnapshot]:
+    try:
+        from playwright.async_api import async_playwright
+    except Exception:  # pragma: no cover - depends on runtime image
+        log.info("Limira rendered evidence snapshots disabled: playwright unavailable")
+        return {}
+
+    snapshots: dict[str, EvidencePageSnapshot] = {}
+    async with async_playwright() as playwright:
+        launch_kwargs: dict[str, Any] = {"args": ["--no-sandbox"]}
+        launch_env = _playwright_chromium_launch_env()
+        if launch_env is not None:
+            launch_kwargs["env"] = launch_env
+        try:
+            browser = await playwright.chromium.launch(**launch_kwargs)
+        except Exception:
+            log.info(
+                "Limira rendered evidence snapshots unavailable: Chromium launch failed",
+                exc_info=True,
+            )
+            return {}
+        try:
+            context = await browser.new_context(
+                java_script_enabled=True,
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                ),
+                viewport={"width": 1365, "height": 1600},
+            )
+            try:
+                for url in urls:
+                    snapshot = await _fetch_single_rendered_evidence_page_snapshot(
+                        context,
+                        url,
+                        timeout_seconds=timeout_seconds,
+                        max_bytes=max_bytes,
+                    )
+                    if snapshot is not None:
+                        snapshots[url] = snapshot
+            finally:
+                await context.close()
+        finally:
+            await browser.close()
+    return snapshots
+
+
+async def _fetch_single_rendered_evidence_page_snapshot(
+    context: Any,
+    url: str,
+    *,
+    timeout_seconds: float,
+    max_bytes: int,
+) -> EvidencePageSnapshot | None:
+    page = await context.new_page()
+    status_code = 0
+    content_type = "text/html"
+    try:
+        await page.route("**/*", _archive_snapshot_playwright_route)
+        response = await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=max(1000, int(timeout_seconds * 1000)),
+        )
+        if response is not None:
+            status_code = int(response.status)
+            content_type = str(response.headers.get("content-type") or "text/html")
+            if not _snapshot_content_type_is_html(content_type):
+                return None
+        await _settle_rendered_snapshot_page(page)
+        final_url = str(page.url or url)
+        html_text = await page.content()
+        if not html_text.strip():
+            return None
+        html_text = await _inline_snapshot_resources(
+            html_text,
+            base_url=final_url,
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+        )
+        html_text, truncated = _cap_snapshot_html(html_text, max_bytes=max_bytes)
+        return EvidencePageSnapshot(
+            url=url,
+            final_url=final_url,
+            status_code=status_code,
+            content_type=content_type,
+            html=html_text,
+            truncated=truncated,
+            snapshot_source="rendered",
+        )
+    except Exception:
+        log.info(
+            "Failed to render limira evidence page snapshot",
+            extra={"url_host": urlsplit(url).netloc},
+            exc_info=True,
+        )
+        return None
+    finally:
+        await page.close()
+
+
+async def _archive_snapshot_playwright_route(route: Any) -> None:
+    request = route.request
+    request_url = str(getattr(request, "url", "") or "")
+    if _snapshot_resource_request_allowed(request_url):
+        await route.continue_()
+        return
+    await route.abort()
+
+
+def _snapshot_resource_request_allowed(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    if scheme in {"about", "blob", "data"}:
+        return True
+    if scheme not in {"http", "https"}:
+        return False
+    return _snapshot_url_fetch_allowed(url)
+
+
+async def _settle_rendered_snapshot_page(page: Any) -> None:
+    render_wait_ms = _env_int(
+        ARCHIVE_SNAPSHOT_RENDER_WAIT_MS_ENV,
+        default=800,
+        minimum=0,
+    )
+    try:
+        await page.wait_for_load_state("networkidle", timeout=render_wait_ms + 800)
+    except Exception:
+        pass
+    if render_wait_ms > 0:
+        await page.wait_for_timeout(render_wait_ms)
+    try:
+        await page.evaluate(
+            """
+            async () => {
+              const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+              const height = Math.max(
+                document.body?.scrollHeight || 0,
+                document.documentElement?.scrollHeight || 0
+              );
+              const step = Math.max(window.innerHeight || 800, 800);
+              for (let y = 0; y < height; y += step) {
+                window.scrollTo(0, y);
+                await delay(80);
+              }
+              window.scrollTo(0, 0);
+            }
+            """
+        )
+    except Exception:
+        pass
 
 
 async def _fetch_single_evidence_page_snapshot(
@@ -593,6 +773,7 @@ async def _fetch_single_evidence_page_snapshot(
     url: str,
     *,
     max_bytes: int,
+    timeout_seconds: float,
 ) -> EvidencePageSnapshot | None:
     try:
         async with client.stream("GET", url) as response:
@@ -617,13 +798,24 @@ async def _fetch_single_evidence_page_snapshot(
             html_text = bytes(buffer).decode(encoding, errors="replace")
             if not html_text.strip():
                 return None
+            html_text = await _inline_snapshot_resources(
+                html_text,
+                base_url=str(response.url),
+                timeout_seconds=timeout_seconds,
+                max_bytes=max_bytes,
+            )
+            html_text, inline_truncated = _cap_snapshot_html(
+                html_text,
+                max_bytes=max_bytes,
+            )
             return EvidencePageSnapshot(
                 url=url,
                 final_url=str(response.url),
                 status_code=response.status_code,
                 content_type=content_type,
                 html=html_text,
-                truncated=truncated,
+                truncated=truncated or inline_truncated,
+                snapshot_source="http",
             )
     except Exception:
         log.info(
@@ -632,6 +824,428 @@ async def _fetch_single_evidence_page_snapshot(
             exc_info=True,
         )
         return None
+
+
+async def _inline_snapshot_resources(
+    raw_html: str,
+    *,
+    base_url: str,
+    timeout_seconds: float,
+    max_bytes: int,
+) -> str:
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:  # pragma: no cover - optional runtime dependency
+        return raw_html
+
+    try:
+        soup = BeautifulSoup(raw_html, "html.parser")
+    except Exception:
+        return raw_html
+
+    budget = {
+        "remaining": max(0, max_bytes - len(raw_html.encode("utf-8", errors="ignore"))),
+        "assets": _env_int(ARCHIVE_SNAPSHOT_MAX_ASSETS_ENV, default=40, minimum=0),
+    }
+    max_asset_bytes = _env_int(
+        ARCHIVE_SNAPSHOT_MAX_ASSET_BYTES_ENV,
+        default=250_000,
+        minimum=1024,
+    )
+    cache: dict[tuple[str, str], str | None] = {}
+    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 1.5))
+    headers = {"User-Agent": "Limira Evidence Snapshot/1.0", "Accept": "*/*"}
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        await _inline_snapshot_stylesheets(
+            soup,
+            client=client,
+            base_url=base_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        await _inline_snapshot_style_blocks(
+            soup,
+            client=client,
+            base_url=base_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        await _inline_snapshot_images(
+            soup,
+            client=client,
+            base_url=base_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+    _absolute_snapshot_links(soup, base_url=base_url)
+    return str(soup)
+
+
+async def _inline_snapshot_stylesheets(
+    soup: Any,
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> None:
+    for link in list(soup.find_all("link")):
+        rel = " ".join(str(item).lower() for item in (link.get("rel") or []))
+        href = str(link.get("href") or "").strip()
+        if "stylesheet" not in rel or not href:
+            continue
+        stylesheet_url = _absolute_snapshot_resource_url(href, base_url=base_url)
+        css_text = await _fetch_snapshot_text_resource(
+            client,
+            stylesheet_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        if css_text is None:
+            link["href"] = stylesheet_url
+            continue
+        css_text = await _inline_snapshot_css_urls(
+            css_text,
+            css_base_url=stylesheet_url,
+            client=client,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        style = soup.new_tag("style")
+        style["data-limira-inlined-from"] = stylesheet_url
+        style.string = css_text
+        link.replace_with(style)
+
+
+async def _inline_snapshot_style_blocks(
+    soup: Any,
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> None:
+    for style in soup.find_all("style"):
+        css_text = style.string
+        if not isinstance(css_text, str) or not css_text.strip():
+            continue
+        style.string = await _inline_snapshot_css_urls(
+            css_text,
+            css_base_url=base_url,
+            client=client,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+    for element in soup.find_all(style=True):
+        style_value = str(element.get("style") or "")
+        if "url(" not in style_value.lower():
+            continue
+        element["style"] = await _inline_snapshot_css_urls(
+            style_value,
+            css_base_url=base_url,
+            client=client,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+
+
+async def _inline_snapshot_images(
+    soup: Any,
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> None:
+    for tag_name, attr_name in (("img", "src"), ("video", "poster"), ("input", "src")):
+        for tag in soup.find_all(tag_name):
+            await _inline_snapshot_element_url_attr(
+                tag,
+                attr_name,
+                client=client,
+                base_url=base_url,
+                budget=budget,
+                max_asset_bytes=max_asset_bytes,
+                cache=cache,
+            )
+    for link in soup.find_all("link"):
+        rel = " ".join(str(item).lower() for item in (link.get("rel") or []))
+        if not any(item in rel for item in ("icon", "apple-touch-icon", "mask-icon")):
+            continue
+        await _inline_snapshot_element_url_attr(
+            link,
+            "href",
+            client=client,
+            base_url=base_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+    for tag in soup.find_all(["img", "source"]):
+        srcset = str(tag.get("srcset") or "").strip()
+        if not srcset:
+            continue
+        inlined = await _inline_snapshot_srcset(
+            srcset,
+            client=client,
+            base_url=base_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        if inlined:
+            tag["srcset"] = inlined
+
+
+async def _inline_snapshot_element_url_attr(
+    tag: Any,
+    attr_name: str,
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> None:
+    value = str(tag.get(attr_name) or "").strip()
+    if not value:
+        return
+    resource_url = _absolute_snapshot_resource_url(value, base_url=base_url)
+    data_url = await _fetch_snapshot_data_url(
+        client,
+        resource_url,
+        budget=budget,
+        max_asset_bytes=max_asset_bytes,
+        cache=cache,
+    )
+    tag[attr_name] = data_url or resource_url
+
+
+async def _inline_snapshot_srcset(
+    srcset: str,
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> str:
+    entries: list[str] = []
+    for raw_item in srcset.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        parts = item.split()
+        resource_url = _absolute_snapshot_resource_url(parts[0], base_url=base_url)
+        data_url = await _fetch_snapshot_data_url(
+            client,
+            resource_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        entries.append(" ".join([data_url or resource_url, *parts[1:]]))
+    return ", ".join(entries)
+
+
+CSS_URL_REFERENCE = re.compile(
+    r"url\(\s*([\"']?)(?!data:|blob:|about:|#)([^\"')]+)\1\s*\)",
+    re.IGNORECASE,
+)
+
+
+async def _inline_snapshot_css_urls(
+    css_text: str,
+    *,
+    css_base_url: str,
+    client: httpx.AsyncClient,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> str:
+    output: list[str] = []
+    position = 0
+    for match in CSS_URL_REFERENCE.finditer(css_text):
+        output.append(css_text[position:match.start()])
+        raw_url = match.group(2).strip()
+        resource_url = _absolute_snapshot_resource_url(raw_url, base_url=css_base_url)
+        data_url = await _fetch_snapshot_data_url(
+            client,
+            resource_url,
+            budget=budget,
+            max_asset_bytes=max_asset_bytes,
+            cache=cache,
+        )
+        output.append(f"url({data_url or resource_url})")
+        position = match.end()
+    output.append(css_text[position:])
+    return "".join(output)
+
+
+def _absolute_snapshot_links(soup: Any, *, base_url: str) -> None:
+    for tag in soup.find_all(["a", "area"]):
+        href = str(tag.get("href") or "").strip()
+        if not href or _snapshot_url_has_terminal_scheme(href):
+            continue
+        tag["href"] = _absolute_snapshot_resource_url(href, base_url=base_url)
+    for tag in soup.find_all(["blockquote", "q"]):
+        cite = str(tag.get("cite") or "").strip()
+        if cite and not _snapshot_url_has_terminal_scheme(cite):
+            tag["cite"] = _absolute_snapshot_resource_url(cite, base_url=base_url)
+
+
+def _snapshot_url_has_terminal_scheme(value: str) -> bool:
+    try:
+        scheme = urlsplit(value).scheme.lower()
+    except ValueError:
+        return True
+    return scheme in {"data", "blob", "about", "javascript", "mailto", "tel"}
+
+
+def _absolute_snapshot_resource_url(value: str, *, base_url: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return value
+    return urljoin(base_url, value)
+
+
+async def _fetch_snapshot_text_resource(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> str | None:
+    cache_key = ("text", url)
+    if cache_key in cache:
+        return cache[cache_key]
+    data = await _fetch_snapshot_resource_bytes(
+        client,
+        url,
+        budget=budget,
+        max_asset_bytes=max_asset_bytes,
+        allowed_content_type_prefixes=("text/css", "text/plain", ""),
+    )
+    if data is None:
+        cache[cache_key] = None
+        return None
+    body, content_type = data
+    charset = "utf-8"
+    match = re.search(r"charset=([^;\s]+)", content_type, re.IGNORECASE)
+    if match:
+        charset = match.group(1).strip("\"'")
+    try:
+        text = body.decode(charset, errors="replace")
+    except LookupError:
+        text = body.decode("utf-8", errors="replace")
+    cache[cache_key] = text
+    return text
+
+
+async def _fetch_snapshot_data_url(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    cache: dict[tuple[str, str], str | None],
+) -> str | None:
+    if url.startswith("data:"):
+        return url
+    cache_key = ("data", url)
+    if cache_key in cache:
+        return cache[cache_key]
+    data = await _fetch_snapshot_resource_bytes(
+        client,
+        url,
+        budget=budget,
+        max_asset_bytes=max_asset_bytes,
+        allowed_content_type_prefixes=(
+            "image/",
+            "font/",
+            "audio/",
+            "video/",
+            "application/font",
+            "application/octet-stream",
+        ),
+    )
+    if data is None:
+        cache[cache_key] = None
+        return None
+    body, content_type = data
+    media_type = content_type.split(";", 1)[0].strip() or "application/octet-stream"
+    data_url = f"data:{media_type};base64,{base64.b64encode(body).decode('ascii')}"
+    cache[cache_key] = data_url
+    return data_url
+
+
+async def _fetch_snapshot_resource_bytes(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    budget: dict[str, int],
+    max_asset_bytes: int,
+    allowed_content_type_prefixes: tuple[str, ...],
+) -> tuple[bytes, str] | None:
+    if budget["assets"] <= 0 or budget["remaining"] <= 0:
+        return None
+    if not _snapshot_url_fetch_allowed(url):
+        return None
+    try:
+        async with client.stream("GET", url) as response:
+            if response.status_code >= 400:
+                return None
+            content_type = str(response.headers.get("content-type") or "")
+            normalized_type = content_type.split(";", 1)[0].strip().lower()
+            if not any(
+                normalized_type.startswith(prefix)
+                for prefix in allowed_content_type_prefixes
+            ):
+                return None
+            content_length = response.headers.get("content-length")
+            limit = min(max_asset_bytes, budget["remaining"])
+            if content_length:
+                try:
+                    if int(content_length) > limit:
+                        return None
+                except ValueError:
+                    pass
+            buffer = bytearray()
+            async for chunk in response.aiter_bytes():
+                if not chunk:
+                    continue
+                if len(buffer) + len(chunk) > limit:
+                    return None
+                buffer.extend(chunk)
+    except Exception:
+        return None
+    if not buffer:
+        return None
+    budget["assets"] -= 1
+    budget["remaining"] = max(0, budget["remaining"] - len(buffer))
+    return bytes(buffer), content_type
+
+
+def _cap_snapshot_html(html_text: str, *, max_bytes: int) -> tuple[str, bool]:
+    encoded = html_text.encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return html_text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 
 
 def _snapshot_url_fetch_allowed(url: str) -> bool:
@@ -687,6 +1301,18 @@ def _env_float(name: str, *, default: float, minimum: float) -> float:
     except ValueError:
         value = default
     return max(minimum, value)
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _normalize_snapshot_url(value: str | None) -> str | None:
@@ -816,9 +1442,17 @@ def _remove_active_html_attributes(document: str) -> str:
 
 
 def _neutralize_active_html_urls(document: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        attr = match.group(1).lower()
+        quote = match.group(2)
+        scheme = match.group(3).lower()
+        if scheme == "javascript" or attr in {"href", "action", "formaction"}:
+            return f'{attr}={quote}#{quote}'
+        return match.group(0)
+
     return re.sub(
-        r"(?is)\b(href|src|action|formaction)\s*=\s*([\"'])\s*(?:javascript|data):[^\"']*\2",
-        r'\1="#"',
+        r"(?is)\b(href|src|action|formaction)\s*=\s*([\"'])\s*(javascript|data):[^\"']*\2",
+        replace,
         document,
     )
 
