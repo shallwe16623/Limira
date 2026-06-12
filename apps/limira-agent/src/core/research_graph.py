@@ -74,6 +74,32 @@ class ResearchPlan(BaseModel):
     verification_strategy: str = Field(min_length=1, max_length=2_000)
 
 
+class UploadScopeSourceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(min_length=1, max_length=120)
+    attached_document_id: str | None = Field(default=None, max_length=120)
+    chunk_id: str | None = Field(default=None, max_length=120)
+    filename: str | None = Field(default=None, max_length=1_000)
+    content_hash: str | None = Field(default=None, max_length=128)
+    text_char_count: int | None = Field(default=None, ge=0)
+    text_truncated: bool = False
+
+
+class ResearchUploadScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_count: int = Field(default=0, ge=0, le=500)
+    retrieval_status: str | None = Field(default=None, max_length=80)
+    retrieved_document_ids: list[str] = Field(default_factory=list, max_length=500)
+    context_only_document_ids: list[str] = Field(default_factory=list, max_length=500)
+    source_payload_count: int = Field(default=0, ge=0, le=500)
+    source_payload_refs: list[UploadScopeSourceRef] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+
+
 class UploadedDocumentSource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -137,6 +163,38 @@ class CompressedFinding(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class SourceCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str | None = Field(default=None, max_length=120)
+    title: str | None = Field(default=None, max_length=1_000)
+    summary: str | None = Field(default=None, max_length=2_000)
+    source_type: str = Field(default="web", max_length=80)
+    source_state: str = Field(default="source_candidate", max_length=80)
+    source_content_state: str | None = Field(default=None, max_length=80)
+    retrieval_status: str | None = Field(default=None, max_length=80)
+    url: str | None = Field(default=None, max_length=4_000)
+    document_id: str | None = Field(default=None, max_length=120)
+    attached_document_id: str | None = Field(default=None, max_length=120)
+    chunk_id: str | None = Field(default=None, max_length=120)
+    filename: str | None = Field(default=None, max_length=1_000)
+    retrieved_at: datetime | None = None
+    content_hash: str | None = Field(default=None, max_length=128)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_event_type: str | None = Field(default=None, max_length=120)
+
+
+class ResearchClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=120)
+    claim: str = Field(min_length=1, max_length=10_000)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    source: Literal["finding", "verified_claim"] = "finding"
+    support_type: str | None = Field(default=None, max_length=80)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
 class VerifiedClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -159,19 +217,48 @@ class VerifiedClaim(BaseModel):
         return normalized
 
 
+class ReportSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    section_id: str = Field(min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=1_000)
+    markdown: str = Field(min_length=1, max_length=20_000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=200)
+    source_event_type: str | None = Field(default=None, max_length=120)
+
+
 class ResearchGraphState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: str = Field(min_length=1, max_length=120)
+    query: str = Field(min_length=1, max_length=20_000)
+    scenario: str | None = Field(default=None, max_length=1_000)
+    source_policy: SourcePolicy = Field(default_factory=SourcePolicy)
+    upload_scope: ResearchUploadScope = Field(default_factory=ResearchUploadScope)
     phase: ResearchPhase = ResearchPhase.SCOPE
     brief: ResearchBrief
     plan: ResearchPlan
+    current_unit_id: str | None = Field(default=None, max_length=80)
+    research_units: list[ResearchUnit] = Field(default_factory=list, max_length=12)
     upload_sources: list[UploadedDocumentSource] = Field(default_factory=list, max_length=100)
     context_only_upload_document_ids: list[str] = Field(default_factory=list, max_length=100)
+    source_candidates: list[SourceCandidate] = Field(default_factory=list, max_length=2_000)
     retrieved_sources: list[RetrievedSource] = Field(default_factory=list, max_length=2_000)
     evidence: list[EvidenceItem] = Field(default_factory=list, max_length=2_000)
     findings: list[CompressedFinding] = Field(default_factory=list, max_length=500)
+    claims: list[ResearchClaim] = Field(default_factory=list, max_length=500)
     verified_claims: list[VerifiedClaim] = Field(default_factory=list, max_length=500)
+    report_sections: list[ReportSection] = Field(default_factory=list, max_length=100)
+    warnings: list[str] = Field(default_factory=list, max_length=200)
+
+    @field_validator("warnings")
+    @classmethod
+    def _bound_warnings(cls, value: list[str]) -> list[str]:
+        return [
+            str(item or "").strip()[:1_000]
+            for item in value
+            if str(item or "").strip()
+        ]
 
 
 class ResearchGraphExecutionResult(BaseModel):
@@ -287,6 +374,7 @@ class ResearchUnitNode(ResearchGraphNode):
         previous: ResearchGraphNodeOutput | None = None,
     ) -> ResearchGraphNodeOutput:
         retrieved_sources = list(state.retrieved_sources)
+        source_candidates = list(state.source_candidates)
         evidence = list(state.evidence)
         artifact_events: list[dict[str, Any]] = []
         failure_experience_summary = None
@@ -308,6 +396,7 @@ class ResearchUnitNode(ResearchGraphNode):
                 upload_provider.tool_name,
             )
             retrieved_sources.append(retrieved_source)
+            source_candidates.append(_source_candidate_from_upload(upload_source))
             evidence.append(evidence_item)
             artifact_events.extend(
                 [
@@ -388,6 +477,9 @@ class ResearchUnitNode(ResearchGraphNode):
                 "plan": state.plan.model_copy(
                     update={"research_units": completed_units}
                 ),
+                "current_unit_id": current_unit_id,
+                "research_units": completed_units,
+                "source_candidates": source_candidates,
                 "retrieved_sources": retrieved_sources,
                 "evidence": evidence,
             }
@@ -476,7 +568,14 @@ class EvidenceCompressorNode(ResearchGraphNode):
             raise ValueError("research_graph_compressor_output_required")
         findings = self._compress_findings(state)
         compressed_state = state.model_copy(
-            update={"phase": self.phase, "findings": findings}
+            update={
+                "phase": self.phase,
+                "findings": findings,
+                "claims": _merge_graph_claims(
+                    state.claims,
+                    _claim_state_from_findings(findings),
+                ),
+            }
         )
         return ResearchGraphNodeOutput(
             state=compressed_state,
@@ -528,7 +627,14 @@ class VerifierNode(ResearchGraphNode):
             raise ValueError("research_graph_verifier_output_required")
         self._validate_verified_claim_evidence(verified_claims, state)
         verified_state = state.model_copy(
-            update={"phase": self.phase, "verified_claims": verified_claims}
+            update={
+                "phase": self.phase,
+                "verified_claims": verified_claims,
+                "claims": _merge_graph_claims(
+                    state.claims,
+                    _claim_state_from_verified_claims(verified_claims),
+                ),
+            }
         )
         return ResearchGraphNodeOutput(
             state=verified_state,
@@ -609,7 +715,19 @@ class WriterNode(ResearchGraphNode):
             final_boxed_answer,
             "research_graph_writer_output_required",
         )
-        written_state = state.model_copy(update={"phase": self.phase})
+        report_event = _final_report_section_artifact_event(
+            state,
+            final_summary=final_summary,
+        )
+        written_state = state.model_copy(
+            update={
+                "phase": self.phase,
+                "report_sections": [
+                    *state.report_sections,
+                    _report_section_from_artifact_event(report_event),
+                ],
+            }
+        )
         return ResearchGraphNodeOutput(
             state=written_state,
             executor_state={
@@ -617,12 +735,7 @@ class WriterNode(ResearchGraphNode):
                 "verified_claim_count": len(state.verified_claims),
                 "final_summary_length": len(final_summary),
             },
-            artifact_events=[
-                _final_report_section_artifact_event(
-                    state,
-                    final_summary=final_summary,
-                )
-            ],
+            artifact_events=[report_event],
             final_summary=final_summary,
             final_boxed_answer=final_boxed_answer,
             failure_experience_summary=(
@@ -712,17 +825,31 @@ def build_initial_research_graph(
     upload_document_ids = _upload_document_ids(document_ids, upload_scope)
     upload_context = _upload_context_summary(upload_scope, upload_document_ids)
     upload_sources = _upload_sources_from_context(upload_context)
+    upload_scope_state = _upload_scope_state_from_context(
+        upload_context,
+        upload_document_ids,
+    )
     policy = _source_policy_from_context(source_policy)
+    scenario_text = _bounded_optional_text(scenario, 1_000)
     brief = ResearchBrief(
         original_query=normalized_query,
         clarified_question=normalized_query,
-        scope=_scope_text(normalized_query, scenario, upload_document_ids, upload_context),
+        scope=_scope_text(
+            normalized_query,
+            scenario_text,
+            upload_document_ids,
+            upload_context,
+        ),
         success_criteria=[
             "Answer the user's question directly.",
             "Use source-backed claims and preserve source attribution.",
             "Separate confirmed facts from uncertainty or conflicting claims.",
         ],
-        required_sources=_required_sources(upload_document_ids, scenario, upload_context),
+        required_sources=_required_sources(
+            upload_document_ids,
+            scenario_text,
+            upload_context,
+        ),
         constraints=_constraints(upload_document_ids, upload_context),
     )
     units = _research_units_for_query(normalized_query, bounded_units, policy)
@@ -746,13 +873,19 @@ def build_initial_research_graph(
     )
     return ResearchGraphState(
         task_id=str(task_id),
+        query=normalized_query,
+        scenario=scenario_text,
+        source_policy=policy,
+        upload_scope=upload_scope_state,
         phase=ResearchPhase.PLAN,
         brief=brief,
         plan=plan,
+        research_units=units,
         upload_sources=upload_sources,
         context_only_upload_document_ids=list(
             upload_context.get("context_only_document_ids") or []
         ),
+        warnings=_initial_graph_warnings(upload_scope_state),
     )
 
 
@@ -813,7 +946,9 @@ def graph_checkpoint_event(
             "task_id": state.task_id,
             "phase": phase.value,
             "status": status,
-            "current_research_unit": node_output.current_research_unit,
+            "current_research_unit": (
+                node_output.current_research_unit or state.current_unit_id
+            ),
             "source_ledger": _source_ledger_for_checkpoint(state),
             "evidence_ledger": _evidence_ledger_for_checkpoint(state),
             "executor_state": executor_state,
@@ -1310,6 +1445,93 @@ def _final_report_section_artifact_event(
     }
 
 
+def _source_candidate_from_upload(source: UploadedDocumentSource) -> SourceCandidate:
+    return SourceCandidate(
+        candidate_id=source.candidate_id,
+        title=_upload_source_title(source),
+        summary=source.snippet or _bounded_graph_text(source.text, 2_000),
+        source_type=source.source_type,
+        source_state="source_candidate",
+        source_content_state=source.source_content_state,
+        retrieval_status=source.retrieval_status,
+        document_id=source.document_id,
+        attached_document_id=source.attached_document_id,
+        chunk_id=source.chunk_id,
+        filename=source.filename,
+        retrieved_at=source.retrieved_at,
+        content_hash=source.content_hash,
+        confidence=0.55,
+        source_event_type="research_graph_upload_source_provider",
+    )
+
+
+def _claim_state_from_findings(findings: list[CompressedFinding]) -> list[ResearchClaim]:
+    return [
+        ResearchClaim(
+            id=f"claim-state-{finding.id}",
+            claim=finding.summary,
+            evidence_ids=list(finding.evidence_ids),
+            source="finding",
+            confidence=finding.confidence,
+        )
+        for finding in findings
+    ]
+
+
+def _claim_state_from_verified_claims(
+    verified_claims: list[VerifiedClaim],
+) -> list[ResearchClaim]:
+    return [
+        ResearchClaim(
+            id=claim.id,
+            claim=claim.claim,
+            evidence_ids=list(claim.evidence_ids),
+            source="verified_claim",
+            support_type=claim.support_type,
+            confidence=claim.confidence,
+        )
+        for claim in verified_claims
+    ]
+
+
+def _merge_graph_claims(
+    existing: list[ResearchClaim],
+    incoming: list[ResearchClaim],
+) -> list[ResearchClaim]:
+    merged: list[ResearchClaim] = []
+    seen: set[tuple[str, str]] = set()
+    for claim in [*existing, *incoming]:
+        key = (claim.source, claim.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(claim)
+    return merged[:500]
+
+
+def _report_section_from_artifact_event(event: dict[str, Any]) -> ReportSection:
+    payload = event.get("payload") if isinstance(event, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return ReportSection(
+        section_id=str(payload.get("section_id") or "REPORT-GRAPH-FINAL").strip(),
+        title=str(payload.get("title") or "Final graph report").strip(),
+        markdown=_bounded_graph_text(
+            str(payload.get("markdown") or payload.get("content") or "").strip(),
+            20_000,
+        ),
+        evidence_refs=[
+            str(item).strip()
+            for item in payload.get("evidence_refs") or []
+            if str(item).strip()
+        ][:200],
+        source_event_type=_bounded_optional_text(
+            payload.get("source_event_type"),
+            120,
+        ),
+    )
+
+
 def _normalize_query(query: str) -> str:
     normalized = re.sub(r"\s+", " ", str(query or "")).strip()
     if not normalized:
@@ -1482,6 +1704,58 @@ def _upload_document_ids(
     return _normalized_upload_document_ids(raw_ids)
 
 
+def _upload_scope_state_from_context(
+    upload_context: dict[str, Any],
+    upload_document_ids: list[str],
+) -> ResearchUploadScope:
+    payloads = [
+        payload
+        for payload in upload_context.get("source_payloads") or []
+        if isinstance(payload, dict)
+    ]
+    return ResearchUploadScope(
+        document_count=len(upload_document_ids),
+        retrieval_status=_bounded_optional_text(
+            upload_context.get("retrieval_status"),
+            80,
+        ),
+        retrieved_document_ids=[
+            str(item).strip()
+            for item in upload_context.get("retrieved_document_ids") or []
+            if str(item).strip()
+        ][:500],
+        context_only_document_ids=[
+            str(item).strip()
+            for item in upload_context.get("context_only_document_ids") or []
+            if str(item).strip()
+        ][:500],
+        source_payload_count=len(payloads),
+        source_payload_refs=[
+            UploadScopeSourceRef(
+                document_id=str(payload.get("document_id") or "").strip(),
+                attached_document_id=_bounded_optional_text(
+                    payload.get("attached_document_id"),
+                    120,
+                ),
+                chunk_id=_bounded_optional_text(payload.get("chunk_id"), 120),
+                filename=_bounded_optional_text(payload.get("filename"), 1_000),
+                content_hash=_short_optional_content_hash(payload.get("content_hash")),
+                text_char_count=_safe_int(payload.get("text_char_count")),
+                text_truncated=bool(payload.get("text_truncated")),
+            )
+            for payload in payloads[:100]
+            if str(payload.get("document_id") or "").strip()
+        ],
+    )
+
+
+def _initial_graph_warnings(upload_scope: ResearchUploadScope) -> list[str]:
+    if not upload_scope.context_only_document_ids:
+        return []
+    context_only_ids = ", ".join(upload_scope.context_only_document_ids[:20])
+    return [f"context_only_upload_documents={context_only_ids}"]
+
+
 def _upload_sources_from_context(
     upload_context: dict[str, Any],
 ) -> list[UploadedDocumentSource]:
@@ -1554,11 +1828,35 @@ def _short_content_hash_from_digest(value: str) -> str:
     return text[:GRAPH_CONTENT_HASH_CHARS]
 
 
+def _short_optional_content_hash(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return _short_content_hash_from_digest(text)
+
+
 def _bounded_graph_text(value: str, max_chars: int) -> str:
     text = str(value or "").strip()
     if len(text) <= max_chars:
         return text
     return text[:max_chars]
+
+
+def _bounded_optional_text(value: Any, max_chars: int) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:max_chars]
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        integer = int(value)
+    except (TypeError, ValueError):
+        return None
+    return integer if integer >= 0 else None
 
 
 def _upload_source_chunk_id(

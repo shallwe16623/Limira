@@ -8,6 +8,7 @@ from src.core import research_langgraph as research_langgraph_module
 from src.core.research_graph import (
     ResearchGraphExecutionContext,
     ResearchGraphExecutionResult,
+    ResearchGraphState,
     ResearchPhase,
     VerifiedClaim,
     build_initial_research_graph,
@@ -113,6 +114,30 @@ def _pipeline_cfg(*, graph_enabled: bool = False, graph_executor: str | None = N
     )
 
 
+def test_research_graph_state_contains_ac2_contract_fields():
+    required_fields = {
+        "task_id",
+        "query",
+        "scenario",
+        "source_policy",
+        "upload_scope",
+        "brief",
+        "plan",
+        "current_unit_id",
+        "research_units",
+        "retrieved_sources",
+        "source_candidates",
+        "evidence",
+        "findings",
+        "claims",
+        "verified_claims",
+        "report_sections",
+        "warnings",
+    }
+
+    assert required_fields <= set(ResearchGraphState.model_fields)
+
+
 def test_initial_research_graph_creates_bounded_scope_and_plan():
     state = build_initial_research_graph(
         task_id="task-graph",
@@ -122,9 +147,18 @@ def test_initial_research_graph_creates_bounded_scope_and_plan():
     )
 
     assert state.phase == ResearchPhase.PLAN
+    assert state.task_id == "task-graph"
+    assert state.query == "Track BYD Section 1260H list status."
+    assert state.scenario == "sanctions_export_controls"
     assert state.brief.original_query == "Track BYD Section 1260H list status."
     assert "sanctions_export_controls" in state.brief.scope
     assert len(state.plan.research_units) == 3
+    assert state.research_units == state.plan.research_units
+    assert state.current_unit_id is None
+    assert state.source_candidates == []
+    assert state.claims == []
+    assert state.report_sections == []
+    assert state.warnings == []
     assert state.plan.research_units[0].id.startswith("unit-1-")
     assert state.plan.research_units[0].search_queries
     assert "evidence" in state.plan.expected_artifacts
@@ -178,7 +212,23 @@ def test_initial_research_graph_applies_upload_context_and_source_policy():
     assert state.upload_sources[0].text == (
         "Uploaded memo states a controlled export exposure."
     )
+    assert state.upload_scope.document_count == 2
+    assert state.upload_scope.retrieval_status == "partial"
+    assert state.upload_scope.retrieved_document_ids == ["doc-a"]
+    assert state.upload_scope.context_only_document_ids == ["doc-b"]
+    assert state.upload_scope.source_payload_count == 1
+    assert state.upload_scope.source_payload_refs[0].document_id == "doc-a"
+    assert state.upload_scope.source_payload_refs[0].filename == "memo.txt"
+    assert (
+        "Uploaded memo states a controlled export exposure."
+        not in state.upload_scope.model_dump_json()
+    )
     assert state.context_only_upload_document_ids == ["doc-b"]
+    assert state.source_policy.min_sources == 5
+    assert state.source_policy.prefer_primary_sources is False
+    assert state.source_policy.prefer_uploaded_documents is True
+    assert state.source_policy.prefer_scenario_sources is True
+    assert state.warnings == ["context_only_upload_documents=doc-b"]
     assert any("uploaded document facts" in item for item in state.brief.constraints)
     assert any("context-only upload IDs" in item and "doc-b" in item for item in state.brief.constraints)
     assert state.plan.research_units[0].source_policy.min_sources == 5
@@ -274,6 +324,107 @@ def test_langgraph_executor_builds_dependency_backed_stategraph():
     assert hasattr(graph, "ainvoke")
     assert research_langgraph_module.StateGraph.__module__.startswith("langgraph.")
     assert research_langgraph_module.LANGGRAPH_EXECUTOR_NAME == "langgraph"
+
+
+@pytest.mark.asyncio
+async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_checkpoints():
+    _FakeOrchestrator.task_descriptions = []
+    upload_text = "Uploaded memo states the entity is listed under program X."
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-state-contract",
+        query="Assess uploaded document evidence",
+        scenario="sanctions_export_controls",
+        document_ids=["doc-upload"],
+        upload_scope={
+            "document_count": 1,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-upload"],
+            "context_only_document_ids": [],
+            "source_payloads": [
+                {
+                    "candidate_id": "SRC-UPLOAD-001",
+                    "document_id": "doc-upload",
+                    "attached_document_id": "attached-doc-upload",
+                    "chunk_id": "UPLOAD-CHUNK-001",
+                    "filename": "memo.txt",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "a" * 64,
+                    "text": upload_text,
+                    "text_char_count": len(upload_text),
+                }
+            ],
+        },
+        source_policy={"min_sources": 3, "prefer_uploaded_documents": True},
+        max_units=2,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Assess uploaded document evidence",
+        task_file_name="",
+        task_id="task-langgraph-state-contract",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    final_state = result.state
+    assert final_state.phase == ResearchPhase.COMPLETE
+    assert final_state.query == "Assess uploaded document evidence"
+    assert final_state.scenario == "sanctions_export_controls"
+    assert final_state.source_policy.min_sources == 3
+    assert final_state.source_policy.prefer_uploaded_documents is True
+    assert final_state.upload_scope.document_count == 1
+    assert final_state.upload_scope.source_payload_count == 1
+    assert upload_text not in final_state.upload_scope.model_dump_json()
+    assert final_state.current_unit_id.startswith("unit-2-")
+    assert final_state.research_units == final_state.plan.research_units
+    assert all(unit.status == "completed" for unit in final_state.research_units)
+    assert final_state.source_candidates[0].document_id == "doc-upload"
+    assert final_state.source_candidates[0].chunk_id == "UPLOAD-CHUNK-001"
+    assert final_state.retrieved_sources
+    assert final_state.evidence
+    assert final_state.findings
+    assert final_state.claims
+    assert any(claim.source == "finding" for claim in final_state.claims)
+    assert any(claim.source == "verified_claim" for claim in final_state.claims)
+    assert final_state.verified_claims
+    assert final_state.report_sections
+    assert "## Verified Claims" in final_state.report_sections[0].markdown
+    assert final_state.report_sections[0].evidence_refs
+
+    report_payloads = [
+        item["payload"]
+        for item in stream_queue.items
+        if item.get("type") == "report_section_generated"
+    ]
+    assert report_payloads
+    assert final_state.report_sections[0].markdown == report_payloads[0]["markdown"]
+    checkpoints = [
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+    ]
+    forbidden_checkpoint_fields = {
+        "query",
+        "scenario",
+        "upload_scope",
+        "source_candidates",
+        "claims",
+        "report_sections",
+        "warnings",
+    }
+    assert checkpoints
+    for checkpoint in checkpoints:
+        assert checkpoint["research_graph_executor"] == "langgraph"
+        assert forbidden_checkpoint_fields.isdisjoint(checkpoint)
+    complete_checkpoint = checkpoints[-1]
+    assert complete_checkpoint["phase"] == "complete"
+    assert complete_checkpoint["status"] == "completed"
+    assert complete_checkpoint["current_research_unit"].startswith("unit-2-")
 
 
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():
