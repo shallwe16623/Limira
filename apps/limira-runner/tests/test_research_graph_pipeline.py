@@ -806,9 +806,28 @@ async def test_langgraph_route_is_not_satisfied_by_serial_executor_patch(
 async def test_feature_flagged_graph_executor_emits_serial_phase_events(
     tmp_path, monkeypatch
 ):
-    _FakeOrchestrator.task_descriptions = []
+    class _SettledStatusOrchestrator:
+        task_descriptions = []
+
+        def __init__(self, *, stream_queue=None, **_kwargs):
+            self.stream_queue = stream_queue
+
+        async def run_main_agent(self, **kwargs):
+            self.__class__.task_descriptions.append(kwargs["task_description"])
+            await self.stream_queue.put(
+                {
+                    "event": "message",
+                    "data": {"delta": {"content": "settled source"}},
+                }
+            )
+            return (
+                "Entity A is confirmed listed under program X.",
+                "Entity A is confirmed listed under program X.",
+                None,
+            )
+
     monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
-    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _SettledStatusOrchestrator)
     stream_queue = _CaptureQueue()
 
     result = await pipeline_module.execute_task_pipeline(
@@ -824,7 +843,7 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
     )
 
     assert "## Key Findings" in result[0]
-    assert result[1] == "summary"
+    assert result[1] == "Entity A is confirmed listed under program X."
     assert [item["event"] for item in stream_queue.items[:3]] == [
         "research_graph_executor_selected",
         "research_brief_created",
@@ -949,14 +968,14 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
         and item.get("data", {}).get("phase") == "complete"
     )
     assert final_message_index < complete_checkpoint_index
-    assert len(_FakeOrchestrator.task_descriptions) == 4
+    assert len(_SettledStatusOrchestrator.task_descriptions) == 4
     assert all(
         "## Research Unit Node" in task_description
-        for task_description in _FakeOrchestrator.task_descriptions
+        for task_description in _SettledStatusOrchestrator.task_descriptions
     )
     assert all(
         "## Limira Research Workflow" not in task_description
-        for task_description in _FakeOrchestrator.task_descriptions
+        for task_description in _SettledStatusOrchestrator.task_descriptions
     )
 
 

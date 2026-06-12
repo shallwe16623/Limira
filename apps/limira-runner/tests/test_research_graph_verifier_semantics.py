@@ -160,6 +160,40 @@ async def test_verifier_does_not_support_same_entity_status_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_verifier_does_not_support_candidate_under_review_status():
+    state = _state_with_finding(
+        claim="Entity A is listed under program X.",
+        evidence=[
+            _evidence(
+                "EVID-001",
+                "Entity A is listed as a candidate for program X and remains "
+                "under review.",
+            )
+        ],
+        evidence_ids=["EVID-001"],
+    )
+
+    claim, verify_output = await _verify(state)
+    write_output = await WriterNode().run(
+        verify_output.state,
+        _context(state.task_id),
+        verify_output,
+    )
+
+    support_types = {detail.support_type for detail in claim.evidence_details}
+    assert claim.support_type in {"weak", "insufficient"}
+    assert "direct" not in support_types
+    assert "Entity A is listed" not in write_output.final_summary.split(
+        "## Evidence Table",
+        1,
+    )[0]
+    assert write_output.final_boxed_answer == (
+        "The available evidence is insufficient to provide a settled answer."
+    )
+    assert write_output.artifact_events[-1]["payload"]["evidence_refs"] == []
+
+
+@pytest.mark.asyncio
 async def test_verifier_supports_mixed_history_with_confirmed_status():
     state = _state_with_finding(
         claim="Entity A is listed under program X.",

@@ -71,6 +71,25 @@ NON_SUPPORTING_STATUS_MARKERS = (
     "nominated",
     "evaluated",
 )
+UNRESOLVED_STATUS_QUALIFIER_PATTERNS = (
+    r"\blisted\s+as\s+(?:a\s+)?candidate\b",
+    r"\bdesignated\s+as\s+(?:a\s+)?candidate\b",
+    r"\bsanctioned\s+as\s+(?:a\s+)?candidate\b",
+    r"\bcandidate\s+for\b",
+    r"\bunder\s+review\b",
+    r"\bpending(?:\s+(?:listing|designation|confirmation|approval|review))?\b",
+    r"\bproposed\s+(?:listing|designation|sanction|program)\b",
+    r"\bawaiting\s+(?:review|confirmation|approval|listing|designation)\b",
+    r"\bapplication\s+(?:pending|under review)\b",
+    r"\bapplied\s+for\b",
+)
+SETTLED_STATUS_SUPPORT_PATTERNS = (
+    r"\bconfirmed\s+(?:as\s+)?(?:listed|designated|sanctioned)\b",
+    r"\b(?:is|are|was|were|has been|have been|currently)\s+"
+    r"(?:listed|designated|sanctioned)\s+under\b",
+    r"\bsubject\s+to\b",
+    r"\bappears\s+on\b",
+)
 ENTAILMENT_STOP_WORDS = {
     "a",
     "an",
@@ -393,9 +412,28 @@ def _has_non_supporting_status_mismatch(
         return False
     if not any(marker in normalized_evidence for marker in NON_SUPPORTING_STATUS_MARKERS):
         return False
+    if (
+        _has_unresolved_status_qualifier(normalized_evidence)
+        and not _has_settled_status_support_clause(normalized_evidence)
+    ):
+        return True
     return not _decisive_support_markers_align(
         normalized_claim,
         normalized_evidence,
+    )
+
+
+def _has_unresolved_status_qualifier(normalized_evidence: str) -> bool:
+    return any(
+        re.search(pattern, normalized_evidence)
+        for pattern in UNRESOLVED_STATUS_QUALIFIER_PATTERNS
+    )
+
+
+def _has_settled_status_support_clause(normalized_evidence: str) -> bool:
+    return any(
+        re.search(pattern, normalized_evidence)
+        for pattern in SETTLED_STATUS_SUPPORT_PATTERNS
     )
 
 
@@ -525,4 +563,6 @@ def _bounded_text(value: str, limit: int) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 1)].rstrip() + "..."
+    if limit <= 3:
+        return text[:limit]
+    return text[: max(0, limit - 3)].rstrip() + "..."
