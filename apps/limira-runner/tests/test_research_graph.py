@@ -6,6 +6,8 @@ from src.core import pipeline as pipeline_module
 from src.core import research_graph as research_graph_module
 from src.core import research_langgraph as research_langgraph_module
 from src.core.research_graph import (
+    CompressedFinding,
+    EvidenceItem,
     EvidenceStrictMode,
     LangGraphResearchUnitNode,
     ResearchGraphExecutionContext,
@@ -14,7 +16,9 @@ from src.core.research_graph import (
     ResearchGraphState,
     ResearchPhase,
     RetrieverRegistry,
+    SourceCandidate,
     UploadedDocumentSearchRetriever,
+    VerifierNode,
     WebSearchRetriever,
     VerifiedClaim,
     build_initial_research_graph,
@@ -172,6 +176,173 @@ def test_evidence_strict_mode_parser_and_report_ref_validation():
     assert validation.evidence_refs == ["EVID-001", "EVID-999"]
     assert validation.unresolved_refs == ["EVID-999"]
     assert validation.invalid_refs == ["EVID-abc", "EVID-abcdef1234567"]
+
+
+def _verifier_state(
+    *,
+    evidence: list[EvidenceItem] | None = None,
+    finding_evidence_ids: list[str] | None = None,
+    finding_summary: str = "Claim requires verification.",
+    source_candidates: list[SourceCandidate] | None = None,
+):
+    state = build_initial_research_graph(
+        task_id="task-verifier-classification",
+        query="Verify a company designation with primary sources",
+        max_units=1,
+    )
+    finding = CompressedFinding(
+        id="finding-verifier",
+        research_unit_id=state.plan.research_units[0].id,
+        summary=finding_summary,
+        evidence_ids=list(finding_evidence_ids or []),
+        confidence=0.85,
+    )
+    return state.model_copy(
+        update={
+            "phase": ResearchPhase.COMPRESS,
+            "source_candidates": list(source_candidates or []),
+            "evidence": list(evidence or []),
+            "findings": [finding],
+        }
+    )
+
+
+def _evidence_item(evidence_id: str, summary: str) -> EvidenceItem:
+    return EvidenceItem(
+        id=evidence_id,
+        retrieved_source_id=f"RSRC-{evidence_id.removeprefix('EVID-')}",
+        title=f"Evidence {evidence_id}",
+        source_type="web",
+        content_hash=(evidence_id.replace("-", "").lower() + "0" * 16)[:16],
+        quote_or_summary=summary,
+        confidence=0.8,
+        tool_name="test_retriever",
+    )
+
+
+async def _run_verifier_for_state(
+    state,
+    *,
+    evidence_strict_mode=EvidenceStrictMode.WARN,
+):
+    context = ResearchGraphExecutionContext(
+        orchestrator=_FakeOrchestrator(),
+        original_task_description="Verify a company designation with primary sources",
+        task_id=state.task_id,
+        evidence_strict_mode=evidence_strict_mode,
+    )
+    output = await VerifierNode().run(
+        state,
+        context,
+        ResearchGraphNodeOutput(state=state),
+    )
+    return output.state.verified_claims[0], output
+
+
+@pytest.mark.asyncio
+async def test_verifier_classifies_content_bearing_evidence_as_supported():
+    evidence = [
+        _evidence_item("EVID-001", "The entity is listed under the program.")
+    ]
+    state = _verifier_state(
+        evidence=evidence,
+        finding_evidence_ids=["EVID-001"],
+        finding_summary="The entity is listed under the program.",
+    )
+
+    claim, output = await _run_verifier_for_state(state)
+
+    assert claim.support_type == "supported"
+    assert claim.evidence_ids == ["EVID-001"]
+    assert claim.confidence == 0.85
+    assert output.artifact_events[0]["payload"]["support_type"] == "supported"
+
+
+@pytest.mark.asyncio
+async def test_verifier_classifies_no_evidence_as_insufficient():
+    state = _verifier_state(
+        finding_evidence_ids=[],
+        finding_summary="The designation cannot be confirmed from evidence.",
+    )
+
+    claim, output = await _run_verifier_for_state(state)
+
+    assert claim.support_type == "insufficient"
+    assert claim.evidence_ids == []
+    assert claim.confidence <= 0.2
+    assert output.artifact_events[0]["payload"]["evidence_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_verifier_classifies_source_candidate_only_support_as_weak():
+    candidate = SourceCandidate(
+        candidate_id="SRC-CANDIDATE-ONLY",
+        title="Candidate-only source",
+        summary="Snippet says the entity may be listed.",
+        source_type="web_search",
+        source_content_state="snippet_only",
+        retrieval_status="candidate_only",
+    )
+    state = _verifier_state(
+        source_candidates=[candidate],
+        finding_evidence_ids=["SRC-CANDIDATE-ONLY"],
+        finding_summary="SRC-CANDIDATE-ONLY suggests possible listing.",
+    )
+
+    claim, _output = await _run_verifier_for_state(state)
+
+    assert claim.support_type == "weak"
+    assert claim.evidence_ids == []
+    assert "source-candidate" in claim.rationale
+
+
+@pytest.mark.asyncio
+async def test_verifier_classifies_missing_or_malformed_refs_as_invalid_ref():
+    state = _verifier_state(
+        evidence=[],
+        finding_evidence_ids=["EVID-999", "EVID-1"],
+        finding_summary="Claim cites missing and malformed refs.",
+    )
+
+    claim, output = await _run_verifier_for_state(state)
+
+    assert claim.support_type == "invalid_ref"
+    assert claim.evidence_ids == ["EVID-999", "EVID-1"]
+    assert output.artifact_events[0]["payload"]["support_type"] == "invalid_ref"
+
+
+@pytest.mark.asyncio
+async def test_verifier_blocks_invalid_refs_in_strict_block_mode():
+    state = _verifier_state(
+        evidence=[],
+        finding_evidence_ids=["EVID-999"],
+        finding_summary="Claim cites a missing ref.",
+    )
+
+    with pytest.raises(ValueError, match="research_graph_verifier_invalid_ref_block"):
+        await _run_verifier_for_state(
+            state,
+            evidence_strict_mode=EvidenceStrictMode.BLOCK,
+        )
+
+
+@pytest.mark.asyncio
+async def test_verifier_classifies_opposing_evidence_as_contradicted():
+    evidence = [
+        _evidence_item("EVID-001", "The entity is listed under the program."),
+        _evidence_item("EVID-002", "The entity is not listed under the program."),
+    ]
+    state = _verifier_state(
+        evidence=evidence,
+        finding_evidence_ids=["EVID-001", "EVID-002"],
+        finding_summary="Sources disagree about whether the entity is listed.",
+    )
+
+    claim, _output = await _run_verifier_for_state(state)
+
+    assert claim.support_type == "contradicted"
+    assert claim.evidence_ids == ["EVID-001", "EVID-002"]
+    assert claim.confidence <= 0.6
 
 
 def test_initial_research_graph_creates_bounded_scope_and_plan():
@@ -1482,11 +1653,11 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
     )
     assert any(
         item.get("claim_id", "").startswith("claim-")
-        and item.get("support_type") == "supports"
+        and item.get("support_type") == "supported"
         and item.get("evidence_ids")
         for item in verify_checkpoint["evidence_ledger"]
     )
-    assert verify_checkpoint["executor_state"]["verified_claims"][0]["support_type"] == "supports"
+    assert verify_checkpoint["executor_state"]["verified_claims"][0]["support_type"] == "supported"
     complete_checkpoint = checkpoints[-1]
     assert complete_checkpoint["status"] == "completed"
     assert complete_checkpoint["resume_policy"] == "terminal"
@@ -1892,7 +2063,7 @@ async def test_feature_flagged_graph_executor_rejects_verified_claim_without_val
             VerifiedClaim.model_construct(
                 id="claim-invalid-evidence",
                 claim="Claim is not linked to valid graph evidence.",
-                support_type="supports",
+                support_type="supported",
                 evidence_ids=evidence_ids,
                 rationale="Bypass model validation to exercise runtime graph guard.",
                 confidence=0.9,

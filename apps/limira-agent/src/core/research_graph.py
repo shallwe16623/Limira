@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 EVIDENCE_ID_FULL_PATTERN = re.compile(r"EVID-(?:\d{3,}|[0-9a-fA-F]{12})")
@@ -24,6 +24,29 @@ EVIDENCE_ID_TOKEN_PATTERN = re.compile(
 GRAPH_CONTENT_HASH_CHARS = 32
 GRAPH_SOURCE_SUMMARY_MAX_CHARS = 20_000
 GRAPH_FINDING_SUMMARY_MAX_CHARS = 10_000
+VERIFIER_NEGATIVE_MARKERS = (
+    "not listed",
+    "not designated",
+    "not sanctioned",
+    "no sanctions",
+    "no evidence",
+    "does not appear",
+    "not subject",
+    "removed from",
+    "absent from",
+)
+VERIFIER_POSITIVE_MARKERS = (
+    "is listed",
+    "listed under",
+    "is designated",
+    "designated under",
+    "is sanctioned",
+    "sanctioned under",
+    "subject to",
+    "confirmed",
+    "appears on",
+    "exposure is confirmed",
+)
 
 
 class EvidenceStrictMode(StrEnum):
@@ -225,21 +248,39 @@ class VerifiedClaim(BaseModel):
 
     id: str = Field(min_length=1, max_length=120)
     claim: str = Field(min_length=1, max_length=10_000)
-    support_type: Literal["supports", "contradicts", "contextual", "weak"]
-    evidence_ids: list[str] = Field(min_length=1, max_length=100)
+    support_type: Literal[
+        "supported",
+        "contradicted",
+        "insufficient",
+        "weak",
+        "invalid_ref",
+    ]
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
     rationale: str = Field(default="", max_length=10_000)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
     @field_validator("evidence_ids")
     @classmethod
-    def _validate_evidence_ids(cls, value: list[str]) -> list[str]:
+    def _normalize_evidence_ids(cls, value: list[str]) -> list[str]:
         normalized: list[str] = []
         for item in value:
             evidence_id = str(item).strip()
-            if EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id) is None:
-                raise ValueError("verified_claim_evidence_id_invalid")
-            normalized.append(evidence_id)
+            if evidence_id:
+                normalized.append(evidence_id)
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_supported_evidence_ids(self) -> "VerifiedClaim":
+        if self.support_type not in {"supported", "contradicted"}:
+            return self
+        if not self.evidence_ids:
+            raise ValueError("verified_claim_evidence_id_required")
+        if any(
+            EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id) is None
+            for evidence_id in self.evidence_ids
+        ):
+            raise ValueError("verified_claim_evidence_id_invalid")
+        return self
 
 
 class ReportSection(BaseModel):
@@ -1133,7 +1174,7 @@ class VerifierNode(ResearchGraphNode):
         verified_claims = self._verify_claims(state)
         if not verified_claims:
             raise ValueError("research_graph_verifier_output_required")
-        self._validate_verified_claim_evidence(verified_claims, state)
+        self._validate_verified_claim_evidence(verified_claims, state, context)
         verified_state = state.model_copy(
             update={
                 "phase": self.phase,
@@ -1166,19 +1207,21 @@ class VerifierNode(ResearchGraphNode):
     def _verify_claims(self, state: ResearchGraphState) -> list[VerifiedClaim]:
         verified_claims: list[VerifiedClaim] = []
         for index, finding in enumerate(state.findings):
-            if not finding.evidence_ids:
-                continue
+            support_type, evidence_ids, rationale = _verification_for_finding(
+                finding,
+                state,
+            )
             verified_claims.append(
                 VerifiedClaim(
                     id=f"claim-{index + 1}-{finding.research_unit_id}",
                     claim=finding.summary,
-                    support_type="supports",
-                    evidence_ids=list(finding.evidence_ids),
-                    rationale=(
-                        "Serial graph verifier linked the finding to retrieved "
-                        "research-unit evidence."
+                    support_type=support_type,
+                    evidence_ids=evidence_ids,
+                    rationale=rationale,
+                    confidence=_verified_claim_confidence(
+                        finding.confidence,
+                        support_type,
                     ),
-                    confidence=finding.confidence,
                 )
             )
         return verified_claims
@@ -1187,6 +1230,7 @@ class VerifierNode(ResearchGraphNode):
         self,
         verified_claims: list[VerifiedClaim],
         state: ResearchGraphState,
+        context: ResearchGraphExecutionContext,
     ) -> None:
         known_evidence_ids = {evidence.id for evidence in state.evidence}
         for claim in verified_claims:
@@ -1194,6 +1238,15 @@ class VerifierNode(ResearchGraphNode):
             if not isinstance(raw_evidence_ids, (list, tuple, set)):
                 raise ValueError("research_graph_verified_claim_evidence_required")
             evidence_ids = [str(evidence_id).strip() for evidence_id in raw_evidence_ids]
+            support_type = str(getattr(claim, "support_type", "") or "")
+            if support_type == "invalid_ref":
+                if context.evidence_strict_mode == EvidenceStrictMode.BLOCK:
+                    raise ValueError(_verifier_invalid_ref_block_error(evidence_ids))
+                continue
+            if support_type in {"insufficient", "weak"}:
+                continue
+            if support_type not in {"supported", "contradicted"}:
+                raise ValueError("research_graph_verified_claim_evidence_required")
             if not evidence_ids:
                 raise ValueError("research_graph_verified_claim_evidence_required")
             if any(
@@ -1798,6 +1851,139 @@ def _required_output_text(value: Any, error_name: str) -> str:
     if not text.strip():
         raise ValueError(error_name)
     return text
+
+
+def _verification_for_finding(
+    finding: CompressedFinding,
+    state: ResearchGraphState,
+) -> tuple[str, list[str], str]:
+    evidence_ids = [str(evidence_id).strip() for evidence_id in finding.evidence_ids]
+    candidate_ids = {
+        str(candidate.candidate_id or "").strip()
+        for candidate in state.source_candidates
+        if str(candidate.candidate_id or "").strip()
+    }
+    candidate_refs = [
+        evidence_id for evidence_id in evidence_ids if evidence_id in candidate_ids
+    ]
+    known_evidence = {evidence.id: evidence for evidence in state.evidence}
+    graph_evidence_ids = [
+        evidence_id
+        for evidence_id in evidence_ids
+        if EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id)
+    ]
+    invalid_refs = [
+        evidence_id
+        for evidence_id in evidence_ids
+        if evidence_id
+        and evidence_id not in candidate_ids
+        and (
+            EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id) is None
+            or evidence_id not in known_evidence
+        )
+    ]
+    missing_refs = [
+        evidence_id
+        for evidence_id in graph_evidence_ids
+        if evidence_id not in known_evidence
+    ]
+    invalid_or_missing_refs = _dedupe_preserve_order([*invalid_refs, *missing_refs])
+    if invalid_or_missing_refs:
+        return (
+            "invalid_ref",
+            invalid_or_missing_refs,
+            "Verifier found missing or malformed evidence references.",
+        )
+    if graph_evidence_ids:
+        linked_evidence = [known_evidence[evidence_id] for evidence_id in graph_evidence_ids]
+        if _linked_evidence_is_contradicted(linked_evidence):
+            return (
+                "contradicted",
+                graph_evidence_ids,
+                "Verifier found opposing assertions across content-bearing evidence.",
+            )
+        return (
+            "supported",
+            graph_evidence_ids,
+            "Verifier linked the finding to content-bearing retrieved evidence.",
+        )
+    if candidate_refs or _finding_mentions_source_candidate(finding, state.source_candidates):
+        return (
+            "weak",
+            [],
+            "Verifier found only source-candidate support without content-bearing evidence.",
+        )
+    return (
+        "insufficient",
+        [],
+        "Verifier found no evidence references for this claim.",
+    )
+
+
+def _verified_claim_confidence(confidence: float, support_type: str) -> float:
+    bounded = max(0.0, min(float(confidence), 1.0))
+    if support_type == "supported":
+        return bounded
+    if support_type == "contradicted":
+        return min(bounded, 0.6)
+    if support_type == "weak":
+        return min(bounded, 0.4)
+    return min(bounded, 0.2)
+
+
+def _linked_evidence_is_contradicted(evidence_items: list[EvidenceItem]) -> bool:
+    if len(evidence_items) < 2:
+        return False
+    polarities = [_evidence_polarity(item.quote_or_summary) for item in evidence_items]
+    return "positive" in polarities and "negative" in polarities
+
+
+def _evidence_polarity(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").lower())
+    if any(marker in normalized for marker in VERIFIER_NEGATIVE_MARKERS):
+        return "negative"
+    if any(marker in normalized for marker in VERIFIER_POSITIVE_MARKERS):
+        return "positive"
+    return "neutral"
+
+
+def _finding_mentions_source_candidate(
+    finding: CompressedFinding,
+    candidates: list[SourceCandidate],
+) -> bool:
+    haystack = str(finding.summary or "").lower()
+    if not haystack:
+        return False
+    for candidate in candidates:
+        tokens = [
+            candidate.candidate_id,
+            candidate.title,
+            candidate.summary,
+            candidate.url,
+        ]
+        if any(
+            token and str(token).strip().lower() in haystack
+            for token in tokens
+        ):
+            return True
+    return False
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
+def _verifier_invalid_ref_block_error(evidence_ids: list[str]) -> str:
+    refs = ",".join(_dedupe_preserve_order(evidence_ids)[:20]) or "missing"
+    return f"research_graph_verifier_invalid_ref_block: invalid_ref={refs}"
 
 
 def _research_unit_id_from_evidence(evidence: EvidenceItem, index: int) -> str:
