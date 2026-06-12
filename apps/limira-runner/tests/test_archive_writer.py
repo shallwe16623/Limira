@@ -216,6 +216,33 @@ def test_summarize_model_normalizes_caller_supplied_base_url_host(tmp_path):
     assert "token" not in json.dumps(metadata)
 
 
+def test_metadata_includes_selected_research_graph_executor(tmp_path):
+    writer = ResearchArchiveWriter(tmp_path, clock=lambda: "2026-06-06T12:00:00+00:00")
+    writer.start("executor-metadata", "query", "user-a")
+    writer.record_event(
+        {
+            "type": "research_graph_executor_selected",
+            "payload": {
+                "data": {
+                    "research_graph_executor": "langgraph",
+                    "token": "sk-secret",
+                },
+            },
+        }
+    )
+
+    result = writer.complete(status="completed", report_markdown="done")
+    metadata = json.loads(
+        (result.archive_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+    trace = json.loads((result.archive_dir / "trace.json").read_text(encoding="utf-8"))
+
+    assert metadata["research_graph_executor"] == "langgraph"
+    assert trace["events"][0]["type"] == "research_graph_executor_selected"
+    serialized = json.dumps({"metadata": metadata, "trace": trace})
+    assert "sk-secret" not in serialized
+
+
 def test_scrub_secrets_redacts_full_authorization_string_values():
     payload = {
         "basic": "Authorization: Basic dXNlcjpzZWNyZXQ=",

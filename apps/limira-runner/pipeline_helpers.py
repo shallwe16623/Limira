@@ -42,6 +42,7 @@ _hydra_initialized = False
 DEFAULT_LLM_PROVIDER = "openai"
 DEFAULT_MODEL_NAME = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
+RESEARCH_GRAPH_EXECUTOR_ENV = "LIMIRA_RESEARCH_GRAPH_EXECUTOR"
 
 
 def _env_or_default(name: str, default: str) -> str:
@@ -49,6 +50,13 @@ def _env_or_default(name: str, default: str) -> str:
     if value is None or not value.strip():
         return default
     return value.strip()
+
+
+def _research_graph_executor_env_override() -> str | None:
+    value = os.getenv(RESEARCH_GRAPH_EXECUTOR_ENV)
+    if value is None or not value.strip():
+        return None
+    return f"+agent.research_graph.executor={value.strip().lower()}"
 
 
 def load_limira_config(config_overrides: Optional[dict] = None) -> DictConfig:
@@ -111,6 +119,9 @@ def load_limira_config(config_overrides: Optional[dict] = None) -> DictConfig:
             "benchmark=default",
         ]
     )
+    research_graph_executor_override = _research_graph_executor_env_override()
+    if research_graph_executor_override is not None:
+        overrides.append(research_graph_executor_override)
 
     # Add config overrides from request
     if config_overrides:

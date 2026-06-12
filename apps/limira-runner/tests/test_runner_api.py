@@ -1525,6 +1525,17 @@ async def test_runner_api_persists_executor_marker_in_operational_status(
             ]
             == executor
         )
+        archive_dir = Path(completed.archive_dir)
+        metadata = json.loads(
+            (archive_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        trace = json.loads((archive_dir / "trace.json").read_text(encoding="utf-8"))
+        assert metadata["research_graph_executor"] == executor
+        assert trace["events"][0]["type"] == "research_graph_executor_selected"
+        assert (
+            trace["events"][0]["payload"]["data"]["research_graph_executor"]
+            == executor
+        )
     finally:
         await client.close()
 

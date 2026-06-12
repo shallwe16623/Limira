@@ -4,6 +4,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 from archive_writer import scrub_secrets
 import pipeline_helpers
@@ -87,6 +88,150 @@ def test_preloaded_pipeline_components_create_fresh_task_runtime(monkeypatch):
     assert first_runtime[2] is not second_runtime[2]
     assert first_runtime[0] is not created[0][0]
     assert second_runtime[0] is not created[0][0]
+
+
+def test_load_limira_config_does_not_default_to_langgraph(monkeypatch):
+    monkeypatch.delenv("LIMIRA_RESEARCH_GRAPH_EXECUTOR", raising=False)
+
+    cfg = pipeline_helpers.load_limira_config(None)
+
+    assert (
+        OmegaConf.select(cfg, "agent.research_graph.executor", default=None)
+        is None
+    )
+    assert pipeline_module._research_graph_executor(cfg) == "legacy"
+
+
+@pytest.mark.parametrize("executor", ["legacy", "serial", "langgraph"])
+def test_load_limira_config_maps_research_graph_executor_env(monkeypatch, executor):
+    monkeypatch.setenv("LIMIRA_RESEARCH_GRAPH_EXECUTOR", executor.upper())
+
+    cfg = pipeline_helpers.load_limira_config(None)
+
+    assert cfg.agent.research_graph.executor == executor
+
+
+def test_invalid_research_graph_executor_env_reaches_executor_error(monkeypatch):
+    monkeypatch.setenv("LIMIRA_RESEARCH_GRAPH_EXECUTOR", "bogus")
+
+    cfg = pipeline_helpers.load_limira_config(None)
+
+    with pytest.raises(ValueError, match="invalid_research_graph_executor"):
+        pipeline_module._research_graph_executor(cfg)
+
+
+@pytest.mark.asyncio
+async def test_stream_events_optimized_env_langgraph_invokes_langgraph_route(
+    monkeypatch,
+):
+    monkeypatch.setenv("LIMIRA_RESEARCH_GRAPH_EXECUTOR", "langgraph")
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "_preload_cache",
+        {
+            "cfg": None,
+            "tool_definitions": None,
+            "sub_agent_tool_definitions": None,
+            "loaded": False,
+        },
+    )
+
+    class _EnvRouteToolManager:
+        def set_task_log(self, task_log):
+            self.task_log = task_log
+
+        async def get_all_tool_definitions(self):
+            return []
+
+    def fake_create_pipeline_components(_cfg):
+        return _EnvRouteToolManager(), {}, object()
+
+    langgraph_calls = []
+
+    async def fake_langgraph_executor(**kwargs):
+        langgraph_calls.append(kwargs["state"].task_id)
+        return ResearchGraphExecutionResult(
+            state=kwargs["state"],
+            final_summary="langgraph summary",
+            final_boxed_answer="langgraph final",
+            failure_experience_summary=None,
+        )
+
+    async def fail_serial_executor(**_kwargs):
+        raise AssertionError("serial executor should not run for env langgraph")
+
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "create_pipeline_components",
+        fake_create_pipeline_components,
+    )
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    monkeypatch.setattr(pipeline_module, "execute_research_graph", fail_serial_executor)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_load_langgraph_executor",
+        lambda: fake_langgraph_executor,
+    )
+
+    events = []
+    async for event in pipeline_helpers.stream_events_optimized(
+        "task-env-langgraph",
+        "Verify a company designation with primary sources",
+    ):
+        events.append(event)
+
+    assert langgraph_calls == ["task-env-langgraph"]
+    assert _FakeOrchestrator.task_descriptions == []
+    executor_events = [
+        event
+        for event in events
+        if event.get("event") == "research_graph_executor_selected"
+    ]
+    assert executor_events
+    assert executor_events[0]["data"]["research_graph_executor"] == "langgraph"
+
+
+@pytest.mark.asyncio
+async def test_stream_events_optimized_invalid_executor_env_emits_error(monkeypatch):
+    monkeypatch.setenv("LIMIRA_RESEARCH_GRAPH_EXECUTOR", "bogus")
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "_preload_cache",
+        {
+            "cfg": None,
+            "tool_definitions": None,
+            "sub_agent_tool_definitions": None,
+            "loaded": False,
+        },
+    )
+
+    class _InvalidEnvToolManager:
+        def set_task_log(self, task_log):
+            self.task_log = task_log
+
+        async def get_all_tool_definitions(self):
+            return []
+
+    monkeypatch.setattr(
+        pipeline_helpers,
+        "create_pipeline_components",
+        lambda _cfg: (_InvalidEnvToolManager(), {}, object()),
+    )
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    events = []
+    async for event in pipeline_helpers.stream_events_optimized(
+        "task-invalid-env-executor",
+        "Verify a company designation with primary sources",
+    ):
+        events.append(event)
+
+    assert [event.get("event") for event in events] == ["error"]
+    assert "invalid_research_graph_executor" in events[0]["data"]["error"]
+    assert "langgraph, legacy, serial" in events[0]["data"]["error"]
 
 
 @pytest.mark.asyncio

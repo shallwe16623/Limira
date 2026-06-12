@@ -15,6 +15,7 @@ ARCHIVE_FILES = ("trace.json", "report.md", "metadata.json", "report.html")
 VALID_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 VALID_FINAL_STATUSES = {"completed", "failed", "cancelled"}
 VALID_ARCHIVE_STATUSES = {"pending", "ready", "failed"}
+VALID_RESEARCH_GRAPH_EXECUTORS = {"legacy", "serial", "langgraph"}
 
 SENSITIVE_KEY_PARTS = {
     "api_key",
@@ -188,6 +189,31 @@ def summarize_model(model_summary: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def normalized_research_graph_executor(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    executor = value.strip().lower()
+    return executor if executor in VALID_RESEARCH_GRAPH_EXECUTORS else None
+
+
+def research_graph_executor_from_event(event: dict[str, Any]) -> str | None:
+    candidates: list[Any] = [event.get("research_graph_executor")]
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        candidates.append(payload.get("research_graph_executor"))
+        data = payload.get("data")
+        if isinstance(data, dict):
+            candidates.append(data.get("research_graph_executor"))
+        checkpoint = payload.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            candidates.append(checkpoint.get("research_graph_executor"))
+    for candidate in candidates:
+        executor = normalized_research_graph_executor(candidate)
+        if executor is not None:
+            return executor
+    return None
+
+
 class ResearchArchiveWriter:
     def __init__(
         self,
@@ -203,6 +229,7 @@ class ResearchArchiveWriter:
         self.model_summary: dict[str, Any] = {}
         self.archive_dir: Path | None = None
         self.events: list[dict[str, Any]] = []
+        self.research_graph_executor: str | None = None
 
     def start(
         self,
@@ -219,6 +246,7 @@ class ResearchArchiveWriter:
         self.start_time = start_time or self.clock()
         self.model_summary = summarize_model(model_summary)
         self.events = []
+        self.research_graph_executor = None
 
         dirname = f"{archive_timestamp(self.start_time)}_{task_id}"
         self.archive_root.mkdir(parents=True, exist_ok=True)
@@ -238,6 +266,9 @@ class ResearchArchiveWriter:
             "timestamp": timestamp,
             "payload": payload,
         }
+        executor = research_graph_executor_from_event(normalized)
+        if executor is not None:
+            self.research_graph_executor = executor
         self.events.append(scrub_secrets(normalized))
 
     def complete(
@@ -309,6 +340,7 @@ class ResearchArchiveWriter:
                 "status": status,
                 "archive_status": archive_status,
                 "archive_filename": "archive.zip",
+                "research_graph_executor": self.research_graph_executor,
                 "model": self.model_summary,
                 "error": error,
             }
