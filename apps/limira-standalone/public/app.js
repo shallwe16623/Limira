@@ -2572,6 +2572,8 @@ function handleStreamEvent(payload) {
 	} else if (artifactEvents.has(eventType)) {
 		addThinkingStep(thinkingStepForArtifactEvent(eventType, eventData));
 		void loadArtifacts();
+	} else if (shouldSuppressStatusThinkingStep(eventType, eventData, data, normalizedPayload)) {
+		// Silent runner status checks keep task state fresh without polluting the work log.
 	} else {
 		const summary = eventData.message || eventData.summary || data.message || data.summary || normalizedPayload.message || eventType;
 		addThinkingStep({
@@ -2781,6 +2783,9 @@ function progressRecordThinkingStep(record, taskId) {
 	if (artifactEvents.has(eventType)) {
 		return { ...thinkingStepForArtifactEvent(eventType, eventData), time };
 	}
+	if (shouldSuppressStatusThinkingStep(eventType, eventData, data, payload)) {
+		return null;
+	}
 	const summary = eventData.message || eventData.summary || data.message || data.summary || payload.message || eventType;
 	return {
 		kind: 'status',
@@ -2789,6 +2794,18 @@ function progressRecordThinkingStep(record, taskId) {
 		status: terminalStatuses.has(String(status || state.status)) ? 'done' : 'active',
 		time
 	};
+}
+
+function shouldSuppressStatusThinkingStep(eventType, eventData, data, payload) {
+	const normalizedEventType = String(eventType || '').toLowerCase();
+	if (normalizedEventType !== 'status' && normalizedEventType !== 'task_update') {
+		return false;
+	}
+	const detail =
+		eventThinkingDetail(eventData) ||
+		eventThinkingDetail(data) ||
+		eventThinkingDetail(payload);
+	return !detail;
 }
 
 function thinkingStepForLoggedToolCall(data, time) {
