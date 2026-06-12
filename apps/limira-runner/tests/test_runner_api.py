@@ -134,6 +134,42 @@ async def failed_stream(task_id, query, _unused, disconnect_check=None):
     raise RuntimeError("Authorization: Basic dXNlcjpzZWNyZXQ=")
 
 
+def executor_marker_stream(executor):
+    async def stream(task_id, query, _unused, disconnect_check=None):
+        assert task_id
+        assert query == "test query"
+        assert disconnect_check is not None
+        yield {
+            "event": "research_graph_executor_selected",
+            "data": {
+                "task_id": task_id,
+                "research_graph_executor": executor,
+            },
+        }
+        yield {
+            "event": "message",
+            "data": {"delta": {"content": f"{executor} route complete"}},
+        }
+
+    return stream
+
+
+def pipeline_error_stream(error_text):
+    async def stream(task_id, query, _unused, disconnect_check=None):
+        assert task_id
+        assert query == "test query"
+        assert disconnect_check is not None
+        yield {
+            "event": "error",
+            "data": {
+                "task_id": task_id,
+                "error": error_text,
+            },
+        }
+
+    return stream
+
+
 async def cancelled_stream(task_id, query, _unused, disconnect_check=None):
     yield {
         "event": "message",
@@ -219,6 +255,20 @@ class GraphCheckpointProbe:
             "event": "message",
             "data": {"delta": {"content": " checkpoint complete"}},
         }
+
+
+class GraphCheckpointWithExecutorProbe(GraphCheckpointProbe):
+    async def stream(self, task_id, query, _unused, disconnect_check=None):
+        assert disconnect_check is not None
+        yield {
+            "event": "research_graph_executor_selected",
+            "data": {
+                "task_id": task_id,
+                "research_graph_executor": "serial",
+            },
+        }
+        async for event in super().stream(task_id, query, _unused, disconnect_check):
+            yield event
 
 
 class ZipFailWriter(ResearchArchiveWriter):
@@ -543,6 +593,40 @@ def test_task_response_exposes_secret_safe_operational_status():
     assert "\"executor_state\"" not in serialized
     assert "sk-secret" not in serialized
     assert "base_url" not in serialized
+
+
+@pytest.mark.parametrize("executor", ["legacy", "serial", "langgraph"])
+def test_task_response_exposes_selected_research_graph_executor(executor):
+    record = TaskRecord(
+        task_id=f"task-executor-{executor}",
+        user_id="user-a",
+        query="observable query",
+        status="completed",
+        archive_status="ready",
+        archive_dir=None,
+        archive_zip_path=None,
+        created_at="2026-06-06T11:59:59+00:00",
+        started_at="2026-06-06T12:00:00+00:00",
+        completed_at="2026-06-06T12:00:10+00:00",
+        model_summary={},
+        checkpoint={
+            "phase": "finished",
+            "status": "completed",
+            "executor_state": {"research_graph_executor": executor},
+            "research_graph_executor": executor,
+            "resume_policy": "terminal",
+            "recoverable_reason": None,
+        },
+    )
+
+    payload = _task_response(record)
+
+    assert_public_task_response_hides_internal_identifiers(payload)
+    assert (
+        payload["operational_status"]["checkpoint"]["research_graph_executor"]
+        == executor
+    )
+    assert "\"executor_state\"" not in json.dumps(payload, ensure_ascii=False)
 
 
 async def start_task(client, headers=USER_A_HEADERS, query="test query"):
@@ -1158,6 +1242,97 @@ async def test_runner_api_persists_durable_events_checkpoint_and_replays_after_r
         await restarted_client.close()
 
 
+@pytest.mark.parametrize("executor", ["legacy", "serial", "langgraph"])
+@pytest.mark.asyncio
+async def test_runner_api_persists_executor_marker_in_operational_status(
+    tmp_path,
+    executor,
+):
+    client, store = await make_client(
+        tmp_path,
+        stream_events=executor_marker_stream(executor),
+    )
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_response = await client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        events = parse_sse(await events_response.text())
+        completed = await wait_for_task_status(store, task_id, "completed")
+
+        assert [event["type"] for event in events] == [
+            "research_graph_executor_selected",
+            "message",
+        ]
+        assert completed.checkpoint["research_graph_executor"] == executor
+        assert (
+            completed.checkpoint["executor_state"]["research_graph_executor"]
+            == executor
+        )
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        assert status_response.status == 200
+        status_payload = await status_response.json()
+        assert_public_task_response_hides_internal_identifiers(status_payload)
+        assert (
+            status_payload["operational_status"]["checkpoint"][
+                "research_graph_executor"
+            ]
+            == executor
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "error_text",
+    [
+        "invalid_research_graph_executor: 'bogus'",
+        "langgraph_executor_not_implemented: install/declare the LangGraph dependency",
+    ],
+)
+@pytest.mark.asyncio
+async def test_runner_api_pipeline_error_event_marks_task_failed(
+    tmp_path,
+    error_text,
+):
+    client, store = await make_client(
+        tmp_path,
+        stream_events=pipeline_error_stream(error_text),
+    )
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_response = await client.get(
+            f"/limira-runner/tasks/{task_id}/events",
+            headers=USER_A_HEADERS,
+        )
+        assert events_response.status == 200
+        events = parse_sse(await events_response.text())
+        failed = await wait_for_task_status(store, task_id, "failed")
+
+        assert [event["type"] for event in events] == ["error"]
+        assert error_text in (failed.error or "")
+        assert failed.archive_status == "ready"
+
+        status_response = await client.get(
+            f"/limira-runner/tasks/{task_id}",
+            headers=USER_A_HEADERS,
+        )
+        assert status_response.status == 200
+        status_payload = await status_response.json()
+        assert status_payload["status"] == "failed"
+        assert error_text in status_payload["error"]
+    finally:
+        await client.close()
+
+
 @pytest.mark.asyncio
 async def test_runner_api_persists_graph_checkpoint_stream_events(tmp_path):
     probe = GraphCheckpointProbe()
@@ -1211,6 +1386,46 @@ async def test_runner_api_persists_graph_checkpoint_stream_events(tmp_path):
         ]
         assert operational_checkpoint["source_ledger_count"] == 1
         assert operational_checkpoint["evidence_ledger_count"] == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_api_preserves_executor_marker_on_graph_checkpoint(tmp_path):
+    probe = GraphCheckpointWithExecutorProbe()
+    client, store = await make_client(tmp_path, stream_events=probe.stream)
+    try:
+        start_payload = await start_task(client)
+        task_id = start_payload["task_id"]
+        events_task = asyncio.create_task(
+            client.get(
+                f"/limira-runner/tasks/{task_id}/events",
+                headers=USER_A_HEADERS,
+            )
+        )
+        await asyncio.wait_for(probe.started.wait(), timeout=1)
+
+        running = await wait_for_task_status(store, task_id, "running")
+        assert running.checkpoint["phase"] == "verify"
+        assert running.checkpoint["research_graph_executor"] == "serial"
+        assert (
+            running.checkpoint["executor_state"]["research_graph_executor"] == "serial"
+        )
+
+        probe.release.set()
+        events_response = await asyncio.wait_for(events_task, timeout=1)
+        assert events_response.status == 200
+        await asyncio.wait_for(events_response.text(), timeout=1)
+        completed = await wait_for_task_status(store, task_id, "completed")
+        assert completed.checkpoint["research_graph_executor"] == "serial"
+        assert (
+            completed.checkpoint["executor_state"]["research_graph_executor"]
+            == "serial"
+        )
+        operational_checkpoint = _task_response(completed)["operational_status"][
+            "checkpoint"
+        ]
+        assert operational_checkpoint["research_graph_executor"] == "serial"
     finally:
         await client.close()
 

@@ -75,6 +75,7 @@ GRAPH_CHECKPOINT_PHASES = {
     "reconcile",
     "complete",
 }
+RESEARCH_GRAPH_EXECUTORS = {"legacy", "serial", "langgraph"}
 log = logging.getLogger(__name__)
 
 
@@ -422,8 +423,16 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
                     status = "failed"
                     error = _event_error(normalized)
             _append_task_event(app, record.task_id, normalized)
+            event_executor = _research_graph_executor_from_event(normalized)
             graph_checkpoint = _graph_checkpoint_from_event(normalized)
             if graph_checkpoint is not None:
+                graph_checkpoint = _checkpoint_with_research_graph_executor(
+                    graph_checkpoint,
+                    event_executor
+                    or _checkpoint_research_graph_executor(
+                        _read_task_checkpoint(app, record.task_id)
+                    ),
+                )
                 _write_task_checkpoint(
                     app,
                     record.task_id,
@@ -440,6 +449,7 @@ async def _run_task_worker(app: web.Application, task_id: str) -> None:
                         status,
                         normalized["type"],
                         state,
+                        research_graph_executor=event_executor,
                     ),
                     updated_at=normalized["timestamp"],
                 )
@@ -785,14 +795,20 @@ def _finish_checkpoint_payload(
                 "recoverable_reason",
                 "graph_checkpoint_terminal_task",
             )
-        return checkpoint
+        return _checkpoint_with_research_graph_executor(
+            checkpoint,
+            _checkpoint_research_graph_executor(previous),
+        )
 
-    return {
-        "phase": "finished",
-        "status": status,
-        "error": scrub_secrets(error),
-        "render_state": state,
-    }
+    return _checkpoint_with_research_graph_executor(
+        {
+            "phase": "finished",
+            "status": status,
+            "error": scrub_secrets(error),
+            "render_state": state,
+        },
+        _checkpoint_research_graph_executor(previous),
+    )
 
 
 def _stream_checkpoint_payload(
@@ -801,20 +817,88 @@ def _stream_checkpoint_payload(
     status: str,
     event_type: str,
     state: dict[str, Any],
+    *,
+    research_graph_executor: str | None = None,
 ) -> dict[str, Any]:
     previous = _read_task_checkpoint(app, task_id)
+    executor = research_graph_executor or _checkpoint_research_graph_executor(previous)
     if _is_graph_checkpoint(previous):
         checkpoint = dict(previous)
         checkpoint["status"] = status
-        return checkpoint
+        return _checkpoint_with_research_graph_executor(checkpoint, executor)
 
-    return {
-        "phase": "stream",
-        "status": status,
-        "event_count": len(_task_event_snapshot(app, task_id)),
-        "last_event_type": event_type,
-        "render_state": state,
-    }
+    return _checkpoint_with_research_graph_executor(
+        {
+            "phase": "stream",
+            "status": status,
+            "event_count": len(_task_event_snapshot(app, task_id)),
+            "last_event_type": event_type,
+            "render_state": state,
+        },
+        executor,
+    )
+
+
+def _checkpoint_with_research_graph_executor(
+    checkpoint: dict[str, Any],
+    research_graph_executor: str | None,
+) -> dict[str, Any]:
+    executor = _normalized_research_graph_executor(research_graph_executor)
+    if executor is None:
+        return checkpoint
+    updated = dict(checkpoint)
+    updated["research_graph_executor"] = executor
+    executor_state = updated.get("executor_state")
+    if not isinstance(executor_state, dict):
+        executor_state = {}
+    else:
+        executor_state = dict(executor_state)
+    executor_state["research_graph_executor"] = executor
+    updated["executor_state"] = executor_state
+    return updated
+
+
+def _checkpoint_research_graph_executor(
+    checkpoint: dict[str, Any] | None,
+) -> str | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    executor = _normalized_research_graph_executor(
+        checkpoint.get("research_graph_executor")
+    )
+    if executor is not None:
+        return executor
+    executor_state = checkpoint.get("executor_state")
+    if isinstance(executor_state, dict):
+        return _normalized_research_graph_executor(
+            executor_state.get("research_graph_executor")
+        )
+    return None
+
+
+def _research_graph_executor_from_event(event: dict[str, Any]) -> str | None:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[Any] = [payload.get("research_graph_executor")]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        candidates.append(data.get("research_graph_executor"))
+    checkpoint = payload.get("checkpoint")
+    if isinstance(checkpoint, dict):
+        candidates.append(checkpoint.get("research_graph_executor"))
+    for candidate in candidates:
+        executor = _normalized_research_graph_executor(candidate)
+        if executor is not None:
+            return executor
+    return None
+
+
+def _normalized_research_graph_executor(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    executor = value.strip().lower()
+    return executor if executor in RESEARCH_GRAPH_EXECUTORS else None
 
 
 def _read_task_checkpoint(
@@ -844,6 +928,13 @@ def _checkpoint_envelope(checkpoint: dict[str, Any]) -> dict[str, Any]:
     for key in ("event_count", "last_event_type", "render_state"):
         if key in raw:
             executor_state[key] = raw[key]
+    research_graph_executor = _normalized_research_graph_executor(
+        raw.get("research_graph_executor")
+    ) or _normalized_research_graph_executor(
+        executor_state.get("research_graph_executor")
+    )
+    if research_graph_executor is not None:
+        executor_state["research_graph_executor"] = research_graph_executor
 
     terminal = (
         phase in {"finished", "recovered", "complete"}
@@ -870,6 +961,7 @@ def _checkpoint_envelope(checkpoint: dict[str, Any]) -> dict[str, Any]:
         "source_ledger": source_ledger,
         "evidence_ledger": evidence_ledger,
         "executor_state": executor_state,
+        "research_graph_executor": research_graph_executor,
         "resume_policy": resume_policy,
         "recoverable_reason": recoverable_reason,
     }
@@ -1229,6 +1321,7 @@ def _task_operational_status(record: TaskRecord) -> dict[str, Any]:
     source_ledger = checkpoint.get("source_ledger")
     evidence_ledger = checkpoint.get("evidence_ledger")
     executor_state = checkpoint.get("executor_state")
+    research_graph_executor = _checkpoint_research_graph_executor(checkpoint)
     lease_state = "released"
     if record.status == "running":
         lease_state = "leased" if record.worker_id and record.lease_expires_at else "missing"
@@ -1244,6 +1337,7 @@ def _task_operational_status(record: TaskRecord) -> dict[str, Any]:
         "checkpoint": {
             "phase": _optional_operational_text(checkpoint.get("phase")),
             "status": _optional_operational_text(checkpoint.get("status")),
+            "research_graph_executor": research_graph_executor,
             "updated_at": record.checkpoint_updated_at,
             "current_research_unit_present": bool(
                 checkpoint.get("current_research_unit")

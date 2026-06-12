@@ -36,7 +36,6 @@ from .research_graph import (
     graph_bootstrap_events,
     graph_task_description,
 )
-from .research_langgraph import execute_langgraph_research
 
 
 RESEARCH_GRAPH_EXECUTOR_LEGACY = "legacy"
@@ -121,6 +120,7 @@ async def execute_task_pipeline(
             source_policy=_context_mapping(research_context, "source_policy"),
         )
         if stream_queue is not None:
+            await stream_queue.put(_research_graph_executor_event(task_id, graph_executor))
             for event in graph_bootstrap_events(graph_state):
                 await stream_queue.put(event)
 
@@ -156,6 +156,7 @@ async def execute_task_pipeline(
             final_boxed_answer = graph_result.final_boxed_answer
             failure_experience_summary = graph_result.failure_experience_summary
         elif graph_executor == RESEARCH_GRAPH_EXECUTOR_LANGGRAPH:
+            execute_langgraph_research = _load_langgraph_executor()
             graph_result = await execute_langgraph_research(
                 state=graph_state,
                 orchestrator=orchestrator,
@@ -203,6 +204,7 @@ async def execute_task_pipeline(
         )
 
     except Exception as e:
+        await _emit_pipeline_error_event(stream_queue, task_id, e)
         error_details = traceback.format_exc()
         task_log.log_step(
             "warning",
@@ -293,6 +295,61 @@ def _research_graph_executor(cfg: DictConfig) -> str:
         RESEARCH_GRAPH_EXECUTOR_SERIAL
         if _research_graph_execution_enabled(cfg)
         else RESEARCH_GRAPH_EXECUTOR_LEGACY
+    )
+
+
+def _load_langgraph_executor():
+    try:
+        from .research_langgraph import execute_langgraph_research
+    except Exception as exc:
+        raise RuntimeError(
+            "langgraph_executor_unavailable: failed to import "
+            "apps.limira-agent.src.core.research_langgraph"
+        ) from exc
+    if not callable(execute_langgraph_research):
+        raise RuntimeError(
+            "langgraph_executor_unavailable: execute_langgraph_research is not callable"
+        )
+    return execute_langgraph_research
+
+
+def _research_graph_executor_event(task_id: str, graph_executor: str) -> dict[str, Any]:
+    return {
+        "event": "research_graph_executor_selected",
+        "data": {
+            "task_id": task_id,
+            "research_graph_executor": graph_executor,
+        },
+    }
+
+
+async def _emit_pipeline_error_event(
+    stream_queue: Optional[Any],
+    task_id: str,
+    error: Exception,
+) -> None:
+    if stream_queue is None or not _should_emit_pipeline_error_event(error):
+        return
+    await stream_queue.put(
+        {
+            "event": "error",
+            "data": {
+                "task_id": task_id,
+                "error": str(error),
+                "error_type": type(error).__name__,
+            },
+        }
+    )
+
+
+def _should_emit_pipeline_error_event(error: Exception) -> bool:
+    text = str(error)
+    return text.startswith(
+        (
+            "invalid_research_graph_executor",
+            "langgraph_executor_unavailable",
+            "langgraph_executor_not_implemented",
+        )
     )
 
 

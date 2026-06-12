@@ -301,16 +301,18 @@ async def test_pipeline_emits_research_graph_bootstrap_before_legacy_executor(
     )
 
     assert result[0] == "summary"
-    assert [item["event"] for item in stream_queue.items[:3]] == [
+    assert [item["event"] for item in stream_queue.items[:4]] == [
+        "research_graph_executor_selected",
         "research_brief_created",
         "research_plan_created",
         "message",
     ]
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "legacy"
     assert (
-        stream_queue.items[0]["data"]["brief"]["original_query"]
+        stream_queue.items[1]["data"]["brief"]["original_query"]
         == "Verify a company designation with primary sources"
     )
-    assert stream_queue.items[1]["data"]["plan"]["research_units"]
+    assert stream_queue.items[2]["data"]["plan"]["research_units"]
     assert len(_FakeOrchestrator.task_descriptions) == 1
     assert "## Limira Research Workflow" in _FakeOrchestrator.task_descriptions[0]
     assert "### Research Units" in _FakeOrchestrator.task_descriptions[0]
@@ -379,7 +381,7 @@ async def test_pipeline_routes_to_explicit_legacy_executor(tmp_path, monkeypatch
     async def fail_serial_executor(**_kwargs):
         raise AssertionError("serial executor should not run")
 
-    async def fail_langgraph_executor(**_kwargs):
+    def fail_langgraph_loader():
         raise AssertionError("langgraph executor should not run")
 
     monkeypatch.setattr(
@@ -389,8 +391,8 @@ async def test_pipeline_routes_to_explicit_legacy_executor(tmp_path, monkeypatch
     )
     monkeypatch.setattr(
         pipeline_module,
-        "execute_langgraph_research",
-        fail_langgraph_executor,
+        "_load_langgraph_executor",
+        fail_langgraph_loader,
     )
     stream_queue = _CaptureQueue()
 
@@ -408,6 +410,7 @@ async def test_pipeline_routes_to_explicit_legacy_executor(tmp_path, monkeypatch
 
     assert result[0] == "summary"
     assert _FakeOrchestrator.task_descriptions
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "legacy"
     assert stream_queue.items[-1]["event"] == "message"
 
 
@@ -419,7 +422,10 @@ async def test_pipeline_routes_to_explicit_serial_executor(tmp_path, monkeypatch
 
     async def fake_serial_executor(**kwargs):
         await kwargs["stream_queue"].put(
-            {"event": "test_serial_executor_used", "data": {"task_id": kwargs["task_id"]}}
+            {
+                "event": "test_serial_executor_used",
+                "data": {"task_id": kwargs["task_id"]},
+            }
         )
         return ResearchGraphExecutionResult(
             state=kwargs["state"],
@@ -428,7 +434,7 @@ async def test_pipeline_routes_to_explicit_serial_executor(tmp_path, monkeypatch
             failure_experience_summary=None,
         )
 
-    async def fail_langgraph_executor(**_kwargs):
+    def fail_langgraph_loader():
         raise AssertionError("langgraph executor should not run")
 
     monkeypatch.setattr(
@@ -438,8 +444,8 @@ async def test_pipeline_routes_to_explicit_serial_executor(tmp_path, monkeypatch
     )
     monkeypatch.setattr(
         pipeline_module,
-        "execute_langgraph_research",
-        fail_langgraph_executor,
+        "_load_langgraph_executor",
+        fail_langgraph_loader,
     )
     stream_queue = _CaptureQueue()
 
@@ -458,6 +464,7 @@ async def test_pipeline_routes_to_explicit_serial_executor(tmp_path, monkeypatch
     assert result[0] == "serial summary"
     assert result[1] == "serial final"
     assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "serial"
     assert stream_queue.items[-1]["event"] == "test_serial_executor_used"
 
 
@@ -491,8 +498,8 @@ async def test_pipeline_routes_to_explicit_langgraph_executor(tmp_path, monkeypa
     )
     monkeypatch.setattr(
         pipeline_module,
-        "execute_langgraph_research",
-        fake_langgraph_executor,
+        "_load_langgraph_executor",
+        lambda: fake_langgraph_executor,
     )
     stream_queue = _CaptureQueue()
 
@@ -512,6 +519,7 @@ async def test_pipeline_routes_to_explicit_langgraph_executor(tmp_path, monkeypa
     assert result[1] == "langgraph final"
     assert result[3] == "langgraph retry"
     assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "langgraph"
     assert stream_queue.items[-1]["event"] == "test_langgraph_executor_used"
 
 
@@ -538,6 +546,44 @@ async def test_pipeline_rejects_invalid_graph_executor(tmp_path, monkeypatch):
     assert "langgraph, legacy, serial" in result[0]
     assert result[1] == ""
     assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[-1]["event"] == "error"
+    assert "invalid_research_graph_executor" in stream_queue.items[-1]["data"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_langgraph_loader_failure_fails_clear_route_error(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    def fail_langgraph_loader():
+        raise RuntimeError("langgraph_executor_unavailable: missing dependency")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_load_langgraph_executor",
+        fail_langgraph_loader,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="langgraph"),
+        task_id="task-pipeline-langgraph-unavailable",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "langgraph_executor_unavailable" in result[0]
+    assert result[1] == ""
+    assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "langgraph"
+    assert stream_queue.items[-1]["event"] == "error"
+    assert "langgraph_executor_unavailable" in stream_queue.items[-1]["data"]["error"]
 
 
 @pytest.mark.asyncio
@@ -579,6 +625,9 @@ async def test_langgraph_route_is_not_satisfied_by_serial_executor_patch(
     assert "serial summary" not in result[0]
     assert result[1] == ""
     assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "langgraph"
+    assert stream_queue.items[-1]["event"] == "error"
+    assert "langgraph_executor_not_implemented" in stream_queue.items[-1]["data"]["error"]
 
 
 @pytest.mark.asyncio
@@ -604,10 +653,12 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
 
     assert "## Verified Claims" in result[0]
     assert result[1] == "summary"
-    assert [item["event"] for item in stream_queue.items[:2]] == [
+    assert [item["event"] for item in stream_queue.items[:3]] == [
+        "research_graph_executor_selected",
         "research_brief_created",
         "research_plan_created",
     ]
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "serial"
     assert [
         item["data"]["phase"]
         for item in stream_queue.items
@@ -646,13 +697,16 @@ async def test_feature_flagged_graph_executor_emits_serial_phase_events(
             "source_ledger",
             "evidence_ledger",
             "executor_state",
+            "research_graph_executor",
             "resume_policy",
             "recoverable_reason",
         }
         assert checkpoint["task_id"] == "task-pipeline-graph-phases"
+        assert checkpoint["research_graph_executor"] == "serial"
         assert isinstance(checkpoint["source_ledger"], list)
         assert isinstance(checkpoint["evidence_ledger"], list)
         assert isinstance(checkpoint["executor_state"], dict)
+        assert checkpoint["executor_state"]["research_graph_executor"] == "serial"
     research_checkpoint = next(
         item for item in checkpoints if item["phase"] == "research"
     )

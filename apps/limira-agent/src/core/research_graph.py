@@ -800,10 +800,13 @@ def graph_checkpoint_event(
     node_output: ResearchGraphNodeOutput,
     *,
     status: Literal["running", "completed", "failed"] = "running",
+    research_graph_executor: str = "serial",
 ) -> dict[str, Any]:
     """Return a serializable checkpoint event for Runner durable persistence."""
 
     terminal = phase == ResearchPhase.COMPLETE and status == "completed"
+    executor_state = dict(node_output.executor_state)
+    executor_state["research_graph_executor"] = research_graph_executor
     return {
         "event": "research_graph_checkpoint",
         "data": {
@@ -813,7 +816,8 @@ def graph_checkpoint_event(
             "current_research_unit": node_output.current_research_unit,
             "source_ledger": _source_ledger_for_checkpoint(state),
             "evidence_ledger": _evidence_ledger_for_checkpoint(state),
-            "executor_state": dict(node_output.executor_state),
+            "executor_state": executor_state,
+            "research_graph_executor": research_graph_executor,
             "resume_policy": "terminal" if terminal else "fail_recoverable",
             "recoverable_reason": (
                 None if terminal else "serial_graph_checkpoint_not_resumable"
