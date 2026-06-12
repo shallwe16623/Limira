@@ -11,6 +11,7 @@ from .research_graph import (
     CompressedFinding,
     EVIDENCE_ID_FULL_PATTERN,
     EVIDENCE_ID_TOKEN_PATTERN,
+    EvidenceSupportDetail,
     GRAPH_CONTENT_HASH_CHARS,
     GRAPH_FINDING_SUMMARY_MAX_CHARS,
     GRAPH_SOURCE_SUMMARY_MAX_CHARS,
@@ -43,6 +44,10 @@ from .research_graph import (
     graph_phase_event,
     parse_evidence_strict_mode,
     _next_graph_phase_value,
+)
+from .research_graph_verifier import (
+    _verification_for_finding,
+    _verified_claim_has_high_confidence_support,
 )
 
 __all__ = [
@@ -78,6 +83,7 @@ __all__ = [
     "_required_output_text",
     "_verification_for_finding",
     "_verified_claim_confidence",
+    "_verified_claim_has_high_confidence_support",
     "_linked_evidence_is_contradicted",
     "_evidence_polarity",
     "_finding_mentions_source_candidate",
@@ -451,6 +457,18 @@ def _checkpoint_verified_claims(entries: list[Any]) -> list[VerifiedClaim]:
                     claim=_bounded_graph_text(claim_text, 10_000),
                     support_type=support_type,  # type: ignore[arg-type]
                     evidence_ids=_checkpoint_string_list(entry.get("evidence_ids"))[:100],
+                    evidence_details=[
+                        EvidenceSupportDetail.model_validate(detail)
+                        for detail in (entry.get("evidence_details") or [])
+                        if isinstance(detail, dict)
+                    ][:100],
+                    counterevidence_ids=_checkpoint_string_list(
+                        entry.get("counterevidence_ids")
+                    )[:100],
+                    temporal_context=_optional_checkpoint_text(
+                        entry.get("temporal_context"),
+                        500,
+                    ),
                     rationale=_bounded_graph_text(
                         str(entry.get("rationale") or ""),
                         10_000,
@@ -858,73 +876,6 @@ def _required_output_text(value: Any, error_name: str) -> str:
     return text
 
 
-def _verification_for_finding(
-    finding: CompressedFinding,
-    state: ResearchGraphState,
-) -> tuple[str, list[str], str]:
-    evidence_ids = [str(evidence_id).strip() for evidence_id in finding.evidence_ids]
-    candidate_ids = {
-        str(candidate.candidate_id or "").strip()
-        for candidate in state.source_candidates
-        if str(candidate.candidate_id or "").strip()
-    }
-    candidate_refs = [
-        evidence_id for evidence_id in evidence_ids if evidence_id in candidate_ids
-    ]
-    known_evidence = {evidence.id: evidence for evidence in state.evidence}
-    graph_evidence_ids = [
-        evidence_id
-        for evidence_id in evidence_ids
-        if EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id)
-    ]
-    invalid_refs = [
-        evidence_id
-        for evidence_id in evidence_ids
-        if evidence_id
-        and evidence_id not in candidate_ids
-        and (
-            EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id) is None
-            or evidence_id not in known_evidence
-        )
-    ]
-    missing_refs = [
-        evidence_id
-        for evidence_id in graph_evidence_ids
-        if evidence_id not in known_evidence
-    ]
-    invalid_or_missing_refs = _dedupe_preserve_order([*invalid_refs, *missing_refs])
-    if invalid_or_missing_refs:
-        return (
-            "invalid_ref",
-            invalid_or_missing_refs,
-            "Verifier found missing or malformed evidence references.",
-        )
-    if graph_evidence_ids:
-        linked_evidence = [known_evidence[evidence_id] for evidence_id in graph_evidence_ids]
-        if _linked_evidence_is_contradicted(linked_evidence):
-            return (
-                "contradicted",
-                graph_evidence_ids,
-                "Verifier found opposing assertions across content-bearing evidence.",
-            )
-        return (
-            "supported",
-            graph_evidence_ids,
-            "Verifier linked the finding to content-bearing retrieved evidence.",
-        )
-    if candidate_refs or _finding_mentions_source_candidate(finding, state.source_candidates):
-        return (
-            "weak",
-            [],
-            "Verifier found only source-candidate support without content-bearing evidence.",
-        )
-    return (
-        "insufficient",
-        [],
-        "Verifier found no evidence references for this claim.",
-    )
-
-
 def _verified_claim_confidence(confidence: float, support_type: str) -> float:
     bounded = max(0.0, min(float(confidence), 1.0))
     if support_type == "supported":
@@ -1098,6 +1049,12 @@ def _evidence_ledger_for_checkpoint(state: ResearchGraphState) -> list[dict[str,
             "claim": claim.claim,
             "support_type": claim.support_type,
             "evidence_ids": list(claim.evidence_ids),
+            "evidence_details": [
+                detail.model_dump(mode="json", exclude_none=True)
+                for detail in claim.evidence_details
+            ],
+            "counterevidence_ids": list(claim.counterevidence_ids),
+            "temporal_context": claim.temporal_context,
             "rationale": claim.rationale,
             "confidence": claim.confidence,
         }
@@ -1232,6 +1189,12 @@ def _verified_claim_artifact_event(claim: VerifiedClaim) -> dict[str, Any]:
             "support_type": claim.support_type,
             "evidence_ids": list(claim.evidence_ids),
             "evidence_refs": list(claim.evidence_ids),
+            "evidence_details": [
+                detail.model_dump(mode="json", exclude_none=True)
+                for detail in claim.evidence_details
+            ],
+            "counterevidence_ids": list(claim.counterevidence_ids),
+            "temporal_context": claim.temporal_context,
             "rationale": claim.rationale,
             "confidence": claim.confidence,
             "source_event_type": "research_graph",
@@ -1244,14 +1207,15 @@ def _final_report_section_artifact_event(
     *,
     final_summary: str,
 ) -> dict[str, Any]:
-    known_evidence_ids = {evidence.id for evidence in state.evidence}
+    known_evidence = {evidence.id: evidence for evidence in state.evidence}
     evidence_refs = list(
         dict.fromkeys(
             evidence_id
             for claim in state.verified_claims
-            if claim.support_type in {"supported", "contradicted"}
+            if claim.support_type == "contradicted"
+            or _verified_claim_has_high_confidence_support(claim, known_evidence)
             for evidence_id in claim.evidence_ids
-            if evidence_id in known_evidence_ids
+            if evidence_id in known_evidence
             and EVIDENCE_ID_FULL_PATTERN.fullmatch(evidence_id)
         )
     )

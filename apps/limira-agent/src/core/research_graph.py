@@ -245,6 +245,23 @@ class ResearchClaim(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class EvidenceSupportDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(min_length=1, max_length=120)
+    support_type: Literal[
+        "direct",
+        "contradictory",
+        "stale",
+        "background",
+        "unrelated",
+        "invalid_ref",
+    ]
+    excerpt: str = Field(default="", max_length=1_000)
+    temporal_context: str | None = Field(default=None, max_length=500)
+    rationale: str = Field(default="", max_length=1_000)
+
+
 class VerifiedClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -258,12 +275,28 @@ class VerifiedClaim(BaseModel):
         "invalid_ref",
     ]
     evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    evidence_details: list[EvidenceSupportDetail] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+    counterevidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    temporal_context: str | None = Field(default=None, max_length=500)
     rationale: str = Field(default="", max_length=10_000)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
     @field_validator("evidence_ids")
     @classmethod
     def _normalize_evidence_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            evidence_id = str(item).strip()
+            if evidence_id:
+                normalized.append(evidence_id)
+        return normalized
+
+    @field_validator("counterevidence_ids")
+    @classmethod
+    def _normalize_counterevidence_ids(cls, value: list[str]) -> list[str]:
         normalized: list[str] = []
         for item in value:
             evidence_id = str(item).strip()
@@ -1259,17 +1292,21 @@ class VerifierNode(ResearchGraphNode):
     def _verify_claims(self, state: ResearchGraphState) -> list[VerifiedClaim]:
         verified_claims: list[VerifiedClaim] = []
         for index, finding in enumerate(state.findings):
-            support_type, evidence_ids, rationale = _verification_for_finding(
+            verification = _verification_for_finding(
                 finding,
                 state,
             )
+            support_type = verification["support_type"]
             verified_claims.append(
                 VerifiedClaim(
                     id=f"claim-{index + 1}-{finding.research_unit_id}",
                     claim=finding.summary,
                     support_type=support_type,
-                    evidence_ids=evidence_ids,
-                    rationale=rationale,
+                    evidence_ids=verification["evidence_ids"],
+                    evidence_details=verification["evidence_details"],
+                    counterevidence_ids=verification["counterevidence_ids"],
+                    temporal_context=verification["temporal_context"],
+                    rationale=verification["rationale"],
                     confidence=_verified_claim_confidence(
                         finding.confidence,
                         support_type,
@@ -1391,8 +1428,7 @@ class WriterNode(ResearchGraphNode):
         supported_claims = [
             claim
             for claim in state.verified_claims
-            if claim.support_type == "supported"
-            and self._valid_claim_evidence_refs(claim, known_evidence)
+            if _verified_claim_has_high_confidence_support(claim, known_evidence)
         ]
         conflict_claims = [
             claim
@@ -1406,7 +1442,10 @@ class WriterNode(ResearchGraphNode):
             if claim.support_type in {"weak", "insufficient", "invalid_ref"}
             or (
                 claim.support_type == "supported"
-                and not self._valid_claim_evidence_refs(claim, known_evidence)
+                and not _verified_claim_has_high_confidence_support(
+                    claim,
+                    known_evidence,
+                )
             )
         ]
         strongest_supported = max(

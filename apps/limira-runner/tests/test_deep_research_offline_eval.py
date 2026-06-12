@@ -278,13 +278,14 @@ def _offline_evidence(
     text: str,
     *,
     retrieved_source_id: str | None = None,
+    retrieved_at: str = "2026-06-06T12:00:00+00:00",
 ) -> EvidenceItem:
     return EvidenceItem(
         id=evidence_id,
         retrieved_source_id=retrieved_source_id or f"RSRC-{evidence_id}",
         title=f"Evidence {evidence_id}",
         source_type="web",
-        retrieved_at="2026-06-06T12:00:00+00:00",
+        retrieved_at=retrieved_at,
         content_hash="a" * 32,
         quote_or_summary=text,
         claims=[text],
@@ -1058,6 +1059,99 @@ async def test_offline_eval_case_snippet_only_cannot_support_claim():
     assert not research_output.state.evidence
     assert verify_output.state.verified_claims[0].support_type == "weak"
     assert verify_output.state.verified_claims[0].evidence_ids == []
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_same_entity_background_is_not_supported():
+    state = build_initial_research_graph(
+        task_id="case-background-does-not-support-claim",
+        query="Assess Entity A listing",
+        max_units=1,
+    )
+    state = state.model_copy(
+        update={
+            "phase": ResearchPhase.COMPRESS,
+            "evidence": [
+                _offline_evidence(
+                    "EVID-001",
+                    "Company profile background: Entity A was founded in 2020.",
+                )
+            ],
+            "findings": [
+                CompressedFinding(
+                    id="finding-background-only",
+                    research_unit_id="unit-1-background",
+                    summary="Entity A is listed under program X.",
+                    evidence_ids=["EVID-001"],
+                    confidence=0.8,
+                )
+            ],
+        }
+    )
+
+    verify_output = await VerifierNode().run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    write_output = await WriterNode().run(
+        verify_output.state,
+        _offline_graph_context(),
+        verify_output,
+    )
+
+    claim = verify_output.state.verified_claims[0]
+    assert claim.support_type == "weak"
+    assert claim.evidence_details[0].support_type == "background"
+    assert "Entity A is listed" not in _markdown_section(
+        write_output.final_summary,
+        "Key Findings",
+    )
+    assert "Entity A is listed" in _markdown_section(
+        write_output.final_summary,
+        "Uncertainties",
+    )
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_stale_current_evidence_is_not_supported():
+    state = build_initial_research_graph(
+        task_id="case-stale-current-evidence",
+        query="Assess current Entity A listing",
+        max_units=1,
+    )
+    state = state.model_copy(
+        update={
+            "phase": ResearchPhase.COMPRESS,
+            "evidence": [
+                _offline_evidence(
+                    "EVID-001",
+                    "In 2020, Entity A was listed under program X.",
+                    retrieved_at="2020-01-01T00:00:00+00:00",
+                )
+            ],
+            "findings": [
+                CompressedFinding(
+                    id="finding-stale-current",
+                    research_unit_id="unit-1-background",
+                    summary="Entity A is currently listed under program X in 2026.",
+                    evidence_ids=["EVID-001"],
+                    confidence=0.8,
+                )
+            ],
+        }
+    )
+
+    verify_output = await VerifierNode().run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    claim = verify_output.state.verified_claims[0]
+
+    assert claim.support_type == "weak"
+    assert claim.evidence_details[0].support_type == "stale"
+    assert "stale_or_incompatible" in (claim.temporal_context or "")
 
 
 def test_offline_eval_restart_recovery_fails_stale_and_preserves_running_terminal(
