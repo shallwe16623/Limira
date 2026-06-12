@@ -1592,6 +1592,57 @@ async def test_artifacts_api_formats_structured_json_report_sections():
 
 
 @pytest.mark.asyncio
+async def test_artifacts_api_drops_outline_only_report_sections():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-outline-only-report",
+        owner_user_id=user.id,
+        query="稀土博弈报告",
+        scenario=None,
+        runner_task_id="runner-outline-only-report",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "title": "中美稀土博弈2025-2026深度研究报告 - 完整版",
+            "sections": [
+                "executive_summary",
+                "timeline",
+                "china_measures",
+                "us_countermeasures",
+            ],
+            "markdown": (
+                "executive_summary\n\n"
+                "timeline\n\n"
+                "china_measures\n\n"
+                "us_countermeasures"
+            ),
+            "source_event_type": "record_research_artifact",
+        },
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "title": "最终回答",
+            "markdown": "# 中美稀土斗法研究报告\n\n## 结论\n\n真正的报告正文。",
+            "source_event_type": "final_summary_show_text",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    artifacts = await limira.get_task_artifacts(task.task_id, user=user, repo=repo)
+
+    assert len(artifacts["report_sections"]) == 1
+    assert artifacts["report_sections"][0]["title"] == "最终回答"
+    serialized = json.dumps(artifacts, ensure_ascii=False)
+    assert "executive_summary" not in serialized
+    assert "真正的报告正文" in serialized
+
+
+@pytest.mark.asyncio
 async def test_archive_download_unwraps_json_wrapped_report_members_from_persisted_archive():
     repo = limira.InMemoryLimiraTaskRepository()
     storage = limira.InMemoryLimiraObjectStorage()

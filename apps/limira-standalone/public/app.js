@@ -2674,10 +2674,10 @@ function handleToolCall(data) {
 			detail: '报告内容已直接写入对话，后续归档会一并打包保存。',
 			status: 'done'
 		});
-		upsertReportMessage(state.finalReportText);
+		const reportChanged = upsertReportMessage(state.finalReportText);
 		state.activeTab = CONVERSATION_VIEW;
 		saveWorkspace();
-		renderMessages();
+		renderMessages({ scrollToReportTop: reportChanged });
 		renderTabs();
 		renderReportControls();
 		return;
@@ -3058,12 +3058,18 @@ async function loadArtifacts(taskId = state.taskId, options = {}) {
 			state.artifacts = artifacts;
 			state.artifactTaskId = normalizedTaskId;
 		}
+		let reportChanged = false;
 		if (activeTaskLoad && options.updateReport !== false) {
-			upsertReportMessage(reportMarkdown(artifacts));
+			reportChanged = upsertReportMessage(reportMarkdown(artifacts));
 			upsertArtifactThinkingStep(artifacts);
 		}
 		saveWorkspace();
-		renderMessages({ preserveScroll: options.silent === true });
+		renderMessages({
+			preserveScroll: options.silent === true,
+			scrollToReportTop: options.scrollToReportTop === true || (
+				reportChanged && terminalStatuses.has(normalizedTaskStatus(state.status))
+			)
+		});
 		renderThinking();
 		renderTabs();
 		renderReportControls();
@@ -3520,6 +3526,20 @@ function renderSubmitButton() {
 	dom.submitResearchButton.disabled = stopMode
 		? !state.taskId || state.isCancellingTask
 		: state.isSubmitting;
+	renderQueryInputPlaceholder(stopMode);
+}
+
+function renderQueryInputPlaceholder(stopMode = isTaskExecutionActive() || state.isSubmitting) {
+	if (!dom.queryInput) {
+		return;
+	}
+	if (state.isCancellingTask) {
+		dom.queryInput.placeholder = '正在中断当前研究任务...';
+	} else if (stopMode) {
+		dom.queryInput.placeholder = '研究任务正在运行，可点击右侧按钮中断。';
+	} else {
+		dom.queryInput.placeholder = '发送消息以开始 OSINT 研究...';
+	}
 }
 
 function renderMessages(options = {}) {
@@ -3564,6 +3584,10 @@ function renderMessages(options = {}) {
 				dom.workspaceContent.scrollTop = previousScrollTop;
 			}
 		});
+		return;
+	}
+	if (options.scrollToReportTop && reportMessages.length) {
+		scrollReportToTop();
 		return;
 	}
 	dom.messageList.scrollTop = dom.messageList.scrollHeight;
@@ -3973,6 +3997,17 @@ function scrollConversationToBottom() {
 			top: dom.workspaceContent.scrollHeight,
 			behavior: 'smooth'
 		});
+	});
+}
+
+function scrollReportToTop() {
+	if (!dom.workspaceContent || isArtifactView() || !dom.reportList) {
+		return;
+	}
+	window.requestAnimationFrame(() => {
+		const target = dom.reportList.querySelector('.message.report') || dom.reportList;
+		const top = Math.max(0, target.offsetTop - 16);
+		dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });
 	});
 }
 
@@ -4716,12 +4751,15 @@ function project([lng, lat], width, height) {
 }
 
 function renderReport() {
-	const sections = state.artifacts.report_sections;
+	const finalText = state.finalReportText ? reportTextFromValue(state.finalReportText) : '';
+	const sections = state.artifacts.report_sections
+		.filter(isDisplayableReportSection)
+		.filter((section) => reportText(section).trim() !== finalText.trim());
 	const cards = sections
 		.map((section, index) => reportCard(reportTitle(section, index), reportText(section), section.evidence_refs))
 		.join('');
-	const finalCard = !cards && state.finalReportText
-		? reportCard('最终回答', reportTextFromValue(state.finalReportText), reportEvidenceRefs())
+	const finalCard = finalText
+		? reportCard('最终回答', finalText, reportEvidenceRefs())
 		: '';
 	dom.artifactContent.innerHTML =
 		cards || finalCard
@@ -5775,7 +5813,7 @@ function normalizeArtifacts(data) {
 		relations: asArray(source.relations || source.entity_relations),
 		timeline_events: asArray(source.timeline_events || source.timeline),
 		map_features: asArray(source.map_features || source.features),
-		report_sections: asArray(source.report_sections || source.reports)
+		report_sections: asArray(source.report_sections || source.reports).filter(isDisplayableReportSection)
 	};
 }
 
@@ -5857,7 +5895,11 @@ function collectPairs(value) {
 }
 
 function reportMarkdown(artifacts = state.artifacts, options = {}) {
+	if (options.includeFinalReport !== false && state.finalReportText) {
+		return reportTextFromValue(state.finalReportText, { includeTitle: true });
+	}
 	const sectionText = artifacts.report_sections
+		.filter(isDisplayableReportSection)
 		.map((section, index) => `## ${reportTitle(section, index)}\n\n${reportText(section)}`)
 		.join('\n\n');
 	if (sectionText) {
@@ -5871,7 +5913,7 @@ function reportMarkdown(artifacts = state.artifacts, options = {}) {
 
 function reportEvidenceRefs() {
 	const refs = new Set();
-	for (const section of state.artifacts.report_sections) {
+	for (const section of state.artifacts.report_sections.filter(isDisplayableReportSection)) {
 		for (const ref of asArray(section.evidence_refs)) {
 			const normalized = String(ref).replace(/^\[|\]$/g, '').trim();
 			if (normalized) refs.add(normalized);
@@ -5897,6 +5939,27 @@ function reportText(section) {
 		reportTextFromValue(section.markdown || section.content || section.text || section.summary || section, { includeTitle: false }) ||
 		artifactReadableText(section)
 	);
+}
+
+function isDisplayableReportSection(section) {
+	const text = reportText(section);
+	if (!text) {
+		return false;
+	}
+	const sections = asArray(section?.sections || section?.report_sections);
+	if (!sections.length || !sections.every(isOutlineKey)) {
+		return true;
+	}
+	const outline = sections.map((item) => String(item).trim()).filter(Boolean);
+	const lines = text.split('\n')
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.filter((line) => !line.startsWith('#') && !line.startsWith('标题：') && !line.toLowerCase().startsWith('title:'));
+	return lines.join('\n') !== outline.join('\n');
+}
+
+function isOutlineKey(value) {
+	return /^[A-Za-z][A-Za-z0-9_-]{2,80}$/.test(String(value || '').trim());
 }
 
 const REPORT_TEXT_FIELDS = ['markdown', 'content', 'text', 'summary'];

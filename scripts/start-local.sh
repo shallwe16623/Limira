@@ -135,6 +135,8 @@ start_runner() {
 		export RUNNER_ALLOW_SQLITE_TASK_STORE=true
 		export RUNNER_SERVICE_TOKEN=\"\${RUNNER_SERVICE_TOKEN:-limira-local-dev-token}\"
 		export LIMIRA_RUNNER_INTERNAL_PORT=\"$RUNNER_PORT\"
+		export LIMIRA_LLM_LENGTH_MAX_RETRIES=\"\${LIMIRA_LLM_LENGTH_MAX_RETRIES:-3}\"
+		export LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS=\"\${LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS:-2}\"
 		cd '$ROOT_DIR/apps/limira-runner'
 		exec '$RUNNER_PYTHON' runner_api.py
 	" >>"$log_file" 2>&1 < /dev/null &

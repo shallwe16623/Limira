@@ -17,6 +17,7 @@ Features:
 import asyncio
 import dataclasses
 import logging
+import os
 from typing import Any, Dict, List, Tuple, Union
 
 import tiktoken
@@ -26,6 +27,28 @@ from ...utils.prompt_utils import generate_mcp_system_prompt
 from ..base_client import BaseClient
 
 logger = logging.getLogger("limira_agent")
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _non_negative_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
 
 
 @dataclasses.dataclass
@@ -120,9 +143,12 @@ class OpenAIClient(BaseClient):
             messages_for_llm, keep_tool_result
         )
 
-        # Retry loop with dynamic max_tokens adjustment
-        max_retries = 10
-        base_wait_time = 30
+        # Retry loop with dynamic max_tokens adjustment.
+        max_retries = _positive_int_env("LIMIRA_LLM_LENGTH_MAX_RETRIES", 10)
+        base_wait_time = _non_negative_float_env(
+            "LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS",
+            30.0,
+        )
         current_max_tokens = self.max_tokens
 
         for attempt in range(max_retries):

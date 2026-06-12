@@ -80,6 +80,12 @@ def test_limira_compose_defines_stack_contract():
     assert runner["environment"]["DEFAULT_MODEL_NAME"] == (
         "${DEFAULT_MODEL_NAME:-deepseek-v4-pro}"
     )
+    assert runner["environment"]["LIMIRA_LLM_LENGTH_MAX_RETRIES"] == (
+        "${LIMIRA_LLM_LENGTH_MAX_RETRIES:-3}"
+    )
+    assert runner["environment"]["LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS"] == (
+        "${LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS:-2}"
+    )
     assert runner["environment"]["SUMMARY_LLM_BASE_URL"] == (
         "${SUMMARY_LLM_BASE_URL:-https://api.deepseek.com/chat/completions}"
     )
@@ -209,6 +215,8 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
         "BASE_URL",
         "DEFAULT_LLM_PROVIDER",
         "DEFAULT_MODEL_NAME",
+        "LIMIRA_LLM_LENGTH_MAX_RETRIES",
+        "LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS",
         "SERPER_API_KEY",
         "JINA_API_KEY",
         "E2B_API_KEY",
@@ -247,6 +255,8 @@ def test_limira_env_example_has_required_placeholders_without_real_secrets():
     assert env["BASE_URL"] == "https://api.deepseek.com"
     assert env["DEFAULT_LLM_PROVIDER"] == "openai"
     assert env["DEFAULT_MODEL_NAME"] == "deepseek-v4-pro"
+    assert env["LIMIRA_LLM_LENGTH_MAX_RETRIES"] == "3"
+    assert env["LIMIRA_LLM_LENGTH_RETRY_WAIT_SECONDS"] == "2"
     assert env["SUMMARY_LLM_BASE_URL"] == "https://api.deepseek.com/chat/completions"
     assert env["SUMMARY_LLM_MODEL_NAME"] == "deepseek-v4-pro"
 

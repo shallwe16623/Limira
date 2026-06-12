@@ -703,6 +703,10 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert ".input-container {\n\tposition: absolute;" in styles
     assert ".input-container .tabs" not in styles
     assert "function scrollConversationToBottom()" in app
+    assert "function scrollReportToTop()" in app
+    assert "renderMessages({ scrollToReportTop: reportChanged });" in app
+    assert "research task is running" not in app
+    assert "研究任务正在运行，可点击右侧按钮中断。" in app
     assert "dom.workspaceContent.scrollTo({\n\t\t\ttop: dom.workspaceContent.scrollHeight," in app
     assert "const top = Math.max(0, dom.conversationPanel.offsetTop - 16);" in app
     assert "dom.workspaceContent.scrollTo({ top, behavior: 'smooth' });" in app
@@ -713,12 +717,16 @@ def test_limira_standalone_frontend_uses_archive_only_export_surface():
     assert "downloadPdfButton" not in index
 
 
-def test_limira_standalone_report_sections_take_precedence_over_cached_final_text():
+def test_limira_standalone_final_report_and_outline_sections_are_sanitized():
     app = _read(LIMIRA_STANDALONE_APP)
 
-    assert "const finalCard = !cards && state.finalReportText" in app
+    assert "report_sections: asArray(source.report_sections || source.reports).filter(isDisplayableReportSection)" in app
+    assert "const finalCard = finalText" in app
+    assert "function isDisplayableReportSection(section)" in app
+    assert "function isOutlineKey(value)" in app
     assert "if (sectionText) {" in app
     assert "return sectionText;" in app
+    assert "if (options.includeFinalReport !== false && state.finalReportText)" in app
     assert "return reportTextFromValue(state.finalReportText, { includeTitle: true });" in app
     assert "const REPORT_SECTION_FIELDS = ['sections', 'report_sections'];" in app
     assert "function embeddedJsonObjectText(text)" in app

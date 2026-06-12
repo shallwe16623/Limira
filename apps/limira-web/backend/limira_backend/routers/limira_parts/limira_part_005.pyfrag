@@ -880,6 +880,8 @@ def _structured_report_markdown_from_wrapper(
     sections = _report_sections_from_wrapper(wrapper)
     if not sections:
         return ""
+    if _sections_are_outline_keys(sections):
+        return ""
     parts: list[str] = []
     title = _direct_report_field(wrapper, REPORT_TITLE_FIELDS)
     if include_title and title:
@@ -1013,9 +1015,43 @@ def _normalize_report_section_artifacts(
             _normalize_report_section_artifact(section)
             for section in normalized.get("report_sections", [])
         )
-        if str(section.get("markdown") or "").strip()
+        if _is_displayable_report_section(section)
     ]
     return normalized
+
+
+def _sections_are_outline_keys(sections: list[Any]) -> bool:
+    if not sections:
+        return False
+    for section in sections:
+        if not isinstance(section, str):
+            return False
+        if not _is_outline_key(section):
+            return False
+    return True
+
+
+def _is_outline_key(value: str) -> bool:
+    return re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,80}", value.strip()) is not None
+
+
+def _is_displayable_report_section(section: Mapping[str, Any]) -> bool:
+    markdown = str(section.get("markdown") or "").strip()
+    if not markdown:
+        return False
+    sections = _report_sections_from_wrapper(section)
+    if not _sections_are_outline_keys(sections):
+        return True
+    outline_keys = [str(item).strip() for item in sections]
+    markdown_lines = [line.strip() for line in markdown.splitlines() if line.strip()]
+    content_lines = [
+        line
+        for line in markdown_lines
+        if not line.startswith("#")
+        and not line.startswith("标题：")
+        and not line.lower().startswith("title:")
+    ]
+    return content_lines != outline_keys
 
 
 def _clean_legacy_report_process_markdown(markdown: str) -> str:
