@@ -1042,10 +1042,17 @@ async def _emit_graph_checkpoint(
     node_output: ResearchGraphNodeOutput,
     *,
     status: Literal["running", "completed", "failed"] = "running",
+    research_graph_executor: str = "serial",
 ) -> None:
     if stream_queue is not None:
         await stream_queue.put(
-            graph_checkpoint_event(state, phase, node_output, status=status)
+            graph_checkpoint_event(
+                state,
+                phase,
+                node_output,
+                status=status,
+                research_graph_executor=research_graph_executor,
+            )
         )
 
 

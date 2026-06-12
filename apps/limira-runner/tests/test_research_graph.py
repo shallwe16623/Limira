@@ -4,7 +4,9 @@ from omegaconf import OmegaConf
 from archive_writer import scrub_secrets
 from src.core import pipeline as pipeline_module
 from src.core import research_graph as research_graph_module
+from src.core import research_langgraph as research_langgraph_module
 from src.core.research_graph import (
+    ResearchGraphExecutionContext,
     ResearchGraphExecutionResult,
     ResearchPhase,
     VerifiedClaim,
@@ -251,6 +253,27 @@ def test_graph_task_description_surfaces_source_policy_flags():
     assert "require_retrieved_at=False" in task_description
     assert "prefer_uploaded_documents=True" in task_description
     assert "prefer_scenario_sources=True" in task_description
+
+
+def test_langgraph_executor_builds_dependency_backed_stategraph():
+    state = build_initial_research_graph(
+        task_id="task-langgraph-builder",
+        query="Verify a company designation with primary sources",
+    )
+    context = ResearchGraphExecutionContext(
+        orchestrator=object(),
+        original_task_description=state.brief.original_query,
+        task_id=state.task_id,
+    )
+
+    graph = research_langgraph_module.build_langgraph_research_graph(
+        context=context,
+        stream_queue=None,
+    )
+
+    assert hasattr(graph, "ainvoke")
+    assert research_langgraph_module.StateGraph.__module__.startswith("langgraph.")
+    assert research_langgraph_module.LANGGRAPH_EXECUTOR_NAME == "langgraph"
 
 
 def test_evidence_id_for_source_is_stable_per_task_source_and_index():
@@ -621,13 +644,52 @@ async def test_langgraph_route_is_not_satisfied_by_serial_executor_patch(
         stream_queue=stream_queue,
     )
 
-    assert "langgraph_executor_not_implemented" in result[0]
+    assert "## Verified Claims" in result[0]
+    assert result[1] == "summary"
     assert "serial summary" not in result[0]
-    assert result[1] == ""
-    assert _FakeOrchestrator.task_descriptions == []
+    assert len(_FakeOrchestrator.task_descriptions) == 4
+    assert all(
+        "## Research Unit Node" in task_description
+        for task_description in _FakeOrchestrator.task_descriptions
+    )
     assert stream_queue.items[0]["data"]["research_graph_executor"] == "langgraph"
-    assert stream_queue.items[-1]["event"] == "error"
-    assert "langgraph_executor_not_implemented" in stream_queue.items[-1]["data"]["error"]
+    checkpoints = [
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+    ]
+    assert [item["phase"] for item in checkpoints] == [
+        "scope",
+        "plan",
+        "research",
+        "compress",
+        "verify",
+        "write",
+        "reconcile",
+        "complete",
+    ]
+    assert all(
+        checkpoint["research_graph_executor"] == "langgraph"
+        for checkpoint in checkpoints
+    )
+    assert all(
+        checkpoint["executor_state"]["research_graph_executor"] == "langgraph"
+        for checkpoint in checkpoints
+    )
+    report_events = [
+        item
+        for item in stream_queue.items
+        if item.get("type") == "report_section_generated"
+    ]
+    assert report_events
+    final_messages = [
+        item
+        for item in stream_queue.items
+        if item.get("event") == "message"
+        and item.get("data", {}).get("source_event_type") == "research_langgraph"
+    ]
+    assert final_messages
+    assert "## Verified Claims" in final_messages[-1]["data"]["delta"]["content"]
 
 
 @pytest.mark.asyncio
