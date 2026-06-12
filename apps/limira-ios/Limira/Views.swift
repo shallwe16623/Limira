@@ -901,11 +901,13 @@ struct CompactComposer: View {
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("移除 \(document.filename)")
+                                .accessibilityIdentifier("SelectedDocumentRemoveButton-\(document.documentId)")
                             }
                             .padding(.horizontal, 10)
                             .frame(height: 30)
                             .background(Color(.tertiarySystemBackground))
                             .clipShape(Capsule())
+                            .accessibilityIdentifier("SelectedDocumentChip-\(document.documentId)")
                         }
                     }
                     .padding(.horizontal, 18)
@@ -918,9 +920,11 @@ struct CompactComposer: View {
                     Button(action: uploadAction) {
                         Label("上传文件", systemImage: "paperclip")
                     }
+                    .accessibilityIdentifier("UploadFileMenuItem")
                     Button(action: historyAction) {
                         Label("引用历史文件", systemImage: "clock.arrow.circlepath")
                     }
+                    .accessibilityIdentifier("HistoryFilesMenuItem")
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 22, weight: .regular))
@@ -1414,13 +1418,15 @@ struct CompactTaskHistoryRow: View {
         .padding(.vertical, 4)
         .contentShape(Rectangle())
         .alert("删除这条对话？", isPresented: $confirmDelete) {
-            Button("取消", role: .cancel) {}
-            Button("删除", role: .destructive) {
-                Task { await model.delete(task) }
+                Button("取消", role: .cancel) {}
+                    .accessibilityIdentifier("CompactHistoryDeleteCancelButton-\(task.taskId)")
+                Button("删除", role: .destructive) {
+                    Task { await model.delete(task) }
+                }
+                .accessibilityIdentifier("CompactHistoryDeleteConfirmButton-\(task.taskId)")
+            } message: {
+                Text("删除后无法从 iOS 端恢复。")
             }
-        } message: {
-            Text("删除后无法从 iOS 端恢复。")
-        }
     }
 }
 
@@ -1437,6 +1443,8 @@ struct CompactHistoryFilesSheet: View {
                     } label: {
                         Label("刷新历史文件", systemImage: "arrow.clockwise")
                     }
+                    .contentShape(Rectangle())
+                    .accessibilityIdentifier("HistoryFilesRefreshButton")
                 }
 
                 Section("可引用文件") {
@@ -1462,14 +1470,18 @@ struct CompactHistoryFilesSheet: View {
                                 }
                             }
                             .buttonStyle(.plain)
+                            .contentShape(Rectangle())
+                            .accessibilityIdentifier("HistoryFileToggle-\(document.documentId)")
                         }
                     }
                 }
             }
+            .accessibilityIdentifier("HistoryFilesList")
             .navigationTitle("引用历史文件 \(model.selectedDocumentIds.count)")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
+                        .accessibilityIdentifier("HistoryFilesDoneButton")
                 }
             }
         }
@@ -1611,16 +1623,24 @@ struct CompactCloudFileRow: View {
                     Button(model.selectedDocumentIds.contains(document.documentId) ? "取消引用" : "引用") {
                         model.toggleSelectedDocument(document)
                     }
+                    .contentShape(Rectangle())
+                    .accessibilityIdentifier("CompactCloudFileReferenceButton-\(document.documentId)")
                     Button("下载") {
                         Task { await model.downloadUpload(document) }
                     }
                     .disabled(document.downloadUrl == nil)
+                    .contentShape(Rectangle())
+                    .accessibilityIdentifier("CompactCloudFileDownloadButton-\(document.documentId)")
                 }
                 .font(.caption.weight(.medium))
             }
             Spacer()
         }
         .padding(.vertical, 6)
+        .background(alignment: .topLeading) {
+            AccessibilityProbe(id: "CompactCloudFileRow-\(document.documentId)")
+                .allowsHitTesting(false)
+        }
     }
 }
 
@@ -1724,6 +1744,7 @@ struct CompactHistorySearchSheet: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
+                        .accessibilityIdentifier("HistorySearchDoneButton")
                 }
             }
         }

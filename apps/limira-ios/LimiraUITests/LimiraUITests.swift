@@ -89,6 +89,65 @@ final class LimiraUITests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    func testCompactAccessibilityRegressionWithMockService() {
+        let app = launchMockEnterpriseApp(autoSubmit: false)
+        let taskId = "mock-task-001"
+
+        let editor = app.textViews["QueryEditor"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        dismissSystemPrompts(in: app)
+        dismissKeyboard(in: app)
+
+        openSidebar(in: app)
+        let search = app.buttons["HistorySearchButton"]
+        XCTAssertTrue(scrollTo(search, in: app))
+        search.tap()
+
+        let searchField = app.textFields["HistorySearchField"]
+        XCTAssertTrue(searchField.waitForExistence(timeout: 3))
+        XCTAssertTrue(searchField.isHittable)
+        searchField.tap()
+        searchField.typeText("测试")
+        tapHittable(app.buttons["HistorySearchSubmitButton"], in: app)
+        dismissKeyboard(in: app)
+
+        let searchRow = app.buttons["CompactHistoryRow-\(taskId)"]
+        XCTAssertTrue(searchRow.waitForExistence(timeout: 3))
+        let archive = app.buttons["CompactHistoryArchiveButton-\(taskId)"]
+        XCTAssertTrue(scrollTo(archive, in: app))
+        archive.tap()
+
+        let delete = app.buttons["CompactHistoryDeleteButton-\(taskId)"]
+        XCTAssertTrue(scrollTo(delete, in: app))
+        delete.tap()
+        let deleteAlert = app.alerts["删除这条对话？"]
+        XCTAssertTrue(deleteAlert.waitForExistence(timeout: 3))
+        let cancelDelete = app.buttons.matching(identifier: "CompactHistoryDeleteCancelButton-\(taskId)").firstMatch
+        XCTAssertTrue(cancelDelete.waitForExistence(timeout: 3))
+        XCTAssertTrue(cancelDelete.isHittable)
+        cancelDelete.tap()
+        tapHittable(app.buttons["HistorySearchDoneButton"], in: app)
+
+        tapHittable(app.buttons["UploadMenuButton"], in: app)
+        tapHittable(app.buttons["HistoryFilesMenuItem"], in: app)
+        tapHittable(app.buttons["HistoryFilesRefreshButton"], in: app)
+        tapHittable(app.buttons["HistoryFileToggle-mock-cloud-doc"], in: app)
+        tapHittable(app.buttons["HistoryFilesDoneButton"], in: app)
+
+        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChips"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.descendants(matching: .any)["SelectedDocumentChip-mock-cloud-doc"].waitForExistence(timeout: 3))
+
+        openSidebar(in: app)
+        let cloud = app.buttons["CompactCloudDriveButton"]
+        XCTAssertTrue(scrollTo(cloud, in: app))
+        cloud.tap()
+        waitForRoute("cloudDrive", in: app)
+
+        tapHittable(app.buttons["CompactCloudFileReferenceButton-mock-cloud-doc"], in: app)
+        tapHittable(app.buttons["CompactCloudFileDownloadButton-mock-cloud-doc"], in: app)
+        XCTAssertTrue(app.descendants(matching: .any)["DownloadPanel"].waitForExistence(timeout: 3))
+    }
+
     func testLiveEnterpriseLoginAgainstSanFranciscoWhenCredentialsProvided() throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["LIMIRA_LIVE_UI_SMOKE"] == "YES" else {
