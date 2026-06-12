@@ -517,11 +517,13 @@ class PageVisitOrJinaSummaryRetriever(GraphRetriever):
         request: RetrieverRequest,
         candidate: SourceCandidate,
     ) -> RetrievedSource | None:
-        if candidate.source_type != self.name:
+        if candidate.source_type not in {self.name, "web_search"}:
             return None
         summary = _bounded_graph_text(
             (
-                f"Scenario-prioritized page summary for {request.unit.question}. "
+                f"Content-bearing page summary for {request.unit.question}. "
+                f"Source: {candidate.title or candidate.url or 'candidate source'}. "
+                f"Snippet context: {candidate.summary or 'no snippet'}. "
                 f"Query terms: {'; '.join(request.unit.search_queries)}."
             ),
             GRAPH_SOURCE_SUMMARY_MAX_CHARS,
@@ -529,7 +531,10 @@ class PageVisitOrJinaSummaryRetriever(GraphRetriever):
         return RetrievedSource(
             id=retrieved_source_id_for_source(
                 task_id=request.state.task_id,
-                source=f"langgraph://{request.unit.id}/page_summary",
+                source=(
+                    f"langgraph://{request.unit.id}/page_summary/"
+                    f"{candidate.candidate_id or candidate.url or candidate.title}"
+                ),
                 index=request.unit_index,
             ),
             url=candidate.url,
@@ -1091,6 +1096,7 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
         candidates: list[SourceCandidate] = []
         retrieved_sources: list[RetrievedSource] = []
         warnings: list[str] = []
+        seen_retrieved_source_ids: set[str] = set()
         for name in names:
             try:
                 retriever = self._retriever_registry.resolve(name)
@@ -1099,10 +1105,14 @@ class LangGraphResearchUnitNode(ResearchGraphNode):
                 continue
             retriever_candidates = await retriever.search(request)
             candidates.extend(retriever_candidates)
-            for candidate in retriever_candidates:
+            for candidate in candidates:
                 retrieved_source = await retriever.retrieve(request, candidate)
-                if retrieved_source is not None:
+                if (
+                    retrieved_source is not None
+                    and retrieved_source.id not in seen_retrieved_source_ids
+                ):
                     retrieved_sources.append(retrieved_source)
+                    seen_retrieved_source_ids.add(retrieved_source.id)
         return candidates, retrieved_sources, warnings
 
     def _retriever_order(self, unit: ResearchUnit) -> list[str]:

@@ -15,10 +15,13 @@ from src.core.research_graph import (
     ResearchGraphNodeOutput,
     ResearchGraphState,
     ResearchPhase,
+    RetrievedSource,
+    GraphRetriever,
     RetrieverRegistry,
     SourceCandidate,
     UploadedDocumentSearchRetriever,
     VerifierNode,
+    PageVisitOrJinaSummaryRetriever,
     WebSearchRetriever,
     VerifiedClaim,
     WriterNode,
@@ -725,6 +728,151 @@ def test_default_retriever_registry_resolves_required_retrievers():
 
 
 @pytest.mark.asyncio
+async def test_langgraph_completes_source_backed_report_without_legacy_fallback(
+    monkeypatch,
+):
+    _FakeOrchestrator.task_descriptions = []
+
+    class _FakeSearchRetriever(GraphRetriever):
+        name = "fake_search"
+
+        async def search(self, request):
+            return [
+                SourceCandidate(
+                    candidate_id="SRC-FAKE-SEARCH-001",
+                    title="Fake primary search result",
+                    summary="Snippet says Entity A may be listed under program X.",
+                    source_type="web_search",
+                    source_state="source_candidate",
+                    source_content_state="snippet_only",
+                    retrieval_status="candidate_only",
+                    url="https://example.test/entity-a",
+                    confidence=0.3,
+                    source_event_type="research_graph_search",
+                )
+            ]
+
+    class _FakePageRetriever(GraphRetriever):
+        name = "fake_page_visit"
+
+        async def retrieve(self, request, candidate):
+            if candidate.source_type != "web_search":
+                return None
+            content = "Primary page content confirms Entity A is listed under program X."
+            return RetrievedSource(
+                id="RSRC-FAKE-PAGE-001",
+                url=candidate.url,
+                title=candidate.title,
+                source_type=self.name,
+                content_hash="f" * 32,
+                quote_or_summary=content,
+                tool_name=self.name,
+                confidence=0.8,
+            )
+
+    registry = RetrieverRegistry()
+    registry.register(_FakeSearchRetriever())
+    registry.register(_FakePageRetriever())
+    registry.register(WebSearchRetriever(), enabled=False)
+    registry.register(PageVisitOrJinaSummaryRetriever(), enabled=False)
+
+    def fake_nodes():
+        return [
+            research_graph_module.ScopeNode(),
+            research_graph_module.PlannerNode(),
+            LangGraphResearchUnitNode(
+                retriever_registry=registry,
+                retriever_names=["fake_search", "fake_page_visit"],
+            ),
+            research_graph_module.EvidenceCompressorNode(),
+            research_graph_module.VerifierNode(),
+            research_graph_module.WriterNode(),
+            research_graph_module.ReconcilerNode(),
+        ]
+
+    monkeypatch.setattr(
+        research_langgraph_module,
+        "default_langgraph_research_graph_nodes",
+        fake_nodes,
+    )
+    initial_state = build_initial_research_graph(
+        task_id="task-langgraph-fake-retrieval",
+        query="Verify Entity A program X listing",
+        max_units=1,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await research_langgraph_module.execute_langgraph_research(
+        state=initial_state,
+        orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
+        original_task_description="Verify Entity A program X listing",
+        task_file_name="",
+        task_id="task-langgraph-fake-retrieval",
+        is_final_retry=False,
+        stream_queue=stream_queue,
+    )
+
+    final_state = result.state
+    assert _FakeOrchestrator.task_descriptions == []
+    assert final_state.phase == ResearchPhase.COMPLETE
+    assert "## Key Findings" in result.final_summary
+    assert "EVID-" in result.final_summary
+    assert {
+        candidate.source_content_state
+        for candidate in final_state.source_candidates
+        if candidate.source_type == "web_search"
+    } == {"snippet_only"}
+    assert all(source.source_type != "web_search" for source in final_state.retrieved_sources)
+    assert {source.source_type for source in final_state.retrieved_sources} == {
+        "fake_page_visit"
+    }
+    assert {evidence.source_type for evidence in final_state.evidence} == {
+        "fake_page_visit"
+    }
+    assert final_state.report_sections[0].evidence_refs
+    assert not any(
+        candidate.source_type == "legacy_agent_adapter"
+        for candidate in final_state.source_candidates
+    )
+
+    typed_events = [
+        item
+        for item in stream_queue.items
+        if item.get("type")
+        in {
+            "source_candidate_collected",
+            "retrieved_source_collected",
+            "evidence_collected",
+            "report_section_generated",
+        }
+    ]
+    assert [item["type"] for item in typed_events[:3]] == [
+        "source_candidate_collected",
+        "retrieved_source_collected",
+        "evidence_collected",
+    ]
+    assert typed_events[0]["payload"]["source_type"] == "web_search"
+    assert typed_events[0]["payload"]["source_content_state"] == "snippet_only"
+    assert typed_events[1]["payload"]["source_type"] == "fake_page_visit"
+    assert typed_events[2]["payload"]["source_type"] == "fake_page_visit"
+    research_checkpoint = next(
+        item["data"]
+        for item in stream_queue.items
+        if item.get("event") == "research_graph_checkpoint"
+        and item["data"]["phase"] == "research"
+    )
+    assert research_checkpoint["executor_state"]["legacy_adapter_calls"] == 0
+    checkpoint_substep = research_checkpoint["executor_state"]["unit_substeps"][0]
+    assert checkpoint_substep["retriever_order"] == ["fake_search", "fake_page_visit"]
+    assert checkpoint_substep["snippet_only_candidate_ids"] == ["SRC-FAKE-SEARCH-001"]
+    assert checkpoint_substep["legacy_adapter_used"] is False
+    assert all(
+        item.get("source_type") != "web_search"
+        for item in research_checkpoint["evidence_ledger"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_langgraph_executor_populates_ac2_state_contract_and_bounded_checkpoints():
     _FakeOrchestrator.task_descriptions = []
     upload_text = "Uploaded memo states the entity is listed under program X."
@@ -1101,7 +1249,8 @@ async def test_langgraph_research_node_retries_pending_units_without_completed_d
     substeps = output.executor_state["unit_substeps"]
     assert substeps[0]["resume_action"] == "skipped_completed_unit"
     assert substeps[1]["steps"] == ["search", "retrieve", "promote", "synthesize"]
-    assert _FakeOrchestrator.task_descriptions
+    assert _FakeOrchestrator.task_descriptions == []
+    assert substeps[1]["legacy_adapter_used"] is False
     assert all(
         event["payload"].get("evidence_id") != "EVID-001"
         for event in output.artifact_events
@@ -1223,19 +1372,44 @@ async def test_langgraph_research_unit_decomposes_upload_retrieval_without_legac
 
 
 @pytest.mark.asyncio
-async def test_langgraph_research_unit_uses_legacy_only_as_fallback_retriever():
+async def test_langgraph_research_unit_uses_legacy_only_as_fallback_retriever(
+    monkeypatch,
+):
     _FakeOrchestrator.task_descriptions = []
+    registry = default_retriever_registry()
+
+    def fallback_nodes():
+        return [
+            research_graph_module.ScopeNode(),
+            research_graph_module.PlannerNode(),
+            LangGraphResearchUnitNode(
+                retriever_registry=registry,
+                retriever_names=["web_search", "legacy_agent_adapter"],
+            ),
+            research_graph_module.EvidenceCompressorNode(),
+            research_graph_module.VerifierNode(),
+            research_graph_module.WriterNode(),
+            research_graph_module.ReconcilerNode(),
+        ]
+
     initial_state = build_initial_research_graph(
         task_id="task-langgraph-legacy-fallback",
         query="Verify a company designation with primary sources",
         max_units=1,
     )
     stream_queue = _CaptureQueue()
+    monkeypatch.setattr(
+        research_langgraph_module,
+        "default_langgraph_research_graph_nodes",
+        fallback_nodes,
+    )
 
     result = await research_langgraph_module.execute_langgraph_research(
         state=initial_state,
         orchestrator=_FakeOrchestrator(stream_queue=stream_queue),
-        original_task_description="Verify a company designation with primary sources",
+        original_task_description=(
+            "Verify a company designation with primary sources"
+        ),
         task_file_name="",
         task_id="task-langgraph-legacy-fallback",
         is_final_retry=False,

@@ -754,13 +754,10 @@ async def test_langgraph_route_is_not_satisfied_by_serial_executor_patch(
     )
 
     assert "## Key Findings" in result[0]
-    assert result[1] == "summary"
+    assert result[1] != "serial final"
+    assert "Content-bearing page summary" in result[1]
     assert "serial summary" not in result[0]
-    assert len(_FakeOrchestrator.task_descriptions) == 4
-    assert all(
-        "## Research Unit Node" in task_description
-        for task_description in _FakeOrchestrator.task_descriptions
-    )
+    assert _FakeOrchestrator.task_descriptions == []
     assert stream_queue.items[0]["data"]["research_graph_executor"] == "langgraph"
     checkpoints = [
         item["data"]
@@ -785,6 +782,10 @@ async def test_langgraph_route_is_not_satisfied_by_serial_executor_patch(
         checkpoint["executor_state"]["research_graph_executor"] == "langgraph"
         for checkpoint in checkpoints
     )
+    research_checkpoint = next(
+        checkpoint for checkpoint in checkpoints if checkpoint["phase"] == "research"
+    )
+    assert research_checkpoint["executor_state"]["legacy_adapter_calls"] == 0
     report_events = [
         item
         for item in stream_queue.items
