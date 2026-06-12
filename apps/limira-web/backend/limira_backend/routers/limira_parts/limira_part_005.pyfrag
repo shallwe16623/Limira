@@ -653,6 +653,7 @@ def _looks_like_final_report_markdown(markdown: str) -> bool:
             "研究报告",
             "详尽调查报告",
             "综合报告",
+            "智库分析报告",
         )
     ) or any(
         marker in lower_text
@@ -797,6 +798,11 @@ REPORT_TITLE_FIELDS = ("title", "report_title", "name")
 REPORT_ID_FIELDS = ("section_id", "report_id", "id")
 REPORT_SECTION_FIELDS = ("sections", "report_sections")
 REPORT_SECTION_TITLE_FIELDS = ("heading", *REPORT_TITLE_FIELDS)
+LEGACY_REPORT_PROCESS_HTML_MARKERS = (
+    '<div class="search-card"',
+    '<div class="scrape-card"',
+    '<div class="tool-card"',
+)
 
 
 def _report_wrapper_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -983,6 +989,7 @@ def _normalize_report_section_artifact(artifact: dict[str, Any]) -> dict[str, An
     )
     markdown = _report_markdown_from_value(source)
     if markdown:
+        markdown = _clean_legacy_report_process_markdown(markdown)
         normalized["markdown"] = markdown
         for field in ("content", "text", "summary"):
             if field in normalized and _report_wrapper_mapping(normalized[field]) is not None:
@@ -1001,10 +1008,31 @@ def _normalize_report_section_artifacts(
 ) -> dict[str, list[dict[str, Any]]]:
     normalized = _normalize_artifact_buckets(artifacts)
     normalized["report_sections"] = [
-        _normalize_report_section_artifact(section)
-        for section in normalized.get("report_sections", [])
+        section
+        for section in (
+            _normalize_report_section_artifact(section)
+            for section in normalized.get("report_sections", [])
+        )
+        if str(section.get("markdown") or "").strip()
     ]
     return normalized
+
+
+def _clean_legacy_report_process_markdown(markdown: str) -> str:
+    text = str(markdown or "").strip()
+    if not any(marker in text for marker in LEGACY_REPORT_PROCESS_HTML_MARKERS):
+        return text
+
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not re.match(r"^#{1,6}\s+\S", line.strip()):
+            continue
+        candidate = "\n".join(lines[index:]).strip()
+        if any(marker in candidate for marker in LEGACY_REPORT_PROCESS_HTML_MARKERS):
+            continue
+        if _looks_like_final_report_markdown(candidate):
+            return candidate
+    return ""
 
 
 def _normalize_report_section_trace_events(

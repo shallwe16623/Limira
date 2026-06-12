@@ -1438,6 +1438,88 @@ async def test_artifacts_api_unwraps_legacy_json_wrapped_report_section_text():
     assert '"content"' not in members["trace.json"]
 
 
+@pytest.mark.asyncio
+async def test_artifacts_api_extracts_final_report_from_legacy_process_html_section():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-legacy-process-html-report",
+        owner_user_id=user.id,
+        query="美国意见领袖涉华言论",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    final_report = (
+        "# 智库分析报告：美国意见领袖涉华言论\n\n"
+        "这是一份完整研究报告，应作为历史对话里的唯一可见报告正文。\n\n"
+        "## 一、核心判断\n\n"
+        + ("报告正文、证据和判断。" * 80)
+        + "\n\n## 二、风险评估\n\n"
+        + ("风险、争议和后续观察。" * 80)
+    )
+    legacy_markdown = (
+        "# 研究启动\n\n"
+        '<div class="search-card">\n'
+        '<div class="search-header">Search: old query</div>\n'
+        "</div>\n\n"
+        '<div class="tool-card"><div class="tool-header">record artifact</div></div>\n\n'
+        + final_report
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-LEGACY",
+            "title": "执行结果",
+            "markdown": legacy_markdown,
+            "source_event_type": "runner_archive_report",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    artifacts = await limira.get_task_artifacts(task.task_id, user=user, repo=repo)
+
+    assert len(artifacts["report_sections"]) == 1
+    section_markdown = artifacts["report_sections"][0]["markdown"]
+    assert section_markdown == final_report
+    assert "<div" not in section_markdown
+    assert "search-card" not in section_markdown
+    assert "tool-card" not in section_markdown
+    assert "old query" not in section_markdown
+
+
+@pytest.mark.asyncio
+async def test_artifacts_api_drops_legacy_process_html_section_without_report_body():
+    repo = limira.InMemoryLimiraTaskRepository()
+    user = limira.LimiraUser("user-a")
+    task = repo.create_task(
+        task_id="task-legacy-process-html-only",
+        owner_user_id=user.id,
+        query="只有过程日志的旧报告",
+        scenario=None,
+        runner_task_id="runner-task-a",
+    )
+    repo.record_artifact(
+        task.task_id,
+        "report_section",
+        {
+            "section_id": "REPORT-LEGACY",
+            "title": "执行结果",
+            "markdown": (
+                '<div class="search-card">\n'
+                '<div class="search-header">Search: old query</div>\n'
+                "</div>\n"
+            ),
+            "source_event_type": "runner_archive_report",
+        },
+    )
+    repo.update_task(task.task_id, status="completed", archive_status="ready")
+
+    artifacts = await limira.get_task_artifacts(task.task_id, user=user, repo=repo)
+
+    assert artifacts["report_sections"] == []
+
+
 def test_show_text_markdown_formats_structured_report_json():
     structured_report = json.dumps(
         {
