@@ -36,6 +36,17 @@ from .research_graph import (
     graph_bootstrap_events,
     graph_task_description,
 )
+from .research_langgraph import execute_langgraph_research
+
+
+RESEARCH_GRAPH_EXECUTOR_LEGACY = "legacy"
+RESEARCH_GRAPH_EXECUTOR_SERIAL = "serial"
+RESEARCH_GRAPH_EXECUTOR_LANGGRAPH = "langgraph"
+RESEARCH_GRAPH_EXECUTORS = {
+    RESEARCH_GRAPH_EXECUTOR_LEGACY,
+    RESEARCH_GRAPH_EXECUTOR_SERIAL,
+    RESEARCH_GRAPH_EXECUTOR_LANGGRAPH,
+}
 
 
 async def execute_task_pipeline(
@@ -100,6 +111,7 @@ async def execute_task_pipeline(
             sub_agent_tool_manager.set_task_log(task_log)
 
     try:
+        graph_executor = _research_graph_executor(cfg)
         graph_state = build_initial_research_graph(
             task_id=task_id,
             query=task_description,
@@ -130,8 +142,21 @@ async def execute_task_pipeline(
             sub_agent_tool_definitions=sub_agent_tool_definitions,
         )
 
-        if _research_graph_execution_enabled(cfg):
+        if graph_executor == RESEARCH_GRAPH_EXECUTOR_SERIAL:
             graph_result = await execute_research_graph(
+                state=graph_state,
+                orchestrator=orchestrator,
+                original_task_description=task_description,
+                task_file_name=task_file_name,
+                task_id=task_id,
+                is_final_retry=is_final_retry,
+                stream_queue=stream_queue,
+            )
+            final_summary = graph_result.final_summary
+            final_boxed_answer = graph_result.final_boxed_answer
+            failure_experience_summary = graph_result.failure_experience_summary
+        elif graph_executor == RESEARCH_GRAPH_EXECUTOR_LANGGRAPH:
+            graph_result = await execute_langgraph_research(
                 state=graph_state,
                 orchestrator=orchestrator,
                 original_task_description=task_description,
@@ -251,6 +276,24 @@ def create_pipeline_components(cfg: DictConfig):
         sub_agent_tool_managers[sub_agent] = sub_agent_tool_manager
 
     return main_agent_tool_manager, sub_agent_tool_managers, output_formatter
+
+
+def _research_graph_executor(cfg: DictConfig) -> str:
+    explicit = OmegaConf.select(cfg, "agent.research_graph.executor", default=None)
+    if explicit is not None:
+        executor = str(explicit).strip().lower()
+        if executor in RESEARCH_GRAPH_EXECUTORS:
+            return executor
+        raise ValueError(
+            "invalid_research_graph_executor: "
+            f"{explicit!r}; expected one of "
+            f"{', '.join(sorted(RESEARCH_GRAPH_EXECUTORS))}"
+        )
+    return (
+        RESEARCH_GRAPH_EXECUTOR_SERIAL
+        if _research_graph_execution_enabled(cfg)
+        else RESEARCH_GRAPH_EXECUTOR_LEGACY
+    )
 
 
 def _research_graph_execution_enabled(cfg: DictConfig) -> bool:

@@ -82,7 +82,7 @@ class _MissingFinalOutputOrchestrator:
         return self.__class__.outputs
 
 
-def _pipeline_cfg(*, graph_enabled: bool = False):
+def _pipeline_cfg(*, graph_enabled: bool = False, graph_executor: str | None = None):
     agent_cfg = {
         "keep_tool_result": True,
         "main_agent": {"max_turns": 1},
@@ -90,6 +90,8 @@ def _pipeline_cfg(*, graph_enabled: bool = False):
     }
     if graph_enabled:
         agent_cfg["research_graph"] = {"enabled": True}
+    if graph_executor is not None:
+        agent_cfg.setdefault("research_graph", {})["executor"] = graph_executor
     return OmegaConf.create(
         {
             "llm": {
@@ -366,6 +368,217 @@ async def test_pipeline_routes_to_graph_executor_when_feature_flag_enabled(
     assert result[3] == "retry context"
     assert _FakeOrchestrator.task_descriptions == []
     assert stream_queue.items[-1]["event"] == "test_graph_executor_used"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_routes_to_explicit_legacy_executor(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fail_serial_executor(**_kwargs):
+        raise AssertionError("serial executor should not run")
+
+    async def fail_langgraph_executor(**_kwargs):
+        raise AssertionError("langgraph executor should not run")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_research_graph",
+        fail_serial_executor,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_langgraph_research",
+        fail_langgraph_executor,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_enabled=True, graph_executor="legacy"),
+        task_id="task-pipeline-explicit-legacy",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "summary"
+    assert _FakeOrchestrator.task_descriptions
+    assert stream_queue.items[-1]["event"] == "message"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_routes_to_explicit_serial_executor(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fake_serial_executor(**kwargs):
+        await kwargs["stream_queue"].put(
+            {"event": "test_serial_executor_used", "data": {"task_id": kwargs["task_id"]}}
+        )
+        return ResearchGraphExecutionResult(
+            state=kwargs["state"],
+            final_summary="serial summary",
+            final_boxed_answer="serial final",
+            failure_experience_summary=None,
+        )
+
+    async def fail_langgraph_executor(**_kwargs):
+        raise AssertionError("langgraph executor should not run")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_research_graph",
+        fake_serial_executor,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_langgraph_research",
+        fail_langgraph_executor,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="serial"),
+        task_id="task-pipeline-explicit-serial",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "serial summary"
+    assert result[1] == "serial final"
+    assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[-1]["event"] == "test_serial_executor_used"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_routes_to_explicit_langgraph_executor(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fail_serial_executor(**_kwargs):
+        raise AssertionError("serial executor should not run")
+
+    async def fake_langgraph_executor(**kwargs):
+        await kwargs["stream_queue"].put(
+            {
+                "event": "test_langgraph_executor_used",
+                "data": {"task_id": kwargs["task_id"]},
+            }
+        )
+        return ResearchGraphExecutionResult(
+            state=kwargs["state"],
+            final_summary="langgraph summary",
+            final_boxed_answer="langgraph final",
+            failure_experience_summary="langgraph retry",
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_research_graph",
+        fail_serial_executor,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_langgraph_research",
+        fake_langgraph_executor,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="langgraph"),
+        task_id="task-pipeline-explicit-langgraph",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert result[0] == "langgraph summary"
+    assert result[1] == "langgraph final"
+    assert result[3] == "langgraph retry"
+    assert _FakeOrchestrator.task_descriptions == []
+    assert stream_queue.items[-1]["event"] == "test_langgraph_executor_used"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_invalid_graph_executor(tmp_path, monkeypatch):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="bogus"),
+        task_id="task-pipeline-invalid-executor",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "invalid_research_graph_executor" in result[0]
+    assert "langgraph, legacy, serial" in result[0]
+    assert result[1] == ""
+    assert _FakeOrchestrator.task_descriptions == []
+
+
+@pytest.mark.asyncio
+async def test_langgraph_route_is_not_satisfied_by_serial_executor_patch(
+    tmp_path, monkeypatch
+):
+    _FakeOrchestrator.task_descriptions = []
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _FakeClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _FakeOrchestrator)
+
+    async def fake_serial_executor(**kwargs):
+        return ResearchGraphExecutionResult(
+            state=kwargs["state"],
+            final_summary="serial summary",
+            final_boxed_answer="serial final",
+            failure_experience_summary=None,
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "execute_research_graph",
+        fake_serial_executor,
+    )
+    stream_queue = _CaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_pipeline_cfg(graph_executor="langgraph"),
+        task_id="task-pipeline-langgraph-not-serial",
+        task_description="Verify a company designation with primary sources",
+        task_file_name="",
+        main_agent_tool_manager=_FakeToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert "langgraph_executor_not_implemented" in result[0]
+    assert "serial summary" not in result[0]
+    assert result[1] == ""
+    assert _FakeOrchestrator.task_descriptions == []
 
 
 @pytest.mark.asyncio
