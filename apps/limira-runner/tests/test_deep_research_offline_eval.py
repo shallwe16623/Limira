@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import sys
@@ -5,11 +6,33 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
 from limira_tools.limira_evidence import tool_evidence_events_from_result
-from runner_api import ACTIVE_TASKS_KEY, _reconcile_task_if_stale, create_app
+from runner_api import (
+    ACTIVE_TASKS_KEY,
+    PENDING_STARTUP_WORKERS_KEY,
+    TASK_WORKERS_KEY,
+    _reconcile_task_if_stale,
+    _start_pending_task_workers,
+    create_app,
+)
+from src.core import pipeline as pipeline_module
 from src.core.research_graph import (
+    CompressedFinding,
+    EvidenceItem,
+    EvidenceStrictMode,
+    LangGraphResearchUnitNode,
+    ResearchGraphExecutionContext,
+    ResearchGraphExecutionResult,
+    ResearchGraphNodeOutput,
+    ResearchPhase,
+    RetrieverRegistry,
+    UploadedDocumentSearchRetriever,
     UploadedDocumentSourceProvider,
+    VerifiedClaim,
+    VerifierNode,
+    WriterNode,
     build_initial_research_graph,
     execute_research_graph,
     graph_task_description,
@@ -46,6 +69,82 @@ class _OfflineCaptureQueue:
 class _OfflineFailingOrchestrator:
     async def run_main_agent(self, **_kwargs):
         raise RuntimeError("offline graph node failure")
+
+
+class _OfflineOrchestrator:
+    task_descriptions = []
+
+    def __init__(self, **_kwargs):
+        pass
+
+    async def run_main_agent(self, **kwargs):
+        self.__class__.task_descriptions.append(kwargs["task_description"])
+        return "offline legacy summary", "offline legacy final", None
+
+
+class _OfflineToolManager:
+    def __init__(self):
+        self.task_log = None
+
+    def set_task_log(self, task_log):
+        self.task_log = task_log
+
+
+class _OfflineClientFactory:
+    def __init__(self, **_kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+class _InstrumentedUploadRetriever(UploadedDocumentSearchRetriever):
+    def __init__(self):
+        self.search_calls = []
+        self.retrieve_calls = []
+
+    async def search(self, request):
+        self.search_calls.append(
+            {
+                "unit_id": request.unit.id,
+                "query": request.unit.question,
+                "upload_count": len(request.state.upload_sources),
+            }
+        )
+        return await super().search(request)
+
+    async def retrieve(self, request, candidate):
+        self.retrieve_calls.append(candidate.candidate_id)
+        return await super().retrieve(request, candidate)
+
+
+class _ResumeProbeStream:
+    def __init__(self):
+        self.contexts = []
+        self.checkpoint = None
+
+    async def stream(self, task_id, query, context, disconnect_check):
+        self.contexts.append(dict(context or {}))
+        resume_checkpoint = context["resume_checkpoint"]
+        self.checkpoint = resume_checkpoint
+        yield {
+            "event": "research_graph_checkpoint",
+            "data": {
+                **resume_checkpoint,
+                "phase": "compress",
+                "status": "running",
+                "last_completed_node": "research",
+                "current_node": "verify",
+                "executor_state": {
+                    **resume_checkpoint["executor_state"],
+                    "node": "EvidenceCompressorNode",
+                },
+            },
+        }
+        yield {
+            "event": "message",
+            "data": {"delta": {"content": "resume completed"}},
+        }
 
 
 class _OfflineResearchClient:
@@ -137,6 +236,66 @@ def _archive_member_texts(archive_bytes: bytes) -> dict[str, str]:
             member_name: archive.read(member_name).decode("utf-8")
             for member_name in archive.namelist()
         }
+
+
+def _offline_pipeline_cfg(*, graph_executor="langgraph", evidence_strict=None):
+    config = {
+        "llm": {
+            "provider": "openai-compatible",
+            "base_url": "https://llm.test",
+            "model_name": "offline-eval-model",
+            "temperature": 0,
+            "top_p": 1,
+            "min_p": 0,
+            "top_k": 0,
+            "max_tokens": 4096,
+            "repetition_penalty": 1,
+            "async_client": False,
+        },
+        "agent": {
+            "keep_tool_result": True,
+            "main_agent": {"max_turns": 1},
+            "sub_agents": None,
+            "research_graph": {"executor": graph_executor},
+        },
+    }
+    if evidence_strict is not None:
+        config["limira"] = {"evidence": {"strict": evidence_strict}}
+    return OmegaConf.create(config)
+
+
+def _offline_graph_context(*, evidence_strict_mode=EvidenceStrictMode.WARN):
+    return ResearchGraphExecutionContext(
+        orchestrator=_OfflineOrchestrator(),
+        original_task_description="offline eval",
+        task_id="offline-eval",
+        evidence_strict_mode=evidence_strict_mode,
+    )
+
+
+def _offline_evidence(
+    evidence_id: str,
+    text: str,
+    *,
+    retrieved_source_id: str | None = None,
+) -> EvidenceItem:
+    return EvidenceItem(
+        id=evidence_id,
+        retrieved_source_id=retrieved_source_id or f"RSRC-{evidence_id}",
+        title=f"Evidence {evidence_id}",
+        source_type="web",
+        retrieved_at="2026-06-06T12:00:00+00:00",
+        content_hash="a" * 32,
+        quote_or_summary=text,
+        claims=[text],
+        confidence=0.8,
+    )
+
+
+def _markdown_section(markdown: str, title: str) -> str:
+    marker = f"## {title}\n"
+    assert marker in markdown
+    return markdown.split(marker, 1)[1].split("\n## ", 1)[0]
 
 
 @pytest.mark.asyncio
@@ -546,6 +705,359 @@ def test_offline_eval_checkpoint_resume_envelope_survives_store_restart(tmp_path
     }
     assert persisted["resume_policy"] == "fail_recoverable"
     assert persisted["recoverable_reason"] == "serial_graph_checkpoint_not_resumable"
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_resume_from_checkpoint_preserves_ledgers(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    store = TaskStore(db_path)
+    task_id = "case-resume-from-checkpoint"
+    store.create_task(
+        task_id=task_id,
+        user_id="user-a",
+        query="checkpoint resume",
+        created_at="2026-06-06T12:00:00+00:00",
+        context={"source_policy": {"prefer_uploaded_documents": True}},
+    )
+    store.claim_queued_task(
+        task_id,
+        started_at="2026-06-06T12:01:00+00:00",
+        worker_id="worker-stale",
+        lease_expires_at="2026-06-06T12:05:00+00:00",
+    )
+    checkpoint = {
+        "phase": "research",
+        "status": "running",
+        "current_research_unit": "unit-1-background",
+        "source_ledger": [
+            {
+                "ledger_type": "research_unit",
+                "unit_id": "unit-1-background",
+                "status": "completed",
+            }
+        ],
+        "evidence_ledger": [
+            {
+                "ledger_type": "evidence",
+                "id": "EVID-001",
+                "retrieved_source_id": "RSRC-001",
+                "content_hash": "a" * 32,
+            }
+        ],
+        "executor_state": {"research_graph_executor": "langgraph"},
+        "research_graph_executor": "langgraph",
+        "last_completed_node": "research",
+        "current_node": "compress",
+        "completed_unit_ids": ["unit-1-background"],
+        "pending_unit_ids": [],
+        "resume_policy": "resume_from_checkpoint",
+        "recoverable_reason": "langgraph_checkpoint_resumable",
+    }
+    store.write_task_checkpoint(
+        task_id,
+        checkpoint=checkpoint,
+        updated_at="2026-06-06T12:04:00+00:00",
+    )
+    stream_probe = _ResumeProbeStream()
+    app = create_app(
+        task_store=store,
+        archive_root=tmp_path / "archives",
+        service_token="shared",
+        stream_events=stream_probe.stream,
+        clock=lambda: "2026-06-06T12:10:00+00:00",
+    )
+
+    queued = store.get_task(task_id)
+    assert queued.status == "queued"
+    assert store.get_task_checkpoint(task_id)["status"] == "queued"
+    if task_id in app[PENDING_STARTUP_WORKERS_KEY]:
+        await _start_pending_task_workers(app)
+    else:
+        assert task_id in app[TASK_WORKERS_KEY]
+
+    worker = app[TASK_WORKERS_KEY][task_id]
+    await asyncio.wait_for(worker, timeout=2.0)
+
+    final_checkpoint = store.get_task_checkpoint(task_id)
+    assert stream_probe.contexts[0]["resume_checkpoint"]["source_ledger"] == (
+        checkpoint["source_ledger"]
+    )
+    assert stream_probe.contexts[0]["resume_checkpoint"]["evidence_ledger"] == (
+        checkpoint["evidence_ledger"]
+    )
+    assert final_checkpoint["source_ledger"] == checkpoint["source_ledger"]
+    assert final_checkpoint["evidence_ledger"] == checkpoint["evidence_ledger"]
+    assert final_checkpoint["resume_policy"] == "terminal"
+    assert {
+        item["id"] for item in final_checkpoint["evidence_ledger"] if "id" in item
+    } == {"EVID-001"}
+    assert store.get_task(task_id).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_upload_search_used():
+    upload_text = "Uploaded program-x memo states the entity is listed."
+    state = build_initial_research_graph(
+        task_id="case-upload-search-used",
+        query="Assess program-x listing from uploaded memo",
+        document_ids=["doc-upload"],
+        upload_scope={
+            "document_count": 1,
+            "retrieval_status": "retrieved",
+            "retrieved_document_ids": ["doc-upload"],
+            "context_only_document_ids": [],
+            "source_payloads": [
+                {
+                    "document_id": "doc-upload",
+                    "attached_document_id": "attached-doc-upload",
+                    "chunk_id": "UPLOAD-CHUNK-001",
+                    "filename": "program-x-memo.txt",
+                    "source_type": "limira_upload",
+                    "source_content_state": "content_bearing",
+                    "retrieval_status": "retrieved",
+                    "retrieved_at": "2026-06-06T12:00:00+00:00",
+                    "content_hash": "b" * 64,
+                    "text": upload_text,
+                    "text_char_count": len(upload_text),
+                }
+            ],
+        },
+        source_policy={"prefer_uploaded_documents": True},
+        max_units=1,
+    )
+    upload_retriever = _InstrumentedUploadRetriever()
+    registry = RetrieverRegistry()
+    registry.register(upload_retriever)
+    research_output = await LangGraphResearchUnitNode(
+        retriever_registry=registry,
+        retriever_names=["uploaded_document_search"],
+    ).run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    verify_output = await VerifierNode().run(
+        research_output.state,
+        _offline_graph_context(),
+        research_output,
+    )
+
+    assert upload_retriever.search_calls
+    assert upload_retriever.retrieve_calls
+    assert upload_text in verify_output.state.evidence[0].quote_or_summary
+    assert verify_output.state.evidence[0].document_id == "doc-upload"
+    assert verify_output.state.verified_claims[0].support_type == "supported"
+    assert verify_output.state.verified_claims[0].evidence_ids == [
+        verify_output.state.evidence[0].id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_contradiction_detected():
+    state = build_initial_research_graph(
+        task_id="case-contradiction-detected",
+        query="Assess listing contradiction",
+        max_units=1,
+    )
+    evidence = [
+        _offline_evidence("EVID-001", "The entity is listed under the program."),
+        _offline_evidence("EVID-002", "The entity is not listed under the program."),
+    ]
+    state = state.model_copy(
+        update={
+            "phase": ResearchPhase.COMPRESS,
+            "evidence": evidence,
+            "findings": [
+                CompressedFinding(
+                    id="finding-conflict",
+                    research_unit_id="unit-1-background",
+                    summary="Sources disagree about whether the entity is listed.",
+                    evidence_ids=["EVID-001", "EVID-002"],
+                    confidence=0.8,
+                )
+            ],
+        }
+    )
+
+    verify_output = await VerifierNode().run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    write_output = await WriterNode().run(
+        verify_output.state,
+        _offline_graph_context(),
+        verify_output,
+    )
+
+    claim = verify_output.state.verified_claims[0]
+    assert claim.support_type == "contradicted"
+    assert claim.evidence_ids == ["EVID-001", "EVID-002"]
+    assert "Sources disagree" in _markdown_section(
+        write_output.final_summary,
+        "Conflicts",
+    )
+    assert "Sources disagree" not in _markdown_section(
+        write_output.final_summary,
+        "Key Findings",
+    )
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_strict_missing_ref_blocks_report():
+    class _BadRefWriter(WriterNode):
+        def _compose_report(self, state):
+            return (
+                "## Answer\nKnown EVID-001; missing EVID-999.",
+                "Known EVID-001; missing EVID-999.",
+            )
+
+    state = build_initial_research_graph(
+        task_id="case-strict-missing-ref-blocks-report",
+        query="Assess strict evidence mode",
+        max_units=1,
+    )
+    state = state.model_copy(
+        update={
+            "phase": ResearchPhase.VERIFY,
+            "evidence": [
+                _offline_evidence("EVID-001", "Primary evidence supports the claim.")
+            ],
+            "verified_claims": [
+                VerifiedClaim(
+                    id="claim-supported",
+                    claim="Primary evidence supports the claim.",
+                    support_type="supported",
+                    evidence_ids=["EVID-001"],
+                    rationale="Collected evidence supports the claim.",
+                    confidence=0.9,
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="research_graph_evidence_strict_block"):
+        await _BadRefWriter().run(
+            state,
+            _offline_graph_context(evidence_strict_mode=EvidenceStrictMode.BLOCK),
+            ResearchGraphNodeOutput(state=state),
+        )
+
+    warn_output = await _BadRefWriter().run(
+        state,
+        _offline_graph_context(evidence_strict_mode=EvidenceStrictMode.WARN),
+        ResearchGraphNodeOutput(state=state),
+    )
+    assert warn_output.artifact_events[0]["payload"]["warning"] == (
+        "unresolved_evidence_refs"
+    )
+    assert warn_output.artifact_events[-1]["type"] == "report_section_generated"
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_langgraph_executor_routes(monkeypatch, tmp_path):
+    _OfflineOrchestrator.task_descriptions = []
+    route_probe = {"langgraph_called": False}
+
+    async def fake_langgraph_executor(**kwargs):
+        route_probe["langgraph_called"] = True
+        return ResearchGraphExecutionResult(
+            state=kwargs["state"],
+            final_summary="langgraph route summary",
+            final_boxed_answer="langgraph route answer",
+            failure_experience_summary=None,
+        )
+
+    async def forbidden_serial_executor(**_kwargs):
+        raise AssertionError("serial executor must not satisfy langgraph route")
+
+    monkeypatch.setattr(pipeline_module, "ClientFactory", _OfflineClientFactory)
+    monkeypatch.setattr(pipeline_module, "Orchestrator", _OfflineOrchestrator)
+    monkeypatch.setattr(pipeline_module, "_load_langgraph_executor", lambda: fake_langgraph_executor)
+    monkeypatch.setattr(pipeline_module, "execute_research_graph", forbidden_serial_executor)
+    stream_queue = _OfflineCaptureQueue()
+
+    result = await pipeline_module.execute_task_pipeline(
+        cfg=_offline_pipeline_cfg(graph_executor="langgraph"),
+        task_id="case-langgraph-executor-routes",
+        task_description="Route through langgraph",
+        task_file_name="",
+        main_agent_tool_manager=_OfflineToolManager(),
+        sub_agent_tool_managers={},
+        output_formatter=object(),
+        log_dir=str(tmp_path),
+        stream_queue=stream_queue,
+    )
+
+    assert route_probe["langgraph_called"] is True
+    assert result[0] == "langgraph route summary"
+    assert result[1] == "langgraph route answer"
+    assert _OfflineOrchestrator.task_descriptions == []
+    assert stream_queue.items[0]["data"]["research_graph_executor"] == "langgraph"
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_scenario_changes_source_policy():
+    state = build_initial_research_graph(
+        task_id="case-scenario-changes-source-policy",
+        query="Assess export control exposure",
+        scenario="sanctions_export_controls",
+        source_policy={"prefer_scenario_sources": True},
+        max_units=1,
+    )
+    output = await LangGraphResearchUnitNode().run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    substeps = output.executor_state["unit_substeps"][0]
+
+    assert state.plan.research_units[0].source_policy.prefer_scenario_sources is True
+    assert substeps["retriever_order"][0] == "page_visit_or_jina_summary"
+    assert output.state.retrieved_sources
+    assert output.state.retrieved_sources[0].source_type == "page_visit_or_jina_summary"
+    assert output.executor_state["legacy_adapter_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_offline_eval_case_snippet_only_cannot_support_claim():
+    state = build_initial_research_graph(
+        task_id="case-snippet-only-cannot-support-claim",
+        query="BYD 1260H listing",
+        max_units=1,
+    )
+    research_output = await LangGraphResearchUnitNode(
+        retriever_names=["web_search"],
+    ).run(
+        state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=state),
+    )
+    candidate = research_output.state.source_candidates[0]
+    candidate_only_state = research_output.state.model_copy(
+        update={
+            "phase": ResearchPhase.COMPRESS,
+            "findings": [
+                CompressedFinding(
+                    id="finding-snippet-only",
+                    research_unit_id="unit-1-background",
+                    summary="Snippet-only candidate suggests possible listing.",
+                    evidence_ids=[candidate.candidate_id],
+                    confidence=0.7,
+                )
+            ],
+        }
+    )
+    verify_output = await VerifierNode().run(
+        candidate_only_state,
+        _offline_graph_context(),
+        ResearchGraphNodeOutput(state=candidate_only_state),
+    )
+
+    assert candidate.source_content_state == "snippet_only"
+    assert not research_output.state.evidence
+    assert verify_output.state.verified_claims[0].support_type == "weak"
+    assert verify_output.state.verified_claims[0].evidence_ids == []
 
 
 def test_offline_eval_restart_recovery_fails_stale_and_preserves_running_terminal(
