@@ -2,6 +2,8 @@ import Foundation
 import Security
 
 enum AppConfiguration {
+    static let allowsInAppPersonalSignup = false
+
     static func apiBaseURL() -> URL {
         if let override = commandLineValue(for: "-LimiraAPIBaseURL"),
            let url = URL(string: override) {
@@ -125,6 +127,9 @@ enum LimiraAPIError: LocalizedError, Equatable {
             "enterprise_cloud_storage_required": "文件能力仅支持企业账号。",
             "enterprise_cloud_storage_quota_exceeded": "企业云文件空间不足。",
             "runner_research_start_failed": "研究任务启动失败。",
+            "runner_task_cancel_failed": "中断任务失败，请稍后重试。",
+            "runner_task_not_found": "任务运行记录不存在。",
+            "runner_task_status_failed": "任务状态刷新失败。",
             "pdf_export_failed": "PDF 导出失败。",
             "task_not_found": "任务不存在或无权访问。",
             "document_not_found": "文件不存在或无权访问。"
@@ -166,11 +171,13 @@ protocol LimiraServicing {
     func signOut() async throws
     func loadScenarios() async throws -> [LimiraScenario]
     func loadTasks(archived: Bool, query: String?) async throws -> [LimiraTask]
+    func loadTask(taskId: String) async throws -> LimiraTask
     func startResearch(query: String, scenario: String?, conversationId: String?, documentIds: [String]) async throws -> LimiraTask
+    func cancelTask(taskId: String) async throws -> LimiraTask
     func archiveHistory(taskId: String) async throws -> LimiraTask
     func restoreHistory(taskId: String) async throws -> LimiraTask
     func deleteHistory(taskId: String) async throws
-    func eventStream(taskId: String) -> AsyncThrowingStream<LimiraStreamEvent, Error>
+    func eventStream(taskId: String, lastEventId: String?) -> AsyncThrowingStream<LimiraStreamEvent, Error>
     func loadArtifacts(taskId: String) async throws -> ArtifactBuckets
     func loadEventLogs(taskId: String) async throws -> EventLogsResponse
     func loadReports(taskId: String) async throws -> [LimiraGeneratedReport]
@@ -273,11 +280,19 @@ final class LimiraAPIClient: LimiraServicing {
         return response.tasks
     }
 
+    func loadTask(taskId: String) async throws -> LimiraTask {
+        try await getJSON("/api/limira/tasks/\(taskId.urlPathEscaped)")
+    }
+
     func startResearch(query: String, scenario: String?, conversationId: String?, documentIds: [String]) async throws -> LimiraTask {
         try await postJSON(
             "/api/limira/research",
             body: ResearchRequest(query: query, scenario: scenario?.nonEmpty, conversationId: conversationId?.nonEmpty, documentIds: documentIds)
         )
+    }
+
+    func cancelTask(taskId: String) async throws -> LimiraTask {
+        try await postJSON("/api/limira/tasks/\(taskId.urlPathEscaped)/cancel", body: EmptyBody())
     }
 
     func archiveHistory(taskId: String) async throws -> LimiraTask {
@@ -292,24 +307,33 @@ final class LimiraAPIClient: LimiraServicing {
         let _: EmptyResponse = try await deleteJSON("/api/limira/tasks/\(taskId.urlPathEscaped)/history")
     }
 
-    func eventStream(taskId: String) -> AsyncThrowingStream<LimiraStreamEvent, Error> {
+    func eventStream(taskId: String, lastEventId: String? = nil) -> AsyncThrowingStream<LimiraStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var request = try makeRequest(path: "/api/limira/tasks/\(taskId.urlPathEscaped)/events", method: "GET")
+                    let queryItems = lastEventId?.nonEmpty.map {
+                        [URLQueryItem(name: "last_event_id", value: $0)]
+                    } ?? []
+                    var request = try makeRequest(path: "/api/limira/tasks/\(taskId.urlPathEscaped)/events", method: "GET", queryItems: queryItems)
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    if let lastEventId = lastEventId?.nonEmpty {
+                        request.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID")
+                    }
                     let (bytes, response) = try await session.bytes(for: request)
                     try validateHTTP(response, data: Data())
                     var dataLines: [String] = []
+                    var eventId: String?
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
                         if line.isEmpty {
-                            emitSSE(dataLines: &dataLines, continuation: continuation)
+                            emitSSE(dataLines: &dataLines, eventId: &eventId, continuation: continuation)
                         } else if line.hasPrefix("data:") {
                             dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+                        } else if line.hasPrefix("id:") {
+                            eventId = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                         }
                     }
-                    emitSSE(dataLines: &dataLines, continuation: continuation)
+                    emitSSE(dataLines: &dataLines, eventId: &eventId, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -547,14 +571,20 @@ final class LimiraAPIClient: LimiraServicing {
         return result
     }
 
-    private func emitSSE(dataLines: inout [String], continuation: AsyncThrowingStream<LimiraStreamEvent, Error>.Continuation) {
+    private func emitSSE(dataLines: inout [String], eventId: inout String?, continuation: AsyncThrowingStream<LimiraStreamEvent, Error>.Continuation) {
         guard !dataLines.isEmpty else { return }
         let data = dataLines.joined(separator: "\n")
         dataLines.removeAll()
         do {
-            continuation.yield(try SSEParser.parseData(data))
+            var event = try SSEParser.parseData(data)
+            event.streamEventId = eventId
+            eventId = nil
+            continuation.yield(event)
         } catch {
-            continuation.yield(LimiraStreamEvent(event: "message", message: data))
+            var event = LimiraStreamEvent(event: "message", message: data)
+            event.streamEventId = eventId
+            eventId = nil
+            continuation.yield(event)
         }
     }
 }

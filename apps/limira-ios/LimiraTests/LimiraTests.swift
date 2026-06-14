@@ -367,11 +367,113 @@ final class LimiraTests: XCTestCase {
 
         await model.selectTask(conversation)
 
-        let statusIndex = try XCTUnwrap(model.messages.firstIndex { $0.text.contains("任务 task-completed") })
+        let userIndex = try XCTUnwrap(model.messages.firstIndex { $0.role == .user && $0.taskId == completed.taskId })
         let reportIndex = try XCTUnwrap(model.messages.firstIndex { $0.isReport && $0.taskId == completed.taskId })
-        XCTAssertGreaterThan(reportIndex, statusIndex)
+        XCTAssertGreaterThan(reportIndex, userIndex)
+        XCTAssertFalse(model.messages.contains { $0.text.contains("任务 task-completed") })
         XCTAssertEqual(model.messages[reportIndex].text, "# Completed conversation report\nThe completed member should render in place.")
         XCTAssertEqual(model.finalReportMarkdown, "# Completed conversation report\nThe completed member should render in place.")
+    }
+
+    @MainActor
+    func testActiveTaskSubmitCancelsInsteadOfPostingSecondResearch() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        let task = try await service.startResearch(query: "first", scenario: nil, conversationId: nil, documentIds: [])
+        model.selectedTask = task
+        model.activeTaskId = task.taskId
+        model.status = "running"
+        model.queryDraft = "second"
+
+        await model.submitResearch()
+
+        XCTAssertEqual(service.startResearchCallCount, 1)
+        XCTAssertEqual(service.cancelTaskCallCount, 1)
+        XCTAssertEqual(model.queryDraft, "second")
+        XCTAssertFalse(model.messages.contains { $0.role == .user && $0.text == "second" })
+    }
+
+    @MainActor
+    func testSubmitResearchBindsLatestUserMessageToNewTask() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        service.mockStreamEvents = []
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        model.queryDraft = "fresh research"
+
+        await model.submitResearch()
+
+        XCTAssertEqual(service.startResearchCallCount, 1)
+        let userMessage = try XCTUnwrap(model.messages.first { $0.role == .user && $0.text == "fresh research" })
+        let taskId = try XCTUnwrap(model.selectedTask?.taskId)
+        XCTAssertEqual(userMessage.taskId, taskId)
+    }
+
+    @MainActor
+    func testStatusAndArchiveEventsDoNotEnterChatMessages() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        let task = try await service.startResearch(query: "status hygiene", scenario: nil, conversationId: nil, documentIds: [])
+        model.selectedTask = task
+        model.activeTaskId = task.taskId
+        model.status = "running"
+        model.messages = [AppMessage(role: .user, text: "status hygiene", taskId: task.taskId)]
+
+        model.handleStreamEvent(
+            LimiraStreamEvent(
+                event: "archive_generated",
+                status: "running",
+                data: [
+                    "archive_status": .string("ready"),
+                    "archive_url": .string("/api/limira/tasks/\(task.taskId)/archive.zip")
+                ]
+            )
+        )
+        model.handleStreamEvent(
+            LimiraStreamEvent(
+                event: "status",
+                status: "completed",
+                data: [
+                    "status": .string("completed"),
+                    "archive_status": .string("ready"),
+                    "terminal": .bool(true)
+                ]
+            )
+        )
+        model.handleStreamEvent(
+            LimiraStreamEvent(
+                event: "message",
+                message: #"{"task_id":"\#(task.taskId)","type":"archive_generated","payload":{"archive_status":"ready"}}"#
+            )
+        )
+
+        XCTAssertEqual(model.messages.count, 1)
+        XCTAssertTrue(model.thinkingSteps.contains { $0.kind == "archive" })
+        XCTAssertFalse(model.messages.contains { $0.text.contains("{\"task_id\"") || $0.text.contains("archive_generated") })
+    }
+
+    @MainActor
+    func testEventStreamReconnectUsesLastEventId() async throws {
+        let service = MockLimiraService()
+        service.mockReportSectionsEnabled = false
+        var event = LimiraStreamEvent(event: "evidence_collected", status: "running", data: ["message": .string("first source")])
+        event.streamEventId = "event-1"
+        service.mockStreamEvents = [event]
+        let model = AppViewModel(service: service, voiceRecorder: MockVoiceRecorder())
+        let task = try await service.startResearch(query: "resume stream", scenario: nil, conversationId: nil, documentIds: [])
+        model.selectedTask = task
+        model.activeTaskId = task.taskId
+        model.status = "running"
+
+        model.connectStream(taskId: task.taskId)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        model.connectStream(taskId: task.taskId)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(service.lastStreamLastEventId, "event-1")
+        XCTAssertTrue(model.thinkingSteps.contains { $0.detail.contains("first source") })
     }
 
     func testResearchArtifactEvidenceSourceURLHelpers() {

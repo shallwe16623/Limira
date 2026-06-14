@@ -1307,8 +1307,10 @@ async def _limira_event_stream(
     runtime_state: LimiraRuntimeState,
     object_storage: Any = None,
     pdf_exporter: Any = None,
+    last_event_id: str | None = None,
 ) -> AsyncIterator[bytes]:
     completion_assets_generated = False
+    _ = last_event_id
 
     async def completion_asset_events() -> list[dict[str, Any]]:
         nonlocal completion_assets_generated

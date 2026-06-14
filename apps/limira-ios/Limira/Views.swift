@@ -371,27 +371,42 @@ private struct PersonalAuthTools: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            DisclosureGroup("注册") {
-                VStack(spacing: 12) {
-                    TextField("用户名", text: $signupUsername)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .modifier(AuthInputModifier())
-                    TextField("邮箱", text: $signupEmail)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.emailAddress)
-                        .autocorrectionDisabled()
-                        .modifier(AuthInputModifier())
-                    TextField("姓名", text: $signupName)
-                        .modifier(AuthInputModifier())
-                    Button("注册") {
-                        Task {
-                            await model.signUp(username: signupUsername, email: signupEmail, password: password, name: signupName)
+            if AppConfiguration.allowsInAppPersonalSignup {
+                DisclosureGroup("注册") {
+                    VStack(spacing: 12) {
+                        TextField("用户名", text: $signupUsername)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .modifier(AuthInputModifier())
+                        TextField("邮箱", text: $signupEmail)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.emailAddress)
+                            .autocorrectionDisabled()
+                            .modifier(AuthInputModifier())
+                        TextField("姓名", text: $signupName)
+                            .modifier(AuthInputModifier())
+                        Button("注册") {
+                            Task {
+                                await model.signUp(username: signupUsername, email: signupEmail, password: password, name: signupName)
+                            }
                         }
+                        .buttonStyle(AuthSecondaryButtonStyle())
+                    }
+                    .padding(.top, 12)
+                }
+            } else {
+                VStack(spacing: 10) {
+                    Text("个人账号暂不在 iOS 端开放注册。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Link(destination: URL(string: "mailto:admin@limira-inc.com?subject=Limira%20iOS%20账号开通")!) {
+                        Label("联系团队开通账号", systemImage: "envelope")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(AuthSecondaryButtonStyle())
+                    .accessibilityIdentifier("PersonalSignupContactButton")
                 }
-                .padding(.top, 12)
             }
 
             DisclosureGroup("邮箱与密码") {
@@ -1171,8 +1186,8 @@ struct CompactConversationCanvas: View {
                 }
             } else if hasConversationActivity {
                 CompactMessageTimeline()
-                if model.isStreaming || model.status != "ready" {
-                    CompactThinkingStatus()
+                if !model.thinkingSteps.isEmpty || model.isStreaming || model.status != "ready" {
+                    CompactThinkingStepsView()
                 }
                 if let file = model.downloadedFile {
                     DownloadPanel(file: file, previewURL: $previewURL)
@@ -1192,6 +1207,7 @@ struct CompactConversationCanvas: View {
             || model.status != "ready"
             || model.isBusy
             || model.isStreaming
+            || !model.thinkingSteps.isEmpty
             || !model.finalReportMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -1879,6 +1895,77 @@ struct CompactThinkingStatus: View {
     }
 }
 
+struct CompactThinkingStepsView: View {
+    @EnvironmentObject private var model: AppViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CompactThinkingStatus()
+            if !model.thinkingSteps.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(model.thinkingSteps.suffix(10)) { step in
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: iconName(for: step))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(tint(for: step))
+                                .frame(width: 18, alignment: .center)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(step.title)
+                                    .font(.subheadline.weight(.semibold))
+                                if !step.detail.isEmpty {
+                                    Text(step.detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(3)
+                                }
+                                if !step.meta.isEmpty {
+                                    Text(step.meta)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.leading, 2)
+                .accessibilityIdentifier("CompactThinkingSteps")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func iconName(for step: TaskProgressStep) -> String {
+        switch step.kind {
+        case "error":
+            return "exclamationmark.triangle.fill"
+        case "warning":
+            return "exclamationmark.circle"
+        case "done", "archive", "report":
+            return "checkmark.circle.fill"
+        case "tool":
+            return "wrench.and.screwdriver"
+        case "artifact":
+            return "sparkles"
+        default:
+            return step.status == "done" ? "checkmark.circle" : "circle.dotted"
+        }
+    }
+
+    private func tint(for step: TaskProgressStep) -> Color {
+        switch step.status {
+        case "error":
+            return .red
+        case "warning":
+            return .orange
+        case "done":
+            return .green
+        default:
+            return .secondary
+        }
+    }
+}
+
 struct CompactComposer: View {
     @EnvironmentObject private var model: AppViewModel
     @FocusState private var focused: Bool
@@ -1942,7 +2029,7 @@ struct CompactComposer: View {
 
                 ZStack(alignment: .topLeading) {
                     if model.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("发送消息以开始 OSINT 研究...")
+                        Text(model.isCancellingTask ? "正在中断当前研究任务..." : (model.isComposerStopMode ? "研究任务正在运行，可点击右侧按钮中断。" : "发送消息以开始 OSINT 研究..."))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 5)
                             .padding(.top, 10)
@@ -1964,14 +2051,22 @@ struct CompactComposer: View {
                     focused = false
                     Task { await model.submitResearch() }
                 } label: {
-                    Image(systemName: "arrow.up")
+                    Image(systemName: model.isComposerStopMode ? "stop.fill" : "arrow.up")
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white)
                         .frame(width: 42, height: 42)
-                        .background(Circle().fill(sendButtonColor))
+                        .background {
+                            if model.isComposerStopMode {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(sendButtonColor)
+                            } else {
+                                Circle()
+                                    .fill(sendButtonColor)
+                            }
+                        }
                 }
                 .disabled(sendDisabled)
-                .accessibilityLabel("发送")
+                .accessibilityLabel(model.isCancellingTask ? "正在中断" : (model.isComposerStopMode ? "中断当前任务" : "发送"))
                 .accessibilityIdentifier("SubmitResearchButton")
             }
             .padding(.horizontal, 10)
@@ -2009,11 +2104,17 @@ struct CompactComposer: View {
     }
 
     private var sendDisabled: Bool {
-        model.isBusy || model.isVoiceTranscribing || model.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if model.isComposerStopMode {
+            return model.isCancellingTask || model.selectedTask == nil
+        }
+        return model.isBusy || model.isVoiceTranscribing || model.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var sendButtonColor: Color {
-        sendDisabled ? Color(.systemGray3) : .black
+        if model.isComposerStopMode {
+            return sendDisabled ? Color(.systemGray3) : .black
+        }
+        return sendDisabled ? Color(.systemGray3) : .black
     }
 }
 
@@ -3294,6 +3395,7 @@ struct EvidenceArtifactList: View {
 }
 
 struct EvidenceArtifactCard: View {
+    @EnvironmentObject private var model: AppViewModel
     var item: ResearchArtifact
     var fallbackIndex: Int
     var open: (URL) -> Void
@@ -3340,9 +3442,15 @@ struct EvidenceArtifactCard: View {
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier("EvidenceOpenSourceButton")
             } else {
-                Text("未提供来源链接")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Button {
+                    model.statusMessage = "该证据没有可打开链接。"
+                } label: {
+                    Label("未提供来源链接", systemImage: "link.badge.plus")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("EvidenceMissingSourceButton")
             }
         }
         .padding(.vertical, 10)

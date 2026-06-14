@@ -393,12 +393,20 @@ final class AppViewModel: ObservableObject {
     @Published var finalReportMarkdown = ""
     @Published var isBusy = false
     @Published var isStreaming = false
+    @Published var isSubmittingResearch = false
+    @Published var isCancellingTask = false
+    @Published var isRefreshingActiveTask = false
+    @Published var activeTaskId: String?
+    @Published var thinkingSteps: [TaskProgressStep] = []
+    @Published var thinkingStepsByTaskId: [String: [TaskProgressStep]] = [:]
     @Published var statusMessage = ""
     @Published var downloadedFile: DownloadedFile?
 
     let service: LimiraServicing
     private let voiceRecorder: VoiceRecording
     private var streamTask: Task<Void, Never>?
+    private var activeTaskRefreshTask: Task<Void, Never>?
+    private var lastEventIdByTaskId: [String: String] = [:]
 
     private let terminalStatuses: Set<String> = ["completed", "failed", "cancelled"]
     private let artifactEvents: Set<String> = [
@@ -436,6 +444,7 @@ final class AppViewModel: ObservableObject {
 
     deinit {
         streamTask?.cancel()
+        activeTaskRefreshTask?.cancel()
     }
 
     var compactRoute: CompactWorkspaceRoute {
@@ -444,6 +453,17 @@ final class AppViewModel: ObservableObject {
 
     var compactShowingArtifacts: Bool {
         compactPresentation.isShowingArtifacts
+    }
+
+    var isTaskExecutionActive: Bool {
+        guard selectedTask != nil || activeTaskId != nil else { return false }
+        let normalized = normalizedTaskStatus(status)
+        return !terminalStatuses.contains(normalized)
+            && normalized != "ready"
+    }
+
+    var isComposerStopMode: Bool {
+        isTaskExecutionActive || isSubmittingResearch || isCancellingTask
     }
 
     var selectedArtifactTaskId: String? {
@@ -565,10 +585,12 @@ final class AppViewModel: ObservableObject {
 
     func signOut() async {
         streamTask?.cancel()
+        activeTaskRefreshTask?.cancel()
         await runBusy {
             try await service.signOut()
             user = nil
             selectedTask = nil
+            activeTaskId = nil
             tasks = []
             archivedTasks = []
             messages = []
@@ -576,8 +598,16 @@ final class AppViewModel: ObservableObject {
             uploads = []
             cloudFiles = []
             reports = []
+            eventLogs = []
+            thinkingSteps = []
+            thinkingStepsByTaskId = [:]
+            lastEventIdByTaskId = [:]
             status = "ready"
             archiveStatus = "pending"
+            isStreaming = false
+            isSubmittingResearch = false
+            isCancellingTask = false
+            isRefreshingActiveTask = false
             compactPresentation.resetToWorkspace()
             selectedDocumentIds = []
             queryDraft = ""
@@ -732,13 +762,16 @@ final class AppViewModel: ObservableObject {
     func startNewChat() async {
         streamTask?.cancel()
         streamTask = nil
+        stopActiveTaskRefresh()
         compactPresentation.resetToWorkspace()
         selectedTask = nil
+        activeTaskId = nil
         messages = []
         artifacts = ArtifactBuckets()
         uploads = []
         reports = []
         eventLogs = []
+        thinkingSteps = []
         finalReportMarkdown = ""
         downloadedFile = nil
         selectedDocumentIds = []
@@ -746,53 +779,183 @@ final class AppViewModel: ObservableObject {
         status = "ready"
         archiveStatus = "pending"
         isStreaming = false
+        isSubmittingResearch = false
+        isCancellingTask = false
         await loadCloudFiles()
     }
 
     func submitResearch() async {
+        if isTaskExecutionActive || isCancellingTask {
+            await cancelCurrentTask()
+            return
+        }
+        guard !isSubmittingResearch else { return }
         let query = queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
         let scenario = selectedScenarioId.nonEmpty
         let conversationId = selectedTask?.conversationId ?? selectedTask?.taskId
         let documentIds = Array(selectedDocumentIds)
-        messages.append(AppMessage(role: .user, text: query, taskId: selectedTask?.taskId))
+        messages.append(AppMessage(role: .user, text: query, taskId: nil))
         queryDraft = ""
+        isSubmittingResearch = true
+        isBusy = true
         status = "starting"
         archiveStatus = "pending"
+        activeTaskId = nil
         finalReportMarkdown = ""
         artifacts = ArtifactBuckets()
         reports = []
+        eventLogs = []
+        thinkingSteps = []
+        addThinkingStep(
+            kind: "planning",
+            title: "拆解研究任务",
+            detail: "围绕“\(truncate(query, limit: 140))”识别核心问题、证据需求和最终报告结构。",
+            status: "active",
+            meta: documentIds.isEmpty ? "" : "已附加 \(documentIds.count) 个文件"
+        )
+        addThinkingStep(
+            kind: "planning",
+            title: "制定信息路线",
+            detail: "优先查找权威机构、公开数据、研究报告和可核验网页，再进行交叉验证、实体抽取、时间线整理和报告归纳。",
+            status: "active"
+        )
 
-        await runBusy {
+        do {
             let task = try await service.startResearch(query: query, scenario: scenario, conversationId: conversationId, documentIds: documentIds)
             selectedTask = task
-            status = task.status
+            activeTaskId = task.taskId
+            status = task.status.nonEmpty ?? "queued"
             archiveStatus = task.archiveStatus ?? "pending"
             selectedArtifactTaskId = task.taskId
-            messages.append(AppMessage(role: .assistant, text: "研究任务已创建：\(task.taskId)", taskId: task.taskId))
+            assignLatestUserMessageTaskId(task.taskId)
+            completeActiveThinkingSteps()
+            addThinkingStep(
+                kind: "status",
+                title: "研究任务已创建",
+                detail: "任务 \(task.taskId) 已进入\(taskStatusLabel(status))状态，正在连接实时进度并沉淀结构化成果。",
+                status: "active"
+            )
             remember(task)
             connectStream(taskId: task.taskId)
+            ensureActiveTaskRefresh()
             await loadArtifacts()
             await loadUploads()
             await loadTasks()
+        } catch {
+            status = "failed"
+            statusMessage = displayError(error)
+            completeActiveThinkingSteps()
+            addThinkingStep(kind: "error", title: "任务启动失败", detail: statusMessage, status: "error")
+            messages.append(AppMessage(role: .error, text: statusMessage))
+        }
+        isSubmittingResearch = false
+        isBusy = false
+        ensureActiveTaskRefresh()
+    }
+
+    func cancelCurrentTask() async {
+        guard let taskId = activeTaskId ?? selectedTask?.taskId,
+              isTaskExecutionActive,
+              !isCancellingTask else {
+            return
+        }
+        isCancellingTask = true
+        addThinkingStep(kind: "status", title: "正在中断任务", detail: "已向服务器发送中断请求。", status: "active")
+        do {
+            let task = try await service.cancelTask(taskId: taskId)
+            selectedTask = task
+            activeTaskId = task.taskId
+            status = task.status
+            archiveStatus = task.archiveStatus ?? archiveStatus
+            remember(task)
+            if terminalStatuses.contains(normalizedTaskStatus(task.status)) {
+                completeActiveThinkingSteps()
+                addThinkingStep(kind: "done", title: "任务已中断", detail: "服务器已确认停止当前任务。", status: "done")
+                streamTask?.cancel()
+                streamTask = nil
+                isStreaming = false
+                stopActiveTaskRefresh()
+            } else {
+                addThinkingStep(kind: "status", title: "中断请求已送达", detail: "任务正在等待 runner 停止当前执行步骤。", status: "active")
+                ensureActiveTaskRefresh()
+            }
+            await loadTaskProgressRecords(taskId: task.taskId)
+            await refreshActiveTaskSnapshot()
+            await loadArtifacts()
+            await loadTasks()
+        } catch {
+            statusMessage = displayError(error)
+            addThinkingStep(kind: "error", title: "中断请求失败", detail: statusMessage, status: "error")
+            messages.append(AppMessage(role: .error, text: "中断任务失败：\(statusMessage)"))
+        }
+        isCancellingTask = false
+        ensureActiveTaskRefresh()
+    }
+
+    func refreshActiveTaskSnapshot() async {
+        guard let taskId = activeTaskId ?? selectedTask?.taskId,
+              isTaskExecutionActive,
+              !isRefreshingActiveTask else {
+            ensureActiveTaskRefresh()
+            return
+        }
+        isRefreshingActiveTask = true
+        defer {
+            isRefreshingActiveTask = false
+            ensureActiveTaskRefresh()
+        }
+        do {
+            await loadTaskProgressRecords(taskId: taskId)
+            let task = try await service.loadTask(taskId: taskId)
+            selectedTask = task
+            activeTaskId = task.taskId
+            status = task.status
+            archiveStatus = task.archiveStatus ?? archiveStatus
+            remember(task)
+            if terminalStatuses.contains(normalizedTaskStatus(task.status)) {
+                completeActiveThinkingSteps()
+                addThinkingStep(
+                    kind: task.status == "cancelled" ? "done" : "status",
+                    title: taskStatusLabel(task.status),
+                    detail: task.status == "completed" ? "任务已完成，正在恢复最终成果。" : "",
+                    status: task.status == "failed" ? "error" : "done"
+                )
+                streamTask?.cancel()
+                streamTask = nil
+                isStreaming = false
+                stopActiveTaskRefresh()
+                await loadArtifacts()
+                await loadReports()
+                await loadUploads()
+                await loadTasks()
+            }
+        } catch {
+            // EventSource remains the primary live path; polling is only a recovery path.
         }
     }
 
     func selectTask(_ task: LimiraTask) async {
+        streamTask?.cancel()
+        streamTask = nil
+        stopActiveTaskRefresh()
         compactPresentation.resetToWorkspace()
         selectedTask = task
+        activeTaskId = terminalStatuses.contains(normalizedTaskStatus(task.status)) ? nil : task.taskId
         selectedArtifactTaskId = task.taskId
         status = task.status
         archiveStatus = task.archiveStatus ?? "pending"
         finalReportMarkdown = ""
         artifacts = ArtifactBuckets()
         eventLogs = []
+        thinkingSteps = taskThinkingSteps(task.taskId)
         messages = conversationMessages(from: task)
         await hydrateConversationHistory(for: task)
         await loadUploads()
         await loadReports()
-        if !terminalStatuses.contains(task.status) {
+        if !terminalStatuses.contains(normalizedTaskStatus(task.status)) {
             connectStream(taskId: task.taskId)
+            ensureActiveTaskRefresh()
         }
     }
 
@@ -835,10 +998,12 @@ final class AppViewModel: ObservableObject {
 
     func connectStream(taskId: String) {
         streamTask?.cancel()
+        activeTaskId = taskId
         isStreaming = true
         streamTask = Task {
             do {
-                for try await event in service.eventStream(taskId: taskId) {
+                let lastEventId = await MainActor.run { self.lastEventIdByTaskId[taskId] }
+                for try await event in service.eventStream(taskId: taskId, lastEventId: lastEventId) {
                     if Task.isCancelled { return }
                     await MainActor.run {
                         handleStreamEvent(event)
@@ -848,7 +1013,13 @@ final class AppViewModel: ObservableObject {
                 await MainActor.run {
                     if !terminalStatuses.contains(status) {
                         status = "stream reconnecting"
-                        statusMessage = displayError(error)
+                        addThinkingStep(
+                            kind: "status",
+                            title: "实时连接正在恢复",
+                            detail: "后台任务仍会继续执行，正在通过历史事件和任务快照恢复进度。",
+                            status: "active"
+                        )
+                        ensureActiveTaskRefresh()
                     }
                     isStreaming = false
                 }
@@ -857,9 +1028,13 @@ final class AppViewModel: ObservableObject {
     }
 
     func handleStreamEvent(_ event: LimiraStreamEvent) {
+        if let streamEventId = event.streamEventId?.nonEmpty,
+           let taskId = activeTaskId ?? selectedTask?.taskId {
+            lastEventIdByTaskId[taskId] = streamEventId
+        }
         let normalizedEvent = normalizedStreamEvent(event)
         if let publicStatus = event.publicStatus ?? normalizedEvent.status {
-            status = publicStatus
+            status = normalizedTaskStatus(publicStatus)
         }
         if let archive = event.raw["archive_status"]?.stringValue
             ?? event.data?.string("archive_status")
@@ -873,32 +1048,53 @@ final class AppViewModel: ObservableObject {
             break
         case "tool_call":
             handleToolCall(event, eventData: normalizedEvent.data)
+        case "archive_generated":
+            archiveStatus = normalizedEvent.data.string("archive_status") ?? archiveStatus
+            addThinkingStep(kind: "archive", title: "任务归档已生成", detail: "报告、证据和运行材料已打包，可在归档入口下载。", status: "done")
+            Task { await loadUploads() }
+        case "completion_asset_warning":
+            addThinkingStep(kind: "warning", title: "部分导出材料生成失败", detail: "任务主体已完成，但部分归档材料需要稍后重试。", status: "warning")
+            messages.append(AppMessage(role: .error, text: "任务已完成，但部分导出文件生成失败，请稍后重试下载。", taskId: selectedTask?.taskId))
         case "error":
             status = "failed"
+            completeActiveThinkingSteps()
+            addThinkingStep(kind: "error", title: "任务执行失败", detail: event.displayText, status: "error")
             messages.append(AppMessage(role: .error, text: event.displayText, taskId: selectedTask?.taskId))
         case "end_of_workflow":
             status = "completed"
+            completeActiveThinkingSteps()
             if !upsertReportMessageFromEventData(normalizedEvent.data, taskId: selectedTask?.taskId) {
-                messages.append(AppMessage(role: .assistant, text: "工作流已完成。", taskId: selectedTask?.taskId))
+                addThinkingStep(kind: "done", title: "工作流已完成", detail: artifactThinkingSummary(), status: "done")
             }
         case let value where value.hasPrefix("start_of_"):
-            messages.append(AppMessage(role: .assistant, text: startMessage(for: value, event: event), taskId: selectedTask?.taskId))
+            addThinkingStep(thinkingStepForStartEvent(value, eventData: normalizedEvent.data, event: event))
         case let value where artifactEvents.contains(value):
-            messages.append(AppMessage(role: .assistant, text: "\(eventLabel(value))：研究成果已更新。", taskId: selectedTask?.taskId))
+            addThinkingStep(thinkingStepForArtifactEvent(value, eventData: normalizedEvent.data))
             Task { await loadArtifacts() }
+        case let value where shouldSuppressStatusEvent(value, eventData: normalizedEvent.data, event: event):
+            break
         default:
-            messages.append(AppMessage(role: .assistant, text: "\(eventLabel(normalizedEvent.eventType))：\(event.displayText)", taskId: selectedTask?.taskId))
+            addThinkingStep(
+                kind: "status",
+                title: eventLabel(normalizedEvent.eventType),
+                detail: truncate(event.displayText, limit: 260),
+                status: terminalStatuses.contains(normalizedTaskStatus(status)) ? "done" : "active"
+            )
         }
 
-        if terminalStatuses.contains(status) {
+        if terminalStatuses.contains(normalizedTaskStatus(status)) {
             isStreaming = false
             streamTask?.cancel()
+            streamTask = nil
+            stopActiveTaskRefresh()
             Task {
                 await loadArtifacts()
                 await loadReports()
                 await loadUploads()
                 await loadTasks()
             }
+        } else {
+            ensureActiveTaskRefresh()
         }
     }
 
@@ -1237,10 +1433,143 @@ final class AppViewModel: ObservableObject {
            let report = reportMarkdown(fromEventValue: .object(input)) {
             finalReportMarkdown = report
             upsertReportMessage(report, taskId: selectedTask?.taskId, artifacts: artifacts, insertAfterTaskId: selectedTask?.taskId)
+            addThinkingStep(kind: "report", title: "最终报告已生成", detail: "报告内容已写入对话，后续归档会一并打包保存。", status: "done")
             return
         }
         let target = toolInput(from: data)?.string("url").map { " · \($0)" } ?? ""
-        messages.append(AppMessage(role: .assistant, text: "调用工具：\(toolName)\(target)", taskId: selectedTask?.taskId))
+        addThinkingStep(kind: "tool", title: "调用工具：\(toolName)", detail: target.trimmingCharacters(in: .whitespacesAndNewlines), status: "active")
+    }
+
+    private func loadTaskProgressRecords(taskId: String) async {
+        do {
+            let logs = try await service.loadEventLogs(taskId: taskId).events
+            if selectedTask?.taskId == taskId {
+                eventLogs = logs
+            }
+            let rebuilt = thinkingSteps(from: logs, taskId: taskId)
+            if !rebuilt.isEmpty {
+                thinkingSteps = rebuilt
+                rememberThinkingSteps(taskId: taskId)
+            }
+            if let report = reportMarkdown(fromEventLogs: logs) {
+                if selectedTask?.taskId == taskId {
+                    finalReportMarkdown = report
+                }
+                upsertReportMessage(report, taskId: taskId, artifacts: artifacts, insertAfterTaskId: taskId)
+            }
+        } catch {
+            if selectedTask?.taskId == taskId {
+                eventLogs = []
+            }
+        }
+    }
+
+    private func ensureActiveTaskRefresh() {
+        guard isTaskExecutionActive else {
+            stopActiveTaskRefresh()
+            return
+        }
+        guard activeTaskRefreshTask == nil else { return }
+        activeTaskRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                if Task.isCancelled { return }
+                await self?.refreshActiveTaskSnapshot()
+            }
+        }
+    }
+
+    private func stopActiveTaskRefresh() {
+        activeTaskRefreshTask?.cancel()
+        activeTaskRefreshTask = nil
+    }
+
+    private func assignLatestUserMessageTaskId(_ taskId: String) {
+        guard let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        messages[index].taskId = taskId
+    }
+
+    private func addThinkingStep(kind: String, title: String, detail: String = "", status: String = "active", meta: String = "") {
+        addThinkingStep(TaskProgressStep(kind: kind, title: title, detail: detail, status: status, meta: meta))
+    }
+
+    private func addThinkingStep(_ step: TaskProgressStep) {
+        let normalizedTitle = step.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedTitle.isEmpty else { return }
+        var next = thinkingSteps.filter { $0.kind != "ready" }
+        if next.contains(where: { $0.signature == step.signature }) {
+            return
+        }
+        next.append(step)
+        thinkingSteps = Array(next.suffix(80))
+        if let taskId = activeTaskId ?? selectedTask?.taskId {
+            rememberThinkingSteps(taskId: taskId)
+        }
+    }
+
+    private func completeActiveThinkingSteps() {
+        thinkingSteps = thinkingSteps.map { step in
+            var updated = step
+            if updated.status == "active" {
+                updated.status = "done"
+            }
+            return updated
+        }
+        if let taskId = activeTaskId ?? selectedTask?.taskId {
+            rememberThinkingSteps(taskId: taskId)
+        }
+    }
+
+    private func rememberThinkingSteps(taskId: String) {
+        thinkingStepsByTaskId[taskId] = Array(thinkingSteps.suffix(80))
+    }
+
+    private func taskThinkingSteps(_ taskId: String) -> [TaskProgressStep] {
+        thinkingStepsByTaskId[taskId] ?? []
+    }
+
+    private func thinkingSteps(from logs: [[String: JSONValue]], taskId: String) -> [TaskProgressStep] {
+        var steps: [TaskProgressStep] = []
+        if let query = taskRecord(for: taskId)?.query.nonEmpty {
+            steps.append(TaskProgressStep(kind: "planning", title: "研究问题", detail: query, status: "done"))
+        }
+        for rawEvent in logs {
+            let event = streamEvent(from: rawEvent)
+            let normalized = normalizedStreamEvent(event)
+            if let step = thinkingStepForProgressEvent(event, normalized: normalized) {
+                if !steps.contains(where: { $0.signature == step.signature }) {
+                    steps.append(step)
+                }
+            }
+        }
+        return Array(steps.suffix(80))
+    }
+
+    private func thinkingStepForProgressEvent(_ event: LimiraStreamEvent, normalized: NormalizedStreamEvent) -> TaskProgressStep? {
+        switch normalized.eventType {
+        case "heartbeat":
+            return nil
+        case "tool_call":
+            let toolName = normalized.data.string("tool_name", "toolName", "tool", "name") ?? "tool"
+            if toolName == "show_text" {
+                return TaskProgressStep(kind: "report", title: "最终报告已生成", detail: "报告内容已写入对话。", status: "done")
+            }
+            return TaskProgressStep(kind: "tool", title: "调用工具：\(toolName)", detail: toolInput(from: normalized.data)?.string("url") ?? "", status: "done")
+        case "archive_generated":
+            return TaskProgressStep(kind: "archive", title: "任务归档已生成", detail: "报告、证据和运行材料已打包。", status: "done")
+        case "completion_asset_warning":
+            return TaskProgressStep(kind: "warning", title: "部分导出材料生成失败", detail: "任务主体已完成，但部分归档材料需要稍后重试。", status: "warning")
+        case "end_of_workflow":
+            return TaskProgressStep(kind: "done", title: "工作流已完成", detail: artifactThinkingSummary(), status: "done")
+        case let value where value.hasPrefix("start_of_"):
+            return thinkingStepForStartEvent(value, eventData: normalized.data, event: event)
+        case let value where artifactEvents.contains(value):
+            return thinkingStepForArtifactEvent(value, eventData: normalized.data)
+        case let value where shouldSuppressStatusEvent(value, eventData: normalized.data, event: event):
+            return nil
+        default:
+            return TaskProgressStep(kind: "status", title: eventLabel(normalized.eventType), detail: truncate(event.displayText, limit: 260), status: "done")
+        }
     }
 
     private struct NormalizedStreamEvent {
@@ -1384,8 +1713,75 @@ final class AppViewModel: ObservableObject {
         return eventLabel(eventType)
     }
 
+    private func thinkingStepForStartEvent(_ eventType: String, eventData: [String: JSONValue], event: LimiraStreamEvent) -> TaskProgressStep {
+        switch eventType {
+        case "start_of_workflow":
+            return TaskProgressStep(kind: "workflow", title: "工作流已启动", detail: "正在执行研究任务。", status: "active")
+        case "start_of_agent":
+            let name = eventData.string("agent_name", "display_name", "name") ?? event.data?.string("agent_name", "display_name") ?? "agent"
+            return TaskProgressStep(kind: "agent", title: "智能体已启动", detail: name, status: "active")
+        case "start_of_llm":
+            let name = eventData.string("agent_name", "model", "name") ?? "模型步骤"
+            return TaskProgressStep(kind: "model", title: "模型步骤已启动", detail: name, status: "active")
+        default:
+            return TaskProgressStep(kind: "status", title: eventLabel(eventType), detail: truncate(event.displayText, limit: 180), status: "active")
+        }
+    }
+
+    private func thinkingStepForArtifactEvent(_ eventType: String, eventData: [String: JSONValue]) -> TaskProgressStep {
+        let label = eventLabel(eventType)
+        let detail = eventData.string("message", "summary", "title", "name") ?? "研究成果已更新。"
+        return TaskProgressStep(kind: "artifact", title: "\(label)已更新", detail: truncate(detail, limit: 220), status: "active")
+    }
+
+    private func shouldSuppressStatusEvent(_ eventType: String, eventData: [String: JSONValue], event: LimiraStreamEvent) -> Bool {
+        if eventType == "status" || eventType == "task_update" {
+            let payload = event.raw
+            let hasOnlyStatusLikeKeys = Set(payload.keys).isSubset(of: ["event", "event_type", "eventName", "event_name", "type", "status", "archive_status", "terminal", "task_id", "payload", "data"])
+            let nestedKeys = Set(eventData.keys)
+            return hasOnlyStatusLikeKeys || nestedKeys.isSubset(of: ["status", "archive_status", "terminal", "task_id"])
+        }
+        if eventType == "message", event.displayText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{\"task_id\"") {
+            return true
+        }
+        return false
+    }
+
+    private func artifactThinkingSummary() -> String {
+        let counts = compactArtifactTabs()
+            .map { "\($0.rawValue) \(artifactCount(for: $0))" }
+            .joined(separator: "，")
+        return counts.isEmpty ? "研究成果已更新。" : counts
+    }
+
+    private func taskStatusLabel(_ value: String) -> String {
+        [
+            "starting": "启动中",
+            "queued": "排队中",
+            "running": "运行中",
+            "stream reconnecting": "重连中",
+            "completed": "已完成",
+            "failed": "失败",
+            "cancelled": "已取消"
+        ][normalizedTaskStatus(value)] ?? value
+    }
+
+    private func normalizedTaskStatus(_ value: String) -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "canceled" ? "cancelled" : normalized
+    }
+
+    private func truncate(_ value: String, limit: Int) -> String {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count > limit else { return text }
+        let index = text.index(text.startIndex, offsetBy: limit)
+        return String(text[..<index]) + "..."
+    }
+
     private func eventLabel(_ eventType: String) -> String {
         [
+            "task_update": "任务状态",
+            "status": "任务状态",
             "evidence_collected": "证据",
             "entity_extracted": "实体",
             "relation_extracted": "关系",
@@ -1398,11 +1794,8 @@ final class AppViewModel: ObservableObject {
     }
 
     private func conversationMessages(from task: LimiraTask) -> [AppMessage] {
-        conversationMembers(for: task).flatMap { member in
-            [
-                AppMessage(role: .user, text: member.query, taskId: member.taskId),
-                AppMessage(role: .assistant, text: "任务 \(member.taskId)：\(member.status)", taskId: member.taskId)
-            ]
+        conversationMembers(for: task).map { member in
+            AppMessage(role: .user, text: member.query, taskId: member.taskId)
         }
     }
 
@@ -1564,14 +1957,7 @@ final class AVVoiceRecorder: NSObject, VoiceRecording {
     }
 
     private func requestPermission() async -> Bool {
-        if #available(iOS 17.0, *) {
-            return await AVAudioApplication.requestRecordPermission()
-        }
-        return await withCheckedContinuation { continuation in
-            AVAudioSession.sharedInstance().requestRecordPermission { granted in
-                continuation.resume(returning: granted)
-            }
-        }
+        await AVAudioApplication.requestRecordPermission()
     }
 }
 
@@ -1595,6 +1981,11 @@ final class MockLimiraService: LimiraServicing {
     var mockEventLogs: [[String: JSONValue]] = [["event": .string("mock")]]
     var mockEventLogsByTaskId: [String: [[String: JSONValue]]] = [:]
     var mockArtifactsByTaskId: [String: ArtifactBuckets] = [:]
+    var mockStreamEvents: [LimiraStreamEvent]?
+    var startResearchCallCount = 0
+    var cancelTaskCallCount = 0
+    var loadTaskCallCount = 0
+    var lastStreamLastEventId: String?
     private var deletedTaskIds: Set<String> = []
     private var mockUploadedDocuments: [LimiraUploadedDocument] = []
     private var mockTask = LimiraTask(
@@ -1645,12 +2036,18 @@ final class MockLimiraService: LimiraServicing {
         return [mockTask]
     }
 
+    func loadTask(taskId: String) async throws -> LimiraTask {
+        loadTaskCallCount += 1
+        return mockTask
+    }
+
     func startResearch(query: String, scenario: String?, conversationId: String?, documentIds: [String]) async throws -> LimiraTask {
+        startResearchCallCount += 1
         mockTask = LimiraTask(
             taskId: "mock-task-\(Int(Date().timeIntervalSince1970))",
             conversationId: conversationId,
             query: query,
-            status: "completed",
+            status: "running",
             archiveStatus: "ready",
             historyArchived: false,
             scenario: scenario,
@@ -1663,6 +2060,13 @@ final class MockLimiraService: LimiraServicing {
             conversationCount: nil,
             uploadedDocuments: nil
         )
+        return mockTask
+    }
+
+    func cancelTask(taskId: String) async throws -> LimiraTask {
+        cancelTaskCallCount += 1
+        mockTask.status = "cancelled"
+        mockTask.archiveStatus = "ready"
         return mockTask
     }
 
@@ -1682,11 +2086,28 @@ final class MockLimiraService: LimiraServicing {
         deletedTaskIds.insert(taskId)
     }
 
-    func eventStream(taskId: String) -> AsyncThrowingStream<LimiraStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
-            continuation.yield(LimiraStreamEvent(event: "start_of_workflow", status: "running"))
-            continuation.yield(LimiraStreamEvent(event: "evidence_collected", status: "running", data: ["message": .string("mock evidence")]))
-            continuation.yield(LimiraStreamEvent(event: "end_of_workflow", status: "completed"))
+    func eventStream(taskId: String, lastEventId: String?) -> AsyncThrowingStream<LimiraStreamEvent, Error> {
+        lastStreamLastEventId = lastEventId
+        return AsyncThrowingStream { continuation in
+            let events = mockStreamEvents ?? [
+                LimiraStreamEvent(event: "start_of_workflow", status: "running"),
+                LimiraStreamEvent(event: "evidence_collected", status: "running", data: ["message": .string("mock evidence")]),
+                LimiraStreamEvent(event: "tool_call", status: "running", data: [
+                    "tool_name": .string("show_text"),
+                    "tool_input": .string(##"{"text":"# Mock report\nSSE and artifacts are connected."}"##)
+                ]),
+                LimiraStreamEvent(event: "archive_generated", status: "completed", data: [
+                    "archive_status": .string("ready"),
+                    "archive_url": .string("/api/limira/tasks/mock-task/archive.zip")
+                ]),
+                LimiraStreamEvent(event: "status", status: "completed", data: ["status": .string("completed")])
+            ]
+            for event in events {
+                if event.status == "completed" {
+                    mockTask.status = "completed"
+                }
+                continuation.yield(event)
+            }
             continuation.finish()
         }
     }

@@ -464,6 +464,7 @@ struct ArtifactBuckets: Decodable, Equatable {
 
 struct LimiraStreamEvent: Codable, Identifiable, Equatable {
     var id = UUID()
+    var streamEventId: String?
     var event: String
     var type: String?
     var status: String?
@@ -530,6 +531,21 @@ struct LimiraStreamEvent: Codable, Identifiable, Equatable {
             ?? data?.string("message", "summary")
             ?? payload?.string("message", "summary")
             ?? event
+    }
+}
+
+struct TaskProgressStep: Identifiable, Equatable {
+    var id = UUID()
+    var kind: String
+    var title: String
+    var detail: String = ""
+    var status: String = "active"
+    var meta: String = ""
+
+    var signature: String {
+        [kind, title, detail, meta]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .joined(separator: "\u{1F}")
     }
 }
 

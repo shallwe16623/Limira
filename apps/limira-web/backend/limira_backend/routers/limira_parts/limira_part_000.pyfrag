@@ -25,7 +25,7 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -856,6 +856,13 @@ class RunnerResearchClientProtocol(Protocol):
     ) -> AsyncIterator[dict[str, Any]]: ...
 
     async def get_task_status(
+        self,
+        *,
+        task: LimiraTask,
+        user: LimiraUser,
+    ) -> dict[str, Any]: ...
+
+    async def cancel_task(
         self,
         *,
         task: LimiraTask,
